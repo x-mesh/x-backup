@@ -74,12 +74,20 @@ pub enum IncrementalOutcome {
     },
 }
 
-/// 증분 base 선택 결과 — 체인 끝의 Complete 백업과 그 기준점 ts.
+/// 증분 base 선택 결과.
+///
+/// 기준점(ts)은 **체인 끝**(tip — 마지막 Complete 백업, 증분 포함)에서 오지만,
+/// manifest에 기록할 `base_id`는 **체인의 base 풀백업**이다(스타 모델 —
+/// `manifest::chain::verify_chain`과 PITR의 증분 수집이 `base_id == 풀 id`를 전제).
+/// tip을 그대로 base_id로 기록하면 두 번째 증분부터 체인이 BROKEN으로 판정되고
+/// PITR이 후속 증분을 수집하지 못해 데이터가 조용히 유실된다(E2E 시나리오 실측 결함).
 #[derive(Debug, Clone)]
 struct BaseSelection {
-    /// base 백업 ID.
-    id: String,
-    /// 다음 증분의 시작 기준점 = base manifest의 oplog_range.end_ts.
+    /// 체인의 base 풀백업 ID — manifest.base_id에 기록.
+    full_base_id: String,
+    /// 기준점을 제공한 체인 끝 백업 ID(로그·진단용).
+    tip_id: String,
+    /// 다음 증분의 시작 기준점 = tip manifest의 oplog_range.end_ts.
     last_backup_ts: OplogTimestamp,
 }
 
@@ -116,9 +124,10 @@ where
     let base = select_base(storage).await?;
     let last_backup_ts: bson::Timestamp = base.last_backup_ts.into();
     tracing::info!(
-        base_id = %base.id,
+        base_id = %base.full_base_id,
+        tip_id = %base.tip_id,
         last_ts = ?base.last_backup_ts,
-        "증분 base 선택 — 이 기준점 이후 oplog를 캡처합니다"
+        "증분 base 선택 — 체인 끝 기준점 이후 oplog를 캡처합니다"
     );
 
     // 3) gap 감지(캡처 전) — 직전 기준점이 oplog 윈도우 안에 아직 있는가?(§6.2)
@@ -228,7 +237,7 @@ where
     };
     let manifest = build_incremental_manifest(
         &backup_id,
-        &base.id,
+        &base.full_base_id,
         &server_meta,
         stored_size,
         &checksum,
@@ -245,7 +254,7 @@ where
 
     tracing::info!(
         backup_id = %backup_id,
-        base_id = %base.id,
+        base_id = %base.full_base_id,
         entries = oplog_count,
         bytes = stored_size,
         "증분 백업 완료"
@@ -253,7 +262,7 @@ where
 
     Ok(IncrementalOutcome::Captured {
         backup_id,
-        base_id: base.id,
+        base_id: base.full_base_id,
         oplog_count,
         oplog_range,
         stored_size_bytes: stored_size,
@@ -280,7 +289,7 @@ async fn record_empty_slice(
 
     let manifest = build_incremental_manifest(
         &backup_id,
-        &base.id,
+        &base.full_base_id,
         server_meta,
         /* stored_size */ 0,
         &checksum,
@@ -297,13 +306,13 @@ async fn record_empty_slice(
 
     tracing::info!(
         backup_id = %backup_id,
-        base_id = %base.id,
+        base_id = %base.full_base_id,
         "증분 백업 — 빈 슬라이스(변경 없음): data 없이 manifest만 기록(oplog_count=0)"
     );
 
     Ok(IncrementalOutcome::Captured {
         backup_id,
-        base_id: base.id.clone(),
+        base_id: base.full_base_id.clone(),
         oplog_count: 0,
         oplog_range,
         stored_size_bytes: 0,
@@ -410,8 +419,41 @@ async fn select_base(storage: &dyn Storage) -> Result<BaseSelection> {
             // oplog_range가 없으면(예: standalone 풀백업) 증분 base 부적격.
             None => continue,
         };
+        // 스타 모델: 기록할 base_id는 항상 체인의 풀백업이다. tip이 증분이면
+        // 그 base_id(이미 풀 id)를 따라가고, 실제 풀백업인지 가드한다 — 고아
+        // 증분이나 깨진 카탈로그 위에 새 증분을 잇지 않기 위함.
+        let full_base_id = match manifest.backup_type {
+            BackupType::Full => manifest.id.clone(),
+            BackupType::Incremental => match &manifest.base_id {
+                Some(b) => b.clone(),
+                None => {
+                    tracing::warn!(
+                        backup_id = %manifest.id,
+                        "base_id 없는 고아 증분 — base 후보에서 제외"
+                    );
+                    continue;
+                }
+            },
+        };
+        if !matches!(manifest.backup_type, BackupType::Full) {
+            let base_ok = matches!(
+                store.read(&full_base_id).await,
+                Ok(b) if matches!(b.backup_type, BackupType::Full)
+                    && matches!(b.status, BackupStatus::Complete)
+                    && !b.selective
+            );
+            if !base_ok {
+                tracing::warn!(
+                    tip_id = %manifest.id,
+                    base_id = %full_base_id,
+                    "체인의 base 풀백업이 없거나 부적격 — 이 체인을 base 후보에서 제외"
+                );
+                continue;
+            }
+        }
         return Ok(BaseSelection {
-            id: manifest.id,
+            full_base_id,
+            tip_id: manifest.id,
             last_backup_ts: end_ts,
         });
     }
@@ -618,8 +660,59 @@ mod tests {
         .await;
 
         let base = select_base(&fs).await.unwrap();
-        assert_eq!(base.id, "ffffffff-bbbb");
+        assert_eq!(base.tip_id, "ffffffff-bbbb");
+        assert_eq!(base.full_base_id, "ffffffff-bbbb");
         assert_eq!(base.last_backup_ts, OplogTimestamp::new(200, 2));
+    }
+
+    /// 스타 모델 회귀(E2E 실측 결함): tip이 증분이어도 기록할 base_id는 체인의
+    /// 풀백업이다 — 기준점(ts)만 tip(체인 끝)에서 온다. tip을 base_id로 기록하면
+    /// 두 번째 증분부터 chain.rs가 BROKEN으로 판정하고 PITR이 후속 증분을 놓친다.
+    #[tokio::test]
+    async fn select_base_resolves_full_id_when_tip_is_incremental() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = LocalFs::new(dir.path()).unwrap();
+        write_full(
+            &fs,
+            "00000000-full",
+            BackupStatus::Complete,
+            false,
+            Some(range(100, 1)),
+        )
+        .await;
+        // tip 증분: base_id가 풀을 가리키고, 기준점은 더 뒤(t=150).
+        let incr = BackupManifest {
+            format_version: FORMAT_VERSION,
+            id: "11111111-incr".into(),
+            created_at: "2026-06-12T00:01:00Z".into(),
+            backup_type: BackupType::Incremental,
+            base_id: Some("00000000-full".into()),
+            topology: Topology::ReplicaSet,
+            server_version: "7.0.35".into(),
+            tool_versions: ToolVersions::default(),
+            selective: false,
+            original_size_bytes: 1,
+            stored_size_bytes: 1,
+            compression: None,
+            encryption: None,
+            checksum_sha256: "x".into(),
+            oplog_range: Some(OplogRange {
+                start_ts: OplogTimestamp::new(100, 1),
+                end_ts: OplogTimestamp::new(150, 7),
+            }),
+            oplog_count: Some(3),
+            promoted_from_gap: false,
+            status: BackupStatus::Complete,
+        };
+        ManifestStore::new(&fs).write(&incr).await.unwrap();
+
+        let base = select_base(&fs).await.unwrap();
+        assert_eq!(base.tip_id, "11111111-incr", "기준점은 체인 끝에서");
+        assert_eq!(
+            base.full_base_id, "00000000-full",
+            "기록할 base는 풀백업(스타 모델)"
+        );
+        assert_eq!(base.last_backup_ts, OplogTimestamp::new(150, 7));
     }
 
     /// base 선택: incomplete·selective·oplog_range 없는 후보는 건너뛴다.
@@ -655,7 +748,7 @@ mod tests {
         .await;
 
         let base = select_base(&fs).await.unwrap();
-        assert_eq!(base.id, "aa-eligible");
+        assert_eq!(base.tip_id, "aa-eligible");
     }
 
     /// base 선택: 백업이 하나도 없으면 Usage 에러(exit 2).
@@ -697,7 +790,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fs = LocalFs::new(dir.path()).unwrap();
         let base = BaseSelection {
-            id: "base-1".into(),
+            full_base_id: "base-1".into(),
+            tip_id: "base-1".into(),
             last_backup_ts: OplogTimestamp::new(123, 4),
         };
 

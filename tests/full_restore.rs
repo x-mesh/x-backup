@@ -64,6 +64,12 @@ const TEST_DB: &str = "xb_restore_it";
 const TEST_COLL: &str = "items";
 const DOC_COUNT: usize = 500;
 
+/// 이 파일의 테스트들은 **같은 mongod의 같은 네임스페이스**를 시드·드롭하고
+/// 풀 인스턴스 백업/복구를 수행하므로 동시에 돌 수 없다(병렬 시 seed↔drop 경합·
+/// 교차 오염 — E2E 정비 중 실측된 flake). 파일 내 mutex로 직렬화한다.
+/// (Makefile/CI의 `--test-threads=1`은 2차 방어.)
+static FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// 정렬된 문서들의 콘텐츠 해시(SC1: 콘텐츠 해시 일치). `_id` 오름차순으로 정렬한 뒤
 /// 각 문서의 정준(canonical) BSON 바이트를 누적 sha256한다.
 async fn collection_content_hash(client: &Client) -> (u64, String) {
@@ -112,6 +118,7 @@ async fn seed(client: &Client) {
 #[tokio::test]
 #[ignore = "requires mongodump + mongorestore + replica set; run with --features integration-tests"]
 async fn backup_then_restore_matches_counts_and_hash() {
+    let _serial = FIXTURE_LOCK.lock().await;
     let src = source_uri();
     let tgt = target_uri();
     let separate_target = tgt != src;
@@ -179,6 +186,7 @@ async fn backup_then_restore_matches_counts_and_hash() {
 #[tokio::test]
 #[ignore = "requires mongodump + replica set; run with --features integration-tests"]
 async fn dry_run_does_not_modify_target() {
+    let _serial = FIXTURE_LOCK.lock().await;
     let src = source_uri();
     let tgt = target_uri();
 
@@ -239,6 +247,7 @@ async fn dry_run_does_not_modify_target() {
 #[tokio::test]
 #[ignore = "requires mongodump + mongorestore + replica set; run with --features integration-tests"]
 async fn restore_half_matches_with_real_mongorestore() {
+    let _serial = FIXTURE_LOCK.lock().await;
     let src = source_uri();
     let tgt = target_uri();
 
