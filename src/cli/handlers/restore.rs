@@ -18,6 +18,10 @@ use crate::storage::LocalFs;
 
 /// `restore` 핸들러 진입점.
 pub async fn handle(config_path: Option<PathBuf>, args: RestoreArgs) -> Result<()> {
+    // 동시 실행 잠금(FR-12) — 같은 프로파일의 backup/restore/prune과 직렬화한다.
+    // 가드(_lock)를 함수 끝까지 유지해 작업 동안 lock을 잡는다(충돌 시 exit 5).
+    let _lock = crate::lock::acquire(&args.profile)?;
+
     // PITR(--at)은 t9 소유 — 풀 복구(t5)는 oplog replay를 수행하지 않는다.
     if args.at.is_some() {
         return Err(XBackupError::Usage(
@@ -84,6 +88,8 @@ pub async fn handle(config_path: Option<PathBuf>, args: RestoreArgs) -> Result<(
         force: args.force,
         dry_run: args.dry_run,
         skip_precheck: args.skip_precheck,
+        // 진행 카운터 미사용(R16 진행 표시는 t13/t9 restore 경로에서 배선) — 빌드 정합용 None.
+        progress_counter: None,
     };
 
     // TTY 여부 — 대화형 확인 가능 여부. stdout 대신 stdin TTY로 본다(확인 입력을 받음).

@@ -26,6 +26,10 @@ use crate::storage::LocalFs;
 
 /// `backup` 핸들러 진입점.
 pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()> {
+    // 동시 실행 잠금(FR-12) — 같은 프로파일의 backup/restore/prune과 직렬화한다.
+    // 가드(_lock)를 함수 끝까지 유지해 작업 동안 lock을 잡는다(충돌 시 exit 5).
+    let _lock = crate::lock::acquire(&args.profile)?;
+
     // 1) config 로드 + 레이어 병합(file + ENV; CLI는 아래에서 직접 반영).
     let config_toml = match &config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {

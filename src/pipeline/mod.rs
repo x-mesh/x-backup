@@ -18,6 +18,7 @@
 pub mod backup;
 pub mod checksum;
 pub mod incremental;
+pub mod prune;
 pub mod restore;
 pub mod stage;
 pub mod verify;
@@ -27,6 +28,10 @@ pub use backup::{
 };
 pub use checksum::{ChecksumHandle, Sha256Reader};
 pub use incremental::{run_incremental_backup, IncrementalOutcome, IncrementalRequest};
+pub use prune::{
+    execute_prune, load_backups, plan_prune, PruneKind, PruneOutcome, PrunePlan, PruneTarget,
+    RetentionPolicy,
+};
 pub use restore::{run_restore, RestoreOutcome, RestorePlan, RestoreRequest};
 pub use stage::{reverse_stack_for, PipelineStage, StageStack};
 pub use verify::{collect_manifest_ids, verify_backup, verify_chain_for, VerifyReport};

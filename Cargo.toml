@@ -90,6 +90,10 @@ aead = { version = "0.5", features = ["stream"] }
 # 마법사(init)는 별도 대화형 크레이트(dialoguer) 대신 std stdin을 직접 읽는다 —
 # 입력 시퀀스 주입(테스트)이 trait 추상화로 더 단순하고 의존성을 줄이기 위함이다.
 indicatif = "0.18"
+# 동시 실행 잠금(t12, FR-12) — stale lock 판정의 PID 생존 확인(kill(pid,0)).
+# std에는 시그널 전송 API가 없어 libc::kill을 직접 호출한다. 이미 transitive로
+# 잠겨 있던 0.2 라인을 직접 의존으로 끌어올린다(추가 빌드 비용 없음).
+libc = "0.2"
 
 [dev-dependencies]
 # Storage trait mock 자동 생성(단위 테스트에서 파이프라인 로직 주입).
