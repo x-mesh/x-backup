@@ -1,0 +1,37 @@
+[package]
+name = "x-backup"
+version = "0.1.0"
+edition = "2021"
+# rust-version: mongodb v3.7 요구사항(1.88+)을 고려해 MSRV를 1.88로 고정한다.
+rust-version = "1.88"
+description = "MongoDB 백업·복구 CLI — 풀/증분(oplog), 로컬/원격(S3 호환), 암호화 중심"
+license = "MIT"
+
+[[bin]]
+name = "x-backup"
+path = "src/main.rs"
+
+[lib]
+name = "x_backup"
+path = "src/lib.rs"
+
+# 의존성은 리서치 stack 최종 표 기준의 "골격" 범위만 선언한다.
+# 무거운 도메인 의존성(mongodb, object_store, age, async-compression 등)은
+# 각 기능 태스크가 필요 시 추가한다 — 스캐폴드 단계에서는 의도적으로 제외.
+[dependencies]
+# 비동기 런타임 (PRD §7 async 파이프라인 토대)
+tokio = { version = "1.47", features = ["full"] }
+# CLI 파서 — derive + env(시크릿 env 참조/오버라이드 보조)
+clap = { version = "4", features = ["derive", "env"] }
+# 직렬화/역직렬화 + config.toml 파싱 + JSON 출력(--json)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# 에러 모델 (PRD §9 exit code 매핑의 토대)
+thiserror = "2"
+anyhow = "1"
+# 구조화 로그 (PRD §11 관측성, --json 로그)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# 체크섬 (PRD §FR-7 sha256, 스캐폴드 단계에서는 미사용이나 stack 기준에 포함)
+sha2 = "0.10"

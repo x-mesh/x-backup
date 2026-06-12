@@ -1,0 +1,16 @@
+# Rust 빌드 산출물
+/target
+
+# 백업 산출물·임시 파일 (로컬 destination 테스트 시)
+*.bin
+*.tmp
+*.lock.tmp
+
+# 시크릿·로컬 환경
+.env
+*.age
+*.key
+
+# OS·에디터
+.DS_Store
+*.swp
