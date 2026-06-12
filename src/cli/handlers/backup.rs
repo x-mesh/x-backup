@@ -6,6 +6,8 @@
 use std::path::PathBuf;
 
 use crate::cli::args::BackupArgs;
+use crate::cli::output::{OutputFlags, OutputMode};
+use crate::cli::progress::{new_counter, ProgressKind, ProgressReporter};
 use crate::compress::{ZstdCompressStage, ALGORITHM_ZSTD};
 use crate::config::env::collect_overrides_from_process;
 use crate::config::merged::MergeInput;
@@ -76,6 +78,17 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
     })?;
     let storage = LocalFs::new(root)?;
 
+    // 출력 모드 결정(R15) — CLI(--json>--quiet>--progress) > config(mode.output) > TTY 자동.
+    // 진행 표시·요약 출력 분기에 일관 사용한다.
+    let mode = OutputMode::resolve_from_env(
+        OutputFlags {
+            json: args.json,
+            quiet: args.quiet,
+            progress: args.progress,
+        },
+        Some(resolved.profile.mode.output.as_str()),
+    );
+
     // backup 실행 전 status 핵심 점검(연결·권한·토폴로지·도구 존재)을 자동 선행한다(FR-8,
     //   PRD §9). 전체 status보다 가벼운 서브셋([`StatusChecker::precheck_subset`])으로, 백업을
     //   *막는* 결함(Fail)만 본다. 하나라도 Fail이면 PrecheckFailed(exit 3)로 백업을 미시작한다.
@@ -96,22 +109,36 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
                     .into(),
             ));
         }
-        return handle_incremental(&resolved, &args, &uri, &storage).await;
+        return handle_incremental(&resolved, &args, &uri, &storage, mode).await;
     }
 
     // 4) 파이프라인 단계 구성(t6): compress → encrypt 고정 순서(PRD §8.4). 단계와
     //    manifest 메타를 함께 만든다(아래 build_stages 참조). --no-encrypt면 암호화 생략.
+    //    진행 표시(R16): 공유 카운터를 만들어 BackupRequest에 주입하고, 백업은 dump 총량을
+    //    사전에 모르므로 부정형(spinner)로 처리 바이트·속도를 stderr에 표시한다(PRD §FR-9).
+    let progress_counter = new_counter();
     let request = BackupRequest {
         uri,
         mongodump_program: "mongodump".to_string(),
         db: args.db.clone(),
         collection: args.collection.clone(),
+        progress_counter: Some(std::sync::Arc::clone(&progress_counter)),
     };
     let (stages, meta) = build_stages(&resolved, &args)?;
-    let outcome = run_full_backup_with_meta(&request, &storage, stages, meta).await?;
 
-    // 5) 요약 출력(stdout — 결과 전용). --json은 t15/t16이 정식화; 여기서는 최소 JSON.
-    if args.json {
+    let reporter = ProgressReporter::start(
+        mode,
+        ProgressKind::Indeterminate {
+            label: "백업".into(),
+        },
+        progress_counter,
+    );
+    let result = run_full_backup_with_meta(&request, &storage, stages, meta).await;
+    reporter.finish().await;
+    let outcome = result?;
+
+    // 5) 요약 출력(stdout — 결과 전용). 진행은 stderr, 결과/--json은 stdout으로 분리.
+    if mode.emits_json() {
         let summary = serde_json::json!({
             "backup_id": outcome.backup_id,
             "stored_size_bytes": outcome.stored_size_bytes,
@@ -119,7 +146,7 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
             "topology": format!("{:?}", outcome.topology),
         });
         println!("{summary}");
-    } else if !args.quiet {
+    } else if mode.shows_human_summary() {
         println!("백업 완료");
         println!("  id:       {}", outcome.backup_id);
         println!("  크기:     {} bytes", outcome.stored_size_bytes);
@@ -148,6 +175,7 @@ async fn handle_incremental(
     args: &BackupArgs,
     uri: &Secret,
     storage: &LocalFs,
+    mode: OutputMode,
 ) -> Result<()> {
     let request = IncrementalRequest {
         uri: uri.clone(),
@@ -166,7 +194,7 @@ async fn handle_incremental(
             oplog_range,
             stored_size_bytes,
         } => {
-            if args.json {
+            if mode.emits_json() {
                 let summary = serde_json::json!({
                     "backup_type": "incremental",
                     "backup_id": backup_id,
@@ -175,7 +203,7 @@ async fn handle_incremental(
                     "stored_size_bytes": stored_size_bytes,
                 });
                 println!("{summary}");
-            } else if !args.quiet {
+            } else if mode.shows_human_summary() {
                 println!("증분 백업 완료");
                 println!("  id:       {backup_id}");
                 println!("  base:     {base_id}");
@@ -196,7 +224,7 @@ async fn handle_incremental(
         }
         IncrementalOutcome::PromotedToFull { outcome, reason } => {
             // 승격은 데이터상 성공이지만 "증분이 아니라 풀이 됨"을 경고로 알린다(exit 4, SC2).
-            if args.json {
+            if mode.emits_json() {
                 let summary = serde_json::json!({
                     "backup_type": "full",
                     "promoted_from_gap": true,
@@ -206,7 +234,7 @@ async fn handle_incremental(
                     "reason": reason,
                 });
                 println!("{summary}");
-            } else if !args.quiet {
+            } else if mode.shows_human_summary() {
                 println!("증분 → 풀 백업 승격(gap 감지)");
                 println!("  id:       {}", outcome.backup_id);
                 println!("  크기:     {} bytes", outcome.stored_size_bytes);

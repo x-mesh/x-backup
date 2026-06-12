@@ -102,6 +102,7 @@ async fn full_then_incremental_records_chain_and_captures_txn() {
         mongodump_program: "mongodump".to_string(),
         db: None,
         collection: None,
+        progress_counter: None,
     };
     let full = run_full_backup(&full_req, &storage, StageStack::new())
         .await
@@ -202,6 +203,7 @@ async fn incremental_empty_slice_records_manifest_only() {
         mongodump_program: "mongodump".to_string(),
         db: None,
         collection: None,
+        progress_counter: None,
     };
     let full = run_full_backup(&full_req, &storage, StageStack::new())
         .await

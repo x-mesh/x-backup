@@ -134,6 +134,7 @@ async fn backup_then_restore_matches_counts_and_hash() {
         mongodump_program: mongodump_program(),
         db: None,
         collection: None,
+        progress_counter: None,
     };
     let backup = run_full_backup(&backup_request, &storage, StageStack::new())
         .await
@@ -162,6 +163,7 @@ async fn backup_then_restore_matches_counts_and_hash() {
         force: true,
         dry_run: false,
         skip_precheck: false,
+        progress_counter: None,
     };
     // 비-TTY(테스트) — confirm은 호출되지 않아야 한다(force=true).
     let outcome = run_restore(&restore_request, &storage, false, |_| {
@@ -195,6 +197,7 @@ async fn dry_run_does_not_modify_target() {
             mongodump_program: mongodump_program(),
             db: None,
             collection: None,
+            progress_counter: None,
         },
         &storage,
         StageStack::new(),
@@ -216,6 +219,7 @@ async fn dry_run_does_not_modify_target() {
         force: false,
         dry_run: true,
         skip_precheck: false,
+        progress_counter: None,
     };
     let outcome = run_restore(&request, &storage, false, |_| panic!("dry-run confirm 미호출"))
         .await
@@ -311,6 +315,7 @@ async fn restore_half_matches_with_real_mongorestore() {
         force: true,
         dry_run: false,
         skip_precheck: false,
+        progress_counter: None,
     };
     run_restore(&request, &storage, false, |_| panic!("force면 confirm 미호출"))
         .await

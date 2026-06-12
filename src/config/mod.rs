@@ -12,6 +12,7 @@ pub mod env;
 pub mod file;
 pub mod merged;
 pub mod secret;
+pub mod wizard;
 
 pub use file::{Config, Profile};
 pub use merged::ResolvedConfig;

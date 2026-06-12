@@ -49,6 +49,14 @@ impl CountingReader {
         }
     }
 
+    /// 외부에서 공유 카운터를 주입해 생성한다(진행 표시 폴링용 — t13/R16).
+    ///
+    /// 진행 표시기가 같은 `Arc<AtomicU64>`를 폴링할 수 있도록, 저장 바이트 카운터의
+    /// backing Arc를 외부와 공유한다. 카운팅 로직(`poll_read`)은 전혀 바뀌지 않는다.
+    fn with_counter(inner: BoxAsyncRead, counter: Arc<AtomicU64>) -> Self {
+        Self { inner, counter }
+    }
+
     /// 누적 바이트를 EOF 이후 읽을 핸들을 반환한다(reader가 move-out 돼도 유효).
     fn handle(&self) -> CountingHandle {
         CountingHandle {
@@ -97,6 +105,9 @@ pub struct BackupRequest {
     pub db: Option<String>,
     /// 선택적 백업 — 특정 컬렉션(`--collection`).
     pub collection: Option<String>,
+    /// 진행 표시용 공유 바이트 카운터(t13/R16). `Some`이면 저장 바이트 카운터의 backing
+    /// Arc로 주입되어, 핸들러의 진행 표시기가 이 값을 폴링한다(없으면 내부 Arc 사용).
+    pub progress_counter: Option<Arc<AtomicU64>>,
 }
 
 impl BackupRequest {
@@ -217,7 +228,11 @@ pub async fn run_full_backup_with_meta(
     let checksum_handle = checksummed.handle();
     // 저장 바이트도 같은 패스에서 센다 — list 기반 사후 조회는 백엔드별 prefix
     // 의미가 달라(LocalFs는 디렉터리 취급) 신뢰할 수 없다.
-    let stored_counted = CountingReader::new(Box::pin(checksummed));
+    // 진행 카운터가 주입됐으면 저장 카운터의 backing Arc로 공유한다(진행 표시 폴링).
+    let stored_counted = match &request.progress_counter {
+        Some(counter) => CountingReader::with_counter(Box::pin(checksummed), Arc::clone(counter)),
+        None => CountingReader::new(Box::pin(checksummed)),
+    };
     let stored_size_handle = stored_counted.handle();
 
     // 5) data.bin 저장(업로드 먼저). put_stream이 바이트를 끝까지 소비한다.
@@ -497,6 +512,7 @@ mod tests {
             mongodump_program: "mongodump".into(),
             db: None,
             collection: None,
+            progress_counter: None,
         };
         assert!(!base.is_selective());
 
@@ -520,6 +536,7 @@ mod tests {
             mongodump_program: r.mongodump_program.clone(),
             db: r.db.clone(),
             collection: r.collection.clone(),
+            progress_counter: None,
         }
     }
 

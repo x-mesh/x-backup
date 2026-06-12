@@ -4,6 +4,7 @@
 //! 구현이고, 나머지는 [`super::exit`]가 미구현 스텁으로 둔다. 후속 태스크가 각 핸들러를 추가한다.
 
 pub mod backup;
+pub mod init;
 pub mod list;
 pub mod restore;
 pub mod status;

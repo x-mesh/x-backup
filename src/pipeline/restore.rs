@@ -17,13 +17,54 @@
 //! - **dry-run:** backup id·대상 URI(redacted)·예상 크기·충돌 네임스페이스를 [`RestorePlan`]
 //!   으로 만들어 무변경 종료(exit 0). 실제 mongorestore를 스폰하지 않는다.
 
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use tokio::io::{AsyncRead, ReadBuf};
+
 use crate::engine::mongo::meta::ServerMeta;
 use crate::engine::mongo::{MongoMeta, RestoreProcess, RestoreSpec, UriConfigFile};
 use crate::error::{Result, XBackupError};
 use crate::manifest::schema::{BackupManifest, BackupType};
 use crate::manifest::store::{data_path, ManifestStore, MANIFEST_FILE};
 use crate::pipeline::stage::reverse_stack_for;
-use crate::storage::Storage;
+use crate::storage::{BoxAsyncRead, Storage};
+
+/// 통과 바이트를 공유 카운터에 누산하는 [`AsyncRead`] 래퍼(진행 표시용 — t13/R16).
+///
+/// 복구 입력 스트림(역스택 출력)을 감싸 mongorestore stdin으로 흐르는 바이트를 센다.
+/// 카운터는 진행 표시기가 폴링하는 `Arc<AtomicU64>`와 공유된다(`poll_read`에서 fetch_add).
+/// 핸들러가 [`run_restore_with_progress`]로 카운터를 주입할 때만 삽입된다.
+struct ProgressCountingReader {
+    inner: BoxAsyncRead,
+    counter: Arc<AtomicU64>,
+}
+
+impl ProgressCountingReader {
+    fn new(inner: BoxAsyncRead, counter: Arc<AtomicU64>) -> Self {
+        Self { inner, counter }
+    }
+}
+
+impl AsyncRead for ProgressCountingReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &poll {
+            let newly = buf.filled().len() - before;
+            if newly > 0 {
+                self.counter.fetch_add(newly as u64, Ordering::SeqCst);
+            }
+        }
+        poll
+    }
+}
 
 /// 복구 요청.
 pub struct RestoreRequest {
@@ -41,6 +82,9 @@ pub struct RestoreRequest {
     pub dry_run: bool,
     /// 복구 사전 점검 우회(`--skip-precheck`).
     pub skip_precheck: bool,
+    /// 진행 표시용 공유 바이트 카운터(t13/R16). `Some`이면 mongorestore stdin으로 흘리는
+    /// 복원 입력 바이트를 누산해, 핸들러의 진행 표시기가 폴링한다(없으면 미주입 — 무비용).
+    pub progress_counter: Option<Arc<AtomicU64>>,
 }
 
 /// 복구 계획(dry-run 출력·실행 요약 공통). 시크릿은 담지 않는다.
@@ -175,7 +219,7 @@ where
     //   TTY면 대화형 확인, 비-TTY면 거부(exit 1).
     let drop_existing = decide_guard(&plan, request.force, is_tty, confirm)?;
 
-    // 실제 복구 스트리밍.
+    // 실제 복구 스트리밍(진행 카운터는 request.progress_counter에서 가져온다 — R16).
     stream_restore(request, storage, &plan, drop_existing).await?;
 
     tracing::info!(
@@ -229,6 +273,9 @@ where
 }
 
 /// data.bin을 읽어 역스택을 통과시켜 mongorestore stdin으로 스트리밍한다.
+///
+/// `request.progress_counter`가 `Some`이면 stdin으로 흘리는 바이트를 누산해 진행
+/// 표시기가 폴링한다(R16).
 async fn stream_restore(
     request: &RestoreRequest,
     storage: &dyn Storage,
@@ -243,7 +290,13 @@ async fn stream_restore(
     // 1) storage에서 data.bin 읽기 스트림 확보 → 역스택 적용.
     let data_rel = data_path(&plan.backup_id);
     let raw = storage.get_stream(&data_rel).await?;
-    let mut restored_stream = stages.apply(raw);
+    let restored = stages.apply(raw);
+    // 진행 카운터가 주입됐으면 mongorestore stdin으로 흘리는 바이트를 누산한다(R16).
+    // (역스택 출력 = 복원 입력 바이트. data.bin 저장 크기와 무관히 실제 통과량을 센다.)
+    let mut restored_stream: BoxAsyncRead = match &request.progress_counter {
+        Some(counter) => Box::pin(ProgressCountingReader::new(restored, Arc::clone(counter))),
+        None => restored,
+    };
 
     // 2) URI를 0600 임시 config로(argv 노출 금지). 핸들은 restore 종료까지 유지.
     let uri_config = UriConfigFile::create(&request.target_uri)?;
@@ -462,6 +515,7 @@ mod tests {
             force: false,
             dry_run: true,
             skip_precheck: true,
+            progress_counter: None,
         };
 
         // confirm은 호출되지 않아야 한다(dry-run).
@@ -606,6 +660,7 @@ mod tests {
             force: true,            // 가드 통과(drop 허용).
             dry_run: false,
             skip_precheck: true,    // DB 연결 없이 스트리밍 경로만 검증.
+            progress_counter: None,
         };
 
         let outcome = run_restore(&request, &fs, false, |_| panic!("force면 confirm 미호출"))
@@ -648,6 +703,7 @@ mod tests {
             force: true,
             dry_run: false,
             skip_precheck: true,
+            progress_counter: None,
         };
         let err = run_restore(&request, &fs, false, |_| true).await.unwrap_err();
         assert_eq!(err.exit_code(), 1);

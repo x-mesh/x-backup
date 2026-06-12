@@ -330,6 +330,8 @@ where
         mongodump_program: request.mongodump_program.clone(),
         db: None,
         collection: None,
+        // 풀 승격 경로는 진행 카운터를 별도 주입하지 않는다(핸들러가 필요 시 외부에서 설정).
+        progress_counter: None,
     };
     let outcome = run_full_backup_with_meta(&full_request, storage, stages, meta).await?;
 

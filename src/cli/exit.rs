@@ -1,36 +1,28 @@
 //! 서브커맨드 디스패치와 종료 코드 연결.
 //!
-//! 핸들러는 현재 "not implemented" 스텁이지만, 종료 코드 경로는 완전히 동작한다.
-//! 각 핸들러는 [`crate::error::Result`]를 반환하고, `main`이 에러의
-//! [`crate::error::XBackupError::exit_code`]로 프로세스를 종료한다.
+//! 모든 서브커맨드가 실제 핸들러로 라우팅된다. 각 핸들러는 [`crate::error::Result`]를
+//! 반환하고, `main`이 에러의 [`crate::error::XBackupError::exit_code`]로 프로세스를 종료한다.
 
 use crate::cli::{handlers, Cli, Command};
-use crate::error::{Result, XBackupError};
+use crate::error::Result;
 
 /// 파싱된 CLI를 해당 핸들러로 디스패치한다.
 ///
-/// `backup`(t4)·`restore`(t5)는 실제 파이프라인을 실행한다. 나머지는 후속 태스크가
-/// 구현할 때까지 미구현 스텁([`XBackupError::Failure`], exit 1)으로 둔다.
+/// 모든 서브커맨드가 실제 핸들러로 라우팅된다(스텁 없음). 각 핸들러는
+/// [`Result`]를 반환하고 `main`이 에러의 exit code로 프로세스를 종료한다.
 pub async fn dispatch(cli: Cli) -> Result<()> {
     let Cli {
         config, command, ..
     } = cli;
     match command {
-        Command::Init(_) => not_implemented("init"),
+        Command::Init(args) => handlers::init::handle(config, args).await,
         Command::Backup(args) => handlers::backup::handle(config, args).await,
         Command::Restore(args) => handlers::restore::handle(config, args).await,
         Command::List(args) => handlers::list::handle(config, args).await,
         Command::Verify(args) => handlers::verify::handle(config, args).await,
-        Command::Prune(_) => not_implemented("prune"),
+        Command::Prune(args) => handlers::prune::handle(config, args).await,
         Command::Status(args) => handlers::status::handle(config, args).await,
     }
-}
-
-/// 미구현 핸들러용 공통 에러. 종료 코드 경로 검증을 위해 실패(exit 1)로 반환한다.
-fn not_implemented(name: &str) -> Result<()> {
-    Err(XBackupError::Failure(format!(
-        "'{name}' 서브커맨드는 아직 구현되지 않았습니다"
-    )))
 }
 
 #[cfg(test)]
@@ -47,12 +39,13 @@ mod tests {
         }
     }
 
-    /// 미구현 핸들러는 exit 1(Failure)로 반환된다.
+    /// init은 라우팅된다 — 테스트 환경(비-TTY)에서는 대화형 가드로 Usage(exit 2)다.
+    /// (더 이상 미구현 스텁 exit 1이 아니다.)
     #[tokio::test]
-    async fn unimplemented_handler_returns_failure() {
+    async fn init_handler_routes_and_guards_non_tty() {
         let result = dispatch(cli_with(Command::Init(InitArgs { force: false }))).await;
-        let err = result.expect_err("미구현이므로 에러여야 함");
-        assert_eq!(err.exit_code(), 1);
+        let err = result.expect_err("비-TTY에서는 마법사 가드로 에러여야 함");
+        assert_eq!(err.exit_code(), 2);
     }
 
     /// status 핸들러로 라우팅된다. config·URI가 없는 프로파일이면 설정 오류(exit 2)로

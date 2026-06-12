@@ -42,6 +42,7 @@ async fn full_backup_produces_three_artifacts() {
         mongodump_program: "mongodump".to_string(),
         db: None,
         collection: None,
+        progress_counter: None,
     };
 
     let outcome = run_full_backup(&request, &storage, StageStack::new())
