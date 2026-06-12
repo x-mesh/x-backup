@@ -1,0 +1,216 @@
+name: CI
+
+# x-backup CI — Rust MongoDB 백업/복구 CLI.
+#
+# 잡 구성 (docs/ci.md에 상세):
+#   - lint-and-test : 모든 PR/push. fmt --check, clippy(-D warnings),
+#                     단위(lib) + DB 불필요 E2E(exit_codes_e2e). DB/Docker 불필요.
+#   - integration   : push to main + nightly. fixture로 single-node replica set
+#                     기동 + mongodb-database-tools 100.16.1(tarball+sha256) 설치 후
+#                     `--features integration-tests`.
+#   - s3            : push to main + nightly. `--features s3-integration --test s3_minio`.
+#                     테스트가 MinIO 컨테이너를 스스로 기동/정리한다(Docker만 필요).
+#   - musl          : 모든 PR/push. cross 0.2.5로 정적 musl 릴리스 빌드 + artifact.
+#
+# Rust 버전 핀: 리포에 rust-toolchain.toml이 없으므로 워크플로에서 핀한다.
+# - MSRV(최소 지원 버전)는 Cargo.toml `rust-version = "1.88"`(mongodb v3.7 요구)이다.
+# - 그러나 CI 검증 토큰체인은 **1.93.0**으로 핀한다(docs/acceptance-report.md §1 실측 환경).
+#   이유: clippy의 `uninlined_format_args` 등 일부 린트는 버전마다 적용 범위가 달라,
+#   정확히 1.88.0으로 `clippy -D warnings`를 돌리면 acceptance에서 0 경고였던 코드가
+#   거짓 실패한다(1.88 clippy가 1.93에는 없는 방식으로 플래그). "1.88+" 요건을 만족하면서
+#   실측 green 상태와 일치시키기 위해 검증은 1.93.0으로 한다. MSRV 회귀 감시가 필요하면
+#   별도 msrv 잡(toolchain 1.88.0, `cargo check`만)을 추가할 수 있다.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # 매일 03:17 UTC — nightly에서 통합/S3 잡까지 실행해 회귀를 잡는다.
+    - cron: "17 3 * * *"
+
+# 같은 ref에 새 push가 오면 진행 중 실행을 취소한다(자원 절약).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 최소 권한.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # 검증 토큰체인 핀(acceptance-report §1 실측 환경 = 1.93.0). MSRV는 1.88(Cargo.toml).
+  RUST_TOOLCHAIN: "1.93.0"
+  # mongodb-database-tools 정확 버전(spike §2 / acceptance-report §1 실측).
+  MONGO_TOOLS_VERSION: "100.16.1"
+
+jobs:
+  # ── 1) lint + 단위 + DB 불필요 E2E (모든 PR/push) ────────────────────────
+  lint-and-test:
+    name: lint & unit/e2e (rust 1.93.0)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned 1.93.0)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: lint-and-test
+
+      - name: rustfmt (check)
+        run: cargo fmt --all -- --check
+
+      - name: clippy (all targets, all features, deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # 단위 테스트(lib). feature를 켜지 않으므로 통합/S3 스위트는
+      # `#![cfg(feature = ...)]`로 아예 컴파일 대상에서 빠진다(DB 불필요).
+      - name: cargo test (unit / lib)
+        run: cargo test --lib
+
+      # DB·Docker 없이 결정론적으로 도는 실 바이너리 E2E(종료 코드 매핑, SC6).
+      - name: cargo test (E2E exit codes, no DB)
+        run: cargo test --test exit_codes_e2e
+
+  # ── 2) 통합 테스트: replica set + mongodb-database-tools (push main + nightly) ─
+  integration:
+    name: integration (replica set)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # PR에서는 돌리지 않는다(Docker/도구 무거움). main push와 nightly에서만.
+    if: github.event_name == 'push' || github.event_name == 'schedule'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned 1.93.0)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: integration
+
+      # mongodb-database-tools 100.16.1 — spike §2의 tarball 방식 + sha256 검증.
+      # Linux x86_64(ubuntu2204) 빌드. sha256은 공식 tarball에서 실측 계산한 값.
+      - name: Install mongodb-database-tools ${{ env.MONGO_TOOLS_VERSION }}
+        run: |
+          set -euo pipefail
+          TOOLS_TGZ="mongodb-database-tools-ubuntu2204-x86_64-${MONGO_TOOLS_VERSION}.tgz"
+          URL="https://fastdl.mongodb.org/tools/db/${TOOLS_TGZ}"
+          EXPECTED_SHA256="04692b94a63a4f01d6c31b0ddd65dc4620ec69702b9036b5879cb4e6ee2cf31a"
+          echo "Downloading ${URL}"
+          curl -fsSLo "${TOOLS_TGZ}" "${URL}"
+          echo "${EXPECTED_SHA256}  ${TOOLS_TGZ}" | sha256sum --check --strict
+          tar xzf "${TOOLS_TGZ}"
+          TOOLS_BIN="${PWD}/mongodb-database-tools-ubuntu2204-x86_64-${MONGO_TOOLS_VERSION}/bin"
+          echo "${TOOLS_BIN}" >> "${GITHUB_PATH}"
+          "${TOOLS_BIN}/mongodump" --version
+
+      - name: Verify mongo tools on PATH
+        run: |
+          mongodump --version
+          mongorestore --version
+
+      # 단일 노드 replica set 기동(GitHub 서비스 컨테이너로는 rs.initiate가 안 되므로
+      # fixture 스크립트를 step에서 직접 실행한다 — PRIMARY까지 폴링 대기).
+      - name: Start single-node replica set (fixture)
+        run: |
+          chmod +x tests/fixtures/replica-set.sh
+          tests/fixtures/replica-set.sh up
+
+      - name: cargo test (integration-tests, replica set)
+        env:
+          # fixture가 띄운 단일 노드 RS URI. 테스트는 이 env가 없으면 동일 기본값을 쓴다.
+          XB_TEST_MONGO_URI: "mongodb://localhost:27017/?replicaSet=rs0&directConnection=true"
+        run: |
+          cargo test --features integration-tests -- --include-ignored --nocapture
+
+      - name: Tear down replica set
+        if: always()
+        run: tests/fixtures/replica-set.sh down
+
+  # ── 3) S3 통합: MinIO (push main + nightly) ──────────────────────────────
+  # s3_minio.rs는 MinIO 컨테이너를 스스로 docker run으로 기동/정리한다.
+  # 따라서 서비스 컨테이너를 미리 띄우지 않는다 — Docker 가용성만 필요하다
+  # (ubuntu-latest 러너에 docker 사전 설치). 테스트 host 프로세스는 127.0.0.1:<port>로
+  # MinIO에 접속하고, mc 사이드카는 host.docker.internal(--add-host)로 버킷을 만든다.
+  s3:
+    name: s3 (MinIO)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name == 'push' || github.event_name == 'schedule'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned 1.93.0)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: s3
+
+      - name: Verify Docker is available (test self-manages MinIO)
+        run: docker info >/dev/null
+
+      - name: cargo test (s3-integration, MinIO)
+        run: cargo test --features s3-integration --test s3_minio -- --nocapture
+
+  # ── 4) musl 정적 빌드 (모든 PR/push) ─────────────────────────────────────
+  # acceptance-report §5 방식: cross 0.2.5 + ghcr.io/cross-rs/x86_64-unknown-linux-musl.
+  # zstd C 빌드 + ring 어셈블리를 컨테이너 안 musl 툴체인이 함께 컴파일한다.
+  musl:
+    name: musl static build
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned 1.93.0)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: musl
+
+      # cross 0.2.5 정확 버전 핀(acceptance-report 기록 방식).
+      - name: Install cross 0.2.5
+        run: cargo install cross --version 0.2.5 --locked
+
+      - name: cross build (release, musl static)
+        run: cross build --release --target x86_64-unknown-linux-musl
+
+      - name: Inspect artifact (static-pie ELF)
+        run: |
+          BIN="target/x86_64-unknown-linux-musl/release/x-backup"
+          file "${BIN}"
+          ./"${BIN}" --version || true
+
+      - name: Upload musl binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: x-backup-x86_64-unknown-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/x-backup
+          if-no-files-found: error
+          retention-days: 14
