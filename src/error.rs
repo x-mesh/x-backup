@@ -46,6 +46,16 @@ pub enum XBackupError {
     #[error("IO 오류: {0}")]
     Io(#[from] std::io::Error),
 
+    /// 스토리지 업로드(put) 실패 — 산출물 저장 중 오류. → exit 1
+    ///
+    /// 부분 산출물은 호출 경로(RAII 가드·멀티파트 abort)에서 정리한다(PRD §11 신뢰성).
+    #[error("스토리지 업로드 실패: {0}")]
+    StorageUpload(String),
+
+    /// 스토리지 다운로드(get)·조회(list)·삭제(delete) 실패 — 산출물 읽기/관리 중 오류. → exit 1
+    #[error("스토리지 다운로드 실패: {0}")]
+    StorageDownload(String),
+
     /// 사용법·플래그 오류(잘못된 인자 조합 등). → exit 2
     #[error("사용법 오류: {0}")]
     Usage(String),
@@ -78,7 +88,10 @@ impl XBackupError {
     pub fn exit_code(&self) -> u8 {
         use exit_codes::*;
         match self {
-            Self::Failure(_) | Self::Io(_) => FAILURE,
+            Self::Failure(_)
+            | Self::Io(_)
+            | Self::StorageUpload(_)
+            | Self::StorageDownload(_) => FAILURE,
             Self::Usage(_) | Self::Config(_) => USAGE,
             Self::PrecheckFailed(_) => PRECHECK,
             Self::Warning(_) | Self::VerifyWarning(_) => WARNING,
@@ -108,6 +121,14 @@ mod tests {
             XBackupError::Io(std::io::Error::other("disk")).exit_code(),
             FAILURE
         );
+        assert_eq!(
+            XBackupError::StorageUpload("x".into()).exit_code(),
+            FAILURE
+        );
+        assert_eq!(
+            XBackupError::StorageDownload("x".into()).exit_code(),
+            FAILURE
+        );
         assert_eq!(XBackupError::Usage("x".into()).exit_code(), USAGE);
         assert_eq!(XBackupError::Config("x".into()).exit_code(), USAGE);
         assert_eq!(
@@ -130,6 +151,8 @@ mod tests {
     fn all_exit_codes_in_valid_range() {
         let samples = [
             XBackupError::Failure("a".into()),
+            XBackupError::StorageUpload("a".into()),
+            XBackupError::StorageDownload("a".into()),
             XBackupError::Usage("a".into()),
             XBackupError::Config("a".into()),
             XBackupError::PrecheckFailed("a".into()),

@@ -35,3 +35,20 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # 체크섬 (PRD §FR-7 sha256, 스캐폴드 단계에서는 미사용이나 stack 기준에 포함)
 sha2 = "0.10"
+# 추상 스토리지 백엔드 (PRD §10 Storage trait). LocalFileSystem은 기본 feature(fs)로 포함되며,
+# aws feature는 S3 백엔드 태스크(t7)가 추가한다 — 여기서는 LocalFs만 활성화한다.
+object_store = "0.13"
+# async fn in trait(dyn) — AFIT는 dyn 미지원이므로 async_trait 매크로를 채택(리서치 architecture §2).
+async-trait = "0.1"
+# AsyncRead ↔ object_store 스트림 경계 어댑터(ReaderStream / StreamReader).
+# ReaderStream이 yield하는 bytes::Bytes는 object_store WriteMultipart::put로 그대로
+# 흘러가므로, 이 계층에서 bytes 크레이트를 직접 참조하지 않는다(t4/t7이 필요 시 추가).
+tokio-util = { version = "0.7", features = ["io"] }
+# Stream 콤비네이터(list 결과 수집, GetResult 스트림 매핑).
+futures = "0.3"
+
+[dev-dependencies]
+# Storage trait mock 자동 생성(단위 테스트에서 파이프라인 로직 주입).
+mockall = "0.14"
+# 단위 테스트용 임시 디렉터리(LocalFs round-trip).
+tempfile = "3"
