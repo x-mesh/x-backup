@@ -263,6 +263,8 @@ mod tests {
             encryption,
             checksum_sha256: "x".into(),
             oplog_range: None,
+            oplog_count: None,
+            promoted_from_gap: false,
             status: BackupStatus::Complete,
         }
     }

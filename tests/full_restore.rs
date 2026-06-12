@@ -290,6 +290,8 @@ async fn restore_half_matches_with_real_mongorestore() {
             hex::encode(Sha256::digest(&archive))
         },
         oplog_range: None,
+        oplog_count: None,
+        promoted_from_gap: false,
         status: BackupStatus::Complete,
     };
     ManifestStore::new(&storage)

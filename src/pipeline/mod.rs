@@ -14,6 +14,7 @@
 
 pub mod backup;
 pub mod checksum;
+pub mod incremental;
 pub mod restore;
 pub mod stage;
 
@@ -21,5 +22,6 @@ pub use backup::{
     run_full_backup, run_full_backup_with_meta, BackupMeta, BackupOutcome, BackupRequest,
 };
 pub use checksum::{ChecksumHandle, Sha256Reader};
+pub use incremental::{run_incremental_backup, IncrementalOutcome, IncrementalRequest};
 pub use restore::{run_restore, RestoreOutcome, RestorePlan, RestoreRequest};
 pub use stage::{reverse_stack_for, PipelineStage, StageStack};

@@ -335,6 +335,10 @@ fn build_manifest(
         encryption: meta.encryption.clone(),
         checksum_sha256: checksum.to_string(),
         oplog_range,
+        // 풀 백업은 oplog가 archive에 내장되어 별도 엔트리 카운트가 없다(증분 전용 필드).
+        oplog_count: None,
+        // 풀 백업은 gap 승격이 아니다(증분 핸들러가 풀로 승격할 때만 true로 덮어쓴다).
+        promoted_from_gap: false,
         status: BackupStatus::Complete,
     }
 }
@@ -448,6 +452,8 @@ mod tests {
             encryption: None,
             checksum_sha256: "x".into(),
             oplog_range: None,
+            oplog_count: None,
+            promoted_from_gap: false,
             status: BackupStatus::Complete,
         };
         let write_err = store.write(&manifest).await.unwrap_err();

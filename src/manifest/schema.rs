@@ -177,10 +177,35 @@ pub struct BackupManifest {
     /// 저장 바이트(data.bin)의 sha256 hex — 무결성 primary(PRD §8.5).
     pub checksum_sha256: String,
     /// dump가 본 oplog 구간(replica set + --oplog일 때만; standalone은 None).
+    ///
+    /// 증분(t8)에서는 `start_ts`=직전 백업 기준점(`last_backup_ts`),
+    /// `end_ts`=실제 캡처한 마지막 oplog 엔트리의 ts다(빈 슬라이스면 start==end==last).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oplog_range: Option<OplogRange>,
+    /// 캡처한 oplog 엔트리 개수(증분 전용, t8). 풀 백업은 oplog가 archive에
+    /// 내장되어 별도 카운트가 없으므로 `None`이다.
+    ///
+    /// **빈 슬라이스 계약(verify/list와의 계약, pitfall 3-2):** 값이 `Some(0)`이면
+    /// 증분 구간에 변경이 없었다는 뜻이며, 이때는 `data.bin`을 업로드하지 않고
+    /// manifest만 기록한다(`stored_size_bytes`=0, `original_size_bytes`=0).
+    /// 따라서 verify/list는 `oplog_count == Some(0)`인 manifest에 대해 `data.bin`의
+    /// 부재를 정상으로 취급해야 한다(존재하지 않는 data 파일을 에러로 보지 않는다).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oplog_count: Option<u64>,
+    /// gap(oplog 윈도우 롤오버) 감지로 증분 요청이 풀 백업으로 **승격**되어
+    /// 생성된 백업이면 `true`(additive, t8). 일반 백업은 `false`(기본).
+    ///
+    /// `backup_type`=Full이면서 이 값이 true면 "증분이 요청됐으나 gap으로 풀 승격됨"을
+    /// 의미한다(SC2, exit 4 경고 동반). 운영 진단·체인 분석용 표식이다.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub promoted_from_gap: bool,
     /// 완료 상태.
     pub status: BackupStatus,
+}
+
+/// `serde(skip_serializing_if)`용 — `false`면 직렬화에서 생략한다(기본 백업의 잡음 제거).
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 #[cfg(test)]
@@ -211,6 +236,8 @@ mod tests {
                 start_ts: OplogTimestamp::new(1_781_272_000, 1),
                 end_ts: OplogTimestamp::new(1_781_272_133, 5),
             }),
+            oplog_count: None,
+            promoted_from_gap: false,
             status: BackupStatus::Complete,
         }
     }

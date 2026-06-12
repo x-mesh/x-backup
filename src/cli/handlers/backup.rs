@@ -16,6 +16,9 @@ use crate::engine::mongo::status::{CheckStatus, StatusChecker};
 use crate::error::{Result, XBackupError};
 use crate::manifest::schema::CompressionMeta;
 use crate::pipeline::backup::{run_full_backup_with_meta, BackupMeta, BackupRequest};
+use crate::pipeline::incremental::{
+    run_incremental_backup, IncrementalOutcome, IncrementalRequest,
+};
 use crate::pipeline::stage::{StageStack, ENV_AES_KEY_HEX};
 use crate::storage::LocalFs;
 
@@ -83,11 +86,17 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
         tracing::warn!("--skip-precheck 지정 — 백업 사전 점검을 건너뜁니다(FR-8 우회)");
     }
 
-    // 증분은 t8 소유. t4는 풀 백업만.
+    // 증분(--type incr)은 드라이버 oplog 캡처 경로로 분기한다(t8). 선택적 백업
+    //   (--db/--collection)과는 병용 불가(증분은 항상 전체 oplog 슬라이스).
     if matches!(args.backup_type, Some(crate::cli::args::BackupType::Incr)) {
-        return Err(XBackupError::Usage(
-            "증분 백업(--type incr)은 아직 미지원입니다(t8) — 풀 백업만 동작".into(),
-        ));
+        if args.db.is_some() || args.collection.is_some() {
+            return Err(XBackupError::Usage(
+                "증분 백업(--type incr)은 선택적 백업(--db/--collection)과 병용할 수 없습니다 \
+                 — 증분은 전체 oplog 슬라이스를 캡처합니다(FR-1/FR-2)."
+                    .into(),
+            ));
+        }
+        return handle_incremental(&resolved, &args, &uri, &storage).await;
     }
 
     // 4) 파이프라인 단계 구성(t6): compress → encrypt 고정 순서(PRD §8.4). 단계와
@@ -124,6 +133,92 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
     }
 
     Ok(())
+}
+
+/// 증분 백업 분기(`--type incr`) — 드라이버 oplog 캡처 → 저장 → manifest, gap 시 풀 승격.
+///
+/// 파이프라인 단계(compress→encrypt)는 풀 백업과 **동일하게** [`build_stages`]로 만든다.
+/// 단, 증분은 캡처 스택 소비 후에도 (late gap 등) 풀 승격을 위해 스택을 새로 만들 수
+/// 있어야 하므로 [`build_stages`]를 팩토리 클로저로 넘긴다([`run_incremental_backup`]).
+///
+/// gap·late gap·oplog-empty로 풀 백업으로 승격되면 **exit 4**(경고 동반 성공,
+/// [`XBackupError::Warning`])로 보고한다(SC2). 정상 증분(빈 슬라이스 포함)은 exit 0.
+async fn handle_incremental(
+    resolved: &ResolvedConfig,
+    args: &BackupArgs,
+    uri: &Secret,
+    storage: &LocalFs,
+) -> Result<()> {
+    let request = IncrementalRequest {
+        uri: uri.clone(),
+        mongodump_program: "mongodump".to_string(),
+    };
+    // 캡처/승격 양쪽에서 동일 구성의 새 StageStack을 만들 수 있도록 팩토리로 넘긴다.
+    let stage_factory = || build_stages(resolved, args);
+
+    let outcome = run_incremental_backup(&request, storage, stage_factory).await?;
+
+    match outcome {
+        IncrementalOutcome::Captured {
+            backup_id,
+            base_id,
+            oplog_count,
+            oplog_range,
+            stored_size_bytes,
+        } => {
+            if args.json {
+                let summary = serde_json::json!({
+                    "backup_type": "incremental",
+                    "backup_id": backup_id,
+                    "base_id": base_id,
+                    "oplog_count": oplog_count,
+                    "stored_size_bytes": stored_size_bytes,
+                });
+                println!("{summary}");
+            } else if !args.quiet {
+                println!("증분 백업 완료");
+                println!("  id:       {backup_id}");
+                println!("  base:     {base_id}");
+                println!("  엔트리:   {oplog_count}건");
+                println!("  크기:     {stored_size_bytes} bytes");
+                println!(
+                    "  oplog:    {{t:{},i:{}}} → {{t:{},i:{}}}",
+                    oplog_range.start_ts.t,
+                    oplog_range.start_ts.i,
+                    oplog_range.end_ts.t,
+                    oplog_range.end_ts.i
+                );
+                if oplog_count == 0 {
+                    println!("  (변경 없음 — 빈 슬라이스: manifest만 기록)");
+                }
+            }
+            Ok(())
+        }
+        IncrementalOutcome::PromotedToFull { outcome, reason } => {
+            // 승격은 데이터상 성공이지만 "증분이 아니라 풀이 됨"을 경고로 알린다(exit 4, SC2).
+            if args.json {
+                let summary = serde_json::json!({
+                    "backup_type": "full",
+                    "promoted_from_gap": true,
+                    "backup_id": outcome.backup_id,
+                    "stored_size_bytes": outcome.stored_size_bytes,
+                    "checksum_sha256": outcome.checksum_sha256,
+                    "reason": reason,
+                });
+                println!("{summary}");
+            } else if !args.quiet {
+                println!("증분 → 풀 백업 승격(gap 감지)");
+                println!("  id:       {}", outcome.backup_id);
+                println!("  크기:     {} bytes", outcome.stored_size_bytes);
+                println!("  사유:     {reason}");
+            }
+            // exit 4(경고 동반 성공) — main이 Warning을 exit 4로 매핑한다.
+            Err(XBackupError::Warning(format!(
+                "증분이 gap으로 풀 백업({})으로 승격되었습니다: {reason}",
+                outcome.backup_id
+            )))
+        }
+    }
 }
 
 /// backup 자동 사전 점검 — status 핵심 서브셋(연결·권한·토폴로지·도구 존재)을 실행한다.

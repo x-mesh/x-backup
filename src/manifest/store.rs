@@ -155,6 +155,8 @@ mod tests {
             encryption: None,
             checksum_sha256: "abc".to_string(),
             oplog_range: None,
+            oplog_count: None,
+            promoted_from_gap: false,
             status: BackupStatus::Complete,
         }
     }
