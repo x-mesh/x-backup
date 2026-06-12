@@ -13,13 +13,16 @@
 //!   다시 reader로 반환한다 — `tokio::io::copy`의 자연 백프레셔를 활용한다.
 
 pub mod local;
+pub mod s3;
 
 pub use local::LocalFs;
+pub use s3::S3Compatible;
 
 use std::pin::Pin;
 
 use tokio::io::AsyncRead;
 
+use crate::config::file::DestinationConfig;
 use crate::error::XBackupError;
 
 /// 스토리지 스트림 경계 타입.
@@ -80,6 +83,60 @@ pub trait Storage: Send + Sync {
     async fn delete(&self, path: &str) -> Result<(), XBackupError>;
 }
 
+/// `DestinationConfig`로부터 적절한 [`Storage`] 백엔드를 생성하는 팩토리.
+///
+/// `destination.type`(`local` | `s3`)에 따라 [`LocalFs`] 또는 [`S3Compatible`]을
+/// `Box<dyn Storage>`로 반환한다 — 호출자(파이프라인 핸들러)는 백엔드 종류를
+/// 몰라도 동일 trait로 다룬다.
+///
+/// ## 이 함수의 책임 경계
+/// - 백엔드 **생성**만 담당한다. CLI 핸들러 배선(어떤 명령이 이 팩토리를 호출할지)은
+///   후속 태스크의 몫이다.
+/// - S3 자격증명은 **env에서 직접 조회**한다 — config의
+///   `destination.s3.credentials_env`가 가리키는 환경변수 이름을 읽어 그 값을
+///   `S3Compatible::new`에 넘긴다. 값 형식은 `"ACCESS_KEY:SECRET_KEY"`다.
+///   (시크릿 평문은 이 경로에서만 잠깐 다루며 로그/Debug에 남기지 않는다.)
+///
+/// ## 에러
+/// - `type` 누락/미지원, 필수 키 누락, credentials env 미설정 등은
+///   [`XBackupError::Config`](exit 2)로 반환한다.
+pub fn from_config(dest: &DestinationConfig) -> Result<Box<dyn Storage>, XBackupError> {
+    let backend = dest.r#type.as_deref().ok_or_else(|| {
+        XBackupError::Config("destination.type이 필요합니다(local | s3)".to_string())
+    })?;
+
+    match backend {
+        "local" => {
+            let path = dest.path.as_deref().ok_or_else(|| {
+                XBackupError::Config("local destination에 path가 필요합니다".to_string())
+            })?;
+            Ok(Box::new(LocalFs::new(path)?))
+        }
+        "s3" => {
+            let s3_cfg = dest.s3.as_ref().ok_or_else(|| {
+                XBackupError::Config(
+                    "s3 destination에 [destination.s3] 블록이 필요합니다".to_string(),
+                )
+            })?;
+            let creds_env = s3_cfg.credentials_env.as_deref().ok_or_else(|| {
+                XBackupError::Config(
+                    "s3 destination에 credentials_env가 필요합니다".to_string(),
+                )
+            })?;
+            // credentials_env가 가리키는 환경변수에서 "ACCESS:SECRET" 값을 읽는다.
+            let creds_raw = std::env::var(creds_env).map_err(|_| {
+                XBackupError::Config(format!(
+                    "S3 자격증명 환경변수 '{creds_env}'가 설정되지 않았습니다"
+                ))
+            })?;
+            Ok(Box::new(S3Compatible::new(s3_cfg, &creds_raw)?))
+        }
+        other => Err(XBackupError::Config(format!(
+            "지원하지 않는 destination.type: '{other}'(local | s3만 지원)"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +164,117 @@ mod tests {
         let entries = storage.list("id/").await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].size, 42);
+    }
+
+    /// from_config: type="local" + 존재하는 path → LocalFs를 만든다.
+    #[tokio::test]
+    async fn from_config_builds_local_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = DestinationConfig {
+            r#type: Some("local".to_string()),
+            path: Some(dir.path().to_string_lossy().to_string()),
+            s3: None,
+        };
+        let storage = from_config(&dest).expect("local 백엔드 생성 성공");
+        // 동일 trait로 put/get round-trip이 되는지 확인(LocalFs↔dyn Storage 교체 가능).
+        storage
+            .put_stream(
+                "bkp/data.bin",
+                Box::pin(std::io::Cursor::new(b"hello".to_vec())),
+                None,
+            )
+            .await
+            .unwrap();
+        let entries = storage.list("bkp").await.unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    /// from_config: type="s3" + 완비된 설정 + credentials env → S3Compatible을 만든다.
+    /// (네트워크 호출 없음 — 빌더 구성까지만 검증.)
+    #[test]
+    fn from_config_builds_s3_backend() {
+        use crate::config::file::S3Config;
+
+        // 테스트 격리를 위해 고유 env 이름 사용.
+        let env_name = "XBACKUP_TEST_S3_CREDS_FROM_CONFIG";
+        // SAFETY: 단일 스레드 테스트에서만 설정/해제하며 다른 테스트와 이름이 겹치지 않는다.
+        unsafe {
+            std::env::set_var(env_name, "AKIATEST:secretvalue");
+        }
+
+        let dest = DestinationConfig {
+            r#type: Some("s3".to_string()),
+            path: None,
+            s3: Some(S3Config {
+                endpoint: Some("http://localhost:9000".to_string()),
+                bucket: Some("test-bucket".to_string()),
+                prefix: Some("mongo/test".to_string()),
+                region: Some("us-east-1".to_string()),
+                credentials_env: Some(env_name.to_string()),
+            }),
+        };
+        let result = from_config(&dest);
+        unsafe {
+            std::env::remove_var(env_name);
+        }
+        assert!(result.is_ok(), "s3 백엔드 생성 실패: {:?}", result.err());
+    }
+
+    /// `from_config`의 에러 종료 코드를 확인하는 헬퍼.
+    ///
+    /// 성공 타입(`Box<dyn Storage>`)이 `Debug`를 구현하지 않아 `unwrap_err`를 쓸 수
+    /// 없으므로, 결과를 직접 매칭해 에러 exit code만 단언한다.
+    fn assert_config_error(dest: &DestinationConfig) {
+        match from_config(dest) {
+            Err(e) => assert_eq!(e.exit_code(), 2),
+            Ok(_) => panic!("Config 에러를 기대했으나 백엔드 생성에 성공했다"),
+        }
+    }
+
+    /// from_config: type 누락은 Config 에러(exit 2).
+    #[test]
+    fn from_config_rejects_missing_type() {
+        assert_config_error(&DestinationConfig {
+            r#type: None,
+            path: None,
+            s3: None,
+        });
+    }
+
+    /// from_config: 미지원 type은 Config 에러(exit 2).
+    #[test]
+    fn from_config_rejects_unknown_type() {
+        assert_config_error(&DestinationConfig {
+            r#type: Some("gcs".to_string()),
+            path: None,
+            s3: None,
+        });
+    }
+
+    /// from_config: local인데 path 누락 → Config 에러(exit 2).
+    #[test]
+    fn from_config_local_requires_path() {
+        assert_config_error(&DestinationConfig {
+            r#type: Some("local".to_string()),
+            path: None,
+            s3: None,
+        });
+    }
+
+    /// from_config: s3인데 credentials env 미설정 → Config 에러(exit 2).
+    #[test]
+    fn from_config_s3_requires_credentials_env_set() {
+        use crate::config::file::S3Config;
+        assert_config_error(&DestinationConfig {
+            r#type: Some("s3".to_string()),
+            path: None,
+            s3: Some(S3Config {
+                endpoint: Some("http://localhost:9000".to_string()),
+                bucket: Some("b".to_string()),
+                prefix: None,
+                region: None,
+                credentials_env: Some("XBACKUP_DEFINITELY_UNSET_ENV_VAR_12345".to_string()),
+            }),
+        });
     }
 }

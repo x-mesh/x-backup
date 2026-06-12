@@ -11,6 +11,9 @@ license = "MIT"
 # 통합 테스트 격리(환경에 mongodump/mongorestore + replica set 필요).
 # 기본 빌드/CI 단위 테스트에는 포함하지 않는다 — `--features integration-tests`로만 활성화.
 integration-tests = []
+# S3 통합 테스트 격리(환경에 docker + MinIO 필요). 기본 빌드/단위 테스트에는
+# 포함하지 않으며 `--features s3-integration`으로만 활성화한다(integration-tests 패턴 동일).
+s3-integration = []
 
 [[bin]]
 name = "x-backup"
@@ -41,8 +44,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # 체크섬 (PRD §FR-7 sha256, 스캐폴드 단계에서는 미사용이나 stack 기준에 포함)
 sha2 = "0.10"
 # 추상 스토리지 백엔드 (PRD §10 Storage trait). LocalFileSystem은 기본 feature(fs)로 포함되며,
-# aws feature는 S3 백엔드 태스크(t7)가 추가한다 — 여기서는 LocalFs만 활성화한다.
-object_store = "0.13"
+# aws feature는 S3 호환 백엔드(t7)가 AmazonS3Builder(with_endpoint+path-style)로 멀티파트
+# 업로드/abort를 구현하는 데 필요하다. reqwest→rustls→ring 체인으로 musl 정적 빌드와 호환된다.
+object_store = { version = "0.13", features = ["aws"] }
 # async fn in trait(dyn) — AFIT는 dyn 미지원이므로 async_trait 매크로를 채택(리서치 architecture §2).
 async-trait = "0.1"
 # AsyncRead ↔ object_store 스트림 경계 어댑터(ReaderStream / StreamReader).
