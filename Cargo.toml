@@ -98,3 +98,7 @@ libc = "0.2"
 [dev-dependencies]
 # Storage trait mock 자동 생성(단위 테스트에서 파이프라인 로직 주입).
 mockall = "0.14"
+# 실제 바이너리 E2E — 빌드된 x-backup을 스폰해 exit code/출력을 검증한다(SC6, C3).
+# Docker·DB 없이 동작하는 시나리오(설정 오류=2, PITR+--only=2, 점검 실패=3, 잠금 충돌=5)만 다룬다.
+assert_cmd = "2"
+predicates = "3"

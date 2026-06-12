@@ -461,6 +461,17 @@ impl StatusChecker {
                 return CheckItem::fail("privileges", "권한", format!("권한 조회 실패: {e}"))
             }
         };
+        // 인증 비활성 서버(인증된 사용자 없음)는 사실상 전권 — 권한 누락으로 보지 않는다.
+        // 단, 운영상 주의가 필요한 구성이므로 경고로 남긴다(백업은 막지 않음).
+        if auth_is_disabled(&doc) {
+            return CheckItem::warn(
+                "privileges",
+                "권한",
+                "인증이 비활성화된 서버입니다(인증된 사용자 없음) — 접속 주체가 전권을 가지므로 \
+                 권한은 충분하나, 운영 환경에서는 인증 활성화를 권장합니다"
+                    .to_string(),
+            );
+        }
         let granted = collect_granted_actions(&doc);
         let missing = missing_actions(&granted);
         if missing.is_empty() {
@@ -714,6 +725,24 @@ impl StatusChecker {
     }
 }
 
+/// 인증이 **비활성**인 서버인지(인증된 사용자가 없는지) 판정한다.
+///
+/// `connectionStatus.authInfo.authenticatedUsers`가 비어 있으면 인증이 꺼져 있거나
+/// (auth 미설정) localhost 예외로 익명 접속한 상태다 — 이 경우 접속 주체는 사실상
+/// **전권**을 가지므로 권한 누락으로 볼 수 없다(`authenticatedUserPrivileges`도 비어
+/// 권한 검사가 거짓 음성을 낸다). 백업을 막을 결함이 아니므로 별도 판정한다.
+///
+/// 배열이 없으면(필드 부재) 보수적으로 "인증된 사용자 없음(=auth 비활성)"으로 본다.
+fn auth_is_disabled(conn_status: &Document) -> bool {
+    let Ok(auth_info) = conn_status.get_document("authInfo") else {
+        return true;
+    };
+    match auth_info.get_array("authenticatedUsers") {
+        Ok(users) => users.is_empty(),
+        Err(_) => true,
+    }
+}
+
 /// `connectionStatus` 응답에서 부여된 모든 액션 이름을 합집합으로 모은다.
 ///
 /// 구조: `authInfo.authenticatedUserPrivileges[].actions[]`. showPrivileges가 true일 때만
@@ -915,6 +944,31 @@ mod tests {
     fn collect_granted_actions_empty_when_no_privileges() {
         let conn = doc! { "authInfo": { "authenticatedUsers": [] } };
         assert!(collect_granted_actions(&conn).is_empty());
+    }
+
+    // ── 인증 비활성 판정(no-auth 서버에서 권한 거짓 음성 방지) ──
+    #[test]
+    fn auth_disabled_when_no_authenticated_users() {
+        // 인증된 사용자 배열이 비어 있으면 auth 비활성으로 본다.
+        let conn = doc! { "authInfo": { "authenticatedUsers": [] } };
+        assert!(auth_is_disabled(&conn));
+        // authInfo 자체가 없어도 보수적으로 비활성으로 본다.
+        assert!(auth_is_disabled(&doc! {}));
+        // authenticatedUsers 필드가 없으면(부재) 비활성으로 본다.
+        assert!(auth_is_disabled(&doc! { "authInfo": {} }));
+    }
+
+    #[test]
+    fn auth_enabled_when_user_present() {
+        let conn = doc! {
+            "authInfo": {
+                "authenticatedUsers": [ { "user": "backup", "db": "admin" } ],
+                "authenticatedUserPrivileges": [
+                    { "resource": { "db": "", "collection": "" }, "actions": ["find", "listCollections"] },
+                ]
+            }
+        };
+        assert!(!auth_is_disabled(&conn), "사용자가 있으면 auth 활성");
     }
 
     // ── oplog 윈도우 임계 ──
