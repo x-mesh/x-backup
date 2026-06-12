@@ -9,8 +9,8 @@ use crate::error::{Result, XBackupError};
 
 /// 파싱된 CLI를 해당 핸들러로 디스패치한다.
 ///
-/// `backup`은 실제 파이프라인을 실행한다(t4). 나머지는 후속 태스크가 구현할 때까지
-/// 미구현 스텁([`XBackupError::Failure`], exit 1)으로 둔다.
+/// `backup`(t4)·`restore`(t5)는 실제 파이프라인을 실행한다. 나머지는 후속 태스크가
+/// 구현할 때까지 미구현 스텁([`XBackupError::Failure`], exit 1)으로 둔다.
 pub async fn dispatch(cli: Cli) -> Result<()> {
     let Cli {
         config, command, ..
@@ -18,7 +18,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
     match command {
         Command::Init(_) => not_implemented("init"),
         Command::Backup(args) => handlers::backup::handle(config, args).await,
-        Command::Restore(_) => not_implemented("restore"),
+        Command::Restore(args) => handlers::restore::handle(config, args).await,
         Command::List(_) => not_implemented("list"),
         Command::Verify(_) => not_implemented("verify"),
         Command::Prune(_) => not_implemented("prune"),

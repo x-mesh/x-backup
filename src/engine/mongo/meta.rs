@@ -87,6 +87,56 @@ impl MongoMeta {
         })
     }
 
+    /// 사용자 네임스페이스(`db.collection`) 목록을 조회한다(복구 사전 점검·충돌 감지용).
+    ///
+    /// 시스템 DB(`admin`/`config`/`local`)는 제외한다 — 복구가 덮어쓸 *사용자 데이터*만
+    /// "기존 데이터"로 본다(PRD §FR-3 가드레일·dry-run 충돌 목록). 결과는 정렬된 `db.coll`
+    /// 문자열 벡터다. `ns_filter`가 `Some(db.coll)`이면 그 네임스페이스로 한정해 본다
+    /// (선택적 복구 `--only` 시 충돌 범위를 좁힌다).
+    pub async fn user_namespaces(&self, ns_filter: Option<&str>) -> Result<Vec<String>> {
+        const SYSTEM_DBS: [&str; 3] = ["admin", "config", "local"];
+
+        // 충돌 범위를 특정 db로 좁힐 수 있으면(--only db.coll) 그 db만 본다.
+        let only_db = ns_filter.and_then(|ns| ns.split('.').next());
+
+        let db_names = self.client.list_database_names().await.map_err(|e| {
+            XBackupError::Failure(format!("데이터베이스 목록 조회 실패: {e}"))
+        })?;
+
+        let mut namespaces = Vec::new();
+        for db_name in db_names {
+            if SYSTEM_DBS.contains(&db_name.as_str()) {
+                continue;
+            }
+            if let Some(want) = only_db {
+                if db_name != want {
+                    continue;
+                }
+            }
+            let db = self.client.database(&db_name);
+            let colls = db.list_collection_names().await.map_err(|e| {
+                XBackupError::Failure(format!("컬렉션 목록 조회 실패({db_name}): {e}"))
+            })?;
+            for coll in colls {
+                // system.* 컬렉션은 사용자 데이터가 아니므로 제외.
+                if coll.starts_with("system.") {
+                    continue;
+                }
+                namespaces.push(format!("{db_name}.{coll}"));
+            }
+        }
+        namespaces.sort();
+
+        // 특정 네임스페이스 필터(db.collection 전체 지정)면 정확히 일치하는 것만.
+        if let Some(ns) = ns_filter {
+            if ns.contains('.') && ns.split('.').count() == 2 && !ns.ends_with('.') {
+                namespaces.retain(|existing| existing == ns);
+            }
+        }
+
+        Ok(namespaces)
+    }
+
     /// `local.oplog.rs`의 최신 엔트리 ts를 반환한다(natural order 내림차순 1건).
     ///
     /// standalone 등 oplog 부재 시 `None`. dump 전후로 호출해 oplog 구간을 산정한다.

@@ -108,6 +108,9 @@ pub struct RestoreArgs {
     /// 사용할 프로파일 이름.
     #[arg(long, value_name = "NAME")]
     pub profile: String,
+    /// 복구할 백업 ID. 미지정 시 최신 풀 백업을 자동 선택한다(FR-3).
+    #[arg(long, value_name = "BACKUP_ID")]
+    pub id: Option<String>,
     /// 복구 대상 MongoDB URI(미지정 시 프로파일 source). 타깃 분리 복구용.
     #[arg(long, value_name = "MONGO_URI")]
     pub target: Option<String>,

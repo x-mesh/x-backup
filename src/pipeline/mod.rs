@@ -8,12 +8,18 @@
 //! → put_stream → manifest(data→meta→사이드카).
 //! 체크섬 기준점 = Storage에 쓰인 최종 바이트(키 없이 구조 검증 가능, PRD §8.5).
 //!
-//! 복구(get_stream → decrypt → decompress → mongorestore stdin)는 t5 소유.
+//! 복구(get_stream → decrypt → decompress → mongorestore stdin)는 [`restore`](t5).
+//! 복구 흐름: storage get_stream(data.bin) → reverse_stack(decrypt→decompress; 평문은
+//! identity) → mongorestore --archive=- stdin. 사전 점검·가드레일·dry-run 포함.
 
 pub mod backup;
 pub mod checksum;
+pub mod restore;
 pub mod stage;
 
-pub use backup::{run_full_backup, BackupOutcome, BackupRequest};
+pub use backup::{
+    run_full_backup, run_full_backup_with_meta, BackupMeta, BackupOutcome, BackupRequest,
+};
 pub use checksum::{ChecksumHandle, Sha256Reader};
-pub use stage::{PipelineStage, StageStack};
+pub use restore::{run_restore, RestoreOutcome, RestorePlan, RestoreRequest};
+pub use stage::{reverse_stack_for, PipelineStage, StageStack};
