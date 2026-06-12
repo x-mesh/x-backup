@@ -57,6 +57,17 @@ pub enum Command {
     Prune(PruneArgs),
     /// 대상 서버 상태를 점검한다(읽기 전용·무부작용).
     Status(StatusArgs),
+    /// x-backup 자신을 최신 릴리스로 갱신한다(설치 소스 자동 감지).
+    Update(UpdateArgs),
+}
+
+/// `update` — 자기 갱신. brew 설치는 brew upgrade로 위임, manual 설치는
+/// 릴리스 자산 다운로드 + sha256 검증 + 원자적 교체(gk 컨벤션).
+#[derive(Debug, Args)]
+pub struct UpdateArgs {
+    /// 최신 버전 확인만 하고 설치하지 않는다.
+    #[arg(long)]
+    pub check: bool,
 }
 
 /// `init` — 마법사로 config.toml 생성(FR-10, R18).

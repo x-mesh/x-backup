@@ -20,6 +20,7 @@ pub mod lock;
 pub mod manifest;
 pub mod pipeline;
 pub mod storage;
+pub mod update;
 
 pub use error::{Result, XBackupError};
 

@@ -69,6 +69,13 @@ uuid = { version = "1", features = ["v7"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 # 사이드카 체크섬·manifest checksum_sha256의 hex 인코딩.
 hex = "0.4"
+
+# --- update 서브커맨드(자기 갱신) ---
+# reqwest는 object_store 경유로 이미 트리에 있는 0.12 계열을 직접 의존으로 노출만 한다
+# (rustls 체인 — musl 정적 빌드 호환). flate2/tar는 릴리스 tarball 추출용(pure Rust).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+flate2 = "1"
+tar = "0.4"
 # 자식 프로세스에 URI를 argv로 넘기지 않기 위한 0600 임시 config 파일(런타임 사용).
 tempfile = "3"
 # 빌드 호환 핀: time 0.3.44+는 bson 2.15→mongodb 3.7.0의 blanket impl(Checked<T>)과

@@ -9,4 +9,5 @@ pub mod list;
 pub mod prune;
 pub mod restore;
 pub mod status;
+pub mod update;
 pub mod verify;
