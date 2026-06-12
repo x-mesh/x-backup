@@ -112,6 +112,7 @@ YAML은 `python3 -c "import yaml; yaml.safe_load(...)"`로 파싱 검증했고 `
 - **해결:** 코드 소유 측이 `cargo fmt --all`을 1회 실행해 커밋하면 이 step이 green이 된다.
   CI는 표준 위생 게이트로서 `fmt --check`를 **유지**한다(제거하면 회귀를 숨김).
 
-### MSRV 회귀 감시(선택)
-정확한 1.88.0 floor 회귀를 막고 싶으면 `toolchain: 1.88.0`로 `cargo check`만 도는 별도
-`msrv` 잡을 추가할 수 있다(clippy/fmt는 1.88에서 거짓 실패하므로 check만 권장).
+### MSRV 회귀 감시(적용됨)
+`msrv` 잡이 `toolchain: 1.88.0`으로 `cargo check --all-features --all-targets`를 돈다
+(clippy/fmt는 1.88에서 거짓 실패하므로 check만). Cargo.toml의 `rust-version = "1.88"`
+주장은 로컬 실측으로 검증됨 — 1.88로 컴파일되지 않는 변경이 들어오면 이 잡이 잡는다.

@@ -18,8 +18,8 @@ name: CI
 #   이유: clippy의 `uninlined_format_args` 등 일부 린트는 버전마다 적용 범위가 달라,
 #   정확히 1.88.0으로 `clippy -D warnings`를 돌리면 acceptance에서 0 경고였던 코드가
 #   거짓 실패한다(1.88 clippy가 1.93에는 없는 방식으로 플래그). "1.88+" 요건을 만족하면서
-#   실측 green 상태와 일치시키기 위해 검증은 1.93.0으로 한다. MSRV 회귀 감시가 필요하면
-#   별도 msrv 잡(toolchain 1.88.0, `cargo check`만)을 추가할 수 있다.
+#   실측 green 상태와 일치시키기 위해 검증은 1.93.0으로 한다. MSRV 회귀는 별도 msrv 잡
+#   (toolchain 1.88.0, `cargo check`만 — clippy 제외)으로 감시한다.
 
 on:
   push:
@@ -81,6 +81,30 @@ jobs:
       # DB·Docker 없이 결정론적으로 도는 실 바이너리 E2E(종료 코드 매핑, SC6).
       - name: cargo test (E2E exit codes, no DB)
         run: cargo test --test exit_codes_e2e
+
+  # ── 1.5) MSRV 검증: Cargo.toml rust-version(1.88) 주장의 회귀 감시 ────────
+  # clippy는 버전별 린트 적용 범위가 달라 1.88에서 거짓 실패하므로(상단 주석)
+  # cargo check만 돈다. 로컬 실측: `cargo +1.88.0 check --all-features --all-targets` 통과.
+  msrv:
+    name: msrv check (rust 1.88.0)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (MSRV 1.88.0)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: cargo check (all features, all targets, MSRV)
+        run: cargo check --all-features --all-targets
 
   # ── 2) 통합 테스트: replica set + mongodb-database-tools (push main + nightly) ─
   integration:
