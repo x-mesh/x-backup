@@ -7,6 +7,7 @@
 
 pub mod args;
 pub mod exit;
+pub mod handlers;
 pub mod output;
 
 pub use args::{Cli, Command};

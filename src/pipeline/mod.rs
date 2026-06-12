@@ -1,7 +1,19 @@
 //! Pipeline 계층 — 백업/복구 스트리밍 파이프 합성(PRD §7).
 //!
-//! 백업: mongodump stdout → compress → encrypt → [sha256 tee] → put_stream → manifest.
-//! 복구: get_stream → decrypt → decompress → mongorestore stdin.
-//! 체크섬 기준점 = 암호화 후 저장 바이트(키 없이 구조 검증 가능).
+//! - [`checksum`]: [`Sha256Reader`] — poll_read 내부 누산 sha256 tee(단일 패스).
+//! - [`stage`]: [`StageStack`] — 단계 합성(t6 compress/encrypt 삽입 지점).
+//! - [`backup`]: 풀 백업 오케스트레이션(dump → 단계 → tee → Storage → manifest).
 //!
-//! TODO(후속 태스크 R1/R5): backup/restore 파이프, sha256 tee AsyncRead 구현.
+//! 백업 흐름: mongodump stdout → StageStack(identity|compress|encrypt) → sha256 tee
+//! → put_stream → manifest(data→meta→사이드카).
+//! 체크섬 기준점 = Storage에 쓰인 최종 바이트(키 없이 구조 검증 가능, PRD §8.5).
+//!
+//! 복구(get_stream → decrypt → decompress → mongorestore stdin)는 t5 소유.
+
+pub mod backup;
+pub mod checksum;
+pub mod stage;
+
+pub use backup::{run_full_backup, BackupOutcome, BackupRequest};
+pub use checksum::{ChecksumHandle, Sha256Reader};
+pub use stage::{PipelineStage, StageStack};

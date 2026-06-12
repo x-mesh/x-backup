@@ -19,7 +19,7 @@ async fn main() -> ExitCode {
     // 스캐폴드 단계에서는 사람이 읽는 형식 + verbosity만 사용한다.
     init_tracing(cli.verbose, false);
 
-    match exit::dispatch(cli.command).await {
+    match exit::dispatch(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             // 시크릿이 새지 않도록 에러는 Display로만 출력한다(Secret은 [REDACTED]).

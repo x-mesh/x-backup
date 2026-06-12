@@ -1,7 +1,17 @@
 //! Manifest 계층 — 백업 메타·체크섬·oplog ts·체인 기록/조회(PRD §FR-7).
 //!
-//! BackupManifest: format_version·id·created_at·backup_type·base_id·topology·
-//! server_version·checksum_sha256·oplog_range·status 등.
-//! manifest 자체 무결성도 사이드카 체크섬으로 보호한다.
+//! - [`schema`]: [`BackupManifest`] 스키마와 [`OplogTimestamp`] 등 값 타입.
+//! - [`store`]: 저장 레이아웃(`<id>/{data.bin,manifest.json,manifest.json.sha256}`)과
+//!   기록 순서(data→manifest→사이드카, pitfall 7-1).
 //!
-//! TODO(후속 태스크 R11/R12/R22): manifest 스키마, store, chain 검증 구현.
+//! manifest 자체 무결성은 사이드카 체크섬으로 보호한다(FR-7). 체인 검증(verify
+//! --chain)은 후속 태스크(R12)가 이 스키마 위에 구현한다.
+
+pub mod schema;
+pub mod store;
+
+pub use schema::{
+    BackupManifest, BackupStatus, BackupType, CompressionMeta, EncryptionMeta, OplogRange,
+    OplogTimestamp, Topology, ToolVersions, FORMAT_VERSION,
+};
+pub use store::ManifestStore;

@@ -4,17 +4,20 @@
 //! 각 핸들러는 [`crate::error::Result`]를 반환하고, `main`이 에러의
 //! [`crate::error::XBackupError::exit_code`]로 프로세스를 종료한다.
 
-use crate::cli::Command;
+use crate::cli::{handlers, Cli, Command};
 use crate::error::{Result, XBackupError};
 
-/// 파싱된 서브커맨드를 해당 핸들러로 디스패치한다.
+/// 파싱된 CLI를 해당 핸들러로 디스패치한다.
 ///
-/// 모든 핸들러가 미구현이므로 현재는 [`XBackupError::Failure`](exit 1)를 반환한다.
-/// 후속 태스크가 각 핸들러를 실제 로직으로 대체한다.
-pub async fn dispatch(command: Command) -> Result<()> {
+/// `backup`은 실제 파이프라인을 실행한다(t4). 나머지는 후속 태스크가 구현할 때까지
+/// 미구현 스텁([`XBackupError::Failure`], exit 1)으로 둔다.
+pub async fn dispatch(cli: Cli) -> Result<()> {
+    let Cli {
+        config, command, ..
+    } = cli;
     match command {
         Command::Init(_) => not_implemented("init"),
-        Command::Backup(_) => not_implemented("backup"),
+        Command::Backup(args) => handlers::backup::handle(config, args).await,
         Command::Restore(_) => not_implemented("restore"),
         Command::List(_) => not_implemented("list"),
         Command::Verify(_) => not_implemented("verify"),
@@ -35,10 +38,19 @@ mod tests {
     use super::*;
     use crate::cli::args::{InitArgs, StatusArgs};
 
+    /// 테스트용 Cli 래퍼(global 플래그 기본값 + 주어진 서브커맨드).
+    fn cli_with(command: Command) -> Cli {
+        Cli {
+            config: None,
+            verbose: 0,
+            command,
+        }
+    }
+
     /// 미구현 핸들러는 exit 1(Failure)로 반환된다.
     #[tokio::test]
     async fn unimplemented_handler_returns_failure() {
-        let result = dispatch(Command::Init(InitArgs { force: false })).await;
+        let result = dispatch(cli_with(Command::Init(InitArgs { force: false }))).await;
         let err = result.expect_err("미구현이므로 에러여야 함");
         assert_eq!(err.exit_code(), 1);
     }
@@ -46,10 +58,10 @@ mod tests {
     /// status 핸들러도 동일하게 종료 코드 경로를 탄다.
     #[tokio::test]
     async fn status_handler_routes_through_exit_code() {
-        let result = dispatch(Command::Status(StatusArgs {
+        let result = dispatch(cli_with(Command::Status(StatusArgs {
             profile: "prod".into(),
             json: false,
-        }))
+        })))
         .await;
         assert_eq!(result.unwrap_err().exit_code(), 1);
     }
