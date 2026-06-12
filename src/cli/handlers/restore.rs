@@ -8,25 +8,26 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use crate::cli::args::RestoreArgs;
+use crate::cli::output::{OutputFlags, OutputMode};
+use crate::cli::progress::{new_counter, ProgressKind, ProgressReporter};
 use crate::config::env::collect_overrides_from_process;
 use crate::config::merged::MergeInput;
 use crate::config::secret::Secret;
 use crate::config::ResolvedConfig;
 use crate::error::{Result, XBackupError};
+use crate::pipeline::pitr::{run_pitr, PitrPlan, PitrRequest};
 use crate::pipeline::restore::{run_restore, RestorePlan, RestoreRequest};
 use crate::storage::LocalFs;
 
 /// `restore` 핸들러 진입점.
 pub async fn handle(config_path: Option<PathBuf>, args: RestoreArgs) -> Result<()> {
     // 동시 실행 잠금(FR-12) — 같은 프로파일의 backup/restore/prune과 직렬화한다.
-    // 가드(_lock)를 함수 끝까지 유지해 작업 동안 lock을 잡는다(충돌 시 exit 5).
+    // PITR·풀 복구 양쪽을 덮도록 --at 분기보다 먼저 잡고, 가드(_lock)를 끝까지 유지한다.
     let _lock = crate::lock::acquire(&args.profile)?;
 
-    // PITR(--at)은 t9 소유 — 풀 복구(t5)는 oplog replay를 수행하지 않는다.
-    if args.at.is_some() {
-        return Err(XBackupError::Usage(
-            "PITR 복구(--at)는 아직 미지원입니다(t9) — 풀 복구만 동작".into(),
-        ));
+    // PITR(--at) 분기(t9) — base 풀 복원 + 증분 oplog 슬라이스 재생으로 시점 복구.
+    if let Some(at) = args.at.clone() {
+        return handle_pitr(config_path, args, at).await;
     }
 
     // 1) config 로드 + 레이어 병합(file + ENV).
@@ -79,7 +80,22 @@ pub async fn handle(config_path: Option<PathBuf>, args: RestoreArgs) -> Result<(
     })?;
     let storage = LocalFs::new(root)?;
 
-    // 4) 복구 요청 조립.
+    // 출력 모드 결정(R15) — CLI > config(mode.output) > stderr TTY 자동.
+    let mode = OutputMode::resolve_from_env(
+        OutputFlags {
+            json: args.json,
+            quiet: args.quiet,
+            progress: args.progress,
+        },
+        Some(resolved.profile.mode.output.as_str()),
+    );
+
+    // 진행 표시(R16): mongorestore stdin으로 흘리는 바이트를 폴링한다. 복원 입력 총량은
+    //   압축 백업이면 복호화·압축해제 후 크기라 사전에 정확히 모르므로 부정형(spinner)으로
+    //   처리 바이트·속도를 stderr에 표시한다(dry-run이면 표시 불필요 — 무변경 계획만).
+    let progress_counter = new_counter();
+
+    // 4) 복구 요청 조립(진행 카운터 주입 — dry-run이 아니면 폴링한다).
     let request = RestoreRequest {
         target_uri,
         mongorestore_program: "mongorestore".to_string(),
@@ -88,26 +104,42 @@ pub async fn handle(config_path: Option<PathBuf>, args: RestoreArgs) -> Result<(
         force: args.force,
         dry_run: args.dry_run,
         skip_precheck: args.skip_precheck,
-        // 진행 카운터 미사용(R16 진행 표시는 t13/t9 restore 경로에서 배선) — 빌드 정합용 None.
-        progress_counter: None,
+        progress_counter: if args.dry_run {
+            None
+        } else {
+            Some(std::sync::Arc::clone(&progress_counter))
+        },
     };
 
     // TTY 여부 — 대화형 확인 가능 여부. stdout 대신 stdin TTY로 본다(확인 입력을 받음).
     let is_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
 
-    let outcome = run_restore(&request, &storage, is_tty, prompt_confirm).await?;
+    let reporter = if request.dry_run {
+        ProgressReporter::disabled(progress_counter)
+    } else {
+        ProgressReporter::start(
+            mode,
+            ProgressKind::Indeterminate {
+                label: "복구".into(),
+            },
+            progress_counter,
+        )
+    };
+    let result = run_restore(&request, &storage, is_tty, prompt_confirm).await;
+    reporter.finish().await;
+    let outcome = result?;
 
-    // 5) 출력. dry-run은 계획을, 실제 복구는 완료 요약을 낸다.
+    // 5) 출력. dry-run은 계획을, 실제 복구는 완료 요약을 낸다. 진행=stderr, 결과=stdout.
     if request.dry_run {
-        print_plan(&outcome.plan, args.json);
-    } else if args.json {
+        print_plan(&outcome.plan, mode.emits_json());
+    } else if mode.emits_json() {
         let summary = serde_json::json!({
             "backup_id": outcome.backup_id,
             "stored_size_bytes": outcome.stored_size_bytes,
             "restored": true,
         });
         println!("{summary}");
-    } else if !args.quiet {
+    } else if mode.shows_human_summary() {
         println!("복구 완료");
         println!("  id:       {}", outcome.backup_id);
         println!("  입력크기: {} bytes", outcome.stored_size_bytes);
@@ -180,4 +212,151 @@ fn prompt_confirm(plan: &RestorePlan) -> bool {
         return false;
     }
     matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+// ── PITR(--at) 분기 (t9) ──────────────────────────────────────────────────
+
+/// PITR 복구 핸들러 — `--at` 분기. base 풀 복원 후 증분 oplog 슬라이스를 목표 시점까지 재생.
+///
+/// 절차: PITR+--only 즉시 거부(exit 2) → config·URI·storage 해석 → [`run_pitr`] →
+/// 결정 종료 ts({t,i}+wall-clock)·체인 보고 출력.
+async fn handle_pitr(config_path: Option<PathBuf>, args: RestoreArgs, at: String) -> Result<()> {
+    // PITR + --only 병용 즉시 거부(pitfall 1-4: --oplogReplay는 ns 필터와 병용 불가, PRD Edge Case).
+    crate::pipeline::pitr::reject_pitr_with_only(args.only.as_deref())?;
+
+    // config·URI·storage 해석(풀 복구 경로와 동일 규칙).
+    let (target_uri, storage) = resolve_target_and_storage(&config_path, &args)?;
+
+    let request = PitrRequest {
+        target_uri,
+        mongorestore_program: "mongorestore".to_string(),
+        at,
+        force: args.force,
+        dry_run: args.dry_run,
+        skip_precheck: args.skip_precheck,
+    };
+
+    let is_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let outcome = run_pitr(&request, &storage, is_tty, prompt_confirm).await?;
+
+    if request.dry_run {
+        print_pitr_plan(&outcome.plan, args.json);
+    } else if args.json {
+        let summary = serde_json::json!({
+            "base_id": outcome.plan.base_id,
+            "incremental_ids": outcome.plan.incremental_ids,
+            "decided_ts": { "t": outcome.plan.decided_ts.t, "i": outcome.plan.decided_ts.i },
+            "decided_wall_clock": outcome.plan.decided_wall_clock,
+            "replayed_slices": outcome.replayed_slices,
+            "restored": true,
+        });
+        println!("{summary}");
+    } else if !args.quiet {
+        println!("PITR 복구 완료");
+        println!("  base id:       {}", outcome.plan.base_id);
+        println!("  재생 슬라이스: {}개", outcome.replayed_slices);
+        println!(
+            "  결정 종료 ts:  {{t:{}, i:{}}}  ({})",
+            outcome.plan.decided_ts.t, outcome.plan.decided_ts.i, outcome.plan.decided_wall_clock
+        );
+    }
+
+    Ok(())
+}
+
+/// config 로드 → 복구 대상 URI·local storage를 해석한다(풀/ PITR 공통 setup).
+///
+/// 풀 복구 경로의 1~3단계와 동일 규칙: `--target` 우선, destination type=local만,
+/// path 필수. 시크릿은 [`Secret`]로 감싼다.
+fn resolve_target_and_storage(
+    config_path: &Option<PathBuf>,
+    args: &RestoreArgs,
+) -> Result<(Secret, LocalFs)> {
+    let config_toml = match config_path {
+        Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
+            XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
+        })?),
+        None => None,
+    };
+    let overrides = collect_overrides_from_process();
+    let resolved = ResolvedConfig::build(MergeInput {
+        config_toml: config_toml.as_deref(),
+        profile_name: &args.profile,
+        overrides: &overrides,
+    })?;
+
+    let target_uri = match &args.target {
+        Some(uri) => Secret::new(uri.clone()),
+        None => resolved.resolved_uri.ok_or_else(|| {
+            XBackupError::Config(format!(
+                "프로파일 '{}'에 source.uri_env가 없고 --target도 지정되지 않았습니다",
+                resolved.profile_name
+            ))
+        })?,
+    };
+
+    let dest = &resolved.profile.destination;
+    match dest.r#type.as_deref() {
+        Some("local") => {}
+        Some("s3") => {
+            return Err(XBackupError::Usage(
+                "destination type=s3는 아직 미지원입니다(t7) — type=local만 동작".into(),
+            ))
+        }
+        Some(other) => {
+            return Err(XBackupError::Config(format!(
+                "알 수 없는 destination type: '{other}'(local만 지원)"
+            )))
+        }
+        None => {
+            return Err(XBackupError::Config(
+                "destination.type이 지정되지 않았습니다(local 필요)".into(),
+            ))
+        }
+    }
+    let root = dest.path.as_deref().ok_or_else(|| {
+        XBackupError::Config("destination.path가 지정되지 않았습니다(local 경로)".into())
+    })?;
+    let storage = LocalFs::new(root)?;
+    Ok((target_uri, storage))
+}
+
+/// PITR dry-run 계획을 출력한다(base·증분 체인·결정 종료 ts·예상 크기 — 무변경). 시크릿 미출력.
+fn print_pitr_plan(plan: &PitrPlan, json: bool) {
+    if json {
+        let summary = serde_json::json!({
+            "dry_run": true,
+            "base_id": plan.base_id,
+            "incremental_ids": plan.incremental_ids,
+            "target_unix": plan.target_unix,
+            "decided_ts": { "t": plan.decided_ts.t, "i": plan.decided_ts.i },
+            "decided_wall_clock": plan.decided_wall_clock,
+            "limit_slice_id": plan.limit_slice_id,
+            "estimated_bytes": plan.estimated_bytes,
+        });
+        println!("{summary}");
+        return;
+    }
+
+    println!("PITR 복구 계획(dry-run) — 실제 변경 없음");
+    println!("  base id:       {}", plan.base_id);
+    if plan.incremental_ids.is_empty() {
+        println!("  증분 체인:     없음(base만으로 목표 시점 도달)");
+    } else {
+        println!(
+            "  증분 체인:     {}개 — {}",
+            plan.incremental_ids.len(),
+            plan.incremental_ids.join(", ")
+        );
+    }
+    if let Some(limit) = &plan.limit_slice_id {
+        println!("  한계 슬라이스: {limit}(이 슬라이스에 --oplogLimit 적용)");
+    } else {
+        println!("  한계 슬라이스: 없음(체인 전체 재생)");
+    }
+    println!(
+        "  결정 종료 ts:  {{t:{}, i:{}}}  ({})",
+        plan.decided_ts.t, plan.decided_ts.i, plan.decided_wall_clock
+    );
+    println!("  예상 입력크기: {} bytes", plan.estimated_bytes);
 }

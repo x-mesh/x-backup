@@ -18,6 +18,7 @@
 pub mod backup;
 pub mod checksum;
 pub mod incremental;
+pub mod pitr;
 pub mod prune;
 pub mod restore;
 pub mod stage;
@@ -28,6 +29,7 @@ pub use backup::{
 };
 pub use checksum::{ChecksumHandle, Sha256Reader};
 pub use incremental::{run_incremental_backup, IncrementalOutcome, IncrementalRequest};
+pub use pitr::{run_pitr, PitrOutcome, PitrPlan, PitrRequest};
 pub use prune::{
     execute_prune, load_backups, plan_prune, PruneKind, PruneOutcome, PrunePlan, PruneTarget,
     RetentionPolicy,
