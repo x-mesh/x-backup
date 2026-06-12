@@ -163,6 +163,9 @@ pub struct VerifyArgs {
     /// 체인 검증 — base+증분 체인 연속성(gap 없음) 확인(PITR 전제).
     #[arg(long)]
     pub chain: bool,
+    /// 결과를 기계 판독 JSON으로 출력한다.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `prune` — 보존 관리 안전 삭제(FR-11, R19).

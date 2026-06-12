@@ -5,11 +5,13 @@
 //!   기록 순서(data→manifest→사이드카, pitfall 7-1).
 //!
 //! manifest 자체 무결성은 사이드카 체크섬으로 보호한다(FR-7). 체인 검증(verify
-//! --chain)은 후속 태스크(R12)가 이 스키마 위에 구현한다.
+//! --chain)은 [`chain`] 모듈이 이 스키마 위에 순수 함수로 구현한다(R12).
 
+pub mod chain;
 pub mod schema;
 pub mod store;
 
+pub use chain::{verify_chain, ChainBreak, ChainNode, ChainReport, ChainWarning};
 pub use schema::{
     BackupManifest, BackupStatus, BackupType, CompressionMeta, EncryptionMeta, OplogRange,
     OplogTimestamp, Topology, ToolVersions, FORMAT_VERSION,
