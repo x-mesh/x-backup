@@ -10,7 +10,9 @@ use crate::compress::{ZstdCompressStage, ALGORITHM_ZSTD};
 use crate::config::env::collect_overrides_from_process;
 use crate::config::merged::MergeInput;
 use crate::config::ResolvedConfig;
+use crate::config::secret::Secret;
 use crate::crypto::build_encrypt_stage;
+use crate::engine::mongo::status::{CheckStatus, StatusChecker};
 use crate::error::{Result, XBackupError};
 use crate::manifest::schema::CompressionMeta;
 use crate::pipeline::backup::{run_full_backup_with_meta, BackupMeta, BackupRequest};
@@ -71,10 +73,14 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
     })?;
     let storage = LocalFs::new(root)?;
 
-    // TODO(t11): backup 실행 전 status 핵심 점검(연결·권한·토폴로지·oplog 윈도우)을
-    //   자동 선행하고, --skip-precheck로 우회한다(PRD §9). 현재는 미구현.
+    // backup 실행 전 status 핵심 점검(연결·권한·토폴로지·도구 존재)을 자동 선행한다(FR-8,
+    //   PRD §9). 전체 status보다 가벼운 서브셋([`StatusChecker::precheck_subset`])으로, 백업을
+    //   *막는* 결함(Fail)만 본다. 하나라도 Fail이면 PrecheckFailed(exit 3)로 백업을 미시작한다.
+    //   --skip-precheck면 우회한다(읽기 전용·무부작용).
     if !args.skip_precheck {
-        tracing::debug!("사전 점검(status 선행)은 t11에서 구현 예정 — 현재 건너뜀");
+        run_precheck(&uri, &resolved.profile_name).await?;
+    } else {
+        tracing::warn!("--skip-precheck 지정 — 백업 사전 점검을 건너뜁니다(FR-8 우회)");
     }
 
     // 증분은 t8 소유. t4는 풀 백업만.
@@ -117,6 +123,43 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
         }
     }
 
+    Ok(())
+}
+
+/// backup 자동 사전 점검 — status 핵심 서브셋(연결·권한·토폴로지·도구 존재)을 실행한다.
+///
+/// 전체 `status`보다 가벼운 [`StatusChecker::precheck_subset`]로 백업을 *막는* 결함만 본다.
+/// 보고서 신호등이 `Fail`이면 [`XBackupError::PrecheckFailed`](exit 3)로 백업을 미시작한다.
+/// `Warn`은 백업을 막지 않는다(로그만; 전체 status가 경고를 상세히 다룬다). 읽기 전용이다.
+async fn run_precheck(uri: &Secret, profile: &str) -> Result<()> {
+    let checker = StatusChecker::connect(uri).await.map_err(|e| {
+        // connect 준비 실패(URI 파싱 등)는 사전 점검 실패로 본다(백업 미시작).
+        XBackupError::PrecheckFailed(format!("사전 점검 연결 준비 실패: {e}"))
+    })?;
+    let report = checker.precheck_subset(profile, "mongodump").await;
+
+    // 점검 항목을 로그로 남긴다(진단용 — stdout 결과 오염 금지, tracing은 stderr).
+    for item in &report.items {
+        match item.status {
+            CheckStatus::Ok => tracing::info!(check = item.key, "{}", item.message),
+            CheckStatus::Warn => tracing::warn!(check = item.key, "{}", item.message),
+            CheckStatus::Fail => tracing::error!(check = item.key, "{}", item.message),
+        }
+    }
+
+    if report.overall == CheckStatus::Fail {
+        // 실패 항목들을 모아 구체 메시지로 보고(어떤 점검이 막았는지).
+        let failed: Vec<String> = report
+            .items
+            .iter()
+            .filter(|i| i.status == CheckStatus::Fail)
+            .map(|i| format!("{}: {}", i.label, i.message))
+            .collect();
+        return Err(XBackupError::PrecheckFailed(format!(
+            "백업 사전 점검 실패(--skip-precheck로 우회 가능) — {}",
+            failed.join(" / ")
+        )));
+    }
     Ok(())
 }
 

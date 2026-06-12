@@ -19,10 +19,10 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Init(_) => not_implemented("init"),
         Command::Backup(args) => handlers::backup::handle(config, args).await,
         Command::Restore(args) => handlers::restore::handle(config, args).await,
-        Command::List(_) => not_implemented("list"),
-        Command::Verify(_) => not_implemented("verify"),
+        Command::List(args) => handlers::list::handle(config, args).await,
+        Command::Verify(args) => handlers::verify::handle(config, args).await,
         Command::Prune(_) => not_implemented("prune"),
-        Command::Status(_) => not_implemented("status"),
+        Command::Status(args) => handlers::status::handle(config, args).await,
     }
 }
 
@@ -55,7 +55,8 @@ mod tests {
         assert_eq!(err.exit_code(), 1);
     }
 
-    /// status 핸들러도 동일하게 종료 코드 경로를 탄다.
+    /// status 핸들러로 라우팅된다. config·URI가 없는 프로파일이면 설정 오류(exit 2)로
+    /// 끊긴다(연결 시도 전에 uri_env 부재를 잡는다 — 무부작용).
     #[tokio::test]
     async fn status_handler_routes_through_exit_code() {
         let result = dispatch(cli_with(Command::Status(StatusArgs {
@@ -63,6 +64,7 @@ mod tests {
             json: false,
         })))
         .await;
-        assert_eq!(result.unwrap_err().exit_code(), 1);
+        // uri_env가 없는 프로파일 → Config(exit 2). 더 이상 미구현 스텁(exit 1)이 아니다.
+        assert_eq!(result.unwrap_err().exit_code(), 2);
     }
 }
