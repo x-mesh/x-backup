@@ -81,9 +81,10 @@ impl Storage for LocalFs {
         // 커밋 전 Drop되면(패닉·조기 반환) best-effort로 삭제를 시도하는 가드.
         let mut guard = UploadGuard::new(&self.inner, object_path.clone());
 
-        let upload = self.inner.put_multipart(&object_path).await.map_err(|e| {
-            XBackupError::StorageUpload(format!("'{path}' 업로드 시작 실패: {e}"))
-        })?;
+        let upload =
+            self.inner.put_multipart(&object_path).await.map_err(|e| {
+                XBackupError::StorageUpload(format!("'{path}' 업로드 시작 실패: {e}"))
+            })?;
         let mut writer = WriteMultipart::new(upload);
 
         // reader를 청크 스트림으로 변환해 업로드 버퍼에 순차 공급한다.
@@ -104,9 +105,10 @@ impl Storage for LocalFs {
         }
 
         // 마지막 파트 flush + 완료. 실패 시 WriteMultipart::finish 내부에서 abort한다.
-        writer.finish().await.map_err(|e| {
-            XBackupError::StorageUpload(format!("'{path}' 업로드 완료 실패: {e}"))
-        })?;
+        writer
+            .finish()
+            .await
+            .map_err(|e| XBackupError::StorageUpload(format!("'{path}' 업로드 완료 실패: {e}")))?;
 
         // 정상 커밋 — 가드 해제(삭제 시도하지 않음).
         guard.disarm();
@@ -115,9 +117,10 @@ impl Storage for LocalFs {
 
     async fn get_stream(&self, path: &str) -> Result<BoxAsyncRead, XBackupError> {
         let object_path = Self::object_path(path)?;
-        let result = self.inner.get(&object_path).await.map_err(|e| {
-            XBackupError::StorageDownload(format!("'{path}' 다운로드 실패: {e}"))
-        })?;
+        let result =
+            self.inner.get(&object_path).await.map_err(|e| {
+                XBackupError::StorageDownload(format!("'{path}' 다운로드 실패: {e}"))
+            })?;
 
         // object_store 바이트 스트림(에러 타입)을 io::Error로 매핑해 StreamReader에 연결.
         let byte_stream = result
@@ -152,9 +155,10 @@ impl Storage for LocalFs {
 
     async fn delete(&self, path: &str) -> Result<(), XBackupError> {
         let object_path = Self::object_path(path)?;
-        self.inner.delete(&object_path).await.map_err(|e| {
-            XBackupError::StorageDownload(format!("'{path}' 삭제 실패: {e}"))
-        })
+        self.inner
+            .delete(&object_path)
+            .await
+            .map_err(|e| XBackupError::StorageDownload(format!("'{path}' 삭제 실패: {e}")))
     }
 }
 
@@ -220,7 +224,7 @@ impl Drop for UploadGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncRead};
+    use tokio::io::{AsyncRead, AsyncReadExt};
 
     /// reader 헬퍼: 바이트 슬라이스를 BoxAsyncRead로 감싼다.
     fn reader_from(data: &[u8]) -> BoxAsyncRead {
@@ -247,9 +251,13 @@ mod tests {
         let fs = LocalFs::new(dir.path()).unwrap();
 
         let payload = b"hello x-backup local storage";
-        fs.put_stream("bkp-1/data.bin", reader_from(payload), Some(payload.len() as u64))
-            .await
-            .unwrap();
+        fs.put_stream(
+            "bkp-1/data.bin",
+            reader_from(payload),
+            Some(payload.len() as u64),
+        )
+        .await
+        .unwrap();
 
         let mut got = Vec::new();
         fs.get_stream("bkp-1/data.bin")

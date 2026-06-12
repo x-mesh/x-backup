@@ -172,9 +172,7 @@ pub fn acquire_in(dir: &Path, profile: &str) -> Result<LockGuard> {
                         }
                     }
                 }
-                StaleDecision::Conflict(extra) => {
-                    Err(conflict_error(&path, &holder, extra))
-                }
+                StaleDecision::Conflict(extra) => Err(conflict_error(&path, &holder, extra)),
             }
         }
     }
@@ -191,9 +189,8 @@ fn try_create(path: &Path, profile: &str) -> Result<Option<LockGuard>> {
     match opts.open(path) {
         Ok(mut file) => {
             let data = LockData::for_current(profile);
-            let bytes = serde_json::to_vec_pretty(&data).map_err(|e| {
-                XBackupError::Failure(format!("lock 메타 직렬화 실패: {e}"))
-            })?;
+            let bytes = serde_json::to_vec_pretty(&data)
+                .map_err(|e| XBackupError::Failure(format!("lock 메타 직렬화 실패: {e}")))?;
             // 기록에 실패하면 막 만든 파일을 정리하고 에러를 올린다(부분 lock 방지).
             if let Err(e) = file.write_all(&bytes).and_then(|_| file.flush()) {
                 let _ = std::fs::remove_file(path);
@@ -320,7 +317,11 @@ fn pid_alive(pid: u32) -> bool {
 /// `started_at`(RFC3339) 이후 경과 초. 파싱 실패면 None(연령 판정 생략).
 fn lock_age_secs(started_at: &str) -> Option<i64> {
     let started = chrono::DateTime::parse_from_rfc3339(started_at).ok()?;
-    Some(chrono::Utc::now().signed_duration_since(started).num_seconds())
+    Some(
+        chrono::Utc::now()
+            .signed_duration_since(started)
+            .num_seconds(),
+    )
 }
 
 /// lock 파일 경로: `<dir>/<profile>.lock`. 프로파일명의 경로 구분자는 무해화한다.
@@ -407,7 +408,7 @@ mod tests {
         {
             let _g = acquire_in(dir.path(), "prof").unwrap();
         } // 여기서 Drop.
-        // 같은 프로파일을 다시 잡을 수 있어야 한다.
+          // 같은 프로파일을 다시 잡을 수 있어야 한다.
         let g2 = acquire_in(dir.path(), "prof");
         assert!(g2.is_ok(), "Drop 후 재획득 실패: {:?}", g2.err());
     }
@@ -496,7 +497,10 @@ mod tests {
 
         let err = acquire_in(dir.path(), "prof").unwrap_err();
         assert_eq!(err.exit_code(), 5);
-        assert!(err.to_string().contains("읽을 수 없"), "손상 안내 누락: {err}");
+        assert!(
+            err.to_string().contains("읽을 수 없"),
+            "손상 안내 누락: {err}"
+        );
     }
 
     /// pid_alive: 현재 프로세스는 살아 있다.

@@ -26,7 +26,7 @@ use crate::engine::mongo::meta::ServerMeta;
 use crate::engine::mongo::{DumpProcess, DumpSpec, MongoMeta, UriConfigFile};
 use crate::error::{Result, XBackupError};
 use crate::manifest::schema::{
-    BackupManifest, BackupStatus, BackupType, OplogRange, Topology, ToolVersions, FORMAT_VERSION,
+    BackupManifest, BackupStatus, BackupType, OplogRange, ToolVersions, Topology, FORMAT_VERSION,
 };
 use crate::manifest::store::{data_path, manifest_path, manifest_sha_path, ManifestStore};
 use crate::pipeline::checksum::Sha256Reader;
@@ -379,8 +379,8 @@ async fn cleanup(storage: &dyn Storage, backup_id: &str) {
 mod tests {
     use super::*;
     use crate::storage::MockStorage;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use tokio::io::AsyncReadExt;
 
     // 이 모듈의 단위 테스트는 드라이버·서브프로세스를 제외한 *저장 측* 합성 로직에
@@ -441,7 +441,9 @@ mod tests {
         mock.expect_put_stream()
             .withf(|p, _, _| p.ends_with("manifest.json"))
             .returning(|_, _, _| {
-                Err(XBackupError::StorageUpload("manifest 저장 실패(주입)".into()))
+                Err(XBackupError::StorageUpload(
+                    "manifest 저장 실패(주입)".into(),
+                ))
             });
         // cleanup의 delete 호출(3종)을 수용하고 플래그를 세운다.
         mock.expect_delete().returning(move |_| {
@@ -476,7 +478,10 @@ mod tests {
 
         // 실제 backup.rs 경로가 하듯 cleanup 호출.
         cleanup(&mock, "bk-fail").await;
-        assert!(cleanup_called.load(Ordering::SeqCst), "cleanup이 delete를 호출하지 않음");
+        assert!(
+            cleanup_called.load(Ordering::SeqCst),
+            "cleanup이 delete를 호출하지 않음"
+        );
     }
 
     /// 저장 크기는 list 사후 조회가 아니라 put 경로의 카운터로 집계된다 —
@@ -487,7 +492,9 @@ mod tests {
         let counted = CountingReader::new(Box::pin(std::io::Cursor::new(payload)));
         let handle = counted.handle();
         let mut sink = Vec::new();
-        tokio::io::copy(&mut Box::pin(counted), &mut sink).await.unwrap();
+        tokio::io::copy(&mut Box::pin(counted), &mut sink)
+            .await
+            .unwrap();
         assert_eq!(handle.total(), 4242);
         assert_eq!(sink.len(), 4242);
     }

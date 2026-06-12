@@ -135,8 +135,7 @@ where
     let mapping = map_target_to_end(base_node, &slices, target_unix);
 
     // 4) 예상 크기 + 계획 조립(시크릿 미포함).
-    let estimated_bytes =
-        estimate_bytes(&store, &report.base_id, &mapping.replay_ids).await;
+    let estimated_bytes = estimate_bytes(&store, &report.base_id, &mapping.replay_ids).await;
     let plan = PitrPlan {
         base_id: report.base_id.clone(),
         incremental_ids: mapping.replay_ids.clone(),
@@ -323,12 +322,11 @@ struct EndMapping {
 ///   여기까지 재생하고 oplogLimit `{target_unix+1, 0}`(미만 의미 → 목표 초 전체 포함,
 ///   다음 초 제외)을 건다. 보고용 종료 ts는 `{target_unix, 0}`(목표 초).
 /// - 모든 슬라이스 end가 목표 이하면 전부 재생(한계 없음), 종료 ts = 마지막 슬라이스 end.
-fn map_target_to_end(
-    base: &ChainNode,
-    slices: &[&ChainNode],
-    target_unix: i64,
-) -> EndMapping {
-    let base_end = base.oplog_range.map(|(_, e)| e).unwrap_or(OplogTimestamp::new(0, 0));
+fn map_target_to_end(base: &ChainNode, slices: &[&ChainNode], target_unix: i64) -> EndMapping {
+    let base_end = base
+        .oplog_range
+        .map(|(_, e)| e)
+        .unwrap_or(OplogTimestamp::new(0, 0));
 
     let mut replay_ids = Vec::new();
     let mut decided_ts = base_end;
@@ -566,11 +564,7 @@ async fn drain_stderr(stderr: tokio::process::ChildStderr) -> Vec<String> {
 }
 
 /// base + 재생 슬라이스들의 저장 바이트 합을 근사한다(읽기 실패는 0으로 무시).
-async fn estimate_bytes(
-    store: &ManifestStore<'_>,
-    base_id: &str,
-    replay_ids: &[String],
-) -> u64 {
+async fn estimate_bytes(store: &ManifestStore<'_>, base_id: &str, replay_ids: &[String]) -> u64 {
     let mut total = 0u64;
     if let Ok(m) = store.read(base_id).await {
         total += m.stored_size_bytes;
@@ -696,7 +690,10 @@ mod tests {
         let slices = ordered_slices(&nodes, &["i1".into(), "i2".into()]);
         let m = map_target_to_end(&base, &slices, 250);
         assert_eq!(m.replay_ids, vec!["i1", "i2"]);
-        assert!(m.limit_slice_id.is_none(), "목표가 마지막 end 이상이면 한계 없음");
+        assert!(
+            m.limit_slice_id.is_none(),
+            "목표가 마지막 end 이상이면 한계 없음"
+        );
         assert_eq!(m.decided_ts, ts(200, 3));
     }
 
@@ -712,7 +709,7 @@ mod tests {
         assert_eq!(m.replay_ids, vec!["i1", "i2"]);
         assert_eq!(m.limit_slice_id.as_deref(), Some("i2"));
         assert_eq!(m.decided_ts, ts(160, 0)); // 보고용: 목표 초.
-        // 한계 인자는 다음 초(미만) → 목표 초 160의 모든 i 포함, 161+ 제외.
+                                              // 한계 인자는 다음 초(미만) → 목표 초 160의 모든 i 포함, 161+ 제외.
         assert_eq!(m.oplog_limit.as_deref(), Some("161:0"));
     }
 

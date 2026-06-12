@@ -88,10 +88,9 @@ impl XBackupError {
     pub fn exit_code(&self) -> u8 {
         use exit_codes::*;
         match self {
-            Self::Failure(_)
-            | Self::Io(_)
-            | Self::StorageUpload(_)
-            | Self::StorageDownload(_) => FAILURE,
+            Self::Failure(_) | Self::Io(_) | Self::StorageUpload(_) | Self::StorageDownload(_) => {
+                FAILURE
+            }
             Self::Usage(_) | Self::Config(_) => USAGE,
             Self::PrecheckFailed(_) => PRECHECK,
             Self::Warning(_) | Self::VerifyWarning(_) => WARNING,
@@ -121,10 +120,7 @@ mod tests {
             XBackupError::Io(std::io::Error::other("disk")).exit_code(),
             FAILURE
         );
-        assert_eq!(
-            XBackupError::StorageUpload("x".into()).exit_code(),
-            FAILURE
-        );
+        assert_eq!(XBackupError::StorageUpload("x".into()).exit_code(), FAILURE);
         assert_eq!(
             XBackupError::StorageDownload("x".into()).exit_code(),
             FAILURE
@@ -136,10 +132,7 @@ mod tests {
             PRECHECK
         );
         assert_eq!(XBackupError::Warning("x".into()).exit_code(), WARNING);
-        assert_eq!(
-            XBackupError::VerifyWarning("x".into()).exit_code(),
-            WARNING
-        );
+        assert_eq!(XBackupError::VerifyWarning("x".into()).exit_code(), WARNING);
         assert_eq!(
             XBackupError::LockConflict("x".into()).exit_code(),
             LOCK_CONFLICT
@@ -162,7 +155,10 @@ mod tests {
         ];
         for err in samples {
             let code = err.exit_code();
-            assert!((SUCCESS..=LOCK_CONFLICT).contains(&code), "코드 {code} 범위 밖");
+            assert!(
+                (SUCCESS..=LOCK_CONFLICT).contains(&code),
+                "코드 {code} 범위 밖"
+            );
         }
     }
 

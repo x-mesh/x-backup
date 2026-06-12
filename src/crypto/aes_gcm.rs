@@ -111,8 +111,7 @@ async fn pump_encrypt(
     rand_fill(&mut nonce_prefix);
 
     let cipher = Aes256Gcm::new(GenericArray::from_slice(&key));
-    let mut stream =
-        EncryptorBE32::from_aead(cipher, GenericArray::from_slice(&nonce_prefix));
+    let mut stream = EncryptorBE32::from_aead(cipher, GenericArray::from_slice(&nonce_prefix));
 
     // 헤더: 매직 + nonce prefix.
     sink.write_all(MAGIC).await?;
@@ -194,8 +193,7 @@ async fn pump_decrypt(
     input.read_exact(&mut nonce_prefix).await?;
 
     let cipher = Aes256Gcm::new(GenericArray::from_slice(&key));
-    let mut stream =
-        DecryptorBE32::from_aead(cipher, GenericArray::from_slice(&nonce_prefix));
+    let mut stream = DecryptorBE32::from_aead(cipher, GenericArray::from_slice(&nonce_prefix));
 
     // 프레임을 미리보기로 한 개씩 앞서 읽어 마지막 프레임을 last로 복호화한다.
     let mut current = read_frame(&mut input).await?;
@@ -204,16 +202,16 @@ async fn pump_decrypt(
         match (&current, &next) {
             (Some(frame), None) => {
                 // 마지막 프레임.
-                let plain = stream
-                    .decrypt_last(frame.as_slice())
-                    .map_err(|_| std::io::Error::other("AES-GCM decrypt_last 실패(변조/키 오류)"))?;
+                let plain = stream.decrypt_last(frame.as_slice()).map_err(|_| {
+                    std::io::Error::other("AES-GCM decrypt_last 실패(변조/키 오류)")
+                })?;
                 sink.write_all(&plain).await?;
                 break;
             }
             (Some(frame), Some(_)) => {
-                let plain = stream
-                    .decrypt_next(frame.as_slice())
-                    .map_err(|_| std::io::Error::other("AES-GCM decrypt_next 실패(변조/키 오류)"))?;
+                let plain = stream.decrypt_next(frame.as_slice()).map_err(|_| {
+                    std::io::Error::other("AES-GCM decrypt_next 실패(변조/키 오류)")
+                })?;
                 sink.write_all(&plain).await?;
                 current = next;
             }
@@ -230,8 +228,8 @@ async fn pump_decrypt(
 
 /// `[len u32 BE][bytes]` 프레임을 쓴다.
 async fn write_frame(sink: &mut tokio::io::DuplexStream, frame: &[u8]) -> std::io::Result<()> {
-    let len = u32::try_from(frame.len())
-        .map_err(|_| std::io::Error::other("프레임 길이 초과(u32)"))?;
+    let len =
+        u32::try_from(frame.len()).map_err(|_| std::io::Error::other("프레임 길이 초과(u32)"))?;
     sink.write_all(&len.to_be_bytes()).await?;
     sink.write_all(frame).await?;
     Ok(())
@@ -302,7 +300,9 @@ mod tests {
     async fn aes_round_trip_small() {
         let payload = b"small secret payload".to_vec();
         let encrypt = Box::new(AesGcmEncryptStage::from_key(KEY));
-        let ct = drain_result(encrypt.wrap(reader_from(&payload))).await.unwrap();
+        let ct = drain_result(encrypt.wrap(reader_from(&payload)))
+            .await
+            .unwrap();
         assert_ne!(ct, payload);
         assert!(ct.starts_with(MAGIC), "매직 헤더 부재");
 
@@ -315,11 +315,11 @@ mod tests {
     #[tokio::test]
     async fn aes_round_trip_multi_chunk() {
         // 2.5청크 분량.
-        let payload: Vec<u8> = (0..(CHUNK_SIZE * 5 / 2))
-            .map(|i| (i % 251) as u8)
-            .collect();
+        let payload: Vec<u8> = (0..(CHUNK_SIZE * 5 / 2)).map(|i| (i % 251) as u8).collect();
         let encrypt = Box::new(AesGcmEncryptStage::from_key(KEY));
-        let ct = drain_result(encrypt.wrap(reader_from(&payload))).await.unwrap();
+        let ct = drain_result(encrypt.wrap(reader_from(&payload)))
+            .await
+            .unwrap();
 
         let decrypt = Box::new(AesGcmDecryptStage::from_key(KEY));
         let restored = drain_result(decrypt.wrap(reader_from(&ct))).await.unwrap();
@@ -341,7 +341,9 @@ mod tests {
     async fn tampered_ciphertext_fails() {
         let payload = b"integrity matters".to_vec();
         let encrypt = Box::new(AesGcmEncryptStage::from_key(KEY));
-        let mut ct = drain_result(encrypt.wrap(reader_from(&payload))).await.unwrap();
+        let mut ct = drain_result(encrypt.wrap(reader_from(&payload)))
+            .await
+            .unwrap();
 
         // 헤더 이후(매직 8 + nonce 7 + len 4 = 19)의 첫 ciphertext 바이트를 뒤집는다.
         let idx = MAGIC.len() + NONCE_PREFIX_LEN + 4;
@@ -360,7 +362,9 @@ mod tests {
     async fn wrong_key_fails() {
         let payload = b"key-bound secret".to_vec();
         let encrypt = Box::new(AesGcmEncryptStage::from_key(KEY));
-        let ct = drain_result(encrypt.wrap(reader_from(&payload))).await.unwrap();
+        let ct = drain_result(encrypt.wrap(reader_from(&payload)))
+            .await
+            .unwrap();
 
         let wrong = [9u8; 32];
         let decrypt = Box::new(AesGcmDecryptStage::from_key(wrong));
@@ -377,7 +381,9 @@ mod tests {
         // 2청크 만들고 마지막 프레임을 통째로 제거 → DecryptorBE32가 last를 못 받아 실패.
         let payload: Vec<u8> = (0..(CHUNK_SIZE + 100)).map(|i| (i % 200) as u8).collect();
         let encrypt = Box::new(AesGcmEncryptStage::from_key(KEY));
-        let ct = drain_result(encrypt.wrap(reader_from(&payload))).await.unwrap();
+        let ct = drain_result(encrypt.wrap(reader_from(&payload)))
+            .await
+            .unwrap();
 
         // 헤더 다음 첫 프레임(len + ciphertext)만 남기고 잘라낸다.
         let header = MAGIC.len() + NONCE_PREFIX_LEN;

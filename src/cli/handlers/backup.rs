@@ -11,8 +11,8 @@ use crate::cli::progress::{new_counter, ProgressKind, ProgressReporter};
 use crate::compress::{ZstdCompressStage, ALGORITHM_ZSTD};
 use crate::config::env::collect_overrides_from_process;
 use crate::config::merged::MergeInput;
-use crate::config::ResolvedConfig;
 use crate::config::secret::Secret;
+use crate::config::ResolvedConfig;
 use crate::crypto::build_encrypt_stage;
 use crate::engine::mongo::status::{CheckStatus, StatusChecker};
 use crate::error::{Result, XBackupError};
@@ -300,10 +300,7 @@ async fn run_precheck(uri: &Secret, profile: &str) -> Result<()> {
 /// - **암호화**: 기본 ON(PRD §FR-5 — 평문은 명시적 `--no-encrypt`만). `--no-encrypt`면
 ///   경고 로그 후 암호화 단계를 생략한다. config `features.encryption.algorithm`에 따라
 ///   age(recipient_file) 또는 aes-256-gcm(env 키)으로 단계를 만든다. manifest.encryption 기록.
-fn build_stages(
-    resolved: &ResolvedConfig,
-    args: &BackupArgs,
-) -> Result<(StageStack, BackupMeta)> {
+fn build_stages(resolved: &ResolvedConfig, args: &BackupArgs) -> Result<(StageStack, BackupMeta)> {
     let features = &resolved.profile.features;
     let mut stack = StageStack::new();
     let mut meta = BackupMeta::none();
@@ -393,8 +390,7 @@ mod tests {
         std::fs::write(&pub_path, id.to_public().to_string()).unwrap();
 
         let mut profile = Profile::default();
-        profile.features.encryption.recipient_file =
-            Some(pub_path.to_str().unwrap().to_string());
+        profile.features.encryption.recipient_file = Some(pub_path.to_str().unwrap().to_string());
 
         let (stack, meta) = build_stages(&resolved_with(profile), &default_args()).unwrap();
         // 순서: zstd(압축) 먼저, age(암호화) 나중.

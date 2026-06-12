@@ -90,9 +90,9 @@ fn profile_subtree<'a>(root: &'a mut toml::Value, name: &str) -> Result<&'a mut 
         .entry("profiles".to_string())
         .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
 
-    let profiles_table = profiles.as_table_mut().ok_or_else(|| {
-        XBackupError::Config("'profiles'가 테이블이 아닙니다".to_string())
-    })?;
+    let profiles_table = profiles
+        .as_table_mut()
+        .ok_or_else(|| XBackupError::Config("'profiles'가 테이블이 아닙니다".to_string()))?;
 
     Ok(profiles_table
         .entry(name.to_string())
@@ -135,7 +135,13 @@ bucket = "db-backups"
 
         assert_eq!(cfg.profile.source.uri_env.as_deref(), Some("MONGO_URI"));
         assert_eq!(
-            cfg.profile.destination.s3.as_ref().unwrap().bucket.as_deref(),
+            cfg.profile
+                .destination
+                .s3
+                .as_ref()
+                .unwrap()
+                .bucket
+                .as_deref(),
             Some("db-backups")
         );
         assert_eq!(cfg.resolved_uri.unwrap().expose(), "mongodb://host/db");

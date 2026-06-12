@@ -251,7 +251,12 @@ mod tests {
     #[test]
     fn quiet_and_progress_conflict() {
         let result = Cli::try_parse_from([
-            "x-backup", "backup", "--profile", "p", "--quiet", "--progress",
+            "x-backup",
+            "backup",
+            "--profile",
+            "p",
+            "--quiet",
+            "--progress",
         ]);
         assert!(result.is_err(), "quiet+progress는 충돌해야 함");
     }

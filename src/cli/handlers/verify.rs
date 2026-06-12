@@ -134,10 +134,7 @@ fn default_profile_name(config_toml: Option<&str>) -> String {
 /// 사람이 읽는 검증 결과 출력(stdout).
 fn print_human(report: &VerifyReport, chain: Option<&ChainReport>) {
     println!("검증 결과 — {}", report.backup_id);
-    println!(
-        "  manifest 정합: {}",
-        ok_mark(report.manifest_sidecar_ok)
-    );
+    println!("  manifest 정합: {}", ok_mark(report.manifest_sidecar_ok));
     println!("  data 체크섬:   {}", ok_mark(report.data_checksum_ok));
     if report.empty_slice {
         println!("  (빈 증분 슬라이스 — data.bin 없음, 정상)");
@@ -153,7 +150,11 @@ fn print_human(report: &VerifyReport, chain: Option<&ChainReport>) {
 
     if let Some(c) = chain {
         println!("체인 — base: {}", c.base_id);
-        println!("  증분 {}개: {}", c.incremental_ids.len(), c.incremental_ids.join(", "));
+        println!(
+            "  증분 {}개: {}",
+            c.incremental_ids.len(),
+            c.incremental_ids.join(", ")
+        );
         if c.is_continuous() {
             println!("  체인 상태:     연속(PITR 가능)");
         } else {
@@ -278,7 +279,9 @@ mod tests {
         let m = full("bk", &sha256_hex(b"original"));
         seed(&fs, &m, b"TAMPERED").await;
 
-        let err = run(&fs, &args("bk", false, false, false)).await.unwrap_err();
+        let err = run(&fs, &args("bk", false, false, false))
+            .await
+            .unwrap_err();
         assert_eq!(err.exit_code(), 1);
     }
 
@@ -315,7 +318,9 @@ mod tests {
         m.status = BackupStatus::Incomplete;
         seed(&fs, &m, payload).await;
 
-        let err = run(&fs, &args("bk", false, false, false)).await.unwrap_err();
+        let err = run(&fs, &args("bk", false, false, false))
+            .await
+            .unwrap_err();
         assert_eq!(err.exit_code(), 4);
     }
 
@@ -338,7 +343,9 @@ mod tests {
         ManifestStore::new(&fs).write(&i1).await.unwrap();
         // base data.bin(빈 입력)으로 구조 검증도 통과시킨다.
         let empty: BoxAsyncRead = Box::pin(std::io::Cursor::new(Vec::new()));
-        fs.put_stream(&data_path("i1"), empty, Some(0)).await.unwrap();
+        fs.put_stream(&data_path("i1"), empty, Some(0))
+            .await
+            .unwrap();
 
         let err = run(&fs, &args("i1", false, true, false)).await.unwrap_err();
         assert_eq!(err.exit_code(), 4, "broken chain은 exit 4: {err}");

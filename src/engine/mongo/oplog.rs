@@ -221,7 +221,11 @@ impl OplogReader {
     /// 커서를 별도 task로 구동해 [`DuplexStream`]에 raw document 바이트를 연결한다 —
     /// 경계 버퍼 + 백프레셔로 전 구간 스트리밍을 유지한다. 캡처 중 `CursorNotFound`는
     /// late gap으로 판정해 스트림 끝에서 에러로 전파한다(부분 산출물 폐기 신호).
-    pub fn capture_stream(&self, last_backup_ts: Timestamp, upper: Timestamp) -> OplogCaptureStream {
+    pub fn capture_stream(
+        &self,
+        last_backup_ts: Timestamp,
+        upper: Timestamp,
+    ) -> OplogCaptureStream {
         let (writer, reader) = tokio::io::duplex(PIPE_BUFFER_BYTES);
         let count = Arc::new(Mutex::new(0u64));
         let outcome: Arc<Mutex<Option<std::result::Result<(), CaptureError>>>> =
@@ -232,14 +236,8 @@ impl OplogReader {
         let outcome_task = Arc::clone(&outcome);
 
         let handle = tokio::spawn(async move {
-            let res = drain_cursor_to_writer(
-                oplog,
-                last_backup_ts,
-                upper,
-                writer,
-                &count_task,
-            )
-            .await;
+            let res =
+                drain_cursor_to_writer(oplog, last_backup_ts, upper, writer, &count_task).await;
             *outcome_task.lock().expect("capture outcome mutex poisoned") = Some(res);
         });
 
@@ -294,7 +292,11 @@ impl CaptureHandle {
     /// - `Err(CaptureError::Other)`: 그 외 드라이버/IO 오류.
     pub async fn finish(self) -> std::result::Result<u64, CaptureError> {
         // 구동 task가 outcome을 채울 때까지 join(스트림 EOF 후엔 곧 완료).
-        let task = self.task.lock().expect("capture task mutex poisoned").take();
+        let task = self
+            .task
+            .lock()
+            .expect("capture task mutex poisoned")
+            .take();
         if let Some(task) = task {
             let _ = task.await;
         }
@@ -438,9 +440,13 @@ fn classify_gap(last: OplogTimestamp, min: OplogTimestamp) -> GapCheck {
         // last < min: 직전 기준점이 윈도우에서 밀려남 → gap(풀 승격).
         Ordering::Less => GapCheck::Gap { last, min },
         // last == min: 경계에 걸침 — 진행하되 위험 경고.
-        Ordering::Equal => GapCheck::Ok { boundary_risk: true },
+        Ordering::Equal => GapCheck::Ok {
+            boundary_risk: true,
+        },
         // last > min: 안전 구간.
-        Ordering::Greater => GapCheck::Ok { boundary_risk: false },
+        Ordering::Greater => GapCheck::Ok {
+            boundary_risk: false,
+        },
     }
 }
 
@@ -457,7 +463,9 @@ mod tests {
     fn gap_classify_safe_when_last_after_min() {
         assert_eq!(
             classify_gap(ts(100, 5), ts(90, 1)),
-            GapCheck::Ok { boundary_risk: false }
+            GapCheck::Ok {
+                boundary_risk: false
+            }
         );
     }
 
@@ -466,7 +474,9 @@ mod tests {
     fn gap_classify_boundary_risk_when_equal() {
         assert_eq!(
             classify_gap(ts(100, 5), ts(100, 5)),
-            GapCheck::Ok { boundary_risk: true }
+            GapCheck::Ok {
+                boundary_risk: true
+            }
         );
     }
 
@@ -512,7 +522,13 @@ mod tests {
     fn extracts_ts_from_raw_document() {
         let d = bson::doc! { "ts": Bson::Timestamp(Timestamp { time: 1781272133, increment: 5 }), "op": "i" };
         let raw = bson::RawDocumentBuf::from_document(&d).unwrap();
-        assert_eq!(ts_of(&raw), Some(Timestamp { time: 1781272133, increment: 5 }));
+        assert_eq!(
+            ts_of(&raw),
+            Some(Timestamp {
+                time: 1781272133,
+                increment: 5
+            })
+        );
 
         let no_ts = bson::doc! { "op": "i" };
         let raw2 = bson::RawDocumentBuf::from_document(&no_ts).unwrap();

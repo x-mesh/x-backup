@@ -55,10 +55,7 @@ async fn full_backup_produces_three_artifacts() {
     let base = dir.path().join(id);
     assert!(base.join("data.bin").exists(), "data.bin 없음");
     assert!(base.join("manifest.json").exists(), "manifest.json 없음");
-    assert!(
-        base.join("manifest.json.sha256").exists(),
-        "사이드카 없음"
-    );
+    assert!(base.join("manifest.json.sha256").exists(), "사이드카 없음");
 
     // 2) manifest 내용 검증: format_version·checksum 기록.
     let store = ManifestStore::new(&storage);
@@ -79,7 +76,11 @@ async fn full_backup_produces_three_artifacts() {
         use sha2::{Digest, Sha256};
         hex::encode(Sha256::digest(&manifest_bytes))
     };
-    assert_eq!(parse_sidecar(&sidecar).unwrap(), expected, "사이드카 불일치");
+    assert_eq!(
+        parse_sidecar(&sidecar).unwrap(),
+        expected,
+        "사이드카 불일치"
+    );
 
     // 4) data.bin 체크섬이 manifest와 일치(저장 바이트 = 체크섬 기준점).
     let data_bytes = std::fs::read(base.join("data.bin")).unwrap();
@@ -87,7 +88,10 @@ async fn full_backup_produces_three_artifacts() {
         use sha2::{Digest, Sha256};
         hex::encode(Sha256::digest(&data_bytes))
     };
-    assert_eq!(data_hash, manifest.checksum_sha256, "data.bin 체크섬 불일치");
+    assert_eq!(
+        data_hash, manifest.checksum_sha256,
+        "data.bin 체크섬 불일치"
+    );
 
     // 경로 헬퍼 일관성(상대 경로).
     assert_eq!(data_path(id), format!("{id}/data.bin"));

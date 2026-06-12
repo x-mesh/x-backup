@@ -15,16 +15,16 @@
 //! manifest 메타를 함께 얻는다. 복구(t5)는 [`build_decrypt_stage`]로 manifest 메타
 //! 기반 역방향 단계를 얻는다.
 
-pub mod age;
 pub mod aes_gcm;
+pub mod age;
 
 use crate::config::file::EncryptionConfig;
 use crate::error::{Result, XBackupError};
 use crate::manifest::schema::EncryptionMeta;
 use crate::pipeline::stage::PipelineStage;
 
-pub use self::age::{AgeDecryptStage, AgeEncryptStage, ALGORITHM_AGE};
 pub use self::aes_gcm::{AesGcmDecryptStage, AesGcmEncryptStage, ALGORITHM_AES_GCM};
+pub use self::age::{AgeDecryptStage, AgeEncryptStage, ALGORITHM_AGE};
 
 /// 복호화 키 소스 — 복구(t5)·verify --deep에서 개인키/대칭키를 어디서 읽을지.
 ///
@@ -55,7 +55,8 @@ pub fn build_encrypt_stage(
         ALGORITHM_AGE => {
             let recipient_file = enc.recipient_file.as_deref().ok_or_else(|| {
                 XBackupError::Config(
-                    "age 암호화에는 features.encryption.recipient_file(공개키 경로)이 필요합니다".into(),
+                    "age 암호화에는 features.encryption.recipient_file(공개키 경로)이 필요합니다"
+                        .into(),
                 )
             })?;
             let stage = AgeEncryptStage::from_recipient_file(recipient_file)?;
@@ -167,11 +168,11 @@ mod tests {
             algorithm: "age".to_string(),
             key_id: Some("age1xxx".to_string()),
         };
-        let code = match build_decrypt_stage(&age_meta, &DecryptKeySource::AesHexKey("00".repeat(32)))
-        {
-            Ok(_) => panic!("불일치인데 성공함"),
-            Err(e) => e.exit_code(),
-        };
+        let code =
+            match build_decrypt_stage(&age_meta, &DecryptKeySource::AesHexKey("00".repeat(32))) {
+                Ok(_) => panic!("불일치인데 성공함"),
+                Err(e) => e.exit_code(),
+            };
         assert_eq!(code, 2);
     }
 

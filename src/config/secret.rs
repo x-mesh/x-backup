@@ -46,7 +46,10 @@ mod tests {
     fn debug_does_not_leak_value() {
         let s = Secret::new("mongodb://user:p@ss@host");
         let rendered = format!("{s:?}");
-        assert!(!rendered.contains("p@ss"), "Debug에 시크릿 노출: {rendered}");
+        assert!(
+            !rendered.contains("p@ss"),
+            "Debug에 시크릿 노출: {rendered}"
+        );
         assert_eq!(rendered, "Secret([REDACTED])");
     }
 

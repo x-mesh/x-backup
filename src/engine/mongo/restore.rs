@@ -83,10 +83,7 @@ impl RestoreProcess {
             .kill_on_drop(true);
 
         let mut child = cmd.spawn().map_err(|e| {
-            XBackupError::Failure(format!(
-                "'{}' 실행 실패(설치/PATH 확인): {e}",
-                spec.program
-            ))
+            XBackupError::Failure(format!("'{}' 실행 실패(설치/PATH 확인): {e}", spec.program))
         })?;
 
         let stdin = child
@@ -277,7 +274,10 @@ mod tests {
         assert_eq!(err.exit_code(), 1);
         let msg = err.to_string();
         assert!(msg.contains("비정상 종료"), "메시지: {msg}");
-        assert!(msg.contains("target unreachable"), "stderr 첨부 누락: {msg}");
+        assert!(
+            msg.contains("target unreachable"),
+            "stderr 첨부 누락: {msg}"
+        );
     }
 
     /// argv 검증: --archive=- / --config 는 항상, --drop 은 drop=true일 때만,
@@ -332,7 +332,10 @@ mod tests {
         proc.wait().await.unwrap();
 
         let recorded = std::fs::read_to_string(format!("{sink_path}.argv")).unwrap();
-        assert!(!recorded.contains("--drop"), "drop 비활성인데 --drop 노출: {recorded}");
+        assert!(
+            !recorded.contains("--drop"),
+            "drop 비활성인데 --drop 노출: {recorded}"
+        );
     }
 
     /// 존재하지 않는 실행파일은 즉시 실패한다(설치/PATH 안내).

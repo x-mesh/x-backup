@@ -14,6 +14,6 @@ pub mod store;
 pub use chain::{verify_chain, ChainBreak, ChainNode, ChainReport, ChainWarning};
 pub use schema::{
     BackupManifest, BackupStatus, BackupType, CompressionMeta, EncryptionMeta, OplogRange,
-    OplogTimestamp, Topology, ToolVersions, FORMAT_VERSION,
+    OplogTimestamp, ToolVersions, Topology, FORMAT_VERSION,
 };
 pub use store::ManifestStore;

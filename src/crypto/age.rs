@@ -101,10 +101,9 @@ async fn pump_encrypt(
 ) -> std::io::Result<()> {
     // Encryptor는 &dyn Recipient 이터레이터를 받는다.
     let recipients: Vec<Box<dyn Recipient + Send>> = vec![Box::new(recipient)];
-    let encryptor = age::Encryptor::with_recipients(
-        recipients.iter().map(|r| r.as_ref() as &dyn Recipient),
-    )
-    .map_err(std::io::Error::other)?;
+    let encryptor =
+        age::Encryptor::with_recipients(recipients.iter().map(|r| r.as_ref() as &dyn Recipient))
+            .map_err(std::io::Error::other)?;
 
     // sink(tokio AsyncWrite)를 futures AsyncWrite로 변환해 age에 넘긴다(age는 futures-io).
     let futures_sink = (&mut sink).compat_write();
@@ -263,7 +262,9 @@ mod tests {
         assert_ne!(ciphertext, payload);
         // age 컨테이너 매직(`age-encryption.org`)이 포함되어야 한다.
         assert!(
-            ciphertext.windows(b"age-encryption.org".len()).any(|w| w == b"age-encryption.org"),
+            ciphertext
+                .windows(b"age-encryption.org".len())
+                .any(|w| w == b"age-encryption.org"),
             "age 헤더 매직 부재"
         );
 

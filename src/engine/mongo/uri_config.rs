@@ -64,7 +64,12 @@ mod tests {
 
         // 권한이 0600인지.
         let mode = std::fs::metadata(cfg.path()).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "권한이 0600이 아님: {:o}", mode & 0o777);
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "권한이 0600이 아님: {:o}",
+            mode & 0o777
+        );
 
         // 내용에 uri 필드가 있고 평문 URI가 들어있는지(자식에 전달할 목적).
         let content = std::fs::read_to_string(cfg.path()).unwrap();
@@ -80,7 +85,10 @@ mod tests {
             cfg.path().to_string()
         };
         // Drop 후에는 파일이 사라져야 한다(종료 후 삭제).
-        assert!(!std::path::Path::new(&path).exists(), "Drop 후에도 파일 잔존: {path}");
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "Drop 후에도 파일 잔존: {path}"
+        );
     }
 
     #[test]
@@ -89,6 +97,9 @@ mod tests {
         let secret = Secret::new("mongodb://host/db?x=a'b");
         let cfg = UriConfigFile::create(&secret).unwrap();
         let content = std::fs::read_to_string(cfg.path()).unwrap();
-        assert!(content.contains("a''b"), "작은따옴표 이스케이프 누락: {content}");
+        assert!(
+            content.contains("a''b"),
+            "작은따옴표 이스케이프 누락: {content}"
+        );
     }
 }

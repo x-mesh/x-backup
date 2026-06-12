@@ -177,9 +177,7 @@ pub fn plan_prune(
     // 3) 각 체인의 보존 여부를 합집합 규칙으로 판정한다.
     let mut targets = Vec::new();
     let mut kept_base_ids = Vec::new();
-    let keep_days_cutoff = policy
-        .keep_days
-        .map(|d| now_secs - (d as i64) * 86_400);
+    let keep_days_cutoff = policy.keep_days.map(|d| now_secs - (d as i64) * 86_400);
 
     for (idx, chain) in chains.iter().enumerate() {
         // 규칙 미지정이면 전부 보존(삭제 금지).
@@ -207,10 +205,8 @@ pub fn plan_prune(
 
     // 4) incomplete 백업(체인 base가 아닌 잔재) — orphan/incomplete로 따로 표시.
     //    체인에 멤버로 흡수된 incomplete 증분은 제외한다(이미 위에서 다뤘다).
-    let chain_members: std::collections::HashSet<&String> = chains
-        .iter()
-        .flat_map(|c| c.member_ids.iter())
-        .collect();
+    let chain_members: std::collections::HashSet<&String> =
+        chains.iter().flat_map(|c| c.member_ids.iter()).collect();
     for m in manifests {
         if m.status != BackupStatus::Incomplete {
             continue;
@@ -273,9 +269,7 @@ fn created_secs(m: &BackupManifest) -> Option<i64> {
 }
 
 /// destination에서 prune 판정 입력(manifest 목록 + orphan ID)을 수집한다.
-pub async fn load_backups(
-    storage: &dyn Storage,
-) -> Result<(Vec<BackupManifest>, Vec<String>)> {
+pub async fn load_backups(storage: &dyn Storage) -> Result<(Vec<BackupManifest>, Vec<String>)> {
     let store = ManifestStore::new(storage);
 
     // manifest를 가진 ID 수집·로드.

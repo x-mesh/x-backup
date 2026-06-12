@@ -70,9 +70,7 @@ async fn collection_content_hash(client: &Client) -> (u64, String) {
     use futures::TryStreamExt;
     use sha2::{Digest, Sha256};
 
-    let coll = client
-        .database(TEST_DB)
-        .collection::<Document>(TEST_COLL);
+    let coll = client.database(TEST_DB).collection::<Document>(TEST_COLL);
     let find_opts = mongodb::options::FindOptions::builder()
         .sort(doc! { "_id": 1 })
         .build();
@@ -95,9 +93,7 @@ async fn collection_content_hash(client: &Client) -> (u64, String) {
 
 /// 시드: 기존 컬렉션을 drop하고 결정적 문서를 채운다.
 async fn seed(client: &Client) {
-    let coll = client
-        .database(TEST_DB)
-        .collection::<Document>(TEST_COLL);
+    let coll = client.database(TEST_DB).collection::<Document>(TEST_COLL);
     coll.drop().await.ok();
     let docs: Vec<Document> = (0..DOC_COUNT)
         .map(|i| doc! { "_id": i as i64, "n": (i * 7 % 101) as i64, "tag": format!("row-{i}") })
@@ -221,9 +217,11 @@ async fn dry_run_does_not_modify_target() {
         skip_precheck: false,
         progress_counter: None,
     };
-    let outcome = run_restore(&request, &storage, false, |_| panic!("dry-run confirm 미호출"))
-        .await
-        .expect("dry-run 성공");
+    let outcome = run_restore(&request, &storage, false, |_| {
+        panic!("dry-run confirm 미호출")
+    })
+    .await
+    .expect("dry-run 성공");
 
     // 계획은 채워지되 대상은 그대로 비어 있어야 한다(무부작용).
     assert_eq!(outcome.backup_id, backup.backup_id);
@@ -317,9 +315,11 @@ async fn restore_half_matches_with_real_mongorestore() {
         skip_precheck: false,
         progress_counter: None,
     };
-    run_restore(&request, &storage, false, |_| panic!("force면 confirm 미호출"))
-        .await
-        .expect("풀 복구 성공");
+    run_restore(&request, &storage, false, |_| {
+        panic!("force면 confirm 미호출")
+    })
+    .await
+    .expect("풀 복구 성공");
 
     // 5) SC1: 문서 수 + 콘텐츠 해시 일치.
     let (restored_count, restored_hash) = collection_content_hash(&tgt_client).await;

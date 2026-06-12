@@ -107,10 +107,19 @@ fn render_human(report: &StatusReport) {
     println!("status 점검 — 프로파일: {}", report.profile);
     println!("{:-<60}", "");
     for item in &report.items {
-        println!("  {} {:<14} {}", signal(item.status), item.label, item.message);
+        println!(
+            "  {} {:<14} {}",
+            signal(item.status),
+            item.label,
+            item.message
+        );
     }
     println!("{:-<60}", "");
-    println!("  전체: {} {}", signal(report.overall), overall_label(report.overall));
+    println!(
+        "  전체: {} {}",
+        signal(report.overall),
+        overall_label(report.overall)
+    );
 }
 
 /// 신호등 기호(사람용 표).

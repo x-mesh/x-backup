@@ -131,15 +131,18 @@ mod tests {
         let vars = [
             ("XB_DESTINATION__S3__BUCKET", "db-backups-staging"),
             ("XB_MODE__OUTPUT", "quiet"),
-            ("PATH", "/usr/bin"),     // 접두사 없음 → 무시
-            ("XB_", "ignored"),       // 빈 키 → 무시
+            ("PATH", "/usr/bin"), // 접두사 없음 → 무시
+            ("XB_", "ignored"),   // 빈 키 → 무시
         ];
         let mut got = collect_overrides(vars);
         got.sort();
         assert_eq!(
             got,
             vec![
-                ("destination.s3.bucket".to_string(), "db-backups-staging".to_string()),
+                (
+                    "destination.s3.bucket".to_string(),
+                    "db-backups-staging".to_string()
+                ),
                 ("mode.output".to_string(), "quiet".to_string()),
             ]
         );
@@ -147,10 +150,8 @@ mod tests {
 
     #[test]
     fn apply_overrides_overwrites_existing_value() {
-        let mut root: toml::Value = toml::from_str(
-            "[destination.s3]\nbucket = \"db-backups\"\n",
-        )
-        .unwrap();
+        let mut root: toml::Value =
+            toml::from_str("[destination.s3]\nbucket = \"db-backups\"\n").unwrap();
         let overrides = collect_overrides([("XB_DESTINATION__S3__BUCKET", "staging")]);
         apply_overrides(&mut root, &overrides).unwrap();
         let bucket = root["destination"]["s3"]["bucket"].as_str().unwrap();
@@ -175,7 +176,10 @@ mod tests {
         ]);
         apply_overrides(&mut root, &overrides).unwrap();
         assert_eq!(root["mode"]["precheck"].as_bool(), Some(false));
-        assert_eq!(root["features"]["compression"]["level"].as_integer(), Some(3));
+        assert_eq!(
+            root["features"]["compression"]["level"].as_integer(),
+            Some(3)
+        );
     }
 
     #[test]

@@ -154,9 +154,7 @@ async fn build_plan(
             let conflicts = meta
                 .user_namespaces(request.only.as_deref())
                 .await
-                .map_err(|e| {
-                    XBackupError::PrecheckFailed(format!("기존 데이터 조회 실패: {e}"))
-                })?;
+                .map_err(|e| XBackupError::PrecheckFailed(format!("기존 데이터 조회 실패: {e}")))?;
             (Some(server_meta.server_version), warning, conflicts)
         }
         None => (None, None, Vec::new()),
@@ -193,9 +191,11 @@ where
     let meta = if request.skip_precheck {
         None
     } else {
-        Some(MongoMeta::connect(&request.target_uri).await.map_err(|e| {
-            XBackupError::PrecheckFailed(format!("복구 대상 연결 실패: {e}"))
-        })?)
+        Some(
+            MongoMeta::connect(&request.target_uri)
+                .await
+                .map_err(|e| XBackupError::PrecheckFailed(format!("복구 대상 연결 실패: {e}")))?,
+        )
     };
 
     let plan = build_plan(request, storage, meta.as_ref()).await?;
@@ -368,8 +368,10 @@ async fn latest_full_manifest(storage: &dyn Storage) -> Result<BackupManifest> {
         }
         let is_newer = match &best {
             None => true,
-            Some(cur) => (manifest.created_at.as_str(), manifest.id.as_str())
-                > (cur.created_at.as_str(), cur.id.as_str()),
+            Some(cur) => {
+                (manifest.created_at.as_str(), manifest.id.as_str())
+                    > (cur.created_at.as_str(), cur.id.as_str())
+            }
         };
         if is_newer {
             best = Some(manifest);
@@ -465,8 +467,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fs = LocalFs::new(dir.path()).unwrap();
 
-        seed_backup(&fs, &full_manifest("bk-old", "2026-06-10T00:00:00Z", "7.0.35"), b"old").await;
-        seed_backup(&fs, &full_manifest("bk-new", "2026-06-12T00:00:00Z", "7.0.35"), b"new").await;
+        seed_backup(
+            &fs,
+            &full_manifest("bk-old", "2026-06-10T00:00:00Z", "7.0.35"),
+            b"old",
+        )
+        .await;
+        seed_backup(
+            &fs,
+            &full_manifest("bk-new", "2026-06-12T00:00:00Z", "7.0.35"),
+            b"new",
+        )
+        .await;
 
         let picked = latest_full_manifest(&fs).await.unwrap();
         assert_eq!(picked.id, "bk-new");
@@ -482,7 +494,12 @@ mod tests {
         incr.backup_type = BackupType::Incremental;
         incr.base_id = Some("bk-full".into());
         seed_backup(&fs, &incr, b"incr").await;
-        seed_backup(&fs, &full_manifest("bk-full", "2026-06-11T00:00:00Z", "7.0.35"), b"full").await;
+        seed_backup(
+            &fs,
+            &full_manifest("bk-full", "2026-06-11T00:00:00Z", "7.0.35"),
+            b"full",
+        )
+        .await;
 
         let picked = latest_full_manifest(&fs).await.unwrap();
         // 증분이 더 최신이지만 풀만 선택 → bk-full.
@@ -504,7 +521,12 @@ mod tests {
     async fn dry_run_produces_plan_without_side_effects() {
         let dir = tempfile::tempdir().unwrap();
         let fs = LocalFs::new(dir.path()).unwrap();
-        seed_backup(&fs, &full_manifest("bk-dry", "2026-06-12T00:00:00Z", "7.0.35"), b"payload").await;
+        seed_backup(
+            &fs,
+            &full_manifest("bk-dry", "2026-06-12T00:00:00Z", "7.0.35"),
+            b"payload",
+        )
+        .await;
 
         let request = RestoreRequest {
             target_uri: crate::config::secret::Secret::new("mongodb://unused/db"),
@@ -564,7 +586,10 @@ mod tests {
     #[test]
     fn guard_no_conflicts_passes_without_drop() {
         let plan = plan_with_conflicts(vec![]);
-        let drop = decide_guard(&plan, false, false, |_| panic!("충돌 없으면 confirm 미호출")).unwrap();
+        let drop = decide_guard(&plan, false, false, |_| {
+            panic!("충돌 없으면 confirm 미호출")
+        })
+        .unwrap();
         assert!(!drop, "충돌 없으면 drop 불필요");
     }
 
@@ -598,7 +623,10 @@ mod tests {
             repl_set_name: Some("rs0".into()),
             server_version: "7.0.99".into(),
         };
-        assert!(version_compat_warning(&same, &manifest).is_none(), "패치 차이는 경고 없음");
+        assert!(
+            version_compat_warning(&same, &manifest).is_none(),
+            "패치 차이는 경고 없음"
+        );
 
         let downgrade = ServerMeta {
             repl_set_name: Some("rs0".into()),
@@ -646,7 +674,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fs = LocalFs::new(dir.path()).unwrap();
         let payload = b"ARCHIVE_BYTES_FOR_RESTORE_streamed_via_stdin";
-        seed_backup(&fs, &full_manifest("bk-pipe", "2026-06-12T00:00:00Z", "7.0.35"), payload).await;
+        seed_backup(
+            &fs,
+            &full_manifest("bk-pipe", "2026-06-12T00:00:00Z", "7.0.35"),
+            payload,
+        )
+        .await;
 
         let sink = tempfile::NamedTempFile::new().unwrap();
         let sink_path = sink.path().to_str().unwrap().to_string();
@@ -657,9 +690,9 @@ mod tests {
             mongorestore_program: fake.to_str().unwrap().to_string(),
             backup_id: Some("bk-pipe".to_string()),
             only: None,
-            force: true,            // 가드 통과(drop 허용).
+            force: true, // 가드 통과(drop 허용).
             dry_run: false,
-            skip_precheck: true,    // DB 연결 없이 스트리밍 경로만 검증.
+            skip_precheck: true, // DB 연결 없이 스트리밍 경로만 검증.
             progress_counter: None,
         };
 
@@ -670,7 +703,10 @@ mod tests {
 
         // mongorestore stdin이 받은 바이트가 원본 data.bin과 동일해야 한다(손실 없음).
         let received = std::fs::read(&sink_path).unwrap();
-        assert_eq!(received, payload, "stdin으로 전달된 바이트가 data.bin과 불일치");
+        assert_eq!(
+            received, payload,
+            "stdin으로 전달된 바이트가 data.bin과 불일치"
+        );
     }
 
     /// mongorestore가 비정상 종료(exit 1)하면 복구는 실패(exit 1)로 전파한다.
@@ -681,7 +717,12 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let fs = LocalFs::new(dir.path()).unwrap();
-        seed_backup(&fs, &full_manifest("bk-fail", "2026-06-12T00:00:00Z", "7.0.35"), b"x").await;
+        seed_backup(
+            &fs,
+            &full_manifest("bk-fail", "2026-06-12T00:00:00Z", "7.0.35"),
+            b"x",
+        )
+        .await;
 
         // exit 1로 끝나는 가짜 mongorestore.
         let mut f = tempfile::Builder::new()
@@ -689,7 +730,11 @@ mod tests {
             .suffix(".sh")
             .tempfile()
             .unwrap();
-        writeln!(f, "#!/usr/bin/env bash\ncat > /dev/null\n>&2 echo 'Failed: boom'\nexit 1").unwrap();
+        writeln!(
+            f,
+            "#!/usr/bin/env bash\ncat > /dev/null\n>&2 echo 'Failed: boom'\nexit 1"
+        )
+        .unwrap();
         let path = f.into_temp_path();
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
@@ -705,7 +750,9 @@ mod tests {
             skip_precheck: true,
             progress_counter: None,
         };
-        let err = run_restore(&request, &fs, false, |_| true).await.unwrap_err();
+        let err = run_restore(&request, &fs, false, |_| true)
+            .await
+            .unwrap_err();
         assert_eq!(err.exit_code(), 1);
     }
 }

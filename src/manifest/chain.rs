@@ -463,7 +463,11 @@ mod tests {
         let nodes = vec![base, empty, i2];
 
         let report = verify_chain(&nodes, "i2");
-        assert!(report.is_continuous(), "빈 슬라이스가 끊김 유발: {:?}", report.breaks);
+        assert!(
+            report.is_continuous(),
+            "빈 슬라이스가 끊김 유발: {:?}",
+            report.breaks
+        );
         // 빈 슬라이스가 정렬상 먼저(같은 start면 id 사전순 e < i2).
         assert_eq!(report.incremental_ids, vec!["e", "i2"]);
     }
@@ -551,7 +555,11 @@ mod tests {
         let nodes = vec![base, i1];
         let report = verify_chain(&nodes, "i1");
         // 접점 끊김은 보고하지 않되 경고는 남는다.
-        assert!(report.is_continuous(), "끊김으로 잘못 보고: {:?}", report.breaks);
+        assert!(
+            report.is_continuous(),
+            "끊김으로 잘못 보고: {:?}",
+            report.breaks
+        );
         assert!(report
             .warnings
             .iter()

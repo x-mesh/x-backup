@@ -22,7 +22,9 @@ const DAY: i64 = 86_400;
 
 /// epoch 초 → RFC3339.
 fn at(secs: i64) -> String {
-    chrono::DateTime::from_timestamp(secs, 0).unwrap().to_rfc3339()
+    chrono::DateTime::from_timestamp(secs, 0)
+        .unwrap()
+        .to_rfc3339()
 }
 
 /// 풀백업 manifest를 만든다.
@@ -68,7 +70,9 @@ fn incr(id: &str, base: &str, prev_end: u32, created_secs: i64) -> BackupManifes
 /// data.bin + manifest를 기록한다.
 async fn seed(fs: &LocalFs, m: &BackupManifest) {
     let reader: BoxAsyncRead = Box::pin(std::io::Cursor::new(b"data".to_vec()));
-    fs.put_stream(&data_path(&m.id), reader, Some(4)).await.unwrap();
+    fs.put_stream(&data_path(&m.id), reader, Some(4))
+        .await
+        .unwrap();
     ManifestStore::new(fs).write(m).await.unwrap();
 }
 
@@ -125,7 +129,10 @@ async fn deletes_full_chain_as_unit() {
         assert!(!exists(&fs, &manifest_path(id)).await, "{id} manifest 남음");
         assert!(!exists(&fs, &data_path(id)).await, "{id} data 남음");
     }
-    assert!(exists(&fs, &manifest_path("new-base")).await, "new-base 보존 실패");
+    assert!(
+        exists(&fs, &manifest_path("new-base")).await,
+        "new-base 보존 실패"
+    );
 }
 
 /// 살아있는 증분이 참조하는 base는 보호된다(체인 단위 보존).
@@ -147,7 +154,10 @@ async fn live_incremental_protects_base() {
 
     // 아무것도 삭제되지 않아야 한다(base가 최근 증분에 의해 보호됨).
     assert_eq!(outcome.deleted_backups, 0);
-    assert!(exists(&fs, &manifest_path("base")).await, "base가 삭제됨(보호 실패)");
+    assert!(
+        exists(&fs, &manifest_path("base")).await,
+        "base가 삭제됨(보호 실패)"
+    );
     assert!(exists(&fs, &manifest_path("recent-i")).await);
 }
 
@@ -159,7 +169,9 @@ async fn orphan_deleted_only_with_force() {
     seed(&fs, &full("keep", 100 * DAY)).await;
     // manifest 없는 유령 data.
     let ghost: BoxAsyncRead = Box::pin(std::io::Cursor::new(b"ghost".to_vec()));
-    fs.put_stream(&data_path("ghost"), ghost, None).await.unwrap();
+    fs.put_stream(&data_path("ghost"), ghost, None)
+        .await
+        .unwrap();
 
     let (manifests, orphans) = load_backups(&fs).await.unwrap();
     assert_eq!(orphans, vec!["ghost".to_string()]);
@@ -171,11 +183,17 @@ async fn orphan_deleted_only_with_force() {
 
     // force 미포함: orphan은 안 지워진다.
     execute_prune(&fs, &plan, false).await.unwrap();
-    assert!(exists(&fs, &data_path("ghost")).await, "force 없이 orphan 삭제됨");
+    assert!(
+        exists(&fs, &data_path("ghost")).await,
+        "force 없이 orphan 삭제됨"
+    );
 
     // force 포함: orphan 삭제.
     execute_prune(&fs, &plan, true).await.unwrap();
-    assert!(!exists(&fs, &data_path("ghost")).await, "force로도 orphan 안 지워짐");
+    assert!(
+        !exists(&fs, &data_path("ghost")).await,
+        "force로도 orphan 안 지워짐"
+    );
 }
 
 /// 빈 증분 슬라이스(data.bin 부재)도 manifest 삭제로 안전 처리된다(NotFound 무시).

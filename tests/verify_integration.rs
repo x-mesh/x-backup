@@ -130,10 +130,18 @@ async fn encrypted_backup_structural_ok_deep_needs_key() {
 
     // 저장 바이트로 data.bin·manifest 기록(체크섬 = 저장 바이트 기준).
     let reader: BoxAsyncRead = Box::pin(std::io::Cursor::new(stored_bytes.clone()));
-    fs.put_stream(&data_path("bk-enc"), reader, Some(stored_bytes.len() as u64))
-        .await
-        .unwrap();
-    let mut m = base_manifest("bk-enc", &sha256_hex(&stored_bytes), stored_bytes.len() as u64);
+    fs.put_stream(
+        &data_path("bk-enc"),
+        reader,
+        Some(stored_bytes.len() as u64),
+    )
+    .await
+    .unwrap();
+    let mut m = base_manifest(
+        "bk-enc",
+        &sha256_hex(&stored_bytes),
+        stored_bytes.len() as u64,
+    );
     m.compression = Some(CompressionMeta {
         algorithm: "zstd".into(),
         level: 8,
@@ -153,7 +161,11 @@ async fn encrypted_backup_structural_ok_deep_needs_key() {
 
     // 2) --deep인데 키 없음 → 거부(Config, exit 2).
     let deep_no_key = verify_backup(&fs, "bk-enc", true).await.unwrap_err();
-    assert_eq!(deep_no_key.exit_code(), 2, "키 부재 deep은 Config(2): {deep_no_key}");
+    assert_eq!(
+        deep_no_key.exit_code(),
+        2,
+        "키 부재 deep은 Config(2): {deep_no_key}"
+    );
     assert!(
         deep_no_key.to_string().contains(ENV_AGE_IDENTITY_FILE),
         "키 격리 안내 누락: {deep_no_key}"
@@ -167,7 +179,11 @@ async fn encrypted_backup_structural_ok_deep_needs_key() {
     unsafe {
         std::env::remove_var(ENV_AGE_IDENTITY_FILE);
     }
-    assert_eq!(deep_ok.deep_decode_ok, Some(true), "키 있으면 deep 디코드 성공");
+    assert_eq!(
+        deep_ok.deep_decode_ok,
+        Some(true),
+        "키 있으면 deep 디코드 성공"
+    );
 }
 
 /// --chain: 끊어진 지점(gap)을 구체적으로 보고한다.
@@ -202,8 +218,16 @@ async fn chain_verify_reports_break() {
     assert!(!report.is_continuous(), "gap이 있는데 연속으로 판정됨");
     // 끊긴 지점이 구체적으로 보고된다.
     assert!(!report.breaks.is_empty());
-    let msg = report.breaks.iter().map(|b| b.to_string()).collect::<Vec<_>>().join("\n");
-    assert!(msg.contains("i1") && msg.contains("i2"), "끊긴 지점 메시지: {msg}");
+    let msg = report
+        .breaks
+        .iter()
+        .map(|b| b.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        msg.contains("i1") && msg.contains("i2"),
+        "끊긴 지점 메시지: {msg}"
+    );
 }
 
 /// list 카탈로그: 정상 체인 ok, broken chain·orphan 표시.
@@ -265,7 +289,9 @@ async fn manifest_sidecar_mismatch_fails() {
 
     // manifest.json을 사이드카와 어긋나게 덮어쓴다(사이드카는 그대로).
     let bad: BoxAsyncRead = Box::pin(std::io::Cursor::new(br#"{"x":1}"#.to_vec()));
-    fs.put_stream(&manifest_path("bk"), bad, None).await.unwrap();
+    fs.put_stream(&manifest_path("bk"), bad, None)
+        .await
+        .unwrap();
 
     let err = verify_backup(&fs, "bk", false).await.unwrap_err();
     assert_eq!(err.exit_code(), 1);

@@ -79,10 +79,7 @@ impl DumpProcess {
             .kill_on_drop(true);
 
         let mut child = cmd.spawn().map_err(|e| {
-            XBackupError::Failure(format!(
-                "'{}' 실행 실패(설치/PATH 확인): {e}",
-                spec.program
-            ))
+            XBackupError::Failure(format!("'{}' 실행 실패(설치/PATH 확인): {e}", spec.program))
         })?;
 
         let stdout = child
@@ -131,7 +128,10 @@ impl DumpProcess {
             Ok(())
         } else {
             // 종료 판정은 exit code로만. stderr는 진단 메시지에만 첨부.
-            let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
+            let code = status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".into());
             let detail = if tail.is_empty() {
                 String::new()
             } else {
@@ -188,7 +188,11 @@ mod tests {
 
     /// 가짜 mongodump 셸 스크립트를 만든다. stdout으로 지정 바이트를 내고,
     /// stderr로 노이즈를 출력한 뒤 주어진 exit code로 종료한다.
-    fn fake_mongodump(stdout_payload: &str, stderr_noise: &str, exit_code: i32) -> tempfile::TempPath {
+    fn fake_mongodump(
+        stdout_payload: &str,
+        stderr_noise: &str,
+        exit_code: i32,
+    ) -> tempfile::TempPath {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
 
@@ -251,7 +255,10 @@ mod tests {
         assert_eq!(err.exit_code(), 1);
         let msg = err.to_string();
         assert!(msg.contains("비정상 종료"), "메시지: {msg}");
-        assert!(msg.contains("connection refused"), "stderr 첨부 누락: {msg}");
+        assert!(
+            msg.contains("connection refused"),
+            "stderr 첨부 누락: {msg}"
+        );
     }
 
     /// 실제 spawn된 자식 프로세스의 argv에 URI가 절대 들어가지 않음을 검증한다.
@@ -309,9 +316,18 @@ mod tests {
             "자식 argv에 URI/시크릿 노출: {recorded}"
         );
         // --config 파일 경로는 인자로 존재해야 한다.
-        assert!(recorded.contains("--config"), "argv에 --config 누락: {recorded}");
-        assert!(recorded.contains("--oplog"), "argv에 --oplog 누락: {recorded}");
-        assert!(recorded.contains("--archive=-"), "argv에 --archive=- 누락: {recorded}");
+        assert!(
+            recorded.contains("--config"),
+            "argv에 --config 누락: {recorded}"
+        );
+        assert!(
+            recorded.contains("--oplog"),
+            "argv에 --oplog 누락: {recorded}"
+        );
+        assert!(
+            recorded.contains("--archive=-"),
+            "argv에 --archive=- 누락: {recorded}"
+        );
     }
 
     /// 존재하지 않는 실행파일은 즉시 실패한다(설치/PATH 안내).
@@ -337,7 +353,9 @@ mod tests {
             collection: None,
         };
         let mut cmd = Command::new(&s.program);
-        cmd.arg("--archive=-").arg("--config").arg(&s.uri_config_path);
+        cmd.arg("--archive=-")
+            .arg("--config")
+            .arg(&s.uri_config_path);
         if s.oplog {
             cmd.arg("--oplog");
         }
@@ -349,7 +367,9 @@ mod tests {
         // config 파일 경로는 있지만, mongodb URI 스킴은 어떤 인자에도 없어야 한다.
         assert!(args.iter().any(|a| a == "--config"));
         assert!(
-            !args.iter().any(|a| a.contains("mongodb://") || a.contains("mongodb+srv://")),
+            !args
+                .iter()
+                .any(|a| a.contains("mongodb://") || a.contains("mongodb+srv://")),
             "argv에 URI 노출: {args:?}"
         );
     }

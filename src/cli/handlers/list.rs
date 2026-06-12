@@ -54,9 +54,9 @@ pub async fn handle(config_path: Option<PathBuf>, args: ListArgs) -> Result<()> 
     }
 
     // broken/incomplete가 하나라도 있으면 경고 동반 성공(exit 4) — 운영자가 알아채도록.
-    let has_warning = rows
-        .iter()
-        .any(|r| r.chain_status == "broken" || r.chain_status == "incomplete" || r.chain_status == "orphan");
+    let has_warning = rows.iter().any(|r| {
+        r.chain_status == "broken" || r.chain_status == "incomplete" || r.chain_status == "orphan"
+    });
     if has_warning {
         return Err(XBackupError::VerifyWarning(
             "broken/incomplete/orphan 항목이 있습니다 — 위 카탈로그를 확인하세요".into(),
@@ -163,10 +163,7 @@ async fn detect_orphans(storage: &dyn Storage, known_ids: &[String]) -> Result<V
 }
 
 /// config를 읽어 destination=local Storage를 연다.
-async fn open_storage(
-    config_path: &Option<PathBuf>,
-    args: &ListArgs,
-) -> Result<Box<dyn Storage>> {
+async fn open_storage(config_path: &Option<PathBuf>, args: &ListArgs) -> Result<Box<dyn Storage>> {
     let config_toml = match config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
             XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
@@ -346,7 +343,10 @@ mod tests {
 
         let rows = build_catalog(&fs).await.unwrap();
         assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|r| r.chain_status == "ok"), "rows: {rows:?}");
+        assert!(
+            rows.iter().all(|r| r.chain_status == "ok"),
+            "rows: {rows:?}"
+        );
     }
 
     /// 끊어진 체인(gap)은 broken으로 표시한다.
@@ -391,7 +391,9 @@ mod tests {
         write_manifest(&fs, &manifest("good", BackupType::Full, None)).await;
         // manifest 없는 data만 있는 유령 디렉터리.
         let ghost: BoxAsyncRead = Box::pin(std::io::Cursor::new(b"orphan data".to_vec()));
-        fs.put_stream(&data_path("ghost"), ghost, None).await.unwrap();
+        fs.put_stream(&data_path("ghost"), ghost, None)
+            .await
+            .unwrap();
 
         let rows = build_catalog(&fs).await.unwrap();
         let orphan = rows.iter().find(|r| r.id == "ghost").unwrap();
@@ -412,8 +414,14 @@ mod tests {
     /// resolve_profile_name: CLI > config.default > "default".
     #[test]
     fn profile_name_resolution() {
-        assert_eq!(resolve_profile_name(Some("cli"), Some("default_profile=\"cfg\"")), "cli");
-        assert_eq!(resolve_profile_name(None, Some("default_profile = \"cfg\"")), "cfg");
+        assert_eq!(
+            resolve_profile_name(Some("cli"), Some("default_profile=\"cfg\"")),
+            "cli"
+        );
+        assert_eq!(
+            resolve_profile_name(None, Some("default_profile = \"cfg\"")),
+            "cfg"
+        );
         assert_eq!(resolve_profile_name(None, None), "default");
     }
 }

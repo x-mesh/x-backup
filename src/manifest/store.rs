@@ -64,9 +64,8 @@ impl<'a> ManifestStore<'a> {
 
         // manifest를 직렬화한다. 사이드카는 *직렬화된 바이트*의 sha256이어야
         // 하므로(파일을 그대로 검증), 같은 바이트로 양쪽을 만든다.
-        let bytes = serde_json::to_vec_pretty(manifest).map_err(|e| {
-            XBackupError::Failure(format!("manifest 직렬화 실패: {e}"))
-        })?;
+        let bytes = serde_json::to_vec_pretty(manifest)
+            .map_err(|e| XBackupError::Failure(format!("manifest 직렬화 실패: {e}")))?;
         let sidecar = sidecar_checksum(&bytes);
 
         // 1) manifest.json
@@ -95,9 +94,8 @@ impl<'a> ManifestStore<'a> {
     /// manifest.json을 읽어 역직렬화한다(list/verify 경로).
     pub async fn read(&self, backup_id: &str) -> Result<BackupManifest> {
         let bytes = read_all(self.storage, &manifest_path(backup_id)).await?;
-        serde_json::from_slice(&bytes).map_err(|e| {
-            XBackupError::Failure(format!("manifest 파싱 실패({backup_id}): {e}"))
-        })
+        serde_json::from_slice(&bytes)
+            .map_err(|e| XBackupError::Failure(format!("manifest 파싱 실패({backup_id}): {e}")))
     }
 }
 
@@ -135,7 +133,7 @@ async fn read_all(storage: &dyn Storage, path: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::schema::{BackupStatus, BackupType, FORMAT_VERSION, Topology};
+    use crate::manifest::schema::{BackupStatus, BackupType, Topology, FORMAT_VERSION};
     use crate::storage::LocalFs;
 
     fn sample(id: &str) -> BackupManifest {

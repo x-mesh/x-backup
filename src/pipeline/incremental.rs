@@ -30,7 +30,7 @@ use crate::engine::mongo::oplog::CaptureError;
 use crate::engine::mongo::{GapCheck, MongoMeta, OplogReader};
 use crate::error::{Result, XBackupError};
 use crate::manifest::schema::{
-    BackupManifest, BackupStatus, BackupType, OplogRange, OplogTimestamp, Topology, ToolVersions,
+    BackupManifest, BackupStatus, BackupType, OplogRange, OplogTimestamp, ToolVersions, Topology,
     FORMAT_VERSION,
 };
 use crate::manifest::store::{data_path, manifest_path, manifest_sha_path, ManifestStore};
@@ -600,8 +600,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fs = LocalFs::new(dir.path()).unwrap();
         // UUID v7는 사전순=생성순. 사전순으로 b > a 가 되도록 id를 둔다.
-        write_full(&fs, "00000000-aaaa", BackupStatus::Complete, false, Some(range(100, 1))).await;
-        write_full(&fs, "ffffffff-bbbb", BackupStatus::Complete, false, Some(range(200, 2))).await;
+        write_full(
+            &fs,
+            "00000000-aaaa",
+            BackupStatus::Complete,
+            false,
+            Some(range(100, 1)),
+        )
+        .await;
+        write_full(
+            &fs,
+            "ffffffff-bbbb",
+            BackupStatus::Complete,
+            false,
+            Some(range(200, 2)),
+        )
+        .await;
 
         let base = select_base(&fs).await.unwrap();
         assert_eq!(base.id, "ffffffff-bbbb");
@@ -614,10 +628,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fs = LocalFs::new(dir.path()).unwrap();
         // 최신순으로: incomplete(스킵) → selective(스킵) → no-range(스킵) → 적격.
-        write_full(&fs, "aa-eligible", BackupStatus::Complete, false, Some(range(50, 1))).await;
+        write_full(
+            &fs,
+            "aa-eligible",
+            BackupStatus::Complete,
+            false,
+            Some(range(50, 1)),
+        )
+        .await;
         write_full(&fs, "bb-norange", BackupStatus::Complete, false, None).await;
-        write_full(&fs, "cc-selective", BackupStatus::Complete, true, Some(range(80, 1))).await;
-        write_full(&fs, "dd-incomplete", BackupStatus::Incomplete, false, Some(range(90, 1))).await;
+        write_full(
+            &fs,
+            "cc-selective",
+            BackupStatus::Complete,
+            true,
+            Some(range(80, 1)),
+        )
+        .await;
+        write_full(
+            &fs,
+            "dd-incomplete",
+            BackupStatus::Incomplete,
+            false,
+            Some(range(90, 1)),
+        )
+        .await;
 
         let base = select_base(&fs).await.unwrap();
         assert_eq!(base.id, "aa-eligible");
@@ -640,7 +675,14 @@ mod tests {
     async fn select_base_rejects_only_selective() {
         let dir = tempfile::tempdir().unwrap();
         let fs = LocalFs::new(dir.path()).unwrap();
-        write_full(&fs, "aa-selective", BackupStatus::Complete, true, Some(range(50, 1))).await;
+        write_full(
+            &fs,
+            "aa-selective",
+            BackupStatus::Complete,
+            true,
+            Some(range(50, 1)),
+        )
+        .await;
         let err = match select_base(&fs).await {
             Ok(_) => panic!("selective base는 거부해야 함"),
             Err(e) => e,
@@ -681,7 +723,10 @@ mod tests {
         // manifest는 있고 data.bin은 없어야 한다(빈 슬라이스 계약).
         let base_dir = dir.path().join(&backup_id);
         assert!(base_dir.join("manifest.json").exists(), "manifest 없음");
-        assert!(!base_dir.join("data.bin").exists(), "빈 슬라이스인데 data.bin 존재");
+        assert!(
+            !base_dir.join("data.bin").exists(),
+            "빈 슬라이스인데 data.bin 존재"
+        );
 
         // manifest 내용 검증.
         let m = ManifestStore::new(&fs).read(&backup_id).await.unwrap();
@@ -710,7 +755,14 @@ mod tests {
             end_ts: OplogTimestamp::new(150, 3),
         };
         let m = build_incremental_manifest(
-            "incr-1", "base-1", &server(), 4242, "deadbeef", r, 17, &meta,
+            "incr-1",
+            "base-1",
+            &server(),
+            4242,
+            "deadbeef",
+            r,
+            17,
+            &meta,
         );
         assert_eq!(m.backup_type, BackupType::Incremental);
         assert_eq!(m.base_id.as_deref(), Some("base-1"));

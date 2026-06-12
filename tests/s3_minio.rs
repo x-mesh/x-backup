@@ -54,9 +54,7 @@ impl MinioContainer {
         let secret_key = "minioadmin".to_string();
 
         // 기존 잔재 컨테이너 제거(이전 실행 실패 등) — best-effort.
-        let _ = Command::new("docker")
-            .args(["rm", "-f", &name])
-            .output();
+        let _ = Command::new("docker").args(["rm", "-f", &name]).output();
 
         let run = Command::new("docker")
             .args([
@@ -184,7 +182,14 @@ fn docker_available() -> bool {
 fn host_curl_code(url: &str) -> String {
     Command::new("curl")
         .args([
-            "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "2", url,
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "--max-time",
+            "2",
+            url,
         ])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -261,7 +266,11 @@ async fn s3_multipart_round_trip_100mb() {
     let expected_hash = Sha256::digest(&payload);
 
     storage
-        .put_stream("bkp-1/data.bin", reader_from(payload.clone()), Some(size as u64))
+        .put_stream(
+            "bkp-1/data.bin",
+            reader_from(payload.clone()),
+            Some(size as u64),
+        )
         .await
         .expect("멀티파트 업로드 성공");
 
@@ -276,7 +285,11 @@ async fn s3_multipart_round_trip_100mb() {
         .expect("스트림 읽기 성공");
 
     assert_eq!(got.len(), payload.len(), "round-trip 길이 불일치");
-    assert_eq!(Sha256::digest(&got), expected_hash, "round-trip sha256 불일치");
+    assert_eq!(
+        Sha256::digest(&got),
+        expected_hash,
+        "round-trip sha256 불일치"
+    );
 
     // list가 prefix 결합/제거를 정확히 처리하는지 — trait 상대 경로로 보여야 한다.
     let entries = storage.list("bkp-1").await.expect("list 성공");
@@ -306,9 +319,7 @@ async fn s3_aborts_on_reader_failure_no_residue() {
         fail_at: 40 * 1024 * 1024,
     }) as x_backup::storage::BoxAsyncRead;
 
-    let result = storage
-        .put_stream("bkp-fail/data.bin", reader, None)
-        .await;
+    let result = storage.put_stream("bkp-fail/data.bin", reader, None).await;
     assert!(result.is_err(), "실패하는 reader는 에러를 반환해야 한다");
 
     // abort가 미완료 멀티파트를 정리했으므로 완성 객체가 없어야 한다.
@@ -317,7 +328,10 @@ async fn s3_aborts_on_reader_failure_no_residue() {
         "abort 후 완성 객체가 존재하면 안 된다"
     );
     let entries = storage.list("bkp-fail").await.expect("list 성공");
-    assert!(entries.is_empty(), "abort 후 잔여 객체가 남았다: {entries:?}");
+    assert!(
+        entries.is_empty(),
+        "abort 후 잔여 객체가 남았다: {entries:?}"
+    );
 }
 
 /// LocalFs와 S3Compatible이 동일 `Box<dyn Storage>` trait로 교체 가능함을 확인한다.
@@ -366,7 +380,11 @@ async fn round_trip_check(storage: &dyn Storage) {
     let hash = Sha256::digest(&payload);
 
     storage
-        .put_stream("swap/data.bin", reader_from(payload.clone()), Some(payload.len() as u64))
+        .put_stream(
+            "swap/data.bin",
+            reader_from(payload.clone()),
+            Some(payload.len() as u64),
+        )
         .await
         .expect("put 성공");
 

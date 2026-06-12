@@ -189,7 +189,9 @@ fn print_plan(plan: &RestorePlan, json: bool) {
             plan.conflicting_namespaces.len(),
             plan.conflicting_namespaces.join(", ")
         );
-        println!("  주의:          기존 데이터가 있습니다 — 실제 복구는 --force 또는 대화형 확인 필요");
+        println!(
+            "  주의:          기존 데이터가 있습니다 — 실제 복구는 --force 또는 대화형 확인 필요"
+        );
     }
     if let Some(w) = &plan.version_warning {
         println!("  경고:          {w}");

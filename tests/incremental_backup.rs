@@ -26,7 +26,7 @@ use mongodb::Client;
 
 use x_backup::config::secret::Secret;
 use x_backup::manifest::schema::{
-    BackupManifest, BackupStatus, BackupType, OplogRange, OplogTimestamp, Topology, ToolVersions,
+    BackupManifest, BackupStatus, BackupType, OplogRange, OplogTimestamp, ToolVersions, Topology,
     FORMAT_VERSION,
 };
 use x_backup::manifest::store::ManifestStore;
@@ -52,10 +52,10 @@ fn identity_factory() -> impl Fn() -> x_backup::Result<(StageStack, BackupMeta)>
 async fn insert_docs(uri: &str, n: usize, tag: &str) {
     let opts = ClientOptions::parse(uri).await.unwrap();
     let client = Client::with_options(opts).unwrap();
-    let coll = client.database("testdb").collection::<bson::Document>("items");
-    let docs: Vec<bson::Document> = (0..n)
-        .map(|i| doc! { "tag": tag, "n": i as i64 })
-        .collect();
+    let coll = client
+        .database("testdb")
+        .collection::<bson::Document>("items");
+    let docs: Vec<bson::Document> = (0..n).map(|i| doc! { "tag": tag, "n": i as i64 }).collect();
     coll.insert_many(docs).await.unwrap();
 }
 
@@ -71,9 +71,15 @@ async fn run_multidoc_transaction(uri: &str, tag: &str) {
         .read_concern(ReadConcern::snapshot())
         .write_concern(WriteConcern::builder().w(Acknowledgment::Majority).build())
         .build();
-    session.start_transaction().with_options(tx_opts).await.unwrap();
+    session
+        .start_transaction()
+        .with_options(tx_opts)
+        .await
+        .unwrap();
 
-    let coll = client.database("testdb").collection::<bson::Document>("txn");
+    let coll = client
+        .database("testdb")
+        .collection::<bson::Document>("txn");
     // 트랜잭션 안에서 여러 문서를 삽입 → 커밋 시 applyOps oplog 엔트리로 묶인다.
     for i in 0..5 {
         coll.insert_one(doc! { "tag": tag, "k": i as i64 })
@@ -143,15 +149,24 @@ async fn full_then_incremental_records_chain_and_captures_txn() {
     };
 
     // 4) 체인 검증 — base 연결·증분 엔트리 캡처.
-    assert_eq!(base_id, full.backup_id, "증분 base_id가 풀 백업 ID와 일치해야 함");
-    assert!(count > 0, "풀 이후 쓰기가 있었으므로 oplog 엔트리가 캡처되어야 함");
+    assert_eq!(
+        base_id, full.backup_id,
+        "증분 base_id가 풀 백업 ID와 일치해야 함"
+    );
+    assert!(
+        count > 0,
+        "풀 이후 쓰기가 있었으므로 oplog 엔트리가 캡처되어야 함"
+    );
 
     let incr_manifest = ManifestStore::new(&storage)
         .read(&incr_id)
         .await
         .expect("증분 manifest");
     assert_eq!(incr_manifest.backup_type, BackupType::Incremental);
-    assert_eq!(incr_manifest.base_id.as_deref(), Some(full.backup_id.as_str()));
+    assert_eq!(
+        incr_manifest.base_id.as_deref(),
+        Some(full.backup_id.as_str())
+    );
     assert_eq!(incr_manifest.oplog_count, Some(count));
     let range = incr_manifest.oplog_range.expect("증분 oplog_range");
     // 증분 시작 기준점 = base의 oplog_range.end_ts.
@@ -166,13 +181,19 @@ async fn full_then_incremental_records_chain_and_captures_txn() {
     let data = dir.path().join(&incr_id).join("data.bin");
     assert!(data.exists(), "증분 data.bin 없음");
     let data_bytes = std::fs::read(&data).unwrap();
-    assert!(!data_bytes.is_empty(), "캡처 엔트리가 있는데 data.bin이 비었음");
+    assert!(
+        !data_bytes.is_empty(),
+        "캡처 엔트리가 있는데 data.bin이 비었음"
+    );
     // 체크섬 정합(저장 바이트 = manifest checksum).
     let hash = {
         use sha2::{Digest, Sha256};
         hex::encode(Sha256::digest(&data_bytes))
     };
-    assert_eq!(hash, incr_manifest.checksum_sha256, "data.bin 체크섬 불일치");
+    assert_eq!(
+        hash, incr_manifest.checksum_sha256,
+        "data.bin 체크섬 불일치"
+    );
 
     // 6) applyOps 실측 — 캡처 바이트에 트랜잭션 마커가 담겼는지 확인한다.
     //    raw oplog BSON 스트림이므로 applyOps 네임스페이스/필드 문자열이 들어 있어야 한다.
@@ -182,10 +203,7 @@ async fn full_then_incremental_records_chain_and_captures_txn() {
         has_apply_ops,
         "멀티도큐먼트 트랜잭션의 applyOps 엔트리가 캡처에 담겨야 함(applyOps 마커 부재)"
     );
-    assert!(
-        has_txn_tag,
-        "트랜잭션 문서 태그(txn-1)가 캡처에 담겨야 함"
-    );
+    assert!(has_txn_tag, "트랜잭션 문서 태그(txn-1)가 캡처에 담겨야 함");
 }
 
 /// 빈 슬라이스: 풀 백업 직후(변경 없음) 증분 → data 없이 manifest만(oplog_count=0).
@@ -231,7 +249,10 @@ async fn incremental_empty_slice_records_manifest_only() {
         if oplog_count == 0 {
             // 빈 슬라이스 계약: manifest 있음, data.bin 없음, stored=0.
             let base = dir.path().join(&backup_id);
-            assert!(base.join("manifest.json").exists(), "빈 슬라이스 manifest 없음");
+            assert!(
+                base.join("manifest.json").exists(),
+                "빈 슬라이스 manifest 없음"
+            );
             assert!(
                 !base.join("data.bin").exists(),
                 "빈 슬라이스인데 data.bin이 존재함"
@@ -240,7 +261,10 @@ async fn incremental_empty_slice_records_manifest_only() {
             let m = ManifestStore::new(&storage).read(&backup_id).await.unwrap();
             assert_eq!(m.oplog_count, Some(0));
             assert_eq!(m.stored_size_bytes, 0);
-            assert_eq!(m.oplog_range.unwrap().start_ts, m.oplog_range.unwrap().end_ts);
+            assert_eq!(
+                m.oplog_range.unwrap().start_ts,
+                m.oplog_range.unwrap().end_ts
+            );
         } else {
             // 0건이 아니면(풀 dump 중 내부 쓰기) 일반 증분 계약을 검증한다.
             assert!(stored_size_bytes > 0, "엔트리가 있는데 stored가 0");
@@ -305,7 +329,15 @@ async fn gap_promotes_to_full_with_exit_4() {
     insert_docs(&uri, 10, "seed").await;
 
     // 가짜 base — 기준점을 oplog 최소 ts보다 한참 과거({t:1,i:1})로 둬 gap을 유발.
-    write_fake_base(&storage, "00000000-fake-base", Timestamp { time: 1, increment: 1 }).await;
+    write_fake_base(
+        &storage,
+        "00000000-fake-base",
+        Timestamp {
+            time: 1,
+            increment: 1,
+        },
+    )
+    .await;
 
     let incr_req = IncrementalRequest {
         uri: Secret::new(uri.clone()),
@@ -324,8 +356,14 @@ async fn gap_promotes_to_full_with_exit_4() {
                 .await
                 .expect("승격 풀 manifest");
             assert_eq!(m.backup_type, BackupType::Full, "승격 결과는 풀 백업");
-            assert!(m.promoted_from_gap, "promoted_from_gap=true 표식이 있어야 함");
-            assert!(reason.contains("gap") || reason.contains("롤오버"), "사유: {reason}");
+            assert!(
+                m.promoted_from_gap,
+                "promoted_from_gap=true 표식이 있어야 함"
+            );
+            assert!(
+                reason.contains("gap") || reason.contains("롤오버"),
+                "사유: {reason}"
+            );
 
             // 핸들러가 이 경로를 exit 4(Warning)로 보고하는지 — 매핑 계약 확인.
             let warn = x_backup::XBackupError::Warning(reason);

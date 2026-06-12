@@ -69,15 +69,30 @@ pub struct CheckItem {
 impl CheckItem {
     /// ok 항목.
     pub fn ok(key: &'static str, label: &'static str, message: impl Into<String>) -> Self {
-        Self { key, label, status: CheckStatus::Ok, message: message.into() }
+        Self {
+            key,
+            label,
+            status: CheckStatus::Ok,
+            message: message.into(),
+        }
     }
     /// warn 항목.
     pub fn warn(key: &'static str, label: &'static str, message: impl Into<String>) -> Self {
-        Self { key, label, status: CheckStatus::Warn, message: message.into() }
+        Self {
+            key,
+            label,
+            status: CheckStatus::Warn,
+            message: message.into(),
+        }
     }
     /// fail 항목.
     pub fn fail(key: &'static str, label: &'static str, message: impl Into<String>) -> Self {
-        Self { key, label, status: CheckStatus::Fail, message: message.into() }
+        Self {
+            key,
+            label,
+            status: CheckStatus::Fail,
+            message: message.into(),
+        }
     }
 }
 
@@ -96,7 +111,11 @@ impl StatusReport {
     /// 항목들로 보고서를 만들고 전체 신호등을 합산한다.
     pub fn new(profile: impl Into<String>, items: Vec<CheckItem>) -> Self {
         let overall = aggregate(&items);
-        Self { profile: profile.into(), items, overall }
+        Self {
+            profile: profile.into(),
+            items,
+            overall,
+        }
     }
 
     /// 신호등 → 종료 코드(PRD §9). fail=3(사전 점검 실패), warn=4(경고 동반 성공), ok=0.
@@ -183,14 +202,21 @@ pub fn parse_interval_secs(s: &str) -> Option<u64> {
         Some(c) if c.is_ascii_digit() => (s, 1),
         _ => return None,
     };
-    num_part.trim().parse::<u64>().ok().map(|n| n.saturating_mul(unit))
+    num_part
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|n| n.saturating_mul(unit))
 }
 
 /// `hello` 응답이 샤딩(mongos)인지 판정한다(PRD §4/§6.5 — 스코프 외, 거부).
 ///
 /// mongos는 `msg == "isdbgrid"`로 식별한다(스파이크·드라이버 관례).
 pub fn is_sharded(hello: &Document) -> bool {
-    hello.get_str("msg").map(|m| m == "isdbgrid").unwrap_or(false)
+    hello
+        .get_str("msg")
+        .map(|m| m == "isdbgrid")
+        .unwrap_or(false)
 }
 
 /// 서버 버전과 mongodump 버전의 호환을 판정한다(PRD §FR-8 3).
@@ -201,10 +227,7 @@ pub fn is_sharded(hello: &Document) -> bool {
 ///
 /// - `mongodump_version`이 `None`이면 도구 부재 → `Fail`.
 /// - 둘 다 있으면 기본 `Ok`(표시 위주). 단, 알려진 비호환 시그널이 있으면 `Warn`.
-pub fn version_compat_status(
-    server_version: &str,
-    mongodump_version: Option<&str>,
-) -> CheckStatus {
+pub fn version_compat_status(server_version: &str, mongodump_version: Option<&str>) -> CheckStatus {
     match mongodump_version {
         None => CheckStatus::Fail,
         Some(tool) => {
@@ -277,7 +300,9 @@ pub fn summarize_replset(status_doc: &Document) -> ReplSetSummary {
     let mut secondary_optimes_ms: Vec<i64> = Vec::new();
 
     for member in members {
-        let Some(m) = member.as_document() else { continue };
+        let Some(m) = member.as_document() else {
+            continue;
+        };
         let state = m.get_str("stateStr").unwrap_or("");
         // optimeDate(BSON DateTime) → epoch millis. 없으면 lag 산정에서 제외.
         let optime_ms = m
@@ -306,7 +331,11 @@ pub fn summarize_replset(status_doc: &Document) -> ReplSetSummary {
         _ => None,
     };
 
-    ReplSetSummary { has_primary, secondary_count, max_secondary_lag_secs }
+    ReplSetSummary {
+        has_primary,
+        secondary_count,
+        max_secondary_lag_secs,
+    }
 }
 
 // ───────────────────────── 드라이버 기반 점검 실행 ─────────────────────────
@@ -457,9 +486,7 @@ impl StatusChecker {
             .await;
         let doc = match resp {
             Ok(d) => d,
-            Err(e) => {
-                return CheckItem::fail("privileges", "권한", format!("권한 조회 실패: {e}"))
-            }
+            Err(e) => return CheckItem::fail("privileges", "권한", format!("권한 조회 실패: {e}")),
         };
         // 인증 비활성 서버(인증된 사용자 없음)는 사실상 전권 — 권한 누락으로 보지 않는다.
         // 단, 운영상 주의가 필요한 구성이므로 경고로 남긴다(백업은 막지 않음).
@@ -504,7 +531,11 @@ impl StatusChecker {
             Ok(doc) => {
                 if doc.get_str("setName").is_ok() {
                     let set = doc.get_str("setName").unwrap_or("?");
-                    CheckItem::ok("topology", "토폴로지", format!("replica set(setName={set})"))
+                    CheckItem::ok(
+                        "topology",
+                        "토폴로지",
+                        format!("replica set(setName={set})"),
+                    )
                 } else {
                     CheckItem::ok("topology", "토폴로지", "standalone".to_string())
                 }
@@ -520,7 +551,10 @@ impl StatusChecker {
         if core.status != CheckStatus::Ok {
             return core;
         }
-        let is_rs = hello.as_ref().map(|d| d.get_str("setName").is_ok()).unwrap_or(false);
+        let is_rs = hello
+            .as_ref()
+            .map(|d| d.get_str("setName").is_ok())
+            .unwrap_or(false);
         if !is_rs {
             return core; // standalone — 멤버 상태 없음.
         }
@@ -533,13 +567,26 @@ impl StatusChecker {
                     .max_secondary_lag_secs
                     .map(|s| format!("{s}s"))
                     .unwrap_or_else(|| "n/a".to_string());
-                let set = hello.as_ref().ok().and_then(|d| d.get_str("setName").ok()).unwrap_or("?");
+                let set = hello
+                    .as_ref()
+                    .ok()
+                    .and_then(|d| d.get_str("setName").ok())
+                    .unwrap_or("?");
                 let msg = format!(
                     "replica set(setName={set}, PRIMARY={}, SECONDARY={}, 최대 lag={lag})",
-                    if summary.has_primary { "있음" } else { "없음" },
+                    if summary.has_primary {
+                        "있음"
+                    } else {
+                        "없음"
+                    },
                     summary.secondary_count,
                 );
-                CheckItem { key: "topology", label: "토폴로지", status, message: msg }
+                CheckItem {
+                    key: "topology",
+                    label: "토폴로지",
+                    status,
+                    message: msg,
+                }
             }
             // replSetGetStatus 실패(권한 등)는 토폴로지 판별 자체는 됐으므로 경고로 강등.
             Err(e) => CheckItem::warn(
@@ -575,7 +622,12 @@ impl StatusChecker {
                 format!("서버={server_version}, mongodump={tool_disp}")
             }
         };
-        CheckItem { key: "version", label: "버전 정합", status, message: msg }
+        CheckItem {
+            key: "version",
+            label: "버전 정합",
+            status,
+            message: msg,
+        }
     }
 
     /// 6) 저장 엔진 — serverStatus.storageEngine.name.
@@ -587,7 +639,11 @@ impl StatusChecker {
                     .ok()
                     .and_then(|se| se.get_str("name").ok())
                     .unwrap_or("unknown");
-                CheckItem::ok("storage_engine", "저장 엔진", format!("storageEngine={engine}"))
+                CheckItem::ok(
+                    "storage_engine",
+                    "저장 엔진",
+                    format!("storageEngine={engine}"),
+                )
             }
             // serverStatus는 clusterMonitor 권한이 필요할 수 있어 실패는 경고로 강등.
             Err(e) => CheckItem::warn(
@@ -600,7 +656,10 @@ impl StatusChecker {
 
     /// 5) oplog 윈도우 — 최소~최신 ts 시간 폭, config interval 대비 여유.
     async fn check_oplog_window(&self, hello: &Result<Document>, interval: &str) -> CheckItem {
-        let is_rs = hello.as_ref().map(|d| d.get_str("setName").is_ok()).unwrap_or(false);
+        let is_rs = hello
+            .as_ref()
+            .map(|d| d.get_str("setName").is_ok())
+            .unwrap_or(false);
         if !is_rs {
             return CheckItem::warn(
                 "oplog_window",
@@ -635,7 +694,12 @@ impl StatusChecker {
                     ),
                     _ => format!("윈도우={window_secs}s, 증분 주기={iv_disp}"),
                 };
-                CheckItem { key: "oplog_window", label: "oplog 윈도우", status, message: msg }
+                CheckItem {
+                    key: "oplog_window",
+                    label: "oplog 윈도우",
+                    status,
+                    message: msg,
+                }
             }
             _ => CheckItem::warn(
                 "oplog_window",
@@ -756,7 +820,9 @@ fn collect_granted_actions(conn_status: &Document) -> BTreeSet<String> {
         return actions;
     };
     for priv_entry in privs {
-        let Some(p) = priv_entry.as_document() else { continue };
+        let Some(p) = priv_entry.as_document() else {
+            continue;
+        };
         if let Ok(acts) = p.get_array("actions") {
             for a in acts {
                 if let Some(name) = a.as_str() {
@@ -876,7 +942,10 @@ mod tests {
         ];
         assert_eq!(aggregate(&items), CheckStatus::Warn);
 
-        let with_fail = vec![CheckItem::warn("a", "A", "x"), CheckItem::fail("b", "B", "y")];
+        let with_fail = vec![
+            CheckItem::warn("a", "A", "x"),
+            CheckItem::fail("b", "B", "y"),
+        ];
         assert_eq!(aggregate(&with_fail), CheckStatus::Fail);
 
         let all_ok = vec![CheckItem::ok("a", "A", "x")];
@@ -914,7 +983,10 @@ mod tests {
         let mut granted = BTreeSet::new();
         granted.insert("find".to_string());
         // listCollections 누락.
-        assert_eq!(missing_actions(&granted), vec!["listCollections".to_string()]);
+        assert_eq!(
+            missing_actions(&granted),
+            vec!["listCollections".to_string()]
+        );
 
         granted.insert("listCollections".to_string());
         assert!(missing_actions(&granted).is_empty());

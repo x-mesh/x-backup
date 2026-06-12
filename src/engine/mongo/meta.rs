@@ -99,9 +99,11 @@ impl MongoMeta {
         // 충돌 범위를 특정 db로 좁힐 수 있으면(--only db.coll) 그 db만 본다.
         let only_db = ns_filter.and_then(|ns| ns.split('.').next());
 
-        let db_names = self.client.list_database_names().await.map_err(|e| {
-            XBackupError::Failure(format!("데이터베이스 목록 조회 실패: {e}"))
-        })?;
+        let db_names = self
+            .client
+            .list_database_names()
+            .await
+            .map_err(|e| XBackupError::Failure(format!("데이터베이스 목록 조회 실패: {e}")))?;
 
         let mut namespaces = Vec::new();
         for db_name in db_names {

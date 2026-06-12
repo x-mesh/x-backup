@@ -57,9 +57,7 @@ pub struct VerifyReport {
 impl VerifyReport {
     /// 구조(+심층) 검증이 모두 통과했는지.
     pub fn is_ok(&self) -> bool {
-        self.manifest_sidecar_ok
-            && self.data_checksum_ok
-            && self.deep_decode_ok.unwrap_or(true)
+        self.manifest_sidecar_ok && self.data_checksum_ok && self.deep_decode_ok.unwrap_or(true)
     }
 }
 
@@ -79,9 +77,10 @@ pub async fn verify_backup(
     let store = ManifestStore::new(storage);
 
     // 1) manifest 로드(읽기 실패 = 검증 불가, exit 1).
-    let manifest = store.read(backup_id).await.map_err(|e| {
-        XBackupError::Failure(format!("manifest 로드 실패({backup_id}): {e}"))
-    })?;
+    let manifest = store
+        .read(backup_id)
+        .await
+        .map_err(|e| XBackupError::Failure(format!("manifest 로드 실패({backup_id}): {e}")))?;
 
     let mut warnings = Vec::new();
 
@@ -105,8 +104,7 @@ pub async fn verify_backup(
     let empty_slice = manifest.oplog_count == Some(0);
 
     // 5) data.bin 스트림 sha256 재계산 vs manifest.checksum_sha256(키 불필요).
-    let data_checksum_ok =
-        verify_data_checksum(storage, backup_id, &manifest, empty_slice).await?;
+    let data_checksum_ok = verify_data_checksum(storage, backup_id, &manifest, empty_slice).await?;
     if !data_checksum_ok {
         return Err(XBackupError::Failure(format!(
             "data.bin 체크섬 불일치({backup_id}): 저장 바이트가 manifest.checksum_sha256과 \
@@ -196,9 +194,10 @@ async fn verify_deep_decode(
 
     // 역스택 구성(키 env에서 해석; 평문이면 identity). 키 부재 시 여기서 Config 에러.
     let stages = reverse_stack_for(manifest)?;
-    let raw = storage.get_stream(&data_path(backup_id)).await.map_err(|e| {
-        XBackupError::Failure(format!("data.bin 읽기 실패({backup_id}): {e}"))
-    })?;
+    let raw = storage
+        .get_stream(&data_path(backup_id))
+        .await
+        .map_err(|e| XBackupError::Failure(format!("data.bin 읽기 실패({backup_id}): {e}")))?;
     let mut decoded = stages.apply(raw);
 
     // 끝까지 읽어 디코드 가능성만 확인한다(평문은 그대로 흘려 보냄). 메모리에 쌓지 않고
@@ -378,9 +377,10 @@ mod tests {
         seed(&fs, &m, payload).await;
 
         // manifest.json을 사이드카와 어긋나게 덮어쓴다(사이드카는 그대로 둠).
-        let bad: BoxAsyncRead =
-            Box::pin(std::io::Cursor::new(br#"{"tampered":true}"#.to_vec()));
-        fs.put_stream(&manifest_path("bk-mt"), bad, None).await.unwrap();
+        let bad: BoxAsyncRead = Box::pin(std::io::Cursor::new(br#"{"tampered":true}"#.to_vec()));
+        fs.put_stream(&manifest_path("bk-mt"), bad, None)
+            .await
+            .unwrap();
 
         let err = verify_backup(&fs, "bk-mt", false).await.unwrap_err();
         assert_eq!(err.exit_code(), 1);
@@ -481,7 +481,8 @@ mod tests {
         // reverse_stack_for의 키 부재는 Config(exit 2). 핸들러가 exit 1로 보정한다.
         assert_eq!(err.exit_code(), 2, "키 부재는 Config 에러: {err}");
         assert!(
-            err.to_string().contains(crate::pipeline::stage::ENV_AGE_IDENTITY_FILE),
+            err.to_string()
+                .contains(crate::pipeline::stage::ENV_AGE_IDENTITY_FILE),
             "키 안내 메시지 누락: {err}"
         );
     }

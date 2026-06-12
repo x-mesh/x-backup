@@ -82,9 +82,7 @@ async fn doc_exists(client: &Client, id: i64) -> bool {
 
 /// 현재 oplog의 최신 ts.t(초)를 읽는다(--at 경계 산정용).
 async fn latest_oplog_secs(client: &Client) -> u32 {
-    let oplog = client
-        .database("local")
-        .collection::<Document>("oplog.rs");
+    let oplog = client.database("local").collection::<Document>("oplog.rs");
     let opts = mongodb::options::FindOneOptions::builder()
         .sort(doc! { "$natural": -1 })
         .build();
@@ -105,9 +103,7 @@ async fn latest_oplog_secs(client: &Client) -> u32 {
 /// `--at`은 초 단위 매핑이라 A와 B를 분리하려면 oplog ts.t가 달라야 한다. 고정 sleep
 /// 대신 oplog 초가 실제로 넘어갈 때까지 폴링한다(pitfall 8-1 동일 정신).
 async fn advance_past_second(client: &Client, after: u32) {
-    let coll = client
-        .database(TEST_DB)
-        .collection::<Document>("_tick");
+    let coll = client.database(TEST_DB).collection::<Document>("_tick");
     for _ in 0..200 {
         if latest_oplog_secs(client).await > after {
             return;
@@ -165,7 +161,10 @@ async fn pitr_recovers_to_point_between_writes() {
     advance_past_second(&client, at_secs).await;
     insert_marker(&client, 102, "writeB").await;
     let b_secs = latest_oplog_secs(&client).await;
-    assert!(b_secs > at_secs, "쓰기B 초({b_secs})가 --at 초({at_secs})보다 커야 분리됨");
+    assert!(
+        b_secs > at_secs,
+        "쓰기B 초({b_secs})가 --at 초({at_secs})보다 커야 분리됨"
+    );
 
     let incr2 = run_incremental_backup(&incr_req, &storage, identity_factory())
         .await
@@ -179,7 +178,11 @@ async fn pitr_recovers_to_point_between_writes() {
     let chain = x_backup::pipeline::verify::verify_chain_for(&storage, &full.backup_id)
         .await
         .expect("chain 수집");
-    assert!(chain.is_continuous(), "체인 불연속 — PITR 전제 미충족: {:?}", chain.breaks);
+    assert!(
+        chain.is_continuous(),
+        "체인 불연속 — PITR 전제 미충족: {:?}",
+        chain.breaks
+    );
 
     // 6) PITR 복구 — --at = 쓰기A의 초(RFC3339 UTC). 대상을 비우고 base+oplog 재생.
     client.database(TEST_DB).drop().await.ok();
@@ -191,13 +194,15 @@ async fn pitr_recovers_to_point_between_writes() {
         target_uri: Secret::new(uri.clone()),
         mongorestore_program: mongorestore_program(),
         at: at_rfc3339.clone(),
-        force: true,        // 빈 대상이지만 명시(가드 통과).
+        force: true, // 빈 대상이지만 명시(가드 통과).
         dry_run: false,
         skip_precheck: true, // DB 연결 점검 없이 복구 경로만 검증.
     };
-    let outcome = run_pitr(&pitr_req, &storage, false, |_| panic!("force면 confirm 미호출"))
-        .await
-        .expect("PITR 복구 성공");
+    let outcome = run_pitr(&pitr_req, &storage, false, |_| {
+        panic!("force면 confirm 미호출")
+    })
+    .await
+    .expect("PITR 복구 성공");
 
     // 결정 종료 ts는 --at 초 이하여야 한다(내림 매핑).
     assert!(
@@ -208,8 +213,14 @@ async fn pitr_recovers_to_point_between_writes() {
     assert_eq!(outcome.plan.base_id, full.backup_id, "PITR base = 풀 백업");
 
     // 7) SC4 핵심 검증: 쓰기A(101) 존재, 쓰기B(102) 부재, seed(1) 존재.
-    assert!(doc_exists(&client, 1).await, "seed(base) 문서가 복원돼야 함");
-    assert!(doc_exists(&client, 101).await, "쓰기A(--at 이하)가 복원돼야 함(SC4)");
+    assert!(
+        doc_exists(&client, 1).await,
+        "seed(base) 문서가 복원돼야 함"
+    );
+    assert!(
+        doc_exists(&client, 101).await,
+        "쓰기A(--at 이하)가 복원돼야 함(SC4)"
+    );
     assert!(
         !doc_exists(&client, 102).await,
         "쓰기B(--at 이후)는 복원되면 안 됨(SC4 — 목표 시점 이후 문서 부재)"
@@ -281,5 +292,8 @@ async fn pitr_dry_run_does_not_modify_target() {
     assert_eq!(outcome.plan.base_id, full.backup_id);
     assert_eq!(outcome.replayed_slices, 0, "dry-run은 재생하지 않음");
     // 대상은 그대로 비어 있어야 한다(무부작용).
-    assert!(!doc_exists(&client, 1).await, "dry-run이 대상을 변경함(무부작용 위반)");
+    assert!(
+        !doc_exists(&client, 1).await,
+        "dry-run이 대상을 변경함(무부작용 위반)"
+    );
 }

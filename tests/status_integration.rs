@@ -35,9 +35,7 @@ async fn full_status_emits_all_check_items() {
         .await
         .expect("status 연결");
 
-    let report = checker
-        .full_report("test", "mongodump", "15m", false)
-        .await;
+    let report = checker.full_report("test", "mongodump", "15m", false).await;
 
     // 점검 항목 키 집합 — FR-8 항목들이 모두 보고되어야 한다.
     let keys: BTreeSet<&str> = report.items.iter().map(|i| i.key).collect();
@@ -50,18 +48,40 @@ async fn full_status_emits_all_check_items() {
         "oplog_window",
         "estimated_size",
     ] {
-        assert!(keys.contains(expected), "점검 항목 누락: {expected} (보고: {keys:?})");
+        assert!(
+            keys.contains(expected),
+            "점검 항목 누락: {expected} (보고: {keys:?})"
+        );
     }
 
     // 연결·토폴로지는 replica set fixture에서 정상이어야 한다.
     let by_key = |k: &str| report.items.iter().find(|i| i.key == k).unwrap();
-    assert_eq!(by_key("connection").status, CheckStatus::Ok, "연결 실패: {:?}", by_key("connection").message);
-    assert_eq!(by_key("topology").status, CheckStatus::Ok, "토폴로지 비정상: {:?}", by_key("topology").message);
+    assert_eq!(
+        by_key("connection").status,
+        CheckStatus::Ok,
+        "연결 실패: {:?}",
+        by_key("connection").message
+    );
+    assert_eq!(
+        by_key("topology").status,
+        CheckStatus::Ok,
+        "토폴로지 비정상: {:?}",
+        by_key("topology").message
+    );
 
     // 전체 신호등은 fail이 아니어야 한다(정상 또는 경고).
-    assert_ne!(report.overall, CheckStatus::Fail, "전체 점검 실패: {:?}", report.items);
+    assert_ne!(
+        report.overall,
+        CheckStatus::Fail,
+        "전체 점검 실패: {:?}",
+        report.items
+    );
     // 종료 코드는 0 또는 4(fail=3 아님).
-    assert!(matches!(report.exit_code(), 0 | 4), "exit code: {}", report.exit_code());
+    assert!(
+        matches!(report.exit_code(), 0 | 4),
+        "exit code: {}",
+        report.exit_code()
+    );
 }
 
 /// `--json` 직렬화가 항목 배열 + overall 구조를 담는지 확인한다.
@@ -98,5 +118,10 @@ async fn precheck_subset_passes_on_healthy_replica_set() {
     assert!(keys.contains("topology"));
     assert!(keys.contains("tool"));
 
-    assert_ne!(report.overall, CheckStatus::Fail, "사전 점검 실패: {:?}", report.items);
+    assert_ne!(
+        report.overall,
+        CheckStatus::Fail,
+        "사전 점검 실패: {:?}",
+        report.items
+    );
 }

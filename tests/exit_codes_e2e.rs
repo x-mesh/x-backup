@@ -156,8 +156,7 @@ fn precheck_unreachable_uri_is_exit_3() {
     let cfg = write_config("XB_E2E_UNREACHABLE_URI", dir.path().to_str().unwrap());
 
     // 도달 불가 + 빠른 타임아웃. 닫힌 포트(1)로 즉시 연결 거부되게 한다.
-    let unreachable =
-        "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=800&connectTimeoutMS=800";
+    let unreachable = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=800&connectTimeoutMS=800";
 
     xbackup()
         .args(["--config", cfg.path().to_str().unwrap()])
@@ -222,6 +221,10 @@ fn lock_conflict_is_exit_5() {
 #[test]
 fn binary_runs_and_reports_version() {
     let bin = cargo_bin("x-backup");
-    assert!(bin.exists(), "x-backup 바이너리가 빌드되지 않음: {}", bin.display());
+    assert!(
+        bin.exists(),
+        "x-backup 바이너리가 빌드되지 않음: {}",
+        bin.display()
+    );
     xbackup().arg("--version").assert().success();
 }

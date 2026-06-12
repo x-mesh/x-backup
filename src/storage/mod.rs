@@ -119,9 +119,7 @@ pub fn from_config(dest: &DestinationConfig) -> Result<Box<dyn Storage>, XBackup
                 )
             })?;
             let creds_env = s3_cfg.credentials_env.as_deref().ok_or_else(|| {
-                XBackupError::Config(
-                    "s3 destination에 credentials_env가 필요합니다".to_string(),
-                )
+                XBackupError::Config("s3 destination에 credentials_env가 필요합니다".to_string())
             })?;
             // credentials_env가 가리키는 환경변수에서 "ACCESS:SECRET" 값을 읽는다.
             let creds_raw = std::env::var(creds_env).map_err(|_| {

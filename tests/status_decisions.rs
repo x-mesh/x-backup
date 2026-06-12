@@ -33,7 +33,9 @@ fn sharded_hello_is_rejected_with_exit_3() {
 /// replica set/standalone hello는 샤딩이 아니다.
 #[test]
 fn non_sharded_topologies_are_not_rejected() {
-    assert!(!is_sharded(&doc! { "setName": "rs0", "isWritablePrimary": true }));
+    assert!(!is_sharded(
+        &doc! { "setName": "rs0", "isWritablePrimary": true }
+    ));
     assert!(!is_sharded(&doc! { "isWritablePrimary": true }));
 }
 
@@ -74,8 +76,14 @@ fn oplog_window_threshold() {
 #[test]
 fn version_compat_signals() {
     assert_eq!(version_compat_status("7.0.35", None), CheckStatus::Fail);
-    assert_eq!(version_compat_status("7.0.35", Some("100.16.1")), CheckStatus::Ok);
-    assert_eq!(version_compat_status("9.0.0", Some("100.16.1")), CheckStatus::Warn);
+    assert_eq!(
+        version_compat_status("7.0.35", Some("100.16.1")),
+        CheckStatus::Ok
+    );
+    assert_eq!(
+        version_compat_status("9.0.0", Some("100.16.1")),
+        CheckStatus::Warn
+    );
 }
 
 /// mongodump --version 출력 파싱.

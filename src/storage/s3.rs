@@ -168,9 +168,9 @@ impl S3Compatible {
             builder = builder.with_endpoint(endpoint).with_allow_http(allow_http);
         }
 
-        let inner = builder.build().map_err(|e| {
-            XBackupError::Config(format!("S3 백엔드 초기화 실패: {e}"))
-        })?;
+        let inner = builder
+            .build()
+            .map_err(|e| XBackupError::Config(format!("S3 백엔드 초기화 실패: {e}")))?;
 
         Ok(Self {
             inner,
@@ -210,10 +210,7 @@ impl S3Compatible {
 ///
 /// `None`/빈 문자열/`"/"` 모두 "prefix 없음"(버킷 루트)으로 매핑한다.
 fn normalize_prefix(prefix: Option<&str>) -> String {
-    prefix
-        .unwrap_or("")
-        .trim_matches('/')
-        .to_string()
+    prefix.unwrap_or("").trim_matches('/').to_string()
 }
 
 #[async_trait::async_trait]
@@ -284,9 +281,10 @@ impl Storage for S3Compatible {
 
     async fn get_stream(&self, path: &str) -> Result<BoxAsyncRead, XBackupError> {
         let object_path = self.object_path(path);
-        let result = self.inner.get(&object_path).await.map_err(|e| {
-            XBackupError::StorageDownload(format!("'{path}' 다운로드 실패: {e}"))
-        })?;
+        let result =
+            self.inner.get(&object_path).await.map_err(|e| {
+                XBackupError::StorageDownload(format!("'{path}' 다운로드 실패: {e}"))
+            })?;
 
         // object_store 바이트 스트림(에러 타입)을 io::Error로 매핑해 StreamReader에 연결.
         let byte_stream = result
@@ -326,9 +324,10 @@ impl Storage for S3Compatible {
 
     async fn delete(&self, path: &str) -> Result<(), XBackupError> {
         let object_path = self.object_path(path);
-        self.inner.delete(&object_path).await.map_err(|e| {
-            XBackupError::StorageDownload(format!("'{path}' 삭제 실패: {e}"))
-        })
+        self.inner
+            .delete(&object_path)
+            .await
+            .map_err(|e| XBackupError::StorageDownload(format!("'{path}' 삭제 실패: {e}")))
     }
 }
 
@@ -421,11 +420,17 @@ mod tests {
         // 16MiB × 9500을 초과하면 ceil(hint/9500) > 16MiB → 적응 증가.
         let large = DEFAULT_PART_SIZE as u64 * TARGET_MAX_PARTS + 1;
         let ps = compute_part_size(Some(large));
-        assert!(ps > DEFAULT_PART_SIZE, "큰 hint는 파트 크기를 키워야 한다: {ps}");
+        assert!(
+            ps > DEFAULT_PART_SIZE,
+            "큰 hint는 파트 크기를 키워야 한다: {ps}"
+        );
 
         // 파트 수가 한도(10,000) 아래인지 — 산정 파트 크기로 나눈 파트 수 검증.
         let parts = large.div_ceil(ps as u64);
-        assert!(parts <= 10_000, "적응 파트 크기로도 10,000파트를 넘었다: {parts}");
+        assert!(
+            parts <= 10_000,
+            "적응 파트 크기로도 10,000파트를 넘었다: {parts}"
+        );
     }
 
     /// 초대용량(1TiB)도 10,000파트 한도 안에서 단일 업로드로 처리 가능해야 한다.
@@ -436,7 +441,10 @@ mod tests {
         let parts = one_tib.div_ceil(ps as u64);
         assert!(parts <= 10_000, "1TiB가 10,000파트를 넘었다: {parts}");
         // 파트 크기는 S3 최소(5MiB) 이상이어야 한다.
-        assert!(ps >= 5 * 1024 * 1024, "파트 크기가 S3 최소(5MiB) 미만: {ps}");
+        assert!(
+            ps >= 5 * 1024 * 1024,
+            "파트 크기가 S3 최소(5MiB) 미만: {ps}"
+        );
     }
 
     /// credentials 파싱: 정상 형식("ACCESS:SECRET")을 access/secret으로 분리한다.
@@ -490,7 +498,10 @@ mod tests {
             credentials_env: Some("CREDS".to_string()),
         };
         let s3 = S3Compatible::new(&cfg, "access:secret").unwrap();
-        assert_eq!(s3.object_path("bkp-1/data.bin").as_ref(), "mongo/prod/bkp-1/data.bin");
+        assert_eq!(
+            s3.object_path("bkp-1/data.bin").as_ref(),
+            "mongo/prod/bkp-1/data.bin"
+        );
 
         // prefix 없는 경우.
         let cfg_no_prefix = S3Config {
@@ -498,7 +509,10 @@ mod tests {
             ..cfg
         };
         let s3_np = S3Compatible::new(&cfg_no_prefix, "access:secret").unwrap();
-        assert_eq!(s3_np.object_path("bkp-1/data.bin").as_ref(), "bkp-1/data.bin");
+        assert_eq!(
+            s3_np.object_path("bkp-1/data.bin").as_ref(),
+            "bkp-1/data.bin"
+        );
     }
 
     /// strip_prefix: list 절대 경로에서 config prefix를 떼어 trait 상대 경로로 되돌린다.

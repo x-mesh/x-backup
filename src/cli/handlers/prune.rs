@@ -193,10 +193,7 @@ fn print_plan(plan: &PrunePlan, dry_run: bool) {
 }
 
 /// config를 읽어 destination=local Storage를 연다(list/backup 핸들러와 동일 패턴).
-async fn open_storage(
-    config_path: &Option<PathBuf>,
-    args: &PruneArgs,
-) -> Result<Box<dyn Storage>> {
+async fn open_storage(config_path: &Option<PathBuf>, args: &PruneArgs) -> Result<Box<dyn Storage>> {
     let config_toml = match config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
             XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
