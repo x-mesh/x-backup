@@ -14,3 +14,6 @@
 # OS·에디터
 .DS_Store
 *.swp
+
+# x-build 하네스 상태 (세션 로컬)
+.xm/

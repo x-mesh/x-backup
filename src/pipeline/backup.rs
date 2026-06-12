@@ -215,13 +215,17 @@ pub async fn run_full_backup_with_meta(
     let staged: BoxAsyncRead = stages.apply(Box::pin(counted));
     let checksummed = Sha256Reader::new(staged);
     let checksum_handle = checksummed.handle();
+    // 저장 바이트도 같은 패스에서 센다 — list 기반 사후 조회는 백엔드별 prefix
+    // 의미가 달라(LocalFs는 디렉터리 취급) 신뢰할 수 없다.
+    let stored_counted = CountingReader::new(Box::pin(checksummed));
+    let stored_size_handle = stored_counted.handle();
 
     // 5) data.bin 저장(업로드 먼저). put_stream이 바이트를 끝까지 소비한다.
     let backup_id = Uuid::now_v7().to_string();
     let data_rel = data_path(&backup_id);
 
     let put_result = storage
-        .put_stream(&data_rel, Box::pin(checksummed), None)
+        .put_stream(&data_rel, Box::pin(stored_counted), None)
         .await;
 
     // 업로드 성공/실패와 무관하게 dump 종료를 판정해야 한다(좀비 방지).
@@ -256,7 +260,7 @@ pub async fn run_full_backup_with_meta(
     let checksum = checksum_handle
         .finalize()
         .ok_or_else(|| XBackupError::Failure("체크섬 확정 실패(이미 소비됨)".into()))?;
-    let stored_size = storage_size(storage, &data_rel).await?;
+    let stored_size = stored_size_handle.total();
     // 원본(압축 전) 입력 바이트. 압축 단계가 없으면 stored와 같다(평문 경로).
     let original_size = original_size_handle.total();
 
@@ -335,16 +339,6 @@ fn build_manifest(
     }
 }
 
-/// 저장된 객체의 크기를 list로 조회한다.
-async fn storage_size(storage: &dyn Storage, path: &str) -> Result<u64> {
-    let entries = storage.list(path).await?;
-    entries
-        .iter()
-        .find(|e| e.path == path)
-        .map(|e| e.size)
-        .ok_or_else(|| XBackupError::Failure(format!("저장 후 '{path}' 크기 조회 실패")))
-}
-
 /// 부분 산출물 정리 — 실패 경로에서 백업 디렉터리의 알려진 파일을 best-effort 삭제한다.
 ///
 /// "업로드 먼저, manifest 나중" 순서이므로, manifest 기록 전 실패면 data.bin만,
@@ -365,7 +359,7 @@ async fn cleanup(storage: &dyn Storage, backup_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{MockStorage, StorageEntry};
+    use crate::storage::MockStorage;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::AsyncReadExt;
@@ -464,19 +458,17 @@ mod tests {
         assert!(cleanup_called.load(Ordering::SeqCst), "cleanup이 delete를 호출하지 않음");
     }
 
-    /// storage_size는 list 결과에서 해당 경로의 크기를 정확히 집어낸다.
+    /// 저장 크기는 list 사후 조회가 아니라 put 경로의 카운터로 집계된다 —
+    /// LocalFs의 list는 prefix를 디렉터리로 취급해 정확 경로 조회가 불가하기 때문.
     #[tokio::test]
-    async fn storage_size_reads_from_list() {
-        let mut mock = MockStorage::new();
-        mock.expect_list().returning(|prefix| {
-            Ok(vec![StorageEntry {
-                path: prefix.to_string(),
-                size: 4242,
-                last_modified: None,
-            }])
-        });
-        let size = storage_size(&mock, "bk/data.bin").await.unwrap();
-        assert_eq!(size, 4242);
+    async fn stored_size_counted_in_stream_pass() {
+        let payload = vec![7u8; 4242];
+        let counted = CountingReader::new(Box::pin(std::io::Cursor::new(payload)));
+        let handle = counted.handle();
+        let mut sink = Vec::new();
+        tokio::io::copy(&mut Box::pin(counted), &mut sink).await.unwrap();
+        assert_eq!(handle.total(), 4242);
+        assert_eq!(sink.len(), 4242);
     }
 
     /// R2 — 선택적 백업은 replica set이라도 --oplog를 자동 제거한다(증분 base 부적격).
