@@ -6,12 +6,15 @@
 use std::path::PathBuf;
 
 use crate::cli::args::BackupArgs;
+use crate::compress::{ZstdCompressStage, ALGORITHM_ZSTD};
 use crate::config::env::collect_overrides_from_process;
 use crate::config::merged::MergeInput;
 use crate::config::ResolvedConfig;
+use crate::crypto::build_encrypt_stage;
 use crate::error::{Result, XBackupError};
-use crate::pipeline::backup::{run_full_backup, BackupRequest};
-use crate::pipeline::stage::StageStack;
+use crate::manifest::schema::CompressionMeta;
+use crate::pipeline::backup::{run_full_backup_with_meta, BackupMeta, BackupRequest};
+use crate::pipeline::stage::{StageStack, ENV_AES_KEY_HEX};
 use crate::storage::LocalFs;
 
 /// `backup` 핸들러 진입점.
@@ -30,8 +33,9 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
         overrides: &overrides,
     })?;
 
-    // 2) URI 시크릿(uri_env로 해석된 값) 확보.
-    let uri = resolved.resolved_uri.ok_or_else(|| {
+    // 2) URI 시크릿(uri_env로 해석된 값) 확보. 이후 build_stages가 &resolved를 쓰므로
+    //    clone으로 꺼내 부분 이동을 피한다(Secret은 Clone).
+    let uri = resolved.resolved_uri.clone().ok_or_else(|| {
         XBackupError::Config(format!(
             "프로파일 '{}'에 source.uri_env가 없거나 해석되지 않았습니다",
             resolved.profile_name
@@ -80,16 +84,16 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
         ));
     }
 
-    // 4) 파이프라인 실행. t4는 평문(identity StageStack). t6이 compress/encrypt 단계를
-    //    여기서 StageStack에 push한다(--no-encrypt/--compress-level 반영 포함).
+    // 4) 파이프라인 단계 구성(t6): compress → encrypt 고정 순서(PRD §8.4). 단계와
+    //    manifest 메타를 함께 만든다(아래 build_stages 참조). --no-encrypt면 암호화 생략.
     let request = BackupRequest {
         uri,
         mongodump_program: "mongodump".to_string(),
         db: args.db.clone(),
         collection: args.collection.clone(),
     };
-    let stages = StageStack::new();
-    let outcome = run_full_backup(&request, &storage, stages).await?;
+    let (stages, meta) = build_stages(&resolved, &args)?;
+    let outcome = run_full_backup_with_meta(&request, &storage, stages, meta).await?;
 
     // 5) 요약 출력(stdout — 결과 전용). --json은 t15/t16이 정식화; 여기서는 최소 JSON.
     if args.json {
@@ -114,4 +118,174 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
     }
 
     Ok(())
+}
+
+/// config·CLI를 해석해 백업 파이프라인 단계 스택과 manifest 메타를 만든다(t6).
+///
+/// 순서(PRD §8.4 고정): **compress → encrypt**. 즉 dump 바이트에 먼저 압축, 그 다음
+/// 암호화를 적용한다([`StageStack::push`]는 push 순서로 감싼다).
+///
+/// - **압축**: config `features.compression`가 활성(현재 zstd 단일)이면 압축 단계 push.
+///   레벨은 CLI `--compress-level` > config `level` 우선. manifest.compression 기록.
+/// - **암호화**: 기본 ON(PRD §FR-5 — 평문은 명시적 `--no-encrypt`만). `--no-encrypt`면
+///   경고 로그 후 암호화 단계를 생략한다. config `features.encryption.algorithm`에 따라
+///   age(recipient_file) 또는 aes-256-gcm(env 키)으로 단계를 만든다. manifest.encryption 기록.
+fn build_stages(
+    resolved: &ResolvedConfig,
+    args: &BackupArgs,
+) -> Result<(StageStack, BackupMeta)> {
+    let features = &resolved.profile.features;
+    let mut stack = StageStack::new();
+    let mut meta = BackupMeta::none();
+
+    // ── 압축(compress 먼저) ──
+    // 현재 지원 알고리즘은 zstd 단일이다(config 기본값도 zstd). 레벨은 CLI 우선.
+    let comp = &features.compression;
+    if comp.algorithm == ALGORITHM_ZSTD {
+        let level = args.compress_level.unwrap_or(comp.level);
+        let stage = ZstdCompressStage::new(level);
+        // manifest에는 실제 적용된(클램프 후) 레벨을 기록한다.
+        meta.compression = Some(CompressionMeta {
+            algorithm: ALGORITHM_ZSTD.to_string(),
+            level: stage.level(),
+        });
+        stack.push(Box::new(stage));
+    } else {
+        return Err(XBackupError::Config(format!(
+            "알 수 없는 압축 알고리즘: '{}'(zstd만 지원)",
+            comp.algorithm
+        )));
+    }
+
+    // ── 암호화(encrypt 나중) ──
+    // 기본 ON. --no-encrypt면 명시적 opt-out(경고 후 생략).
+    let enc = &features.encryption;
+    if args.no_encrypt {
+        tracing::warn!(
+            "--no-encrypt 지정 — 평문으로 백업합니다(암호화 생략). 산출물에 민감 데이터가 \
+             평문으로 저장됩니다(PRD §FR-5 명시적 opt-out)."
+        );
+    } else if !enc.enabled {
+        // config에서 암호화를 끈 경우도 평문이나, 의도치 않은 평문 저장을 막기 위해 경고.
+        tracing::warn!(
+            "config features.encryption.enabled=false — 평문으로 백업합니다(암호화 생략)."
+        );
+    } else {
+        // aes-256-gcm은 env에서 키를 읽어 주입한다(age는 recipient 파일에서 로드).
+        let aes_key = std::env::var(ENV_AES_KEY_HEX).ok();
+        let (stage, enc_meta) = build_encrypt_stage(enc, aes_key.as_deref())?;
+        meta.encryption = Some(enc_meta);
+        stack.push(stage);
+    }
+
+    Ok((stack, meta))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::args::BackupArgs;
+    use crate::config::file::Profile;
+    use crate::config::merged::ResolvedConfig;
+
+    /// 테스트용 ResolvedConfig — 주어진 profile로 구성(URI는 비워 둠).
+    fn resolved_with(profile: Profile) -> ResolvedConfig {
+        ResolvedConfig {
+            profile_name: "test".to_string(),
+            profile,
+            resolved_uri: None,
+        }
+    }
+
+    /// 기본 BackupArgs(플래그 미지정).
+    fn default_args() -> BackupArgs {
+        BackupArgs {
+            profile: "test".to_string(),
+            backup_type: None,
+            db: None,
+            collection: None,
+            no_encrypt: false,
+            compress_level: None,
+            quiet: false,
+            progress: false,
+            json: false,
+            skip_precheck: false,
+        }
+    }
+
+    /// 기본 경로: 압축(zstd) + 암호화(age, recipient_file 지정) 둘 다 push, compress→encrypt 순서.
+    #[test]
+    fn default_path_pushes_compress_then_encrypt() {
+        // recipient 파일을 임시로 만든다(age 공개키).
+        let id = age::x25519::Identity::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let pub_path = dir.path().join("age.pub");
+        std::fs::write(&pub_path, id.to_public().to_string()).unwrap();
+
+        let mut profile = Profile::default();
+        profile.features.encryption.recipient_file =
+            Some(pub_path.to_str().unwrap().to_string());
+
+        let (stack, meta) = build_stages(&resolved_with(profile), &default_args()).unwrap();
+        // 순서: zstd(압축) 먼저, age(암호화) 나중.
+        assert_eq!(stack.stage_names(), vec!["zstd", "age"]);
+        assert_eq!(meta.compression.as_ref().unwrap().algorithm, "zstd");
+        assert_eq!(meta.encryption.as_ref().unwrap().algorithm, "age");
+        // age key_id에는 recipient 지문이 들어간다(키 자체 아님).
+        assert!(meta
+            .encryption
+            .as_ref()
+            .unwrap()
+            .key_id
+            .as_ref()
+            .unwrap()
+            .starts_with("age1"));
+    }
+
+    /// --no-encrypt면 암호화 단계를 생략하고 압축만 남는다(평문, encryption 메타 None).
+    #[test]
+    fn no_encrypt_skips_encryption_stage() {
+        let profile = Profile::default();
+        let mut args = default_args();
+        args.no_encrypt = true;
+        let (stack, meta) = build_stages(&resolved_with(profile), &args).unwrap();
+        assert_eq!(stack.stage_names(), vec!["zstd"]);
+        assert!(meta.encryption.is_none());
+        assert!(meta.compression.is_some());
+    }
+
+    /// --compress-level이 config 레벨을 덮어쓴다.
+    #[test]
+    fn cli_compress_level_overrides_config() {
+        let mut profile = Profile::default();
+        profile.features.compression.level = 3;
+        let mut args = default_args();
+        args.compress_level = Some(19);
+        args.no_encrypt = true; // 암호화는 이 테스트 범위 밖.
+        let (_stack, meta) = build_stages(&resolved_with(profile), &args).unwrap();
+        assert_eq!(meta.compression.unwrap().level, 19);
+    }
+
+    /// config 압축 레벨이 CLI 미지정 시 그대로 쓰인다.
+    #[test]
+    fn config_compress_level_used_when_no_cli() {
+        let mut profile = Profile::default();
+        profile.features.compression.level = 7;
+        let mut args = default_args();
+        args.no_encrypt = true;
+        let (_stack, meta) = build_stages(&resolved_with(profile), &args).unwrap();
+        assert_eq!(meta.compression.unwrap().level, 7);
+    }
+
+    /// age 암호화인데 recipient_file이 없으면 Config 에러로 막는다.
+    #[test]
+    fn age_without_recipient_file_is_config_error() {
+        let profile = Profile::default(); // recipient_file = None, algorithm = age 기본.
+        let result = build_stages(&resolved_with(profile), &default_args());
+        let code = match result {
+            Ok(_) => panic!("recipient_file 없는 age는 실패해야 함"),
+            Err(e) => e.exit_code(),
+        };
+        assert_eq!(code, 2);
+    }
 }

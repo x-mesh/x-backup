@@ -1,0 +1,316 @@
+//! age(X25519) 암호화 단계 — 기본 암호화 경로(PRD §8.1).
+//!
+//! 공개키(recipient)로만 암호화하므로 백업 호스트는 공개키만 보유하면 된다 — 개인키
+//! 없이는 복호화 불가(공개키-only 격리, §8.1/§8.5). age는 내부적으로
+//! ChaCha20-Poly1305 STREAM(64KiB 청크)으로 대용량을 안전하게 처리한다.
+//!
+//! ## AsyncRead↔AsyncWrite 브리지
+//! age async API는 **쓰기 기반**이다: [`Encryptor::wrap_async_output`]는
+//! `futures::io::AsyncWrite`를 받아 암호문을 그쪽으로 쓴다. 하지만 [`PipelineStage`]는
+//! `AsyncRead → AsyncRead` 어댑터다. 그래서 [`tokio::io::duplex`] 파이프를 만들고,
+//! **백그라운드 태스크**가 입력 reader를 age 암호화 writer로 펌프한다. duplex의 읽기
+//! 끝을 다음 단계 reader로 반환한다. duplex 버퍼가 자연 백프레셔를 제공하므로 전 구간
+//! 스트리밍이 유지된다(메모리 상수, R1).
+//!
+//! futures-io ↔ tokio-io 트레이트 차이는 `tokio_util::compat`로 변환한다.
+//!
+//! ## 복호화
+//! [`AgeDecryptStage`]는 개인키(identity)로 복호화한다. [`Decryptor::new_async`]가
+//! 반환하는 futures-io reader를 tokio reader로 변환해 다음 단계로 흘린다. 개인키가
+//! 없거나 틀리면 복호화에 실패한다(테스트로 보장).
+
+use std::str::FromStr;
+
+use age::x25519;
+use age::{Decryptor, Identity, Recipient};
+use futures::io::{AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+use crate::error::{Result, XBackupError};
+use crate::pipeline::stage::PipelineStage;
+use crate::storage::BoxAsyncRead;
+
+/// 암호화 알고리즘 식별자(manifest `encryption.algorithm`).
+pub const ALGORITHM_AGE: &str = "age";
+
+/// duplex 파이프 버퍼 크기 — age STREAM 청크(64KiB)와 균형을 맞춘 백프레셔 버퍼.
+const DUPLEX_BUF_BYTES: usize = 64 * 1024;
+
+/// age 암호화 단계 — recipient 공개키로 암호화한다(정방향).
+pub struct AgeEncryptStage {
+    recipient: x25519::Recipient,
+}
+
+impl AgeEncryptStage {
+    /// recipient 파일(공개키 `age1...`)을 읽어 암호화 단계를 만든다.
+    ///
+    /// 파일에는 한 줄짜리 age recipient 공개키가 있어야 한다(주석·빈 줄 허용).
+    pub fn from_recipient_file(path: &str) -> Result<Self> {
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            XBackupError::Config(format!("age recipient 파일 읽기 실패({path}): {e}"))
+        })?;
+        let recipient = parse_recipient(&raw).ok_or_else(|| {
+            XBackupError::Config(format!(
+                "age recipient 파일에 유효한 공개키(age1...)가 없습니다: {path}"
+            ))
+        })?;
+        Ok(Self { recipient })
+    }
+
+    /// recipient 공개키로 직접 단계를 만든다(테스트·프로그램 구성용).
+    pub fn from_recipient(recipient: x25519::Recipient) -> Self {
+        Self { recipient }
+    }
+
+    /// recipient 공개키 식별자(`age1...` 지문) — manifest `encryption.key_id` 기록용.
+    pub fn key_id(&self) -> String {
+        self.recipient.to_string()
+    }
+}
+
+impl PipelineStage for AgeEncryptStage {
+    fn wrap(self: Box<Self>, input: BoxAsyncRead) -> BoxAsyncRead {
+        // duplex: writer(펌프 태스크가 암호문을 씀) ↔ reader(다음 단계가 읽음).
+        let (writer, reader) = tokio::io::duplex(DUPLEX_BUF_BYTES);
+        let recipient = self.recipient;
+
+        // 백그라운드 펌프: 입력 평문 → age 암호화 → duplex writer.
+        tokio::spawn(async move {
+            if let Err(e) = pump_encrypt(recipient, input, writer).await {
+                tracing::error!("age 암호화 펌프 실패: {e}");
+            }
+        });
+
+        Box::pin(reader)
+    }
+
+    fn name(&self) -> &'static str {
+        ALGORITHM_AGE
+    }
+}
+
+/// age STREAM 펌프 청크 크기(입력 읽기 단위).
+const PUMP_CHUNK: usize = 64 * 1024;
+
+/// 입력 평문을 age로 암호화해 `sink`(tokio AsyncWrite)로 펌프한다.
+async fn pump_encrypt(
+    recipient: x25519::Recipient,
+    mut input: BoxAsyncRead,
+    mut sink: tokio::io::DuplexStream,
+) -> std::io::Result<()> {
+    // Encryptor는 &dyn Recipient 이터레이터를 받는다.
+    let recipients: Vec<Box<dyn Recipient + Send>> = vec![Box::new(recipient)];
+    let encryptor = age::Encryptor::with_recipients(
+        recipients.iter().map(|r| r.as_ref() as &dyn Recipient),
+    )
+    .map_err(std::io::Error::other)?;
+
+    // sink(tokio AsyncWrite)를 futures AsyncWrite로 변환해 age에 넘긴다(age는 futures-io).
+    let futures_sink = (&mut sink).compat_write();
+    let mut age_writer = encryptor
+        .wrap_async_output(futures_sink)
+        .await
+        .map_err(std::io::Error::other)?;
+
+    // 평문을 청크 단위로 읽어 age writer(futures AsyncWrite)로 흘린다.
+    let mut buf = vec![0u8; PUMP_CHUNK];
+    loop {
+        let n = input.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        age_writer
+            .write_all(&buf[..n])
+            .await
+            .map_err(std::io::Error::other)?;
+    }
+
+    // age STREAM 마지막 청크 flush·finalize(close 누락 시 truncation).
+    age_writer.close().await.map_err(std::io::Error::other)?;
+    sink.shutdown().await?;
+    Ok(())
+}
+
+/// age 복호화 단계 — 개인키(identity)로 복호화한다(역방향, 복구·verify --deep).
+pub struct AgeDecryptStage {
+    identity: x25519::Identity,
+}
+
+impl AgeDecryptStage {
+    /// identity 파일(개인키 `AGE-SECRET-KEY-1...`)을 읽어 복호화 단계를 만든다.
+    pub fn from_identity_file(path: &str) -> Result<Self> {
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            XBackupError::Config(format!("age identity 파일 읽기 실패({path}): {e}"))
+        })?;
+        let identity = parse_identity(&raw).ok_or_else(|| {
+            XBackupError::Config(format!(
+                "age identity 파일에 유효한 개인키(AGE-SECRET-KEY-1...)가 없습니다: {path}"
+            ))
+        })?;
+        Ok(Self { identity })
+    }
+
+    /// identity 개인키로 직접 단계를 만든다(테스트·프로그램 구성용).
+    pub fn from_identity(identity: x25519::Identity) -> Self {
+        Self { identity }
+    }
+}
+
+impl PipelineStage for AgeDecryptStage {
+    fn wrap(self: Box<Self>, input: BoxAsyncRead) -> BoxAsyncRead {
+        let (writer, reader) = tokio::io::duplex(DUPLEX_BUF_BYTES);
+        let identity = self.identity;
+
+        tokio::spawn(async move {
+            if let Err(e) = pump_decrypt(identity, input, writer).await {
+                // 개인키 없음/불일치/변조 등은 여기서 실패 — duplex가 끊기며 다음 단계가 EOF/에러.
+                tracing::error!("age 복호화 펌프 실패: {e}");
+            }
+        });
+
+        Box::pin(reader)
+    }
+
+    fn name(&self) -> &'static str {
+        ALGORITHM_AGE
+    }
+}
+
+/// age 암호문을 identity로 복호화해 `sink`로 펌프한다.
+async fn pump_decrypt(
+    identity: x25519::Identity,
+    input: BoxAsyncRead,
+    mut sink: tokio::io::DuplexStream,
+) -> std::io::Result<()> {
+    // 입력(tokio AsyncRead)을 futures AsyncRead로 변환해 Decryptor에 넘긴다.
+    let buffered = BufReader::new(input);
+    let futures_input = buffered.compat();
+
+    let decryptor = Decryptor::new_async(futures_input)
+        .await
+        .map_err(std::io::Error::other)?;
+
+    // identity 참조 이터레이터는 decrypt_async 호출 동안만 살아 있으면 된다 — 반환된
+    // reader는 자체 상태를 소유한다. ids는 await을 가로지르지 않도록 즉시 소비한다.
+    let mut plaintext_reader = {
+        let id_ref: &dyn Identity = &identity;
+        decryptor
+            .decrypt_async(std::iter::once(id_ref))
+            .map_err(std::io::Error::other)?
+    };
+
+    // 복호화 reader(futures AsyncRead)를 청크 단위로 읽어 sink로 흘린다.
+    let mut buf = vec![0u8; PUMP_CHUNK];
+    loop {
+        let n = plaintext_reader
+            .read(&mut buf)
+            .await
+            .map_err(std::io::Error::other)?;
+        if n == 0 {
+            break;
+        }
+        sink.write_all(&buf[..n]).await?;
+    }
+    sink.shutdown().await?;
+    Ok(())
+}
+
+/// recipient 파일 본문에서 첫 유효 공개키를 파싱한다(주석 `#`·빈 줄 무시).
+fn parse_recipient(raw: &str) -> Option<x25519::Recipient> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .find_map(|l| x25519::Recipient::from_str(l).ok())
+}
+
+/// identity 파일 본문에서 첫 유효 개인키를 파싱한다(주석 `#`·빈 줄 무시).
+fn parse_identity(raw: &str) -> Option<x25519::Identity> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .find_map(|l| x25519::Identity::from_str(l).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    fn reader_from(data: &[u8]) -> BoxAsyncRead {
+        Box::pin(std::io::Cursor::new(data.to_vec()))
+    }
+
+    async fn drain_result(reader: BoxAsyncRead) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut r = reader;
+        r.read_to_end(&mut out).await?;
+        Ok(out)
+    }
+
+    /// age 암호화 → 같은 키로 복호화가 원본을 복원한다(round-trip).
+    #[tokio::test]
+    async fn age_round_trip() {
+        let identity = x25519::Identity::generate();
+        let recipient = identity.to_public();
+        let payload = b"top-secret BSON archive bytes \x00\x01\x02".to_vec();
+
+        let encrypt = Box::new(AgeEncryptStage::from_recipient(recipient));
+        let ciphertext = drain_result(encrypt.wrap(reader_from(&payload)))
+            .await
+            .unwrap();
+        // 암호문은 평문과 달라야 한다(실제 암호화).
+        assert_ne!(ciphertext, payload);
+        // age 컨테이너 매직(`age-encryption.org`)이 포함되어야 한다.
+        assert!(
+            ciphertext.windows(b"age-encryption.org".len()).any(|w| w == b"age-encryption.org"),
+            "age 헤더 매직 부재"
+        );
+
+        let decrypt = Box::new(AgeDecryptStage::from_identity(identity));
+        let restored = drain_result(decrypt.wrap(reader_from(&ciphertext)))
+            .await
+            .unwrap();
+        assert_eq!(restored, payload, "age round-trip 후 원본 불일치");
+    }
+
+    /// 개인키(identity) 없이/다른 키로는 복호화에 실패해야 한다(공개키 격리, §8.1).
+    #[tokio::test]
+    async fn decrypt_with_wrong_key_fails() {
+        let recipient_identity = x25519::Identity::generate();
+        let recipient = recipient_identity.to_public();
+        let payload = b"secret".to_vec();
+
+        let encrypt = Box::new(AgeEncryptStage::from_recipient(recipient));
+        let ciphertext = drain_result(encrypt.wrap(reader_from(&payload)))
+            .await
+            .unwrap();
+
+        // 전혀 다른 키쌍으로 복호화 시도 → 실패(plaintext 미복원).
+        let wrong_identity = x25519::Identity::generate();
+        let decrypt = Box::new(AgeDecryptStage::from_identity(wrong_identity));
+        let result = drain_result(decrypt.wrap(reader_from(&ciphertext))).await;
+        // 펌프 실패로 duplex가 끊기면 read_to_end가 에러이거나, 빈/부분 출력이 된다.
+        // 어느 경우든 원본 평문이 복원되어선 안 된다.
+        match result {
+            Err(_) => {}
+            Ok(out) => assert_ne!(out, payload, "틀린 키로 평문이 복원됨(격리 실패)"),
+        }
+    }
+
+    /// recipient 파일 파싱이 주석·빈 줄을 건너뛰고 공개키를 찾는다.
+    #[test]
+    fn parse_recipient_skips_comments() {
+        let id = x25519::Identity::generate();
+        let pub_str = id.to_public().to_string();
+        let body = format!("# age recipient\n\n{pub_str}\n");
+        let parsed = parse_recipient(&body).expect("공개키 파싱 실패");
+        assert_eq!(parsed.to_string(), pub_str);
+    }
+
+    /// 잘못된 본문은 None을 반환한다(상위에서 Config 에러로 변환).
+    #[test]
+    fn parse_recipient_rejects_garbage() {
+        assert!(parse_recipient("not-a-key\n# comment\n").is_none());
+    }
+}

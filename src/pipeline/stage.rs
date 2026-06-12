@@ -26,7 +26,21 @@
 //! 단계 합성 자체에는 await가 없고, 데이터가 흐를 때 각 어댑터의 `poll_read`가
 //! 자연 백프레셔로 연결된다.
 
+use crate::compress::ZstdDecompressStage;
+use crate::crypto::{build_decrypt_stage, DecryptKeySource};
+use crate::error::{Result, XBackupError};
+use crate::manifest::schema::BackupManifest;
 use crate::storage::BoxAsyncRead;
+
+/// 복호화 age identity 파일 경로를 담는 환경변수(복구·verify --deep 키 소스, §8.3/§8.5).
+///
+/// 백업 호스트는 공개키만 보유하므로(§8.1) 복호화는 개인키를 가진 별도 호스트에서
+/// 수행한다. `reverse_stack_for`는 이 env에서 identity 파일 경로를 읽는다(핸들러
+/// 시그니처를 바꾸지 않고 키 소스를 주입하기 위한 최소 추상화 — 태스크 지침 2).
+pub const ENV_AGE_IDENTITY_FILE: &str = "XB_AGE_IDENTITY_FILE";
+
+/// AES-256-GCM 대칭 키(32바이트 hex)를 담는 환경변수(대안 경로 키 소스, §8.2/§8.3).
+pub const ENV_AES_KEY_HEX: &str = "XB_AES_KEY_HEX";
 
 /// 단일 스트림 변환 단계.
 ///
@@ -90,10 +104,90 @@ impl StageStack {
     }
 }
 
+/// manifest 메타를 보고 **복구용 역방향(reverse) 스택**을 만든다(t5 복구 경로).
+///
+/// 백업 파이프라인이 `dump → compress → encrypt → storage` 순서였으므로, 복구는
+/// 그 역순 `storage → decrypt → decompress → mongorestore`로 변환해야 한다(PRD §7
+/// "복구 역방향"). 따라서 이 팩토리가 만드는 스택은 storage에서 읽은 바이트에
+/// **먼저 복호화 단계, 그 다음 압축해제 단계**를 적용하도록 push 순서를 잡는다
+/// ([`StageStack::apply`]는 push 순서대로 감싸므로 decrypt를 먼저 push한다).
+///
+/// ## 역순 합성 규칙(PRD §8.4)
+/// 백업 순서가 compress→encrypt이므로 역순은 **decrypt → decompress**다. [`StageStack`]은
+/// push 순서대로 입력을 감싸므로, storage 바이트에 먼저 decrypt를 push하고 그 다음
+/// decompress를 push한다. manifest 메타가:
+/// - 둘 다 None → identity 스택(평문 round-trip).
+/// - `encryption`만 Some → decrypt 단계만.
+/// - `compression`만 Some → decompress 단계만.
+/// - 둘 다 Some → decrypt 후 decompress.
+///
+/// ## 키 소스(§8.3/§8.5)
+/// 복호화 키는 환경변수에서 읽는다([`ENV_AGE_IDENTITY_FILE`]/[`ENV_AES_KEY_HEX`]) —
+/// 핸들러/파이프라인 시그니처를 바꾸지 않고 개인키를 격리 호스트에서 주입하기 위한
+/// 최소 추상화다. 암호화 백업인데 해당 env가 없으면 명확한 Config 에러를 반환한다.
+pub fn reverse_stack_for(manifest: &BackupManifest) -> Result<StageStack> {
+    let mut stack = StageStack::new();
+
+    // 1) 복호화 단계(역순 첫 단계) — storage 바이트에 가장 먼저 적용.
+    if let Some(enc_meta) = &manifest.encryption {
+        let key = resolve_decrypt_key(&enc_meta.algorithm)?;
+        let decrypt = build_decrypt_stage(enc_meta, &key)?;
+        stack.push(decrypt);
+    }
+
+    // 2) 압축해제 단계(역순 두 번째) — 복호화된 평문에 적용.
+    if let Some(comp_meta) = &manifest.compression {
+        match comp_meta.algorithm.as_str() {
+            crate::compress::ALGORITHM_ZSTD => {
+                stack.push(Box::new(ZstdDecompressStage::new()));
+            }
+            other => {
+                return Err(XBackupError::Failure(format!(
+                    "알 수 없는 압축 알고리즘: '{other}'(zstd만 지원) — 복구 불가"
+                )));
+            }
+        }
+    }
+
+    Ok(stack)
+}
+
+/// 암호화 알고리즘에 맞는 복호화 키 소스를 환경변수에서 해석한다(§8.3/§8.5).
+fn resolve_decrypt_key(algorithm: &str) -> Result<DecryptKeySource> {
+    match algorithm {
+        crate::crypto::ALGORITHM_AGE => {
+            let path = std::env::var(ENV_AGE_IDENTITY_FILE).map_err(|_| {
+                XBackupError::Config(format!(
+                    "age 암호화 백업의 복호화에는 개인키가 필요합니다 — \
+                     {ENV_AGE_IDENTITY_FILE}에 identity 파일 경로를 지정하세요(§8.5 키 격리)"
+                ))
+            })?;
+            Ok(DecryptKeySource::AgeIdentityFile(path))
+        }
+        crate::crypto::ALGORITHM_AES_GCM => {
+            let hex = std::env::var(ENV_AES_KEY_HEX).map_err(|_| {
+                XBackupError::Config(format!(
+                    "aes-256-gcm 백업의 복호화에는 대칭 키가 필요합니다 — \
+                     {ENV_AES_KEY_HEX}에 32바이트 hex 키를 지정하세요"
+                ))
+            })?;
+            Ok(DecryptKeySource::AesHexKey(hex))
+        }
+        other => Err(XBackupError::Config(format!(
+            "알 수 없는 암호화 알고리즘: '{other}'(age | aes-256-gcm) — 복구 불가"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tokio::io::AsyncReadExt;
+
+    /// 키 env(`XB_AGE_IDENTITY_FILE` 등)를 만지는 테스트를 직렬화한다 — process-wide
+    /// env는 병렬 테스트 간 공유 상태라 동시 set/remove가 서로 간섭할 수 있다.
+    static ENV_GUARD: Mutex<()> = Mutex::new(());
 
     fn reader_from(data: &[u8]) -> BoxAsyncRead {
         Box::pin(std::io::Cursor::new(data.to_vec()))
@@ -142,5 +236,181 @@ mod tests {
             .unwrap();
         // first가 먼저 감싸고, second가 그 위를 감싸므로 base|first|second 순.
         assert_eq!(out, b"base|first|second");
+    }
+
+    use crate::manifest::schema::{
+        BackupManifest, BackupStatus, BackupType, CompressionMeta, EncryptionMeta, Topology,
+        FORMAT_VERSION,
+    };
+
+    fn manifest_with(
+        compression: Option<CompressionMeta>,
+        encryption: Option<EncryptionMeta>,
+    ) -> BackupManifest {
+        BackupManifest {
+            format_version: FORMAT_VERSION,
+            id: "bk-rev".into(),
+            created_at: "2026-06-12T00:00:00Z".into(),
+            backup_type: BackupType::Full,
+            base_id: None,
+            topology: Topology::ReplicaSet,
+            server_version: "7.0.35".into(),
+            tool_versions: Default::default(),
+            selective: false,
+            original_size_bytes: 10,
+            stored_size_bytes: 10,
+            compression,
+            encryption,
+            checksum_sha256: "x".into(),
+            oplog_range: None,
+            status: BackupStatus::Complete,
+        }
+    }
+
+    /// 평문 manifest(압축·암호화 메타 모두 None)는 identity 역스택을 만든다(t5 평문 경로).
+    #[test]
+    fn reverse_stack_for_plaintext_is_identity() {
+        let m = manifest_with(None, None);
+        let stack = reverse_stack_for(&m).expect("평문은 identity 스택이어야 함");
+        assert!(stack.is_identity());
+    }
+
+    /// 압축만 있는 메타는 decompress 단계 하나짜리 역스택을 만든다(키 불필요).
+    #[test]
+    fn reverse_stack_for_compressed_builds_decompress_stage() {
+        let m = manifest_with(
+            Some(CompressionMeta {
+                algorithm: "zstd".into(),
+                level: 10,
+            }),
+            None,
+        );
+        let stack = reverse_stack_for(&m).expect("압축 백업은 decompress 역스택이어야 함");
+        assert_eq!(stack.stage_names(), vec!["zstd"]);
+    }
+
+    /// 암호화(age) 백업인데 identity env가 없으면 Config 에러(exit 2)로 키 부재를 알린다.
+    #[test]
+    fn reverse_stack_for_age_without_identity_env_errors() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        // 이 테스트가 의존하는 env가 없음을 보장(병렬 테스트 격리를 위해 직접 확인).
+        // SAFETY: ENV_GUARD로 직렬화된 구간에서만 env를 만지며, 직후 동기 호출 후 해제한다.
+        unsafe {
+            std::env::remove_var(super::ENV_AGE_IDENTITY_FILE);
+        }
+        let m = manifest_with(
+            None,
+            Some(EncryptionMeta {
+                algorithm: "age".into(),
+                key_id: None,
+            }),
+        );
+        // StageStack은 Debug가 아니므로 match로 에러를 꺼낸다.
+        let err = match reverse_stack_for(&m) {
+            Ok(_) => panic!("키 없는 age 복구는 실패해야 함"),
+            Err(e) => e,
+        };
+        assert_eq!(err.exit_code(), 2);
+        assert!(
+            err.to_string().contains(super::ENV_AGE_IDENTITY_FILE),
+            "메시지: {err}"
+        );
+    }
+
+    /// 암호화 + 압축 둘 다 있으면 역순(decrypt → decompress) 스택을 만든다(키 제공 시).
+    #[test]
+    fn reverse_stack_for_encrypted_and_compressed_orders_decrypt_then_decompress() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        // identity 파일을 임시로 만들어 env에 주입한다.
+        use age::secrecy::ExposeSecret;
+        let id = age::x25519::Identity::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let id_path = dir.path().join("id.txt");
+        std::fs::write(&id_path, id.to_string().expose_secret()).unwrap();
+        // SAFETY: 테스트 전용 env 설정 — 직후 동기적으로 reverse_stack_for를 호출하고 해제한다.
+        unsafe {
+            std::env::set_var(super::ENV_AGE_IDENTITY_FILE, &id_path);
+        }
+
+        let m = manifest_with(
+            Some(CompressionMeta {
+                algorithm: "zstd".into(),
+                level: 10,
+            }),
+            Some(EncryptionMeta {
+                algorithm: "age".into(),
+                key_id: None,
+            }),
+        );
+        let stack = reverse_stack_for(&m).expect("키가 있으면 역스택 생성");
+        // decrypt(age) 먼저, decompress(zstd) 다음 — apply가 push 순서로 감싼다.
+        assert_eq!(stack.stage_names(), vec!["age", "zstd"]);
+
+        unsafe {
+            std::env::remove_var(super::ENV_AGE_IDENTITY_FILE);
+        }
+    }
+
+    /// 정·역 full round-trip: compress→encrypt(백업) 후 reverse_stack_for(decrypt→decompress,
+    /// env identity)로 원본을 복원한다 — t6 정방향 스택과 역스택이 정확히 짝을 이룬다.
+    #[tokio::test]
+    async fn forward_then_reverse_round_trip() {
+        use crate::compress::ZstdCompressStage;
+        use crate::crypto::AgeEncryptStage;
+
+        use age::secrecy::ExposeSecret;
+        let id = age::x25519::Identity::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let id_path = dir.path().join("id.txt");
+        std::fs::write(&id_path, id.to_string().expose_secret()).unwrap();
+
+        let payload: Vec<u8> = (0..70_000u32).map(|i| (i % 97) as u8).collect();
+
+        // 백업 정방향: compress → encrypt(recipient 직접 — env 불필요).
+        let mut forward = StageStack::new();
+        forward
+            .push(Box::new(ZstdCompressStage::new(8)))
+            .push(Box::new(AgeEncryptStage::from_recipient(id.to_public())));
+        let mut stored = Vec::new();
+        forward
+            .apply(reader_from(&payload))
+            .read_to_end(&mut stored)
+            .await
+            .unwrap();
+        assert_ne!(stored, payload);
+
+        // 복구 역방향: manifest 메타 기반 reverse_stack_for(decrypt → decompress).
+        let m = manifest_with(
+            Some(CompressionMeta {
+                algorithm: "zstd".into(),
+                level: 8,
+            }),
+            Some(EncryptionMeta {
+                algorithm: "age".into(),
+                key_id: None,
+            }),
+        );
+        // env는 reverse_stack_for(동기) 호출 동안만 필요하다 — 가드를 await 이전에 해제해
+        // MutexGuard가 await을 가로지르지 않게 한다(clippy await_holding_lock 회피).
+        let reverse = {
+            let _guard = ENV_GUARD.lock().unwrap();
+            // SAFETY: ENV_GUARD로 직렬화된 동기 구간에서만 env를 만지고 즉시 해제한다.
+            unsafe {
+                std::env::set_var(super::ENV_AGE_IDENTITY_FILE, &id_path);
+            }
+            let stack = reverse_stack_for(&m).expect("역스택 생성");
+            unsafe {
+                std::env::remove_var(super::ENV_AGE_IDENTITY_FILE);
+            }
+            stack
+        };
+
+        let mut restored = Vec::new();
+        reverse
+            .apply(reader_from(&stored))
+            .read_to_end(&mut restored)
+            .await
+            .unwrap();
+        assert_eq!(restored, payload, "full round-trip 후 원본 불일치");
     }
 }

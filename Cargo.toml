@@ -52,7 +52,9 @@ async-trait = "0.1"
 # AsyncRead ↔ object_store 스트림 경계 어댑터(ReaderStream / StreamReader).
 # ReaderStream이 yield하는 bytes::Bytes는 object_store WriteMultipart::put로 그대로
 # 흘러가므로, 이 계층에서 bytes 크레이트를 직접 참조하지 않는다(t4/t7이 필요 시 추가).
-tokio-util = { version = "0.7", features = ["io"] }
+# compat: age async API가 futures-io AsyncRead/AsyncWrite를 쓰므로 tokio↔futures
+# 경계 변환에 tokio-util compat 어댑터가 필요하다(t6 crypto/age).
+tokio-util = { version = "0.7", features = ["io", "compat"] }
 # Stream 콤비네이터(list 결과 수집, GetResult 스트림 매핑).
 futures = "0.3"
 # MongoDB 드라이버 — dump 전후 oplog 최신 ts·서버 버전·토폴로지(setName) 조회용(t4 범위).
@@ -73,6 +75,16 @@ tempfile = "3"
 # 충돌(E0119)한다. 직접 사용하지 않지만 transitive 해석을 0.3.43에 고정해 빌드를 보호한다.
 # (mongodb가 time 호환을 갱신하면 제거 가능.)
 time = "=0.3.43"
+# 압축(t6) — async-compression(tokio bufread zstd 어댑터). PipelineStage가
+# AsyncRead→AsyncRead 어댑터로 직접 합성한다(리서치 stack §3, compress→encrypt 고정).
+async-compression = { version = "0.4", features = ["tokio", "zstd"] }
+# 암호화 기본(t6) — age v0.11(X25519 공개키 격리, §8.1). async feature로
+# Encryptor::wrap_async_output / Decryptor::new_async를 tokio 파이프라인에 브리지한다.
+age = { version = "0.11", features = ["async"] }
+# 암호화 대안(t6) — AES-256-GCM + aead STREAM(BE32) 청크 프레이밍(§8.2, pitfall 4-2).
+# config algorithm="aes-256-gcm" 선택 시 활성. 키는 env(32바이트 hex) 참조.
+aes-gcm = "0.10"
+aead = { version = "0.5", features = ["stream"] }
 
 [dev-dependencies]
 # Storage trait mock 자동 생성(단위 테스트에서 파이프라인 로직 주입).

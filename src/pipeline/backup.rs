@@ -13,7 +13,13 @@
 //! manifest 나중"). 어느 단계든 실패하면 [`cleanup`]으로 부분 산출물(data.bin 등)을
 //! best-effort 삭제한다 — manifest가 가리키는 파일이 없는 유령 상태를 피한다.
 
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
 use chrono::Utc;
+use tokio::io::{AsyncRead, ReadBuf};
 use uuid::Uuid;
 
 use crate::engine::mongo::meta::ServerMeta;
@@ -26,6 +32,60 @@ use crate::manifest::store::{data_path, manifest_path, manifest_sha_path, Manife
 use crate::pipeline::checksum::Sha256Reader;
 use crate::pipeline::stage::StageStack;
 use crate::storage::{BoxAsyncRead, Storage};
+
+/// 통과 바이트 수를 세는 [`AsyncRead`] 래퍼 — 압축 *전* 원본 입력량(original_size_bytes)
+/// 측정용. sha256 tee([`Sha256Reader`])와 동형의 단일-패스 카운터로, 추가 버퍼·태스크
+/// 없이 `poll_read`에서 누산한다. 핸들([`CountingHandle`])로 EOF 후 총량을 회수한다.
+struct CountingReader {
+    inner: BoxAsyncRead,
+    counter: Arc<AtomicU64>,
+}
+
+impl CountingReader {
+    fn new(inner: BoxAsyncRead) -> Self {
+        Self {
+            inner,
+            counter: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// 누적 바이트를 EOF 이후 읽을 핸들을 반환한다(reader가 move-out 돼도 유효).
+    fn handle(&self) -> CountingHandle {
+        CountingHandle {
+            counter: Arc::clone(&self.counter),
+        }
+    }
+}
+
+/// [`CountingReader`]의 누적 통과 바이트를 회수하는 핸들.
+struct CountingHandle {
+    counter: Arc<AtomicU64>,
+}
+
+impl CountingHandle {
+    /// 현재까지 통과한 총 바이트 수(EOF 후 호출하면 원본 총량).
+    fn total(&self) -> u64 {
+        self.counter.load(Ordering::SeqCst)
+    }
+}
+
+impl AsyncRead for CountingReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &poll {
+            let newly = buf.filled().len() - before;
+            if newly > 0 {
+                self.counter.fetch_add(newly as u64, Ordering::SeqCst);
+            }
+        }
+        poll
+    }
+}
 
 /// 풀 백업 요청.
 pub struct BackupRequest {
@@ -46,6 +106,36 @@ impl BackupRequest {
     }
 }
 
+/// oplog 포함 여부 결정(R2/FR-1) — replica set이라도 **선택적 백업이면 --oplog를 자동
+/// 제거**한다(선택적 dump는 일관 oplog 구간을 보장할 수 없어 증분 base 부적격).
+///
+/// - replica set + 전체 백업 → oplog 포함(true).
+/// - replica set + 선택적(`--db`/`--collection`) → oplog 자동 제거(false).
+/// - standalone → 항상 false(oplog 부재).
+fn decide_oplog(supports_oplog: bool, selective: bool) -> bool {
+    supports_oplog && !selective
+}
+
+/// 압축·암호화 manifest 메타(t6). 스택에 해당 단계를 push했을 때 채워 넣어 manifest에
+/// 기록한다. 평문 경로는 [`BackupMeta::none`](기본값)으로 모두 `None`이다.
+///
+/// 메타는 **단계 구성과 분리**해 전달한다 — `StageStack`은 단계 *이름*만 알지 레벨·키
+/// 식별자 같은 기록값은 모르기 때문이다(handlers/backup.rs가 config·CLI에서 해석해 채움).
+#[derive(Debug, Clone, Default)]
+pub struct BackupMeta {
+    /// manifest.compression(압축 단계가 있으면 Some).
+    pub compression: Option<crate::manifest::schema::CompressionMeta>,
+    /// manifest.encryption(암호화 단계가 있으면 Some).
+    pub encryption: Option<crate::manifest::schema::EncryptionMeta>,
+}
+
+impl BackupMeta {
+    /// 평문 경로용 빈 메타(압축·암호화 모두 없음).
+    pub fn none() -> Self {
+        Self::default()
+    }
+}
+
 /// 백업 성공 결과 요약(CLI 출력용).
 #[derive(Debug, Clone)]
 pub struct BackupOutcome {
@@ -61,26 +151,39 @@ pub struct BackupOutcome {
     pub oplog_range: Option<OplogRange>,
 }
 
-/// 풀 백업을 끝까지 실행한다(메타 질의 → dump → 저장 → manifest).
+/// 풀 백업을 끝까지 실행한다(평문/기존 호환 진입점, 메타 없음).
 ///
-/// `storage`는 destination 백엔드(t4는 LocalFs). `stages`는 파이프라인 변환 단계
-/// (t4는 빈 identity, t6이 채움).
+/// `stages`가 비어 있으면 평문 백업이다. 압축·암호화 메타를 manifest에 기록하려면
+/// [`run_full_backup_with_meta`]를 쓴다(t6 핸들러 경로).
 pub async fn run_full_backup(
     request: &BackupRequest,
     storage: &dyn Storage,
     stages: StageStack,
+) -> Result<BackupOutcome> {
+    run_full_backup_with_meta(request, storage, stages, BackupMeta::none()).await
+}
+
+/// 풀 백업을 끝까지 실행한다(메타 질의 → dump → 단계 → 저장 → manifest).
+///
+/// `storage`는 destination 백엔드. `stages`는 파이프라인 변환 단계(compress→encrypt,
+/// t6이 구성). `meta`는 manifest에 기록할 압축/암호화 메타(단계 구성과 분리 전달).
+pub async fn run_full_backup_with_meta(
+    request: &BackupRequest,
+    storage: &dyn Storage,
+    stages: StageStack,
+    meta: BackupMeta,
 ) -> Result<BackupOutcome> {
     // 1) 드라이버로 서버 메타 + dump 전 oplog ts 조회.
     let mongo = MongoMeta::connect(&request.uri).await?;
     let server_meta = mongo.server_meta().await?;
     let topology = server_meta.topology();
 
-    // 선택적 백업이면 --oplog 비활성(FR-1). 그 외 replica set이면 자동 부여.
+    // 선택적 백업이면 --oplog 자동 제거(R2/FR-1). 그 외 replica set이면 자동 부여.
     let selective = request.is_selective();
-    let use_oplog = server_meta.supports_oplog() && !selective;
+    let use_oplog = decide_oplog(server_meta.supports_oplog(), selective);
     if selective && server_meta.supports_oplog() {
         tracing::warn!(
-            "선택적 백업(--db/--collection)은 --oplog와 병용 불가 — oplog 미포함, 증분 base 부적격(FR-1)"
+            "선택적 백업(--db/--collection)은 --oplog와 병용 불가 — oplog 자동 제거, 증분 base 부적격(R2/FR-1)"
         );
     }
 
@@ -104,8 +207,12 @@ pub async fn run_full_backup(
     let mut dump = DumpProcess::spawn(&spec)?;
     let stdout = dump.take_stdout()?;
 
-    // 4) 파이프라인 합성: dump stdout → 단계(identity/t6) → sha256 tee.
-    let staged: BoxAsyncRead = stages.apply(Box::pin(stdout));
+    // 4) 파이프라인 합성: dump stdout → (입력 바이트 카운터) → 단계(identity/t6) → sha256 tee.
+    //    입력 카운터는 *압축 전* 원본 바이트(original_size_bytes)를 세고, sha256 tee는
+    //    *저장 직전* 최종 바이트(stored, 압축·암호화 후)에 걸린다(설계 불변: 체크섬=저장 바이트).
+    let counted = CountingReader::new(Box::pin(stdout));
+    let original_size_handle = counted.handle();
+    let staged: BoxAsyncRead = stages.apply(Box::pin(counted));
     let checksummed = Sha256Reader::new(staged);
     let checksum_handle = checksummed.handle();
 
@@ -150,17 +257,20 @@ pub async fn run_full_backup(
         .finalize()
         .ok_or_else(|| XBackupError::Failure("체크섬 확정 실패(이미 소비됨)".into()))?;
     let stored_size = storage_size(storage, &data_rel).await?;
+    // 원본(압축 전) 입력 바이트. 압축 단계가 없으면 stored와 같다(평문 경로).
+    let original_size = original_size_handle.total();
 
-    // 8) manifest 작성. 평문이므로 compression/encryption은 None, original=stored.
+    // 8) manifest 작성. 압축/암호화 메타는 meta에서 가져오고, original/stored를 분리 기록.
     let manifest = build_manifest(
         &backup_id,
-        request,
         &server_meta,
         topology,
         selective,
+        original_size,
         stored_size,
         &checksum,
         oplog_range,
+        &meta,
     );
 
     // 9) manifest → 사이드카 기록(data 다음, pitfall 7-1). 실패 시 전체 정리.
@@ -186,19 +296,19 @@ pub async fn run_full_backup(
     })
 }
 
-/// manifest 값을 조립한다(평문 t4 경로).
+/// manifest 값을 조립한다. 압축/암호화 메타는 `meta`에서, 크기는 분리 기록한다(t6).
 #[allow(clippy::too_many_arguments)]
 fn build_manifest(
     backup_id: &str,
-    request: &BackupRequest,
     server_meta: &ServerMeta,
     topology: Topology,
     selective: bool,
+    original_size: u64,
     stored_size: u64,
     checksum: &str,
     oplog_range: Option<OplogRange>,
+    meta: &BackupMeta,
 ) -> BackupManifest {
-    let _ = request; // t4는 request에서 추가로 기록할 메타 없음(t6/t8이 확장).
     BackupManifest {
         format_version: FORMAT_VERSION,
         id: backup_id.to_string(),
@@ -213,12 +323,12 @@ fn build_manifest(
             archive_format: None,
         },
         selective,
-        // 평문 단계라 입력=출력. t6이 압축 시 original_size_bytes를 dump 입력 총량으로
-        // 분리 기록한다(checksum tee를 입력 측에도 두거나 카운터 추가).
-        original_size_bytes: stored_size,
+        // original = 압축 전 dump 입력 총량, stored = 압축·암호화 후 저장 총량(t6).
+        // 압축·암호화 단계가 없으면 두 값이 같다(평문 경로).
+        original_size_bytes: original_size,
         stored_size_bytes: stored_size,
-        compression: None,
-        encryption: None,
+        compression: meta.compression.clone(),
+        encryption: meta.encryption.clone(),
         checksum_sha256: checksum.to_string(),
         oplog_range,
         status: BackupStatus::Complete,
@@ -367,5 +477,86 @@ mod tests {
         });
         let size = storage_size(&mock, "bk/data.bin").await.unwrap();
         assert_eq!(size, 4242);
+    }
+
+    /// R2 — 선택적 백업은 replica set이라도 --oplog를 자동 제거한다(증분 base 부적격).
+    #[test]
+    fn decide_oplog_drops_oplog_for_selective() {
+        // replica set + 전체 백업 → oplog 포함.
+        assert!(decide_oplog(true, false));
+        // replica set + 선택적 → oplog 자동 제거(R2).
+        assert!(!decide_oplog(true, true));
+        // standalone → 항상 제거(oplog 부재).
+        assert!(!decide_oplog(false, false));
+        assert!(!decide_oplog(false, true));
+    }
+
+    /// is_selective는 --db/--collection 중 하나라도 있으면 true.
+    #[test]
+    fn is_selective_detects_db_or_collection() {
+        let base = BackupRequest {
+            uri: crate::config::secret::Secret::new("mongodb://h/db"),
+            mongodump_program: "mongodump".into(),
+            db: None,
+            collection: None,
+        };
+        assert!(!base.is_selective());
+
+        let with_db = BackupRequest {
+            db: Some("app".into()),
+            ..rebuild(&base)
+        };
+        assert!(with_db.is_selective());
+
+        let with_coll = BackupRequest {
+            collection: Some("users".into()),
+            ..rebuild(&base)
+        };
+        assert!(with_coll.is_selective());
+    }
+
+    /// 테스트용 BackupRequest 복제 헬퍼(Secret은 Clone, 나머지 필드 복사).
+    fn rebuild(r: &BackupRequest) -> BackupRequest {
+        BackupRequest {
+            uri: r.uri.clone(),
+            mongodump_program: r.mongodump_program.clone(),
+            db: r.db.clone(),
+            collection: r.collection.clone(),
+        }
+    }
+
+    /// build_manifest가 selective 플래그와 압축/암호화 메타·분리 크기를 정확히 기록한다.
+    #[test]
+    fn build_manifest_records_selective_meta_and_sizes() {
+        let server = ServerMeta {
+            repl_set_name: Some("rs0".into()),
+            server_version: "7.0.35".into(),
+        };
+        let meta = BackupMeta {
+            compression: Some(crate::manifest::schema::CompressionMeta {
+                algorithm: "zstd".into(),
+                level: 10,
+            }),
+            encryption: Some(crate::manifest::schema::EncryptionMeta {
+                algorithm: "age".into(),
+                key_id: Some("age1abc".into()),
+            }),
+        };
+        let m = build_manifest(
+            "bk-1",
+            &server,
+            Topology::ReplicaSet,
+            /* selective */ true,
+            /* original */ 1000,
+            /* stored */ 250,
+            "deadbeef",
+            None,
+            &meta,
+        );
+        assert!(m.selective, "선택적 백업 manifest.selective=true");
+        assert_eq!(m.original_size_bytes, 1000);
+        assert_eq!(m.stored_size_bytes, 250);
+        assert_eq!(m.compression.unwrap().level, 10);
+        assert_eq!(m.encryption.unwrap().algorithm, "age");
     }
 }
