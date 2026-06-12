@@ -17,3 +17,6 @@
 
 # x-build 하네스 상태 (세션 로컬)
 .xm/
+
+# 로컬 설치 도구(make tools)
+.tools/

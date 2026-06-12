@@ -1,0 +1,26 @@
+# 테스트용 PostgreSQL — 2차 PostgreSQL 어댑터(PRD §12 로드맵) 대비 환경.
+#
+# 현재 x-backup 1차는 MongoDB 전용이므로 이 compose는 어댑터 개발·실험용이다.
+# 기본 자격증명은 로컬 테스트 전용 — 외부 노출 금지. 운영 값은 환경변수로 주입:
+#   XB_PG_PORT / XB_PG_USER / XB_PG_PASSWORD / XB_PG_DB
+#
+# 사용: make postgres-up / make postgres-down
+
+services:
+  postgres:
+    image: ${XB_PG_IMAGE:-postgres:16}
+    container_name: x-backup-postgres
+    environment:
+      POSTGRES_USER: ${XB_PG_USER:-xbackup}
+      POSTGRES_PASSWORD: ${XB_PG_PASSWORD:-xbackup-dev} # 로컬 전용 기본값
+      POSTGRES_DB: ${XB_PG_DB:-xbackup}
+    ports:
+      - "${XB_PG_PORT:-5432}:5432"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 3s
