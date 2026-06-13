@@ -159,7 +159,7 @@ automatically — so you don't wire any of that up by hand.
 ```bash
 make mongodb-up           # start the containers
 scripts/xb setup          # prepare .devenv + run a status check
-scripts/xb seed           # seed sample data into the source
+scripts/xb seed           # deterministic baseline (drops, then inserts)
 scripts/xb backup         # full backup (compressed + encrypted)
 scripts/xb list
 scripts/xb verify-latest  # structural + deep verify of the newest backup
@@ -167,9 +167,25 @@ scripts/xb restore-target # restore to the target (:27117) and print the doc cou
 make devenv-down          # tear down containers + remove .devenv
 ```
 
+To exercise **incremental** backups you need writes between backups, so the wrapper
+has `churn`, which adds random documents to the source without dropping anything:
+
+```bash
+scripts/xb churn 100            # add 100 random docs (generates oplog)
+scripts/xb backup --type incr   # captures them as an increment
+scripts/xb list                 # full ← incr chain
+
+scripts/xb incr-demo            # all of the above in one shot:
+                                # seed → full → (churn → incr) ×2 → list
+```
+
 Any real x-backup subcommand passes straight through (`scripts/xb backup --type incr`,
 `scripts/xb status --json`). To export the env and call `x-backup` directly instead:
 `eval "$(scripts/xb env)"`. Plaintext backups: `XB_NO_ENCRYPT=1 scripts/xb setup`.
+
+On a near-empty oplog (a fresh container), an increment may promote itself to a full
+backup — that is the gap guard working, not an error. Churning data in first keeps the
+oplog window healthy.
 
 ## Docs
 

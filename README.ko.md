@@ -165,7 +165,7 @@ make postgres-up        # 2차 PostgreSQL 어댑터 대비
 ```bash
 make mongodb-up           # 컨테이너 기동
 scripts/xb setup          # .devenv 준비 + status 점검
-scripts/xb seed           # 소스에 샘플 데이터 시드
+scripts/xb seed           # 결정적 베이스라인(drop 후 삽입)
 scripts/xb backup         # 풀 백업(압축+암호화)
 scripts/xb list
 scripts/xb verify-latest  # 최신 백업 구조+심층 검증
@@ -173,9 +173,25 @@ scripts/xb restore-target # 타깃(:27117)으로 복구 후 문서 수 출력
 make devenv-down          # 컨테이너 종료 + .devenv 삭제
 ```
 
+**증분**을 확인하려면 백업 사이에 쓰기가 있어야 한다. `churn`이 소스에 무작위
+데이터를 drop 없이 추가해 oplog 변경을 만든다:
+
+```bash
+scripts/xb churn 100            # 무작위 문서 100건 추가(oplog 생성)
+scripts/xb backup --type incr   # 그 변경분을 증분으로 캡처
+scripts/xb list                 # full ← incr 체인
+
+scripts/xb incr-demo            # 위 과정을 한 번에:
+                                # seed → full → (churn → incr) ×2 → list
+```
+
 실제 x-backup 서브커맨드는 그대로 통과한다(`scripts/xb backup --type incr`,
 `scripts/xb status --json`). 환경만 export해서 `x-backup`을 직접 쓰려면
 `eval "$(scripts/xb env)"`. 평문 백업은 `XB_NO_ENCRYPT=1 scripts/xb setup`.
+
+oplog가 거의 빈 갓 띄운 컨테이너에서는 증분이 스스로 풀 백업으로 승격될 수 있다 —
+gap 가드가 동작하는 것이지 오류가 아니다. churn으로 데이터를 먼저 쌓으면 oplog
+윈도우가 건강해진다.
 
 ## Docs
 

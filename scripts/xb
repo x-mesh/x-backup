@@ -10,11 +10,16 @@
 # 빠른 시작:
 #   make mongodb-up          # 컨테이너 기동(별도)
 #   scripts/xb setup         # .devenv 준비 + status 점검
-#   scripts/xb seed          # 소스에 샘플 데이터
+#   scripts/xb seed          # 소스에 결정적 베이스라인(drop 후 삽입)
 #   scripts/xb backup        # 풀 백업(암호화·압축)
-#   scripts/xb list
+#   scripts/xb churn [N]     # 소스에 무작위 데이터 N건 추가(drop 안 함) → oplog 생성
+#   scripts/xb backup --type incr   # 증분 백업(churn한 변경분 캡처)
+#   scripts/xb list           # 체인 확인(full ← incr)
 #   scripts/xb restore-target # 타깃(:27117)으로 복구
 #   scripts/xb verify-latest  # 최신 백업 구조+심층 검증
+#
+# 증분 데모(한 번에):
+#   scripts/xb incr-demo     # seed→full→(churn→incr)×2→list 체인까지
 #
 # x-backup 서브커맨드(backup/restore/list/verify/prune/status/init/update)는
 # 그대로 통과되며 --config·--profile·env가 자동 주입된다:
@@ -154,6 +159,41 @@ cmd_reset() {
   log "완료"
 }
 
+# churn — 소스에 무작위 데이터 N건을 *추가*(drop 안 함)해 oplog 변경을 만든다.
+# 증분 백업이 캡처할 변경분을 만들기 위한 명령. _id는 ObjectId 자동 생성이라
+# 반복 호출해도 충돌하지 않는다(seed의 고정 _id와도 무관).
+cmd_churn() {
+  require_containers
+  local n="${1:-100}"
+  log "소스($SRC_CTR)에 무작위 데이터 +${n}건 추가(oplog 생성)"
+  docker exec "$SRC_CTR" mongosh --quiet --eval "
+    const db = db.getSiblingDB('$TEST_DB');
+    const docs = Array.from({length: ${n}}, () => ({
+      total:   Math.floor(Math.random() * 100000),
+      item:    'sku-' + Math.floor(Math.random() * 1000),
+      ts:      new Date(),
+      payload: Math.random().toString(36).slice(2),
+    }));
+    db.orders.insertMany(docs);
+    print('churned +${n} -> orders=' + db.orders.countDocuments({}));
+  "
+}
+
+# incr-demo — 증분 체인이 형성되는 전 과정을 한 번에 보여준다.
+#   seed(베이스라인) → full → (churn → incr) ×2 → list
+cmd_incr_demo() {
+  resolve_bin; ensure_tools_path; ensure_devenv; export_env; require_containers
+  cmd_seed 200
+  log "풀 백업(base)"; "$BIN" backup --profile "$PROFILE" --type full
+  local round
+  for round in 1 2; do
+    cmd_churn 80
+    log "증분 백업 #$round"; "$BIN" backup --profile "$PROFILE" --type incr
+  done
+  log "체인 카탈로그:"
+  "$BIN" list --profile "$PROFILE"
+}
+
 latest_id() {
   "$BIN" list --profile "$PROFILE" --json |
     python3 -c "import json,sys; b=json.load(sys.stdin)['backups']; print(b[0]['id'] if b else '')"
@@ -188,7 +228,7 @@ cmd_down() {
 }
 
 usage() {
-  sed -n '3,32p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,33p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # --- 라우팅 -----------------------------------------------------------------
@@ -198,6 +238,8 @@ main() {
     setup)           cmd_setup "$@" ;;
     env)             cmd_env "$@" ;;
     seed)            cmd_seed "$@" ;;
+    churn)           cmd_churn "$@" ;;
+    incr-demo)       cmd_incr_demo "$@" ;;
     reset)           cmd_reset "$@" ;;
     restore-target)  cmd_restore_target "$@" ;;
     verify-latest)   cmd_verify_latest "$@" ;;
