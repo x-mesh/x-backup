@@ -83,7 +83,24 @@ x-backup restore --profile prod --target mongodb://staging --dry-run
 x-backup restore --profile prod --target mongodb://staging --force
 x-backup restore --profile prod --at 2026-06-01T00:00:00Z --force   # PITR
 x-backup prune   --profile prod --keep-full 7 --dry-run
+x-backup migrate --profile prod --target mongodb://newcluster --force # direct copy, no file
 ```
+
+### Migrate (direct copy, no file)
+
+`migrate` copies one MongoDB straight into another — `mongodump | mongorestore` streamed
+directly, no intermediate file. Use it for one-off moves where you don't need a stored,
+verifiable backup.
+
+```bash
+x-backup migrate --profile prod --target mongodb://newcluster --dry-run
+x-backup migrate --profile prod --target mongodb://newcluster --drop --force
+```
+
+It is a copy, not a backup: no manifest, checksum, encryption-at-rest, or PITR. If the
+target already has data it refuses without `--force` (or an interactive confirm). For a
+point-in-time-consistent move of a busy replica set, or to keep a verifiable artifact,
+use the file path instead (`backup` → `restore --target`, which supports `--oplog`/PITR).
 
 ### config.toml
 

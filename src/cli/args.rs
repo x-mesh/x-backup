@@ -57,8 +57,48 @@ pub enum Command {
     Prune(PruneArgs),
     /// 대상 서버 상태를 점검한다(읽기 전용·무부작용).
     Status(StatusArgs),
+    /// source→target으로 파일 없이 직접 마이그레이션한다(mongodump|mongorestore).
+    Migrate(MigrateArgs),
     /// x-backup 자신을 최신 릴리스로 갱신한다(설치 소스 자동 감지).
     Update(UpdateArgs),
+}
+
+/// `migrate` — source(프로파일) → target으로 파일 없이 직접 복사.
+///
+/// 백업이 아니라 복사다 — manifest·체크섬·암호화·PITR는 만들지 않는다. 정확한 시점
+/// 일관성/검증 가능한 백업본이 필요하면 `backup` → `restore --target`을 쓴다.
+#[derive(Debug, Args)]
+pub struct MigrateArgs {
+    /// 사용할 프로파일 이름(source 접속 정보).
+    #[arg(long, value_name = "NAME")]
+    pub profile: String,
+    /// 대상(target) MongoDB URI. 필수.
+    #[arg(long, value_name = "MONGO_URI")]
+    pub target: String,
+    /// 선택적 마이그레이션 — 특정 DB만.
+    #[arg(long, value_name = "DB")]
+    pub db: Option<String>,
+    /// 선택적 마이그레이션 — 특정 컬렉션만.
+    #[arg(long, value_name = "COLL")]
+    pub collection: Option<String>,
+    /// target의 기존 컬렉션을 복원 전 drop한다(기본 비활성).
+    #[arg(long)]
+    pub drop: bool,
+    /// target에 기존 데이터가 있어도 덮어쓰기를 허용한다(가드레일 해제).
+    #[arg(long)]
+    pub force: bool,
+    /// 실제 전송 없이 계획만 출력(연결·버전·충돌 네임스페이스).
+    #[arg(long)]
+    pub dry_run: bool,
+    /// 진행 표시를 억제하고 요약·경고·에러만 출력(cron/CI).
+    #[arg(long, conflicts_with = "progress")]
+    pub quiet: bool,
+    /// 비-TTY에서도 진행 표시를 강제한다.
+    #[arg(long)]
+    pub progress: bool,
+    /// 진행/결과를 기계 판독 JSON으로 출력한다.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `update` — 자기 갱신. brew 설치는 brew upgrade로 위임, manual 설치는

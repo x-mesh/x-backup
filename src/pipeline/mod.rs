@@ -18,6 +18,7 @@
 pub mod backup;
 pub mod checksum;
 pub mod incremental;
+pub mod migrate;
 pub mod pitr;
 pub mod prune;
 pub mod restore;

@@ -86,7 +86,23 @@ x-backup restore --profile prod --target mongodb://staging --dry-run
 x-backup restore --profile prod --target mongodb://staging --force
 x-backup restore --profile prod --at 2026-06-01T00:00:00Z --force   # PITR
 x-backup prune   --profile prod --keep-full 7 --dry-run
+x-backup migrate --profile prod --target mongodb://newcluster --force # 파일 없이 직접 복사
 ```
+
+### Migrate (파일 없이 직접 복사)
+
+`migrate`는 한 MongoDB를 다른 MongoDB로 바로 복사한다 — `mongodump | mongorestore`를
+중간 파일 없이 직접 스트리밍한다. 저장·검증 가능한 백업본이 필요 없는 일회성 이전에 쓴다.
+
+```bash
+x-backup migrate --profile prod --target mongodb://newcluster --dry-run
+x-backup migrate --profile prod --target mongodb://newcluster --drop --force
+```
+
+백업이 아니라 복사다: manifest·체크섬·at-rest 암호화·PITR이 없다. target에 기존
+데이터가 있으면 `--force`(또는 대화형 확인) 없이는 거부한다. 쓰기가 많은 replica set을
+정확한 시점으로 옮기거나 검증 가능한 산출물을 남기려면 파일 경로(`backup` →
+`restore --target`, `--oplog`/PITR 지원)를 쓴다.
 
 ### config.toml
 
