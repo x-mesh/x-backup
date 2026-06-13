@@ -72,9 +72,13 @@ pub struct MigrateArgs {
     /// 사용할 프로파일 이름(source 접속 정보).
     #[arg(long, value_name = "NAME")]
     pub profile: String,
-    /// 대상(target) MongoDB URI. 필수.
-    #[arg(long, value_name = "MONGO_URI")]
-    pub target: String,
+    /// 대상(target) MongoDB URI. `--target-profile`과 택일(둘 중 하나 필수).
+    #[arg(long, value_name = "MONGO_URI", conflicts_with = "target_profile")]
+    pub target: Option<String>,
+    /// 대상을 다른 프로파일의 source 접속으로 지정한다(URI 직접 입력 대신).
+    /// 같은 config.toml 안의 프로파일 이름.
+    #[arg(long, value_name = "NAME")]
+    pub target_profile: Option<String>,
     /// 선택적 마이그레이션 — 특정 DB만.
     #[arg(long, value_name = "DB")]
     pub db: Option<String>,

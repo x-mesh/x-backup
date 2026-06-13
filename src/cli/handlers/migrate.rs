@@ -43,6 +43,29 @@ pub async fn handle(config_path: Option<PathBuf>, args: MigrateArgs) -> Result<(
         ))
     })?;
 
+    // 2.5) target URI 확보 — --target(URI 직접) 또는 --target-profile(다른 프로파일의
+    //      source). 둘 다 없으면 사용법 오류, 둘 다 있으면 clap이 막는다.
+    let target_uri = match (&args.target, &args.target_profile) {
+        (Some(uri), _) => Secret::new(uri.clone()),
+        (None, Some(tp)) => {
+            let tcfg = ResolvedConfig::build(MergeInput {
+                config_toml: config_toml.as_deref(),
+                profile_name: tp,
+                overrides: &overrides,
+            })?;
+            tcfg.resolved_uri.ok_or_else(|| {
+                XBackupError::Config(format!(
+                    "target 프로파일 '{tp}'에 source.uri/uri_env가 없습니다"
+                ))
+            })?
+        }
+        (None, None) => {
+            return Err(XBackupError::Usage(
+                "--target <uri> 또는 --target-profile <name> 중 하나가 필요합니다".into(),
+            ))
+        }
+    };
+
     let mode = OutputMode::resolve_from_env(
         OutputFlags {
             json: args.json,
@@ -54,7 +77,7 @@ pub async fn handle(config_path: Option<PathBuf>, args: MigrateArgs) -> Result<(
 
     let request = MigrateRequest {
         source_uri,
-        target_uri: Secret::new(args.target.clone()),
+        target_uri,
         mongodump_program: "mongodump".to_string(),
         mongorestore_program: "mongorestore".to_string(),
         db: args.db.clone(),

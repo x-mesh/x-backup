@@ -97,12 +97,24 @@ x-backup migrate --profile prod --target mongodb://newcluster --force # 파일 �
 ```bash
 x-backup migrate --profile prod --target mongodb://newcluster --dry-run
 x-backup migrate --profile prod --target mongodb://newcluster --drop --force
+x-backup migrate --profile prod --target-profile staging --drop --force   # target을 프로파일로
 ```
 
-백업이 아니라 복사다: manifest·체크섬·at-rest 암호화·PITR이 없다. target에 기존
-데이터가 있으면 `--force`(또는 대화형 확인) 없이는 거부한다. 쓰기가 많은 replica set을
-정확한 시점으로 옮기거나 검증 가능한 산출물을 남기려면 파일 경로(`backup` →
-`restore --target`, `--oplog`/PITR 지원)를 쓴다.
+target은 URI 직접(`--target`) 또는 다른 프로파일의 source(`--target-profile <name>`,
+같은 config에서 해석)로 줄 수 있다 — URI를 붙여넣지 않고 양쪽 접속을 config.toml에
+둘 수 있다.
+
+**덮어쓰기 동작**(target 전체를 지우지 않는다):
+- `--drop` 없이: 문서를 insert한다. 같은 `_id`의 기존 문서는 **유지(덮어쓰지 않음,
+  duplicate-key로 건너뜀)**. source에 없는 컬렉션은 그대로 둔다.
+- `--drop` 있으면: **source에 있는 컬렉션만** drop 후 재생성한다. target의 다른
+  컬렉션은 손대지 않는다. target DB/인스턴스 전체를 지우지는 않는다.
+- target에 데이터가 있으면 `--drop` 여부와 무관하게 `--force`(또는 대화형 확인)를
+  요구한다. 즉 옮기는 컬렉션을 깨끗이 교체하려면 `--drop --force`다.
+
+백업이 아니라 복사다: manifest·체크섬·at-rest 암호화·PITR이 없다. 쓰기가 많은
+replica set을 정확한 시점으로 옮기거나 검증 가능한 산출물을 남기려면 파일 경로
+(`backup` → `restore --target`, `--oplog`/PITR 지원)를 쓴다.
 
 ### config.toml
 

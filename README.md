@@ -95,10 +95,22 @@ verifiable backup.
 ```bash
 x-backup migrate --profile prod --target mongodb://newcluster --dry-run
 x-backup migrate --profile prod --target mongodb://newcluster --drop --force
+x-backup migrate --profile prod --target-profile staging --drop --force   # target from a profile
 ```
 
-It is a copy, not a backup: no manifest, checksum, encryption-at-rest, or PITR. If the
-target already has data it refuses without `--force` (or an interactive confirm). For a
+The target can be a literal URI (`--target`) or another profile's source
+(`--target-profile <name>`, resolved from the same config) — so you can keep both
+endpoints in `config.toml` instead of pasting URIs.
+
+**Overwrite semantics** (it does *not* wipe the whole target):
+- without `--drop`: documents are inserted; an existing doc with the same `_id` is **kept,
+  not overwritten** (duplicate-key, skipped). Collections not in the source are untouched.
+- with `--drop`: each collection **present in the source** is dropped and recreated; other
+  collections in the target are left alone. The target database/instance is never fully dropped.
+- the guard requires `--force` (or an interactive confirm) whenever the target already has
+  data, independent of `--drop`. So a clean replace of the migrated collections is `--drop --force`.
+
+It is a copy, not a backup: no manifest, checksum, encryption-at-rest, or PITR. For a
 point-in-time-consistent move of a busy replica set, or to keep a verifiable artifact,
 use the file path instead (`backup` → `restore --target`, which supports `--oplog`/PITR).
 

@@ -104,6 +104,11 @@ level     = 6
 enabled        = $enc_enabled
 algorithm      = "age"
 recipient_file = "$AGE_PUB"
+
+# 마이그레이션 대상용 프로파일 — 타깃 컨테이너(:$( echo "$TGT_URI" | sed 's#.*localhost:##; s#/.*##' )).
+# 'xb migrate --target-profile target'으로 source($PROFILE) → 이 프로파일로 직접 복사.
+[profiles.target.source]
+uri = "$TGT_URI"
 EOF
   fi
 }
@@ -120,7 +125,7 @@ export_env() {
 
 # --profile을 받는 서브커맨드 목록.
 takes_profile() {
-  case "$1" in backup|restore|list|status|prune) return 0 ;; *) return 1 ;; esac
+  case "$1" in backup|restore|list|status|prune|migrate) return 0 ;; *) return 1 ;; esac
 }
 
 # --- 컨테이너 헬스 확인 -----------------------------------------------------
