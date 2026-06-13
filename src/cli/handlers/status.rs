@@ -83,30 +83,19 @@ async fn handle_all(config_toml: Option<&str>, json: bool) -> Result<()> {
                         "key": i.key,
                         "label": i.label,
                         "status": format!("{:?}", i.status).to_lowercase(),
+                        "value": i.value,
                         "message": i.message,
                     })).collect::<Vec<_>>(),
                 })
             })
             .collect();
         println!("{}", serde_json::json!({ "profiles": items }));
+    } else if reports.len() == 1 {
+        // 프로파일이 하나면 비교 의미가 없다 — 단일 status 상세 표 그대로.
+        render_human(&reports[0]);
     } else {
-        // 1) 프로파일별 전체 상세(단일 status와 동일한 표) — 왜 WARN/FAIL인지까지 보인다.
-        for r in &reports {
-            render_human(r);
-            println!();
-        }
-        // 2) 마지막에 한눈에 보는 종합 표(스크린샷·exit code 맥락용).
-        println!("{:<14} {:<8} 요약", "profile", "overall");
-        println!("{:-<60}", "");
-        for r in &reports {
-            println!(
-                "{:<14} {:<8} {}",
-                r.profile,
-                overall_short(r.overall),
-                summary_line(r)
-            );
-        }
-        println!("{:-<60}", "");
+        // 둘 이상이면 source(왼쪽=첫 열) 기준 비교 표.
+        render_comparison(&reports);
     }
 
     // 최악 신호등으로 종료 코드 결정.
@@ -173,20 +162,230 @@ fn overall_placeholder(overall: CheckStatus) -> Vec<crate::engine::mongo::status
     }]
 }
 
-/// --all 한 줄 요약: 첫 경고/실패 항목의 라벨(없으면 정상).
-fn summary_line(report: &StatusReport) -> String {
-    match report.items.iter().find(|i| i.status != CheckStatus::Ok) {
-        Some(item) => format!("{}: {}", signal(item.status), item.label),
-        None => "정상".to_string(),
-    }
-}
-
 /// --all 표용 짧은 overall 라벨.
 fn overall_short(status: CheckStatus) -> &'static str {
     match status {
         CheckStatus::Ok => "OK",
         CheckStatus::Warn => "WARN",
         CheckStatus::Fail => "FAIL",
+    }
+}
+
+// ───────────────────────── --all 비교(diff) 뷰 ─────────────────────────
+
+/// ANSI 색을 쓸지 — stdout이 TTY이고 `NO_COLOR`가 없을 때만.
+fn use_color() -> bool {
+    use std::io::IsTerminal;
+    std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+}
+
+/// 동아시아 폭(Hangul·CJK·전각) 문자는 2칸, 그 외 1칸으로 표시 폭을 계산한다.
+fn display_width(s: &str) -> usize {
+    s.chars().map(|c| if is_wide(c) { 2 } else { 1 }).sum()
+}
+
+/// 터미널에서 2칸을 차지하는 광폭 문자인지(East Asian Wide, 간이 판정).
+fn is_wide(c: char) -> bool {
+    matches!(c as u32,
+        0x1100..=0x115F | 0x2E80..=0x303E | 0x3041..=0x33FF | 0x3400..=0x4DBF |
+        0x4E00..=0x9FFF | 0xA000..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF |
+        0xFE30..=0xFE4F | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6)
+}
+
+/// 표시 폭 기준으로 우측 공백 패딩(좌측 정렬).
+fn pad(s: &str, width: usize) -> String {
+    let w = display_width(s);
+    if w >= width {
+        s.to_string()
+    } else {
+        format!("{s}{}", " ".repeat(width - w))
+    }
+}
+
+/// `--all` 비교 뷰 — 왼쪽 첫 열(source 기준)과 나머지 프로파일을 차원별로 나란히 비교한다.
+///
+/// 각 점검 차원을 행으로, 프로파일을 열로 둔다. 셀은 비교용 짧은 값(없으면 상태 단어)이며,
+/// 기준 열과 **다른 값**은 색(또는 비-TTY면 `*`)으로 강조하고 행 앞에 `Δ`를 단다. WARN/FAIL의
+/// 구체 메시지는 표 아래 노트로 보존한다(요약이 detail을 가리지 않게).
+fn render_comparison(reports: &[StatusReport]) {
+    use std::collections::HashMap;
+
+    let color = use_color();
+    let baseline = &reports[0];
+
+    // 1) 차원 키 순서 = 등장 순(첫 보고서 우선, 이후 미등장 키를 뒤에 추가).
+    let mut keys: Vec<&str> = Vec::new();
+    let mut labels: HashMap<&str, &str> = HashMap::new();
+    for r in reports {
+        for it in &r.items {
+            if !keys.contains(&it.key) {
+                keys.push(it.key);
+            }
+            labels.entry(it.key).or_insert(it.label);
+        }
+    }
+
+    // 2) 셀 텍스트 조회 헬퍼: (value 우선, 없으면 상태 단어, 항목 없으면 "—").
+    let cell_text = |report: &StatusReport, key: &str| -> Option<(String, CheckStatus)> {
+        report.items.iter().find(|i| i.key == key).map(|it| {
+            (
+                it.value
+                    .clone()
+                    .unwrap_or_else(|| overall_short(it.status).to_string()),
+                it.status,
+            )
+        })
+    };
+
+    // 3) 열 너비 계산(표시 폭 기준).
+    let label_w = keys
+        .iter()
+        .map(|k| display_width(labels.get(k).copied().unwrap_or(k)))
+        .chain(std::iter::once(display_width("점검")))
+        .max()
+        .unwrap_or(8)
+        .max(8);
+    let col_w: Vec<usize> = reports
+        .iter()
+        .map(|r| {
+            let header = display_width(&r.profile);
+            let cells = keys
+                .iter()
+                .map(|k| cell_text(r, k).map(|(t, _)| display_width(&t)).unwrap_or(1));
+            header.max(cells.max().unwrap_or(0)).max(6)
+        })
+        .collect();
+
+    let total_w = 2 + label_w + 2 + col_w.iter().map(|w| w + 2).sum::<usize>();
+    let rule = "─".repeat(total_w.min(120));
+
+    // 4) 헤더.
+    println!(
+        "status --all 비교 — 기준(왼쪽): {}",
+        paint(&baseline.profile, BOLD, color)
+    );
+    println!("{rule}");
+    print!("  {}  ", pad("점검", label_w));
+    for (r, w) in reports.iter().zip(&col_w) {
+        print!("{}  ", pad(&r.profile, *w));
+    }
+    println!();
+    println!("{rule}");
+
+    // 5) 차원별 행.
+    for key in &keys {
+        let base = cell_text(baseline, key);
+        let base_val = base.as_ref().map(|(t, _)| t.clone());
+        // 행에 차이가 있는가 — 어느 비기준 열이든 값(또는 누락)이 기준과 다르면 true.
+        let row_differs = reports
+            .iter()
+            .skip(1)
+            .any(|r| cell_text(r, key).map(|(t, _)| t) != base_val);
+
+        let gutter = if row_differs {
+            paint("Δ", CYAN, color)
+        } else {
+            " ".to_string()
+        };
+        let label = labels.get(key).copied().unwrap_or(key);
+        print!("{gutter} {}  ", pad(label, label_w));
+
+        for (idx, (r, w)) in reports.iter().zip(&col_w).enumerate() {
+            match cell_text(r, key) {
+                Some((text, status)) => {
+                    let differs = idx != 0 && Some(&text) != base_val.as_ref();
+                    print!("{}  ", fmt_cell(&text, status, differs, *w, color));
+                }
+                None => print!("{}  ", pad("—", *w)),
+            }
+        }
+        println!();
+    }
+
+    // 6) overall 행.
+    println!("{rule}");
+    print!("  {}  ", pad("overall", label_w));
+    for (r, w) in reports.iter().zip(&col_w) {
+        let txt = overall_short(r.overall);
+        print!("{}  ", fmt_cell(txt, r.overall, false, *w, color));
+    }
+    println!();
+    println!("{rule}");
+
+    // 7) 노트 — WARN/FAIL 항목의 구체 메시지(detail 보존).
+    let mut notes: Vec<String> = Vec::new();
+    for r in reports {
+        for it in &r.items {
+            if it.status != CheckStatus::Ok {
+                notes.push(format!(
+                    "  {} [{}] {}: {}",
+                    signal(it.status),
+                    r.profile,
+                    it.label,
+                    it.message
+                ));
+            }
+        }
+    }
+    if !notes.is_empty() {
+        println!("노트(경고·실패 상세):");
+        for n in notes {
+            println!("{n}");
+        }
+    }
+}
+
+// ANSI 색 코드(use_color()가 false면 미적용).
+const RESET: &str = "\x1b[0m";
+const BOLD: &str = "\x1b[1m";
+const UNDERLINE: &str = "\x1b[4m";
+const RED: &str = "\x1b[31m";
+const YELLOW: &str = "\x1b[33m";
+const CYAN: &str = "\x1b[36m";
+
+/// 단일 코드로 텍스트를 감싼다(color=false면 원문 그대로).
+fn paint(s: &str, code: &str, color: bool) -> String {
+    if color {
+        format!("{code}{s}{RESET}")
+    } else {
+        s.to_string()
+    }
+}
+
+/// 비교 셀 렌더 — 표시 폭 패딩 후 상태색 + diff 강조(bold·underline / 비-TTY는 `*`)를 입힌다.
+fn fmt_cell(text: &str, status: CheckStatus, differs: bool, width: usize, color: bool) -> String {
+    // 비-TTY: 색 대신 다른 셀과 구분되도록 차이 셀에 ` *`를 덧붙인다(패딩 폭에 반영).
+    if !color {
+        let marked = if differs {
+            format!("{text} *")
+        } else {
+            text.to_string()
+        };
+        return pad(&marked, width);
+    }
+    let padded = pad(text, width);
+    let status_code = match status {
+        CheckStatus::Ok => "",
+        CheckStatus::Warn => YELLOW,
+        CheckStatus::Fail => RED,
+    };
+    let mut prefix = String::new();
+    if differs {
+        prefix.push_str(BOLD);
+        prefix.push_str(UNDERLINE);
+        // 차이가 상태색으로 안 드러나는 OK 셀은 CYAN으로 "다름"을 표시.
+        prefix.push_str(if status == CheckStatus::Ok {
+            CYAN
+        } else {
+            status_code
+        });
+    } else {
+        prefix.push_str(status_code);
+    }
+    if prefix.is_empty() {
+        padded
+    } else {
+        format!("{prefix}{padded}{RESET}")
     }
 }
 
@@ -292,5 +491,52 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"overall\":\"fail\""));
         assert!(json.contains("\"connection\""));
+    }
+
+    #[test]
+    fn json_includes_value_when_present() {
+        let report = StatusReport::new(
+            "prod",
+            vec![CheckItem::ok("version", "버전 정합", "서버=7.0.35").with_value("7.0.35")],
+        );
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"value\":\"7.0.35\""));
+    }
+
+    #[test]
+    fn display_width_counts_hangul_as_two() {
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(display_width("버전"), 4); // 한글 2자 × 2칸
+        assert_eq!(display_width("7.0.35"), 6);
+        // 중점(·)은 광폭이 아니다(1칸).
+        assert_eq!(display_width("연결·인증"), 9); // 연결(4)+·(1)+인증(4)
+    }
+
+    #[test]
+    fn pad_uses_display_width() {
+        // "버전"=4칸 → 폭 8이면 공백 4개.
+        assert_eq!(pad("버전", 8), "버전    ");
+        // 이미 폭 이상이면 그대로.
+        assert_eq!(pad("wiredTiger", 6), "wiredTiger");
+    }
+
+    #[test]
+    fn fmt_cell_color_marks_diff_with_ansi() {
+        let s = fmt_cell("7.0.35", CheckStatus::Ok, true, 8, true);
+        assert!(s.contains(BOLD) && s.contains(UNDERLINE) && s.contains(RESET));
+    }
+
+    #[test]
+    fn fmt_cell_nocolor_marks_diff_with_star() {
+        let s = fmt_cell("7.0.35", CheckStatus::Ok, true, 12, false);
+        assert!(s.contains('*'));
+        assert!(!s.contains('\x1b'), "비-TTY는 ANSI를 쓰지 않는다");
+    }
+
+    #[test]
+    fn fmt_cell_nocolor_same_has_no_marker() {
+        let s = fmt_cell("wiredTiger", CheckStatus::Ok, false, 12, false);
+        assert!(!s.contains('*'));
+        assert!(!s.contains('\x1b'));
     }
 }

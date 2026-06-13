@@ -75,7 +75,7 @@ While the repository is private, this needs `GITHUB_TOKEN` (or a prior `gh auth 
 ```bash
 x-backup init                                   # interactive wizard → config.toml
 x-backup status  --profile prod                 # is the server ready to back up?
-x-backup status  --all                          # check every profile at once
+x-backup status  --all                          # side-by-side diff of every profile (source vs target)
 x-backup peek    --profile prod                 # eyeball data: per-collection counts + latest doc
 x-backup backup  --profile prod                 # full backup → compress → encrypt → store
 x-backup backup  --profile prod --type incr     # oplog increment

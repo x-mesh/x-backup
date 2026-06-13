@@ -64,6 +64,10 @@ pub struct CheckItem {
     pub status: CheckStatus,
     /// 상세 메시지(누락 권한·버전·윈도우 등 구체 정보).
     pub message: String,
+    /// 프로파일 간 비교용 짧은 값(예: `"7.0.35"`, `"wiredTiger"`, `"none"`). `status --all`
+    /// 비교 표에서 열 간 diff 판정·표시에 쓴다. 비교 의미가 없는 항목은 `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
 }
 
 impl CheckItem {
@@ -74,6 +78,7 @@ impl CheckItem {
             label,
             status: CheckStatus::Ok,
             message: message.into(),
+            value: None,
         }
     }
     /// warn 항목.
@@ -83,6 +88,7 @@ impl CheckItem {
             label,
             status: CheckStatus::Warn,
             message: message.into(),
+            value: None,
         }
     }
     /// fail 항목.
@@ -92,7 +98,14 @@ impl CheckItem {
             label,
             status: CheckStatus::Fail,
             message: message.into(),
+            value: None,
         }
+    }
+
+    /// 비교용 값을 설정한다(빌더 — `CheckItem::ok(...).with_value("7.0.35")`).
+    pub fn with_value(mut self, value: impl Into<String>) -> Self {
+        self.value = Some(value.into());
+        self
     }
 }
 
@@ -481,8 +494,10 @@ impl StatusChecker {
                     "연결·인증",
                     format!("연결 성공({who}메커니즘={})", self.connection.mechanism),
                 )
+                .with_value(self.connection.mechanism.to_string())
             }
-            Err(e) => CheckItem::fail("connection", "연결·인증", format!("연결 실패: {e}")),
+            Err(e) => CheckItem::fail("connection", "연결·인증", format!("연결 실패: {e}"))
+                .with_value("연결 실패"),
         }
     }
 
@@ -493,7 +508,10 @@ impl StatusChecker {
             .await;
         let doc = match resp {
             Ok(d) => d,
-            Err(e) => return CheckItem::fail("privileges", "권한", format!("권한 조회 실패: {e}")),
+            Err(e) => {
+                return CheckItem::fail("privileges", "권한", format!("권한 조회 실패: {e}"))
+                    .with_value("조회 실패")
+            }
         };
         // 인증 비활성 서버(인증된 사용자 없음)는 사실상 전권 — 권한 누락으로 보지 않는다.
         // 단, 운영상 주의가 필요한 구성이므로 경고로 남긴다(백업은 막지 않음).
@@ -504,7 +522,8 @@ impl StatusChecker {
                 "인증이 비활성화된 서버입니다(인증된 사용자 없음) — 접속 주체가 전권을 가지므로 \
                  권한은 충분하나, 운영 환경에서는 인증 활성화를 권장합니다"
                     .to_string(),
-            );
+            )
+            .with_value("인증 비활성");
         }
         let granted = collect_granted_actions(&doc);
         let missing = missing_actions(&granted);
@@ -514,6 +533,7 @@ impl StatusChecker {
                 "권한",
                 "백업에 필요한 권한(전 DB read + oplog 읽기 상당)을 보유".to_string(),
             )
+            .with_value("충분")
         } else {
             CheckItem::fail(
                 "privileges",
@@ -523,6 +543,7 @@ impl StatusChecker {
                     missing.join(", ")
                 ),
             )
+            .with_value(format!("누락 {}", missing.len()))
         }
     }
 
@@ -534,7 +555,8 @@ impl StatusChecker {
                 "토폴로지",
                 "샤딩 클러스터(mongos) 감지 — 1차 스코프 외입니다. 백업을 거부합니다(PRD §4/§6.5)"
                     .to_string(),
-            ),
+            )
+            .with_value("sharded"),
             Ok(doc) => {
                 if doc.get_str("setName").is_ok() {
                     let set = doc.get_str("setName").unwrap_or("?");
@@ -543,11 +565,14 @@ impl StatusChecker {
                         "토폴로지",
                         format!("replica set(setName={set})"),
                     )
+                    .with_value(format!("rs:{set}"))
                 } else {
                     CheckItem::ok("topology", "토폴로지", "standalone".to_string())
+                        .with_value("standalone")
                 }
             }
-            Err(e) => CheckItem::fail("topology", "토폴로지", format!("hello 조회 실패: {e}")),
+            Err(e) => CheckItem::fail("topology", "토폴로지", format!("hello 조회 실패: {e}"))
+                .with_value("조회 실패"),
         }
     }
 
@@ -593,6 +618,7 @@ impl StatusChecker {
                     label: "토폴로지",
                     status,
                     message: msg,
+                    value: Some(format!("rs:{set}")),
                 }
             }
             // replSetGetStatus 실패(권한 등)는 토폴로지 판별 자체는 됐으므로 경고로 강등.
@@ -600,7 +626,8 @@ impl StatusChecker {
                 "topology",
                 "토폴로지",
                 format!("{} (멤버 상태 조회 실패: {e})", core.message),
-            ),
+            )
+            .with_value(core.value.clone().unwrap_or_default()),
         }
     }
 
@@ -610,6 +637,7 @@ impl StatusChecker {
             Ok(doc) => doc.get_str("version").unwrap_or("unknown").to_string(),
             Err(e) => {
                 return CheckItem::fail("version", "버전 정합", format!("buildInfo 조회 실패: {e}"))
+                    .with_value("조회 실패")
             }
         };
         let tool_version = detect_mongodump_version(mongodump_program);
@@ -634,6 +662,8 @@ impl StatusChecker {
             label: "버전 정합",
             status,
             message: msg,
+            // 비교는 서버 버전 기준(mongodump는 로컬 도구라 서버 간 diff 의미 없음).
+            value: Some(server_version),
         }
     }
 
@@ -651,13 +681,15 @@ impl StatusChecker {
                     "저장 엔진",
                     format!("storageEngine={engine}"),
                 )
+                .with_value(engine.to_string())
             }
             // serverStatus는 clusterMonitor 권한이 필요할 수 있어 실패는 경고로 강등.
             Err(e) => CheckItem::warn(
                 "storage_engine",
                 "저장 엔진",
                 format!("serverStatus 조회 실패(권한 부족 가능): {e}"),
-            ),
+            )
+            .with_value("조회 실패"),
         }
     }
 
@@ -672,7 +704,8 @@ impl StatusChecker {
                 "oplog_window",
                 "oplog 윈도우",
                 "standalone — oplog 없음(증분 백업 불가, 풀 백업만 가능)".to_string(),
-            );
+            )
+            .with_value("없음(standalone)");
         }
 
         let oplog = self
@@ -706,13 +739,15 @@ impl StatusChecker {
                     label: "oplog 윈도우",
                     status,
                     message: msg,
+                    value: Some(format!("{window_secs}s")),
                 }
             }
             _ => CheckItem::warn(
                 "oplog_window",
                 "oplog 윈도우",
                 "oplog 엔트리를 읽지 못함(권한/빈 oplog 가능)".to_string(),
-            ),
+            )
+            .with_value("읽기 실패"),
         }
     }
 
@@ -726,6 +761,7 @@ impl StatusChecker {
                     "예상 크기",
                     format!("DB 목록 조회 실패(권한 부족 가능): {e}"),
                 )
+                .with_value("조회 실패")
             }
         };
 
@@ -758,6 +794,8 @@ impl StatusChecker {
                 human_bytes(total_storage),
             ),
         )
+        // 비교는 dataSize 기준(논리 데이터량 — 백업 대상 크기에 가장 근접).
+        .with_value(human_bytes(total_data))
     }
 
     /// 8) (선택) secondary 가용성 — prefer_secondary 구성 시 읽기 가능한 secondary 존재 여부.
@@ -780,18 +818,21 @@ impl StatusChecker {
                 "secondary 가용성",
                 format!("멤버 {hosts}개 — prefer_secondary 백업 가능(secondary 후보 존재)"),
             )
+            .with_value(format!("멤버 {hosts}"))
         } else if is_primary {
             CheckItem::warn(
                 "secondary",
                 "secondary 가용성",
                 "prefer_secondary 구성이나 읽을 secondary가 없음 — PRIMARY에서 백업됨".to_string(),
             )
+            .with_value("없음")
         } else {
             CheckItem::warn(
                 "secondary",
                 "secondary 가용성",
                 "secondary 가용성을 판정할 멤버 정보가 부족".to_string(),
             )
+            .with_value("불명")
         }
     }
 }
