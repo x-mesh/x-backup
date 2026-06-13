@@ -34,15 +34,22 @@ pub use error::{Result, XBackupError};
 pub fn init_tracing(verbosity: u8, json: bool) {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-    let default_level = match verbosity {
-        0 => "warn",
-        1 => "info",
-        2 => "debug",
-        _ => "trace",
+    // verbosity → 필터. -vv부터는 MongoDB 드라이버 로그도 끌어올려(연결·토폴로지 진단)
+    // "더 많은 출력"을 준다. 0=warn / 1=info / 2=debug(+driver info) / 3+=trace(+driver debug).
+    let default_filter = match verbosity {
+        0 => "x_backup=warn".to_string(),
+        1 => "x_backup=info".to_string(),
+        2 => "x_backup=debug,mongodb=info".to_string(),
+        _ => "x_backup=trace,mongodb=debug,object_store=debug".to_string(),
     };
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("x_backup={default_level}")));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+
+    // -vv 이상에서는 사람용 포맷에 target·라인 번호를 붙여 어디서 나온 로그인지 보이게 한다.
+    // -vvv(trace)에서는 스레드 ID까지(동시 파이프라인 추적용).
+    let show_loc = verbosity >= 2;
+    let show_thread = verbosity >= 3;
 
     // 로그는 stderr로 보낸다 — stdout은 결과·progress·--json 출력 전용(PRD §9-9.1).
     let registry = tracing_subscriber::registry().with(filter);
@@ -52,7 +59,13 @@ pub fn init_tracing(verbosity: u8, json: bool) {
             .try_init()
     } else {
         registry
-            .with(fmt::layer().with_writer(std::io::stderr))
+            .with(
+                fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_target(show_loc)
+                    .with_line_number(show_loc)
+                    .with_thread_ids(show_thread),
+            )
             .try_init()
     };
     // 중복 초기화 에러는 무시한다(테스트에서 여러 번 호출될 수 있음).

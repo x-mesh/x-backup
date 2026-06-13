@@ -23,7 +23,7 @@
 use std::collections::BTreeSet;
 
 use bson::{doc, Document, Timestamp};
-use mongodb::options::{ClientOptions, FindOneOptions};
+use mongodb::options::FindOneOptions;
 use mongodb::Client;
 use serde::Serialize;
 
@@ -356,10 +356,8 @@ pub struct StatusChecker {
 
 impl StatusChecker {
     /// URI 시크릿으로 연결하고 인증 메타를 캐싱한다(ping은 [`Self::full_report`] 첫 항목에서).
-    pub async fn connect(uri: &Secret) -> Result<Self> {
-        let options = ClientOptions::parse(uri.expose())
-            .await
-            .map_err(|e| XBackupError::Failure(format!("MongoDB URI 파싱 실패: {e}")))?;
+    pub async fn connect(uri: &Secret, timeout_secs: Option<u64>) -> Result<Self> {
+        let options = super::conn::client_options(uri, timeout_secs).await?;
 
         // 인증 메커니즘·사용자 추출(시크릿 비노출 — 메커니즘/사용자명만).
         let connection = match &options.credential {

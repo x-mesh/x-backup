@@ -137,6 +137,8 @@ default_profile = "prod"
 uri_env = "MONGO_URI"            # prod: env reference (config can leak — keep secrets out)
 # uri = "mongodb://localhost:27017/?replicaSet=rs0"   # dev/no-secret: literal is fine
                                  # if both set, uri_env (when its env is present) wins
+connect_timeout_secs = 5         # MongoDB connect/server-selection timeout (default 5s)
+                                 # a serverSelectionTimeoutMS in the URI wins (warns if it differs)
 
 [profiles.prod.destination]      # where backup FILES go — storage, not a MongoDB
 type = "s3"                      # local | s3

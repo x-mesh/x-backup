@@ -72,6 +72,15 @@ impl DumpProcess {
             cmd.arg("--collection").arg(coll);
         }
 
+        // -vv 진단용: 실행 인자(시크릿 제외 — URI는 config 파일로 전달).
+        tracing::debug!(
+            program = %spec.program,
+            oplog = spec.oplog,
+            db = spec.db.as_deref().unwrap_or("(전체)"),
+            collection = spec.collection.as_deref().unwrap_or("(전체)"),
+            "mongodump 스폰(--archive=- --config <임시>)"
+        );
+
         cmd.stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())

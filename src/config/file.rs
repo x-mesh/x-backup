@@ -98,6 +98,13 @@ pub struct SourceConfig {
     /// 가능하면 secondary에서 백업할지 여부.
     #[serde(default)]
     pub prefer_secondary: bool,
+    /// MongoDB 접속(server-selection/connect) 타임아웃(초). 미지정 시 기본 5초.
+    ///
+    /// 이 프로파일로 실행하는 모든 명령의 MongoDB 연결(source·`--target` 모두)에 적용된다.
+    /// URI에 `serverSelectionTimeoutMS`가 있으면 **URI가 우선**하며, 이 값과 다르면
+    /// 경고를 출력한다(설정한 경우에만). `None`이면 기본 5초.
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u64>,
 }
 
 /// 백업 위치 — `[profiles.<name>.destination]`.

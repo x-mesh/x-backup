@@ -46,27 +46,28 @@ pub async fn handle(config_path: Option<PathBuf>, args: StatusArgs) -> Result<()
     let interval = resolved.profile.features.incremental.interval.clone();
     let prefer_secondary = resolved.profile.source.prefer_secondary;
 
-    let report = match StatusChecker::connect(&uri).await {
-        Ok(checker) => {
-            checker
-                .full_report(
-                    &resolved.profile_name,
-                    DEFAULT_MONGODUMP,
-                    &interval,
-                    prefer_secondary,
-                )
-                .await
-        }
-        // connect 자체 실패(URI 파싱 등)는 단일 연결 실패 항목 보고서로 만든다.
-        Err(e) => StatusReport::new(
-            &resolved.profile_name,
-            vec![crate::engine::mongo::status::CheckItem::fail(
-                "connection",
-                "연결·인증",
-                format!("연결 준비 실패: {e}"),
-            )],
-        ),
-    };
+    let report =
+        match StatusChecker::connect(&uri, resolved.profile.source.connect_timeout_secs).await {
+            Ok(checker) => {
+                checker
+                    .full_report(
+                        &resolved.profile_name,
+                        DEFAULT_MONGODUMP,
+                        &interval,
+                        prefer_secondary,
+                    )
+                    .await
+            }
+            // connect 자체 실패(URI 파싱 등)는 단일 연결 실패 항목 보고서로 만든다.
+            Err(e) => StatusReport::new(
+                &resolved.profile_name,
+                vec![crate::engine::mongo::status::CheckItem::fail(
+                    "connection",
+                    "연결·인증",
+                    format!("연결 준비 실패: {e}"),
+                )],
+            ),
+        };
 
     // 4) 출력 — --json 구조화 또는 사람용 표.
     if args.json {

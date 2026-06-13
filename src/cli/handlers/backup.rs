@@ -53,6 +53,8 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
             resolved.profile_name
         ))
     })?;
+    // 접속 타임아웃(초) — config source.connect_timeout_secs(미설정이면 None → 기본 5초).
+    let timeout_secs = resolved.profile.source.connect_timeout_secs;
 
     // 3) destination 구성 — local/s3 모두 from_config로 일반화. 멀티 destination이면
     //    첫 항목이 primary(필수), 나머지는 보조(순차 fan-out으로 복제 — 아래).
@@ -82,7 +84,7 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
     //   *막는* 결함(Fail)만 본다. 하나라도 Fail이면 PrecheckFailed(exit 3)로 백업을 미시작한다.
     //   --skip-precheck면 우회한다(읽기 전용·무부작용).
     if !args.skip_precheck {
-        run_precheck(&uri, &resolved.profile_name).await?;
+        run_precheck(&uri, &resolved.profile_name, timeout_secs).await?;
     } else {
         tracing::warn!("--skip-precheck 지정 — 백업 사전 점검을 건너뜁니다(FR-8 우회)");
     }
@@ -111,6 +113,7 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
         mongodump_program: "mongodump".to_string(),
         db: args.db.clone(),
         collection: args.collection.clone(),
+        timeout_secs,
         progress_counter: Some(std::sync::Arc::clone(&progress_counter)),
     };
     let (stages, meta) = build_stages(&resolved, &args)?;
@@ -232,6 +235,7 @@ async fn handle_incremental(
     let request = IncrementalRequest {
         uri: uri.clone(),
         mongodump_program: "mongodump".to_string(),
+        timeout_secs: resolved.profile.source.connect_timeout_secs,
     };
     // 캡처/승격 양쪽에서 동일 구성의 새 StageStack을 만들 수 있도록 팩토리로 넘긴다.
     let stage_factory = || build_stages(resolved, args);
@@ -322,11 +326,13 @@ async fn handle_incremental(
 /// 전체 `status`보다 가벼운 [`StatusChecker::precheck_subset`]로 백업을 *막는* 결함만 본다.
 /// 보고서 신호등이 `Fail`이면 [`XBackupError::PrecheckFailed`](exit 3)로 백업을 미시작한다.
 /// `Warn`은 백업을 막지 않는다(로그만; 전체 status가 경고를 상세히 다룬다). 읽기 전용이다.
-async fn run_precheck(uri: &Secret, profile: &str) -> Result<()> {
-    let checker = StatusChecker::connect(uri).await.map_err(|e| {
-        // connect 준비 실패(URI 파싱 등)는 사전 점검 실패로 본다(백업 미시작).
-        XBackupError::PrecheckFailed(format!("사전 점검 연결 준비 실패: {e}"))
-    })?;
+async fn run_precheck(uri: &Secret, profile: &str, timeout_secs: Option<u64>) -> Result<()> {
+    let checker = StatusChecker::connect(uri, timeout_secs)
+        .await
+        .map_err(|e| {
+            // connect 준비 실패(URI 파싱 등)는 사전 점검 실패로 본다(백업 미시작).
+            XBackupError::PrecheckFailed(format!("사전 점검 연결 준비 실패: {e}"))
+        })?;
     let report = checker.precheck_subset(profile, "mongodump").await;
 
     // 점검 항목을 로그로 남긴다(진단용 — stdout 결과 오염 금지, tracing은 stderr).

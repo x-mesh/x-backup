@@ -41,6 +41,8 @@ pub struct MigrateRequest {
     pub drop: bool,
     /// 계획만 출력하고 실제 전송은 하지 않음.
     pub dry_run: bool,
+    /// MongoDB 접속 타임아웃(초). `None`이면 기본 5초. source·target 연결 모두에 적용.
+    pub timeout_secs: Option<u64>,
 }
 
 /// 마이그레이션 결과 요약(CLI 출력용).
@@ -82,10 +84,10 @@ fn ns_of(db: &Option<String>, collection: &Option<String>) -> Option<String> {
 ///
 /// dry-run·실제 실행이 공통으로 사용한다. 프로세스는 스폰하지 않는다.
 pub async fn plan_migrate(request: &MigrateRequest) -> Result<MigratePlan> {
-    let source = MongoMeta::connect(&request.source_uri).await?;
+    let source = MongoMeta::connect(&request.source_uri, request.timeout_secs).await?;
     let source_meta = source.server_meta().await?;
 
-    let target = MongoMeta::connect(&request.target_uri)
+    let target = MongoMeta::connect(&request.target_uri, request.timeout_secs)
         .await
         .map_err(|e| XBackupError::PrecheckFailed(format!("target 연결 실패: {e}")))?;
     let target_meta = target.server_meta().await?;

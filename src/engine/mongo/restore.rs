@@ -76,6 +76,14 @@ impl RestoreProcess {
             cmd.arg("--drop");
         }
 
+        // -vv 진단용: 실행 인자(시크릿 제외 — URI는 config 파일로 전달).
+        tracing::debug!(
+            program = %spec.program,
+            drop = spec.drop,
+            ns_include = spec.ns_include.as_deref().unwrap_or("(전체)"),
+            "mongorestore 스폰(--archive=- --config <임시>)"
+        );
+
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

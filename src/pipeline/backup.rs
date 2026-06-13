@@ -105,6 +105,8 @@ pub struct BackupRequest {
     pub db: Option<String>,
     /// 선택적 백업 — 특정 컬렉션(`--collection`).
     pub collection: Option<String>,
+    /// MongoDB 접속 타임아웃(초). `None`이면 기본 5초.
+    pub timeout_secs: Option<u64>,
     /// 진행 표시용 공유 바이트 카운터(t13/R16). `Some`이면 저장 바이트 카운터의 backing
     /// Arc로 주입되어, 핸들러의 진행 표시기가 이 값을 폴링한다(없으면 내부 Arc 사용).
     pub progress_counter: Option<Arc<AtomicU64>>,
@@ -185,7 +187,7 @@ pub async fn run_full_backup_with_meta(
     meta: BackupMeta,
 ) -> Result<BackupOutcome> {
     // 1) 드라이버로 서버 메타 + dump 전 oplog ts 조회.
-    let mongo = MongoMeta::connect(&request.uri).await?;
+    let mongo = MongoMeta::connect(&request.uri, request.timeout_secs).await?;
     let server_meta = mongo.server_meta().await?;
     let topology = server_meta.topology();
 
@@ -519,6 +521,7 @@ mod tests {
             mongodump_program: "mongodump".into(),
             db: None,
             collection: None,
+            timeout_secs: None,
             progress_counter: None,
         };
         assert!(!base.is_selective());
@@ -543,6 +546,7 @@ mod tests {
             mongodump_program: r.mongodump_program.clone(),
             db: r.db.clone(),
             collection: r.collection.clone(),
+            timeout_secs: None,
             progress_counter: None,
         }
     }

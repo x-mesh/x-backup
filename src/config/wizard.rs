@@ -243,6 +243,7 @@ pub fn run_wizard(prompt: &mut dyn Prompt) -> Result<Config> {
             uri: None,
             uri_env: Some(uri_env),
             prefer_secondary,
+            connect_timeout_secs: None,
         },
         destination,
         destinations: Vec::new(),

@@ -15,6 +15,7 @@
 //!
 //! dump/restore 자체는 서브프로세스가 수행하고 드라이버는 메타데이터만 다룬다(태스크 지침 1).
 
+pub mod conn;
 pub mod dump;
 pub mod meta;
 pub mod oplog;
@@ -22,6 +23,7 @@ pub mod restore;
 pub mod status;
 pub mod uri_config;
 
+pub use conn::{client_options, DEFAULT_TIMEOUT_SECS};
 pub use dump::{DumpProcess, DumpSpec};
 pub use meta::{MongoMeta, ServerMeta};
 pub use oplog::{CaptureError, CaptureHandle, GapCheck, OplogCaptureStream, OplogReader};

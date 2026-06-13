@@ -85,6 +85,7 @@ pub async fn handle(config_path: Option<PathBuf>, args: RestoreArgs) -> Result<(
         force: args.force,
         dry_run: args.dry_run,
         skip_precheck: args.skip_precheck,
+        timeout_secs: resolved.profile.source.connect_timeout_secs,
         progress_counter: if args.dry_run {
             None
         } else {
@@ -207,8 +208,8 @@ async fn handle_pitr(config_path: Option<PathBuf>, args: RestoreArgs, at: String
     // PITR + --only 병용 즉시 거부(pitfall 1-4: --oplogReplay는 ns 필터와 병용 불가, PRD Edge Case).
     crate::pipeline::pitr::reject_pitr_with_only(args.only.as_deref())?;
 
-    // config·URI·storage 해석(풀 복구 경로와 동일 규칙).
-    let (target_uri, storage) = resolve_target_and_storage(&config_path, &args)?;
+    // config·URI·storage·타임아웃 해석(풀 복구 경로와 동일 규칙).
+    let (target_uri, storage, timeout_secs) = resolve_target_and_storage(&config_path, &args)?;
 
     let request = PitrRequest {
         target_uri,
@@ -217,6 +218,7 @@ async fn handle_pitr(config_path: Option<PathBuf>, args: RestoreArgs, at: String
         force: args.force,
         dry_run: args.dry_run,
         skip_precheck: args.skip_precheck,
+        timeout_secs,
     };
 
     let is_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
@@ -251,10 +253,11 @@ async fn handle_pitr(config_path: Option<PathBuf>, args: RestoreArgs, at: String
 ///
 /// 풀 복구 경로의 1~3단계와 동일 규칙: `--target` 우선, destination type=local만,
 /// path 필수. 시크릿은 [`Secret`]로 감싼다.
+#[allow(clippy::type_complexity)]
 fn resolve_target_and_storage(
     config_path: &Option<PathBuf>,
     args: &RestoreArgs,
-) -> Result<(Secret, Box<dyn Storage>)> {
+) -> Result<(Secret, Box<dyn Storage>, Option<u64>)> {
     let config_toml = match config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
             XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
@@ -279,7 +282,11 @@ fn resolve_target_and_storage(
     };
 
     let storage = select_restore_storage(&resolved.profile, args.from.as_deref())?;
-    Ok((target_uri, storage))
+    Ok((
+        target_uri,
+        storage,
+        resolved.profile.source.connect_timeout_secs,
+    ))
 }
 
 /// 복구에 쓸 destination 백엔드를 고른다 — 멀티 destination 중 `--from`(이름 또는

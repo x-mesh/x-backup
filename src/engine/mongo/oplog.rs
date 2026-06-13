@@ -26,7 +26,7 @@ use std::task::{Context, Poll};
 
 use bson::{doc, Bson, RawDocument, RawDocumentBuf, Timestamp};
 use mongodb::error::ErrorKind;
-use mongodb::options::{ClientOptions, FindOptions};
+use mongodb::options::FindOptions;
 use mongodb::Client;
 use tokio::io::{AsyncRead, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::task::JoinHandle;
@@ -100,10 +100,8 @@ impl OplogReader {
     ///
     /// [`MongoMeta::connect`](super::meta::MongoMeta::connect)와 동일한 연결 절차다 —
     /// 증분 핸들러가 메타 질의와 별개로 oplog 전용 리더를 만들 때 쓴다.
-    pub async fn connect(uri: &Secret) -> Result<Self> {
-        let options = ClientOptions::parse(uri.expose())
-            .await
-            .map_err(|e| XBackupError::Failure(format!("MongoDB URI 파싱/연결 실패: {e}")))?;
+    pub async fn connect(uri: &Secret, timeout_secs: Option<u64>) -> Result<Self> {
+        let options = super::conn::client_options(uri, timeout_secs).await?;
         let client = Client::with_options(options)
             .map_err(|e| XBackupError::Failure(format!("MongoDB 클라이언트 생성 실패: {e}")))?;
         Ok(Self::new(client))

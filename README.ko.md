@@ -136,6 +136,8 @@ default_profile = "prod"
 uri_env = "MONGO_URI"            # prod: env 참조(config는 유출될 수 있으니 시크릿은 밖에)
 # uri = "mongodb://localhost:27017/?replicaSet=rs0"   # 개발·무자격증명: 직접 값도 OK
                                  # 둘 다 있으면 uri_env(해당 env가 있을 때)가 우선
+connect_timeout_secs = 5         # MongoDB 접속/server-selection 타임아웃(기본 5초)
+                                 # URI의 serverSelectionTimeoutMS가 우선(다르면 경고)
 
 [profiles.prod.destination]      # 백업 *파일*을 둘 곳 — 저장소이지 MongoDB가 아님
 type = "s3"                      # local | s3

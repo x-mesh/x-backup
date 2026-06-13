@@ -84,6 +84,7 @@ pub async fn handle(config_path: Option<PathBuf>, args: MigrateArgs) -> Result<(
         collection: args.collection.clone(),
         drop: args.drop,
         dry_run: args.dry_run,
+        timeout_secs: resolved.profile.source.connect_timeout_secs,
     };
 
     let is_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();

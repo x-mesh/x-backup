@@ -82,6 +82,8 @@ pub struct RestoreRequest {
     pub dry_run: bool,
     /// 복구 사전 점검 우회(`--skip-precheck`).
     pub skip_precheck: bool,
+    /// MongoDB 접속 타임아웃(초). `None`이면 기본 5초.
+    pub timeout_secs: Option<u64>,
     /// 진행 표시용 공유 바이트 카운터(t13/R16). `Some`이면 mongorestore stdin으로 흘리는
     /// 복원 입력 바이트를 누산해, 핸들러의 진행 표시기가 폴링한다(없으면 미주입 — 무비용).
     pub progress_counter: Option<Arc<AtomicU64>>,
@@ -192,7 +194,7 @@ where
         None
     } else {
         Some(
-            MongoMeta::connect(&request.target_uri)
+            MongoMeta::connect(&request.target_uri, request.timeout_secs)
                 .await
                 .map_err(|e| XBackupError::PrecheckFailed(format!("복구 대상 연결 실패: {e}")))?,
         )
@@ -537,6 +539,7 @@ mod tests {
             force: false,
             dry_run: true,
             skip_precheck: true,
+            timeout_secs: None,
             progress_counter: None,
         };
 
@@ -693,6 +696,7 @@ mod tests {
             force: true, // 가드 통과(drop 허용).
             dry_run: false,
             skip_precheck: true, // DB 연결 없이 스트리밍 경로만 검증.
+            timeout_secs: None,
             progress_counter: None,
         };
 
@@ -748,6 +752,7 @@ mod tests {
             force: true,
             dry_run: false,
             skip_precheck: true,
+            timeout_secs: None,
             progress_counter: None,
         };
         let err = run_restore(&request, &fs, false, |_| true)

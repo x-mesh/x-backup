@@ -71,6 +71,8 @@ pub struct PitrRequest {
     pub dry_run: bool,
     /// 복구 사전 점검 우회(`--skip-precheck`).
     pub skip_precheck: bool,
+    /// MongoDB 접속 타임아웃(초). `None`이면 기본 5초.
+    pub timeout_secs: Option<u64>,
 }
 
 /// PITR 복구 계획(dry-run 출력·실행 요약 공통). 시크릿은 담지 않는다.
@@ -169,6 +171,7 @@ where
         force: request.force,
         dry_run: false,
         skip_precheck: request.skip_precheck,
+        timeout_secs: request.timeout_secs,
         // base 풀 복원은 PITR 자체 진행 표시(상위)에 위임 — 별도 카운터 미주입.
         progress_counter: None,
     };

@@ -9,7 +9,7 @@
 //! oplog `ts`는 BSON Timestamp{t,i}로 다룬다(DateTime 변환 금지, pitfall 2-2).
 
 use bson::{doc, Timestamp};
-use mongodb::options::{ClientOptions, FindOneOptions};
+use mongodb::options::FindOneOptions;
 use mongodb::Client;
 
 use crate::config::secret::Secret;
@@ -51,10 +51,10 @@ pub struct MongoMeta {
 
 impl MongoMeta {
     /// URI 시크릿으로 클라이언트를 연결한다(SRV lookup 포함).
-    pub async fn connect(uri: &Secret) -> Result<Self> {
-        let options = ClientOptions::parse(uri.expose())
-            .await
-            .map_err(|e| XBackupError::Failure(format!("MongoDB URI 파싱/연결 실패: {e}")))?;
+    /// `timeout_secs`는 프로파일의 `source.connect_timeout_secs`(미설정이면 `None` →
+    /// 기본 5초). URI에 `serverSelectionTimeoutMS`가 있으면 URI가 우선한다([`client_options`]).
+    pub async fn connect(uri: &Secret, timeout_secs: Option<u64>) -> Result<Self> {
+        let options = super::conn::client_options(uri, timeout_secs).await?;
         let client = Client::with_options(options)
             .map_err(|e| XBackupError::Failure(format!("MongoDB 클라이언트 생성 실패: {e}")))?;
         Ok(Self { client })

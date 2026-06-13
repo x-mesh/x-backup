@@ -47,6 +47,8 @@ pub struct IncrementalRequest {
     pub uri: crate::config::secret::Secret,
     /// 풀 승격 시 쓸 mongodump 실행파일 경로(보통 `"mongodump"`).
     pub mongodump_program: String,
+    /// MongoDB 접속 타임아웃(초). `None`이면 기본 5초.
+    pub timeout_secs: Option<u64>,
 }
 
 /// 증분 백업 결과 — 일반 증분이거나 gap으로 승격된 풀 백업.
@@ -110,7 +112,7 @@ where
     F: Fn() -> Result<(StageStack, BackupMeta)>,
 {
     // 1) 토폴로지 확인 — standalone(oplog 부재)이면 사유와 함께 거부(exit 1, FR-2).
-    let mongo = MongoMeta::connect(&request.uri).await?;
+    let mongo = MongoMeta::connect(&request.uri, request.timeout_secs).await?;
     let server_meta = mongo.server_meta().await?;
     if !server_meta.supports_oplog() {
         return Err(XBackupError::Failure(
@@ -131,7 +133,7 @@ where
     );
 
     // 3) gap 감지(캡처 전) — 직전 기준점이 oplog 윈도우 안에 아직 있는가?(§6.2)
-    let reader = OplogReader::connect(&request.uri).await?;
+    let reader = OplogReader::connect(&request.uri, request.timeout_secs).await?;
     match reader.detect_gap(last_backup_ts).await? {
         GapCheck::Ok { boundary_risk } => {
             if boundary_risk {
@@ -339,6 +341,7 @@ where
         mongodump_program: request.mongodump_program.clone(),
         db: None,
         collection: None,
+        timeout_secs: request.timeout_secs,
         // 풀 승격 경로는 진행 카운터를 별도 주입하지 않는다(핸들러가 필요 시 외부에서 설정).
         progress_counter: None,
     };
