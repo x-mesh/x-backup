@@ -87,13 +87,23 @@ x-backup prune   --profile prod --keep-full 7 --dry-run
 
 ### config.toml
 
+A config has three distinct axes, easy to conflate:
+
+- **source** — the MongoDB you back up (your prod). `uri_env` (an env var name) for anything
+  with credentials; `uri` (a literal) is fine for local/no-secret connections.
+- **destination** — where backup *files* go. This is storage (`local` / `s3`), **not** a MongoDB.
+- **restore target** — the MongoDB you restore *into*. Not in config; passed at restore time
+  with `restore --target <uri>`.
+
 ```toml
 default_profile = "prod"
 
 [profiles.prod.source]
-uri_env = "MONGO_URI"            # secrets are env references only, never plaintext
+uri_env = "MONGO_URI"            # prod: env reference (config can leak — keep secrets out)
+# uri = "mongodb://localhost:27017/?replicaSet=rs0"   # dev/no-secret: literal is fine
+                                 # if both set, uri_env (when its env is present) wins
 
-[profiles.prod.destination]
+[profiles.prod.destination]      # where backup FILES go — storage, not a MongoDB
 type = "s3"                      # local | s3
 
 [profiles.prod.destination.s3]

@@ -238,6 +238,7 @@ pub fn run_wizard(prompt: &mut dyn Prompt) -> Result<Config> {
             precheck: true,
         },
         source: SourceConfig {
+            uri: None,
             uri_env: Some(uri_env),
             prefer_secondary,
         },

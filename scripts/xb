@@ -77,14 +77,23 @@ ensure_devenv() {
     local enc_enabled="true"
     [ "${XB_NO_ENCRYPT:-0}" = "1" ] && enc_enabled="false"
     cat > "$CFG" <<EOF
-# scripts/xb가 자동 생성한 개발용 config. 시크릿(URI)은 MONGO_URI env로 주입한다.
+# scripts/xb가 자동 생성한 개발용 config.
+#
+# 세 가지는 서로 다른 축이다:
+#   - source      = 백업 대상(prod) MongoDB. 여기선 :$( echo "$SRC_URI" | sed 's#.*localhost:##; s#/.*##' ) 컨테이너.
+#   - destination = 백업 *파일*을 둘 곳(MongoDB 아님). 여기선 로컬 폴더.
+#   - 복구 대상   = 복구를 부을 MongoDB. config가 아니라 'restore --target <uri>'로 지정
+#                   (래퍼의 restore-target은 :$( echo "$TGT_URI" | sed 's#.*localhost:##; s#/.*##' ) 컨테이너로 보냄).
+#
+# 개발이라 source.uri를 직접 적었다(자격증명 없는 로컬 연결이라 안전). 비밀번호가
+# 있는 prod는 평문 대신 uri_env = "MONGO_URI"로 env 참조를 쓴다(FR-10·§11).
 default_profile = "$PROFILE"
 
 [profiles.$PROFILE.source]
-uri_env = "MONGO_URI"
+uri = "$SRC_URI"            # 백업 대상(prod) = 소스 컨테이너
 
 [profiles.$PROFILE.destination]
-type = "local"
+type = "local"             # 백업 파일 저장소(local | s3) — MongoDB가 아님
 path = "$STORE"
 
 [profiles.$PROFILE.features.compression]
@@ -102,7 +111,9 @@ EOF
 # 모든 x-backup 호출에 공통으로 주입되는 환경.
 export_env() {
   export XB_CONFIG="$CFG"                  # --config 글로벌 플래그를 대신함
-  export MONGO_URI="$SRC_URI"              # source.uri_env가 가리키는 시크릿
+  # 생성된 config는 source.uri를 직접 갖지만, uri_env="MONGO_URI" 방식 config도
+  # 래퍼로 그대로 쓸 수 있게 호환용으로 같이 export한다(있어도 무해).
+  export MONGO_URI="$SRC_URI"
   export XB_AGE_IDENTITY_FILE="$AGE_KEY"   # restore·verify --deep 복호화용(백업엔 무관)
   export PATH
 }

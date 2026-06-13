@@ -64,7 +64,18 @@ impl Default for ModeConfig {
 /// 접속 대상 — `[profiles.<name>.source]`. 시크릿은 env 참조만 보관한다.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SourceConfig {
-    /// MongoDB URI가 담긴 환경변수 이름(시크릿 평문 저장 금지).
+    /// 백업 대상(prod) MongoDB URI를 **직접** 지정한다.
+    ///
+    /// 자격증명이 없는 연결(로컬/개발)에 편리하다. **비밀번호가 포함된 URI는
+    /// 여기 쓰지 말 것** — config 파일이 유출되면 시크릿도 함께 샌다. 그런 경우
+    /// [`uri_env`](Self::uri_env)로 env 참조를 쓴다(FR-10·§11). `XB_SOURCE__URI`
+    /// 환경변수로도 오버라이드된다.
+    #[serde(default)]
+    pub uri: Option<String>,
+    /// 백업 대상 MongoDB URI가 담긴 **환경변수 이름**(시크릿 평문 저장 금지).
+    ///
+    /// `uri`(직접)보다 우선한다 — env가 설정돼 있으면 그 값을, 비어 있으면
+    /// `uri` 리터럴로 폴백한다.
     #[serde(default)]
     pub uri_env: Option<String>,
     /// 가능하면 secondary에서 백업할지 여부.

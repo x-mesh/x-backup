@@ -90,13 +90,22 @@ x-backup prune   --profile prod --keep-full 7 --dry-run
 
 ### config.toml
 
+config에는 헷갈리기 쉬운 세 축이 있다:
+
+- **source** — 백업 대상 MongoDB(prod). 자격증명이 있으면 `uri_env`(환경변수 *이름*),
+  로컬·무자격증명이면 `uri`(직접 값)도 된다.
+- **destination** — 백업 *파일*을 둘 곳. 저장소(`local`/`s3`)이며 **MongoDB가 아니다**.
+- **복구 대상** — 복구를 부을 MongoDB. config가 아니라 복구 시 `restore --target <uri>`로 지정.
+
 ```toml
 default_profile = "prod"
 
 [profiles.prod.source]
-uri_env = "MONGO_URI"            # 시크릿은 env 참조만(평문 금지)
+uri_env = "MONGO_URI"            # prod: env 참조(config는 유출될 수 있으니 시크릿은 밖에)
+# uri = "mongodb://localhost:27017/?replicaSet=rs0"   # 개발·무자격증명: 직접 값도 OK
+                                 # 둘 다 있으면 uri_env(해당 env가 있을 때)가 우선
 
-[profiles.prod.destination]
+[profiles.prod.destination]      # 백업 *파일*을 둘 곳 — 저장소이지 MongoDB가 아님
 type = "s3"                      # local | s3
 
 [profiles.prod.destination.s3]

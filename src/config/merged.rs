@@ -8,8 +8,8 @@
 //!
 //! 시크릿 *값*은 여기서 트리에 넣지 않는다 — `uri_env`로 env에서 읽어 [`Secret`]에 담는다.
 
-use crate::config::env::{apply_overrides, resolve_secret_with};
-use crate::config::file::Profile;
+use crate::config::env::apply_overrides;
+use crate::config::file::{Profile, SourceConfig};
 use crate::config::secret::Secret;
 use crate::error::{Result, XBackupError};
 
@@ -66,11 +66,10 @@ impl ResolvedConfig {
             ))
         })?;
 
-        // 5) uri_env가 있으면 시크릿을 해석한다.
-        let resolved_uri = match profile.source.uri_env.as_deref() {
-            Some(env_name) => Some(resolve_secret_with(env_name, &secret_lookup)?),
-            None => None,
-        };
+        // 5) source URI 해석 — 우선순위: uri_env(env 값) > uri(직접 리터럴).
+        //    uri_env가 가리키는 env가 설정돼 있으면 그 값을, 비었거나 없으면 직접 uri로
+        //    폴백한다. 둘 다 없으면 None(URI가 필요한 핸들러가 이후 명확히 거부).
+        let resolved_uri = resolve_source_uri(&profile.source, &secret_lookup)?;
 
         Ok(Self {
             profile_name: input.profile_name.to_string(),
@@ -78,6 +77,36 @@ impl ResolvedConfig {
             resolved_uri,
         })
     }
+}
+
+/// source URI를 해석한다 — `uri_env`(env 값) > `uri`(직접 리터럴) 우선순위.
+///
+/// - `uri_env`가 가리키는 env가 설정·비어있지 않으면 그 값.
+/// - 그렇지 않고 직접 `uri`가 있으면 그 값(env 미설정 시 폴백).
+/// - `uri_env`만 있고 env도 `uri`도 없으면 명확한 설정 오류.
+/// - 둘 다 없으면 `None`(URI가 필요한 핸들러가 이후 거부).
+fn resolve_source_uri<F>(source: &SourceConfig, lookup: &F) -> Result<Option<Secret>>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(env_name) = source.uri_env.as_deref() {
+        match lookup(env_name) {
+            Some(v) if !v.is_empty() => return Ok(Some(Secret::new(v))),
+            _ => {
+                if let Some(uri) = source.uri.as_deref().filter(|s| !s.is_empty()) {
+                    return Ok(Some(Secret::new(uri.to_string())));
+                }
+                return Err(XBackupError::Config(format!(
+                    "시크릿 환경변수 '{env_name}'가 설정되지 않았습니다(또는 source.uri로 직접 지정)"
+                )));
+            }
+        }
+    }
+    Ok(source
+        .uri
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(Secret::new))
 }
 
 /// `root` 안에서 `[profiles.<name>]` 하위 테이블의 가변 참조를 얻는다(없으면 생성).
@@ -203,5 +232,72 @@ bucket = "db-backups"
         )
         .unwrap_err();
         assert_eq!(err.exit_code(), 2);
+    }
+
+    /// source.uri를 직접 쓰면 env 없이도 해석된다(개발/무자격증명용).
+    #[test]
+    fn direct_uri_resolves_without_env() {
+        let toml = "[profiles.p.source]\nuri = \"mongodb://localhost:27017/?replicaSet=rs0\"\n";
+        let cfg = ResolvedConfig::build_with(
+            MergeInput {
+                config_toml: Some(toml),
+                profile_name: "p",
+                overrides: &[],
+            },
+            lookup(&[]),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.resolved_uri.unwrap().expose(),
+            "mongodb://localhost:27017/?replicaSet=rs0"
+        );
+    }
+
+    /// uri_env가 가리키는 env가 설정돼 있으면 직접 uri보다 우선한다(ENV > 리터럴).
+    #[test]
+    fn uri_env_beats_direct_uri_when_set() {
+        let toml = "[profiles.p.source]\nuri = \"mongodb://literal/db\"\nuri_env = \"MONGO_URI\"\n";
+        let cfg = ResolvedConfig::build_with(
+            MergeInput {
+                config_toml: Some(toml),
+                profile_name: "p",
+                overrides: &[],
+            },
+            lookup(&[("MONGO_URI", "mongodb://from-env/db")]),
+        )
+        .unwrap();
+        assert_eq!(cfg.resolved_uri.unwrap().expose(), "mongodb://from-env/db");
+    }
+
+    /// uri_env가 있으나 env 미설정이면 직접 uri로 폴백한다.
+    #[test]
+    fn uri_env_unset_falls_back_to_direct_uri() {
+        let toml = "[profiles.p.source]\nuri = \"mongodb://literal/db\"\nuri_env = \"MONGO_URI\"\n";
+        let cfg = ResolvedConfig::build_with(
+            MergeInput {
+                config_toml: Some(toml),
+                profile_name: "p",
+                overrides: &[],
+            },
+            lookup(&[]), // MONGO_URI 미설정 → uri 리터럴로 폴백
+        )
+        .unwrap();
+        assert_eq!(cfg.resolved_uri.unwrap().expose(), "mongodb://literal/db");
+    }
+
+    /// uri도 uri_env도 없으면 resolved_uri는 None(이후 핸들러가 거부).
+    #[test]
+    fn no_source_uri_yields_none() {
+        let toml = "[profiles.p.destination]\ntype = \"local\"\npath = \"/tmp/x\"\n";
+        let cfg = ResolvedConfig::build_with(
+            MergeInput {
+                config_toml: Some(toml),
+                profile_name: "p",
+                overrides: &[],
+            },
+            lookup(&[]),
+        )
+        .unwrap();
+        assert!(cfg.resolved_uri.is_none());
     }
 }
