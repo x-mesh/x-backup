@@ -258,6 +258,10 @@ scripts/xb incr-demo            # 위 과정을 한 번에:
 `scripts/xb status --json`). 환경만 export해서 `x-backup`을 직접 쓰려면
 `eval "$(scripts/xb env)"`. 평문 백업은 `XB_NO_ENCRYPT=1 scripts/xb setup`.
 
+`scripts/xb`는 소스가 바뀌면 자동으로 재빌드한다(mtime 비교 — 변경 없으면 빌드 안 함).
+그래서 코드를 고친 뒤 `make build`를 따로 안 해도 된다. `XB_BIN=<경로>`로 바이너리를
+지정하거나 `XB_NO_BUILD=1`로 자동 빌드를 끌 수 있다.
+
 생성된 config에는 프로파일이 둘 있다 — `demo`(source `:27017`)와 `target`(`:27117`) —
 그래서 양쪽 상태를 다 볼 수 있다. `--profile`은 위치에 상관없이 동작한다(래퍼가 올바른
 자리에 끼워 준다): `scripts/xb --profile target status` 또는 `scripts/xb status --profile target`.

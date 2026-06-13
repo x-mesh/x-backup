@@ -257,6 +257,10 @@ Any real x-backup subcommand passes straight through (`scripts/xb backup --type 
 `scripts/xb status --json`). To export the env and call `x-backup` directly instead:
 `eval "$(scripts/xb env)"`. Plaintext backups: `XB_NO_ENCRYPT=1 scripts/xb setup`.
 
+`scripts/xb` rebuilds automatically when sources changed (mtime check; no rebuild when
+nothing changed), so you don't need `make build` after edits. Override with
+`XB_BIN=<path>` or skip the check with `XB_NO_BUILD=1`.
+
 The generated config has two profiles — `demo` (source `:27017`) and `target` (`:27117`) —
 so you can check either side. `--profile` works in any position (the wrapper places it
 correctly): `scripts/xb --profile target status` or `scripts/xb status --profile target`.

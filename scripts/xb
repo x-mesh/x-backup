@@ -51,13 +51,28 @@ log()  { printf '\033[36m[xb]\033[0m %s\n' "$*" >&2; }
 err()  { printf '\033[31m[xb] %s\033[0m\n' "$*" >&2; exit 1; }
 
 # --- 바이너리·도구 해석 -----------------------------------------------------
+# XB_BIN이 있으면 그걸 그대로 쓴다. 없으면 target/release/x-backup을 쓰되,
+# 소스(src/·Cargo.toml)가 바이너리보다 최신이면 자동 재빌드한다(고치고 빌드 까먹는
+# 함정 방지). 변경이 없으면 빌드를 건너뛴다(mtime 비교). XB_NO_BUILD=1로 끌 수 있다.
 resolve_bin() {
   if [ -n "${XB_BIN:-}" ]; then BIN="$XB_BIN"; return; fi
-  if [ -x "$ROOT/target/release/x-backup" ]; then BIN="$ROOT/target/release/x-backup"; return; fi
-  if [ -x "$ROOT/target/debug/x-backup" ]; then BIN="$ROOT/target/debug/x-backup"; return; fi
-  log "바이너리가 없어 release 빌드 — cargo build --release"
-  ( cd "$ROOT" && cargo build --release >&2 )
-  BIN="$ROOT/target/release/x-backup"
+  local rel="$ROOT/target/release/x-backup"
+  if [ -x "$rel" ] && { [ "${XB_NO_BUILD:-0}" = "1" ] || ! sources_newer_than "$rel"; }; then
+    BIN="$rel"; return
+  fi
+  log "release 빌드(소스 변경 감지 또는 바이너리 없음) — cargo build --release"
+  ( cd "$ROOT" && cargo build --release >&2 ) || err "빌드 실패"
+  BIN="$rel"
+}
+
+# src/ 또는 Cargo.toml 중 하나라도 주어진 파일보다 최신이면 0(=재빌드 필요).
+sources_newer_than() {
+  local target="$1"
+  # -newer 비교: target보다 새로 수정된 .rs/Cargo.toml이 하나라도 있으면 출력이 생긴다.
+  local newer
+  newer=$(find "$ROOT/src" "$ROOT/Cargo.toml" -name '*.rs' -o -name 'Cargo.toml' 2>/dev/null \
+    | while read -r f; do [ "$f" -nt "$target" ] && { echo x; break; }; done)
+  [ -n "$newer" ]
 }
 
 ensure_tools_path() {
