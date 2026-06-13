@@ -155,6 +155,28 @@ make scenario           # E2E 시나리오(풀→증분→verify→복구→PITR
 make postgres-up        # 2차 PostgreSQL 어댑터 대비
 ```
 
+### 컨테이너에 직접 테스트하기
+
+`scripts/xb`는 `make mongodb-up` 컨테이너에 대고 손으로 테스트하기 위한 래퍼다. 처음
+실행하면 `.devenv/`에 `config.toml`과 age 키쌍을 만들고, 필요한 env(`XB_CONFIG`,
+`MONGO_URI`, `XB_AGE_IDENTITY_FILE`)·도구 PATH·`--profile`을 자동으로 주입한다 —
+설정을 손으로 엮을 필요가 없다.
+
+```bash
+make mongodb-up           # 컨테이너 기동
+scripts/xb setup          # .devenv 준비 + status 점검
+scripts/xb seed           # 소스에 샘플 데이터 시드
+scripts/xb backup         # 풀 백업(압축+암호화)
+scripts/xb list
+scripts/xb verify-latest  # 최신 백업 구조+심층 검증
+scripts/xb restore-target # 타깃(:27117)으로 복구 후 문서 수 출력
+make devenv-down          # 컨테이너 종료 + .devenv 삭제
+```
+
+실제 x-backup 서브커맨드는 그대로 통과한다(`scripts/xb backup --type incr`,
+`scripts/xb status --json`). 환경만 export해서 `x-backup`을 직접 쓰려면
+`eval "$(scripts/xb env)"`. 평문 백업은 `XB_NO_ENCRYPT=1 scripts/xb setup`.
+
 ## Docs
 
 | 문서 | 내용 |

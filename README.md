@@ -149,6 +149,28 @@ make scenario           # E2E scenario (full → incr → verify → restore →
 make postgres-up        # PostgreSQL, for the upcoming adapter
 ```
 
+### Manual testing against the containers
+
+`scripts/xb` wraps the binary for hands-on testing against `make mongodb-up`. On first
+run it creates `.devenv/` with a `config.toml` and an age keypair, then injects the right
+env (`XB_CONFIG`, `MONGO_URI`, `XB_AGE_IDENTITY_FILE`), tools PATH, and `--profile`
+automatically — so you don't wire any of that up by hand.
+
+```bash
+make mongodb-up           # start the containers
+scripts/xb setup          # prepare .devenv + run a status check
+scripts/xb seed           # seed sample data into the source
+scripts/xb backup         # full backup (compressed + encrypted)
+scripts/xb list
+scripts/xb verify-latest  # structural + deep verify of the newest backup
+scripts/xb restore-target # restore to the target (:27117) and print the doc counts
+make devenv-down          # tear down containers + remove .devenv
+```
+
+Any real x-backup subcommand passes straight through (`scripts/xb backup --type incr`,
+`scripts/xb status --json`). To export the env and call `x-backup` directly instead:
+`eval "$(scripts/xb env)"`. Plaintext backups: `XB_NO_ENCRYPT=1 scripts/xb setup`.
+
 ## Docs
 
 The docs are written in Korean.

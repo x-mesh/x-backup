@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+#
+# xb — x-backup 개발 테스트 래퍼.
+#
+# `make mongodb-up`으로 띄운 컨테이너(소스 :27017 / 타깃 :27117)를 대상으로
+# x-backup을 손쉽게 돌리기 위한 래퍼다. 처음 실행 시 .devenv/ 아래에
+# config.toml + age 키쌍을 자동 생성하고, 필요한 환경변수(XB_CONFIG·MONGO_URI·
+# XB_AGE_IDENTITY_FILE)와 도구 PATH·바이너리를 알아서 잡는다.
+#
+# 빠른 시작:
+#   make mongodb-up          # 컨테이너 기동(별도)
+#   scripts/xb setup         # .devenv 준비 + status 점검
+#   scripts/xb seed          # 소스에 샘플 데이터
+#   scripts/xb backup        # 풀 백업(암호화·압축)
+#   scripts/xb list
+#   scripts/xb restore-target # 타깃(:27117)으로 복구
+#   scripts/xb verify-latest  # 최신 백업 구조+심층 검증
+#
+# x-backup 서브커맨드(backup/restore/list/verify/prune/status/init/update)는
+# 그대로 통과되며 --config·--profile·env가 자동 주입된다:
+#   scripts/xb backup --type incr
+#   scripts/xb status --json
+#
+# 환경만 export해서 진짜 x-backup을 직접 쓰고 싶으면:
+#   eval "$(scripts/xb env)" && x-backup status --profile demo
+#
+# 오버라이드: XB_PROFILE(기본 demo), XB_BIN, XB_NO_ENCRYPT=1(평문 백업),
+#             XB_MONGO_PORT/XB_MONGO_TARGET_PORT.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+DEVENV="$ROOT/.devenv"
+CFG="$DEVENV/config.toml"
+STORE="$DEVENV/store"
+AGE_PUB="$DEVENV/age.pub"
+AGE_KEY="$DEVENV/age.key"
+PROFILE="${XB_PROFILE:-demo}"
+
+SRC_URI="mongodb://localhost:${XB_MONGO_PORT:-27017}/?replicaSet=rs0&directConnection=true"
+TGT_URI="mongodb://localhost:${XB_MONGO_TARGET_PORT:-27117}/?replicaSet=rs0&directConnection=true"
+SRC_CTR="x-backup-mongo"
+TGT_CTR="x-backup-mongo-target"
+TEST_DB="xbdemo"
+
+log()  { printf '\033[36m[xb]\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[31m[xb] %s\033[0m\n' "$*" >&2; exit 1; }
+
+# --- 바이너리·도구 해석 -----------------------------------------------------
+resolve_bin() {
+  if [ -n "${XB_BIN:-}" ]; then BIN="$XB_BIN"; return; fi
+  if [ -x "$ROOT/target/release/x-backup" ]; then BIN="$ROOT/target/release/x-backup"; return; fi
+  if [ -x "$ROOT/target/debug/x-backup" ]; then BIN="$ROOT/target/debug/x-backup"; return; fi
+  log "바이너리가 없어 release 빌드 — cargo build --release"
+  ( cd "$ROOT" && cargo build --release >&2 )
+  BIN="$ROOT/target/release/x-backup"
+}
+
+ensure_tools_path() {
+  if [ -d "$ROOT/.tools/bin" ]; then PATH="$ROOT/.tools/bin:$PATH"; fi
+  command -v mongodump >/dev/null 2>&1 || err "mongodump가 PATH에 없습니다 — 'make tools'로 설치하세요"
+}
+
+# --- .devenv 자동 생성 ------------------------------------------------------
+ensure_devenv() {
+  mkdir -p "$STORE"
+  if [ ! -f "$AGE_KEY" ] || [ ! -f "$AGE_PUB" ]; then
+    log "age 키쌍 생성 → $DEVENV"
+    ( cd "$ROOT" && cargo run --quiet --release --example gen_age_key -- "$DEVENV" >&2 )
+  fi
+  if [ ! -f "$CFG" ]; then
+    log "config.toml 생성 → $CFG"
+    local enc_enabled="true"
+    [ "${XB_NO_ENCRYPT:-0}" = "1" ] && enc_enabled="false"
+    cat > "$CFG" <<EOF
+# scripts/xb가 자동 생성한 개발용 config. 시크릿(URI)은 MONGO_URI env로 주입한다.
+default_profile = "$PROFILE"
+
+[profiles.$PROFILE.source]
+uri_env = "MONGO_URI"
+
+[profiles.$PROFILE.destination]
+type = "local"
+path = "$STORE"
+
+[profiles.$PROFILE.features.compression]
+algorithm = "zstd"
+level     = 6
+
+[profiles.$PROFILE.features.encryption]
+enabled        = $enc_enabled
+algorithm      = "age"
+recipient_file = "$AGE_PUB"
+EOF
+  fi
+}
+
+# 모든 x-backup 호출에 공통으로 주입되는 환경.
+export_env() {
+  export XB_CONFIG="$CFG"                  # --config 글로벌 플래그를 대신함
+  export MONGO_URI="$SRC_URI"              # source.uri_env가 가리키는 시크릿
+  export XB_AGE_IDENTITY_FILE="$AGE_KEY"   # restore·verify --deep 복호화용(백업엔 무관)
+  export PATH
+}
+
+# --profile을 받는 서브커맨드 목록.
+takes_profile() {
+  case "$1" in backup|restore|list|status|prune) return 0 ;; *) return 1 ;; esac
+}
+
+# --- 컨테이너 헬스 확인 -----------------------------------------------------
+require_containers() {
+  for c in "$SRC_CTR" "$TGT_CTR"; do
+    local s
+    s=$(docker inspect -f '{{.State.Health.Status}}' "$c" 2>/dev/null || echo "missing")
+    [ "$s" = "healthy" ] || err "$c 가 healthy 아님($s) — 'make mongodb-up' 먼저 실행하세요"
+  done
+}
+
+# --- 래퍼 전용 서브커맨드 ---------------------------------------------------
+cmd_setup() {
+  resolve_bin; ensure_tools_path; ensure_devenv; export_env
+  require_containers
+  log "준비 완료. config=$CFG profile=$PROFILE store=$STORE"
+  "$BIN" status --profile "$PROFILE" || true
+}
+
+cmd_env() {
+  ensure_devenv
+  echo "export XB_CONFIG='$CFG'"
+  echo "export MONGO_URI='$SRC_URI'"
+  echo "export XB_AGE_IDENTITY_FILE='$AGE_KEY'"
+  [ -d "$ROOT/.tools/bin" ] && echo "export PATH='$ROOT/.tools/bin:'\$PATH"
+  echo "# 타깃(복구용): $TGT_URI"
+}
+
+cmd_seed() {
+  require_containers
+  local n="${1:-300}"
+  log "소스($SRC_CTR) 시드: $TEST_DB.orders=$n, customers=50"
+  docker exec "$SRC_CTR" mongosh --quiet --eval "
+    const db = db.getSiblingDB('$TEST_DB');
+    db.dropDatabase();
+    db.orders.insertMany(Array.from({length: $n}, (_, i) => ({_id: i, total: i*10, item: 'sku-'+(i%20)})));
+    db.customers.insertMany(Array.from({length: 50}, (_, i) => ({_id: i, name: 'c'+i})));
+    print('seeded orders=' + db.orders.countDocuments({}) + ' customers=' + db.customers.countDocuments({}));
+  "
+}
+
+cmd_reset() {
+  require_containers
+  log "소스·타깃의 $TEST_DB 드롭"
+  docker exec "$SRC_CTR" mongosh --quiet --eval "db.getSiblingDB('$TEST_DB').dropDatabase()" >/dev/null
+  docker exec "$TGT_CTR" mongosh --quiet --eval "db.getSiblingDB('$TEST_DB').dropDatabase()" >/dev/null
+  log "완료"
+}
+
+latest_id() {
+  "$BIN" list --profile "$PROFILE" --json |
+    python3 -c "import json,sys; b=json.load(sys.stdin)['backups']; print(b[0]['id'] if b else '')"
+}
+
+cmd_restore_target() {
+  resolve_bin; ensure_tools_path; ensure_devenv; export_env; require_containers
+  log "타깃($TGT_URI)으로 복구 (개인키로 복호화)"
+  "$BIN" restore --profile "$PROFILE" --target "$TGT_URI" --force "$@"
+  log "타깃 데이터 확인:"
+  docker exec "$TGT_CTR" mongosh --quiet --eval "
+    const db = db.getSiblingDB('$TEST_DB');
+    print('orders=' + db.orders.countDocuments({}) + ' customers=' + db.customers.countDocuments({}));
+  "
+}
+
+cmd_verify_latest() {
+  resolve_bin; ensure_tools_path; ensure_devenv; export_env
+  local id; id=$(latest_id)
+  [ -n "$id" ] || err "백업이 없습니다 — 먼저 'scripts/xb backup'"
+  log "verify(구조) $id"
+  "$BIN" verify --id "$id"
+  log "verify --deep(복호화) $id"
+  "$BIN" verify --id "$id" --deep
+}
+
+cmd_down() {
+  log "컨테이너 종료(make mongodb-down) + .devenv 제거"
+  ( cd "$ROOT" && make mongodb-down >&2 ) || true
+  rm -rf "$DEVENV"
+  log "완료"
+}
+
+usage() {
+  sed -n '3,32p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# --- 라우팅 -----------------------------------------------------------------
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    setup)           cmd_setup "$@" ;;
+    env)             cmd_env "$@" ;;
+    seed)            cmd_seed "$@" ;;
+    reset)           cmd_reset "$@" ;;
+    restore-target)  cmd_restore_target "$@" ;;
+    verify-latest)   cmd_verify_latest "$@" ;;
+    down)            cmd_down "$@" ;;
+    help|-h|--help)  usage ;;
+    *)
+      # x-backup 서브커맨드 통과 — env·config 주입, 필요 시 --profile 기본값.
+      resolve_bin; ensure_tools_path; ensure_devenv; export_env
+      if takes_profile "$cmd" && ! printf '%s\n' "$@" | grep -q -- '--profile'; then
+        set -- --profile "$PROFILE" "$@"
+      fi
+      exec "$BIN" "$cmd" "$@"
+      ;;
+  esac
+}
+
+main "$@"

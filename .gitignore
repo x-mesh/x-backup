@@ -20,3 +20,6 @@
 
 # 로컬 설치 도구(make tools)
 .tools/
+
+# scripts/xb 개발 테스트 환경(로컬, 시크릿 키 포함)
+.devenv/

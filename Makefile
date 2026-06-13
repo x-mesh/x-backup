@@ -19,7 +19,8 @@ TOOLS_PATH    := $(abspath $(TOOLS_DIR))/bin
 .DEFAULT_GOAL := help
 
 .PHONY: help build build-debug lint fmt test test-integration test-s3 \
-        mongodb-up mongodb-down postgres-up postgres-down tools scenario clean
+        mongodb-up mongodb-down postgres-up postgres-down tools scenario clean \
+        devenv devenv-down
 
 help: ## 타깃 목록 출력
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -82,6 +83,15 @@ $(TOOLS_DIR)/bin/mongodump:
 
 scenario: build tools mongodb-up ## E2E 시나리오 실행(docs/test-scenario.md) — 풀/증분/검증/복구/PITR
 	PATH="$(TOOLS_PATH):$$PATH" scripts/scenario-e2e.sh
+
+# ── 대화형 테스트 환경(scripts/xb 래퍼) ───────────────────────────────
+
+devenv: build tools mongodb-up ## 손쉬운 테스트 환경 — 컨테이너+config+키 준비 후 scripts/xb 안내
+	scripts/xb setup
+	@printf '\n다음처럼 쓰세요:\n  scripts/xb seed\n  scripts/xb backup\n  scripts/xb list\n  scripts/xb verify-latest\n  scripts/xb restore-target\n  eval "$$(scripts/xb env)"   # 환경만 export\n'
+
+devenv-down: ## 테스트 환경 정리(컨테이너 종료 + .devenv 삭제)
+	scripts/xb down
 
 clean: ## 빌드 산출물·도구 제거(컨테이너는 *-down 타깃으로)
 	cargo clean
