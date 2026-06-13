@@ -23,7 +23,13 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             // 시크릿이 새지 않도록 에러는 Display로만 출력한다(Secret은 [REDACTED]).
-            tracing::error!("{err}");
+            // 경고 동반 성공(exit 4)은 실패가 아니므로 WARN으로 내려, 색·레벨로
+            // 성공/경고/실패가 구분되게 한다(gap→풀 승격, verify 경고 등).
+            if err.is_warning() {
+                tracing::warn!("{err}");
+            } else {
+                tracing::error!("{err}");
+            }
             err.exit()
         }
     }

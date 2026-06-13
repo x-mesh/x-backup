@@ -102,6 +102,14 @@ impl XBackupError {
     pub fn exit(&self) -> ExitCode {
         ExitCode::from(self.exit_code())
     }
+
+    /// 경고 동반 성공(exit 4)인지 — `main`이 ERROR가 아닌 WARN 레벨로 출력하기 위해 쓴다.
+    ///
+    /// gap→풀 승격, verify 경고처럼 작업은 성공했으나 주의가 필요한 경우다. 빨간 ERROR로
+    /// 찍으면 실패처럼 보이므로(exit 4 ≠ 실패) 호출부에서 표시 레벨을 분기한다.
+    pub fn is_warning(&self) -> bool {
+        self.exit_code() == exit_codes::WARNING
+    }
 }
 
 /// 크레이트 전역에서 사용하는 결과 별칭.
