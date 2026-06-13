@@ -95,11 +95,95 @@ impl AsyncRead for CountingReader {
     }
 }
 
+/// 백업/복구 엔진 — 외부 도구 사용 여부.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Engine {
+    /// 드라이버로 직접 백업/복구(외부 도구 불필요). 자체 아카이브 포맷. **기본**.
+    #[default]
+    Native,
+    /// 외부 `mongodump`/`mongorestore` 오케스트레이션(시점 일관 `--oplog` 지원).
+    Mongodump,
+}
+
+impl Engine {
+    /// config 문자열(`native`|`mongodump`)에서 파싱한다. 그 외 값은 설정 오류.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "native" => Ok(Engine::Native),
+            "mongodump" => Ok(Engine::Mongodump),
+            other => Err(XBackupError::Config(format!(
+                "알 수 없는 engine: '{other}'(native | mongodump만 지원)"
+            ))),
+        }
+    }
+
+    /// manifest.archive_format에 기록할 포맷 식별자.
+    pub fn archive_format(self) -> &'static str {
+        match self {
+            Engine::Native => crate::engine::native::archive::FORMAT_ID,
+            Engine::Mongodump => "mongodump",
+        }
+    }
+}
+
+/// dump 스트림의 종료 처리 — 엔진별로 다른 정리/대기 로직을 한 자리에 모은다.
+///
+/// `DumpProcess`·`NativeDumpHandle`의 wait/finish가 `self`를 소비하므로 `Option`으로
+/// 감싸 `take()` 후 호출한다(중복 호출 안전).
+enum DumpFinalizer {
+    /// mongodump 자식 프로세스(+ 0600 임시 URI config 핸들 — 종료까지 유지).
+    /// Box로 감싼다 — 변형 간 크기 격차 회피(`clippy::large_enum_variant`).
+    Mongodump(Box<MongodumpFinalizer>),
+    /// 네이티브 덤프 task 핸들(EOF 후 결과 회수).
+    Native(Option<crate::engine::native::backup::NativeDumpHandle>),
+}
+
+/// mongodump 종료 처리 페이로드 — 자식 프로세스 + 0600 임시 URI config 핸들.
+struct MongodumpFinalizer {
+    proc: Option<DumpProcess>,
+    _uri_config: UriConfigFile,
+}
+
+impl DumpFinalizer {
+    /// 정상 경로 — 스트림 EOF 후 종료를 판정한다(mongodump exit code / native task 결과).
+    async fn finish(&mut self) -> Result<()> {
+        match self {
+            DumpFinalizer::Mongodump(m) => match m.proc.take() {
+                Some(p) => p.wait().await,
+                None => Ok(()),
+            },
+            DumpFinalizer::Native(handle) => match handle.take() {
+                Some(h) => h.finish().await,
+                None => Ok(()),
+            },
+        }
+    }
+
+    /// 실패 경로 — 자식/리더를 정리한다(좀비/누수 방지).
+    async fn abort(&mut self) {
+        match self {
+            DumpFinalizer::Mongodump(m) => {
+                if let Some(p) = m.proc.take() {
+                    p.abort().await;
+                }
+            }
+            // native: 리더가 이미 drop되어 쓰기 task가 BrokenPipe로 끝난다 — 결과만 흡수.
+            DumpFinalizer::Native(handle) => {
+                if let Some(h) = handle.take() {
+                    let _ = h.finish().await;
+                }
+            }
+        }
+    }
+}
+
 /// 풀 백업 요청.
 pub struct BackupRequest {
     /// 연결·메타 질의에 쓸 MongoDB URI 시크릿.
     pub uri: crate::config::secret::Secret,
-    /// mongodump 실행파일 경로(보통 `"mongodump"`).
+    /// 백업 엔진(native | mongodump). 기본 native.
+    pub engine: Engine,
+    /// mongodump 실행파일 경로(보통 `"mongodump"`; mongodump 엔진에서만 사용).
     pub mongodump_program: String,
     /// 선택적 백업 — 특정 DB(`--db`). 지정 시 `--oplog` 비활성(FR-1).
     pub db: Option<String>,
@@ -191,45 +275,64 @@ pub async fn run_full_backup_with_meta(
     let server_meta = mongo.server_meta().await?;
     let topology = server_meta.topology();
 
-    // 선택적 백업이면 --oplog 자동 제거(R2/FR-1). 그 외 replica set이면 자동 부여.
+    // 선택적 백업이면(--db/--collection) 증분 base 부적격이라 oplog 구간을 기록하지 않는다.
+    // replica set + 전체 백업일 때만 oplog 구간을 기록해 증분 체인의 base가 되게 한다.
     let selective = request.is_selective();
-    let use_oplog = decide_oplog(server_meta.supports_oplog(), selective);
+    let record_oplog = decide_oplog(server_meta.supports_oplog(), selective);
     if selective && server_meta.supports_oplog() {
         tracing::warn!(
-            "선택적 백업(--db/--collection)은 --oplog와 병용 불가 — oplog 자동 제거, 증분 base 부적격(R2/FR-1)"
+            "선택적 백업(--db/--collection)은 일관 oplog 구간을 보장할 수 없어 증분 base 부적격(R2/FR-1)"
         );
     }
 
-    let oplog_start = if use_oplog {
+    let oplog_start = if record_oplog {
         mongo.latest_oplog_ts().await?
     } else {
         None
     };
 
-    // 2) URI를 0600 임시 config로 — argv 노출 금지(PRD §11). 핸들은 dump 종료까지 유지.
-    let uri_config = UriConfigFile::create(&request.uri)?;
-
-    // 3) mongodump 스폰(--archive=-, 필요 시 --oplog).
-    let spec = DumpSpec {
-        program: request.mongodump_program.clone(),
-        uri_config_path: uri_config.path().to_string(),
-        oplog: use_oplog,
-        db: request.db.clone(),
-        collection: request.collection.clone(),
+    // 2) dump 스트림 생성 — 엔진 분기. mongodump는 `--archive=-`(시점 일관 `--oplog`),
+    //    native는 드라이버로 직접 아카이브 스트림을 만든다(외부 도구 불필요).
+    let archive_format = request.engine.archive_format();
+    let (dump_stream, mut finalizer): (BoxAsyncRead, DumpFinalizer) = match request.engine {
+        Engine::Mongodump => {
+            // URI를 0600 임시 config로 — argv 노출 금지(PRD §11). 핸들은 dump 종료까지 유지.
+            let uri_config = UriConfigFile::create(&request.uri)?;
+            let spec = DumpSpec {
+                program: request.mongodump_program.clone(),
+                uri_config_path: uri_config.path().to_string(),
+                oplog: record_oplog,
+                db: request.db.clone(),
+                collection: request.collection.clone(),
+            };
+            let mut proc = DumpProcess::spawn(&spec)?;
+            let stdout = proc.take_stdout()?;
+            (
+                Box::pin(stdout),
+                DumpFinalizer::Mongodump(Box::new(MongodumpFinalizer {
+                    proc: Some(proc),
+                    _uri_config: uri_config,
+                })),
+            )
+        }
+        Engine::Native => {
+            let dumper =
+                crate::engine::native::NativeDumper::connect(&request.uri, request.timeout_secs)
+                    .await?;
+            let nds = dumper.dump_stream(request.db.clone(), request.collection.clone());
+            let handle = nds.handle();
+            (Box::pin(nds), DumpFinalizer::Native(Some(handle)))
+        }
     };
-    let mut dump = DumpProcess::spawn(&spec)?;
-    let stdout = dump.take_stdout()?;
 
-    // 4) 파이프라인 합성: dump stdout → (입력 바이트 카운터) → 단계(identity/t6) → sha256 tee.
+    // 3) 파이프라인 합성: dump stream → (입력 바이트 카운터) → 단계(compress→encrypt) → sha256 tee.
     //    입력 카운터는 *압축 전* 원본 바이트(original_size_bytes)를 세고, sha256 tee는
     //    *저장 직전* 최종 바이트(stored, 압축·암호화 후)에 걸린다(설계 불변: 체크섬=저장 바이트).
-    let counted = CountingReader::new(Box::pin(stdout));
+    let counted = CountingReader::new(dump_stream);
     let original_size_handle = counted.handle();
     let staged: BoxAsyncRead = stages.apply(Box::pin(counted));
     let checksummed = Sha256Reader::new(staged);
     let checksum_handle = checksummed.handle();
-    // 저장 바이트도 같은 패스에서 센다 — list 기반 사후 조회는 백엔드별 prefix
-    // 의미가 달라(LocalFs는 디렉터리 취급) 신뢰할 수 없다.
     // 진행 카운터가 주입됐으면 저장 카운터의 backing Arc로 공유한다(진행 표시 폴링).
     let stored_counted = match &request.progress_counter {
         Some(counter) => CountingReader::with_counter(Box::pin(checksummed), Arc::clone(counter)),
@@ -237,7 +340,7 @@ pub async fn run_full_backup_with_meta(
     };
     let stored_size_handle = stored_counted.handle();
 
-    // 5) data.bin 저장(업로드 먼저). put_stream이 바이트를 끝까지 소비한다.
+    // 4) data.bin 저장(업로드 먼저). put_stream이 바이트를 끝까지 소비한다.
     let backup_id = Uuid::now_v7().to_string();
     let data_rel = data_path(&backup_id);
 
@@ -245,22 +348,19 @@ pub async fn run_full_backup_with_meta(
         .put_stream(&data_rel, Box::pin(stored_counted), None)
         .await;
 
-    // 업로드 성공/실패와 무관하게 dump 종료를 판정해야 한다(좀비 방지).
-    // 업로드 성공 시: stdout EOF까지 소비됐으므로 wait가 정상 반환.
-    // 업로드 실패 시: dump를 kill+wait로 정리.
+    // 업로드 성공/실패와 무관하게 dump 종료를 판정해야 한다(좀비/누수 방지).
     if let Err(put_err) = put_result {
-        dump.abort().await;
+        finalizer.abort().await;
         return Err(put_err);
     }
-    // dump 종료 코드 판정(exit code only).
-    if let Err(dump_err) = dump.wait().await {
-        // dump가 실패했으면 저장된 부분 data.bin을 정리한다.
+    // dump 종료 판정(mongodump exit code / native task 결과).
+    if let Err(dump_err) = finalizer.finish().await {
         cleanup(storage, &backup_id).await;
         return Err(dump_err);
     }
 
-    // 6) dump 후 oplog ts 조회(구간 end).
-    let oplog_end = if use_oplog {
+    // 5) dump 후 oplog ts 조회(구간 end).
+    let oplog_end = if record_oplog {
         mongo.latest_oplog_ts().await?
     } else {
         None
@@ -281,7 +381,8 @@ pub async fn run_full_backup_with_meta(
     // 원본(압축 전) 입력 바이트. 압축 단계가 없으면 stored와 같다(평문 경로).
     let original_size = original_size_handle.total();
 
-    // 8) manifest 작성. 압축/암호화 메타는 meta에서 가져오고, original/stored를 분리 기록.
+    // 8) manifest 작성. 압축/암호화 메타는 meta에서, archive_format(엔진)도 기록한다 —
+    //    복구가 이 값을 보고 mongorestore/native 중 맞는 소비자를 고른다.
     let manifest = build_manifest(
         &backup_id,
         &server_meta,
@@ -291,6 +392,7 @@ pub async fn run_full_backup_with_meta(
         stored_size,
         &checksum,
         oplog_range,
+        archive_format,
         &meta,
     );
 
@@ -328,6 +430,7 @@ fn build_manifest(
     stored_size: u64,
     checksum: &str,
     oplog_range: Option<OplogRange>,
+    archive_format: &str,
     meta: &BackupMeta,
 ) -> BackupManifest {
     BackupManifest {
@@ -339,9 +442,9 @@ fn build_manifest(
         topology,
         server_version: server_meta.server_version.clone(),
         tool_versions: ToolVersions {
-            // dump 버전·archive 포맷은 t11 사전점검/파싱에서 채운다(현재 미수집).
             mongodump: None,
-            archive_format: None,
+            // 복구가 소비자(mongorestore vs native)를 고르는 기준.
+            archive_format: Some(archive_format.to_string()),
         },
         selective,
         // original = 압축 전 dump 입력 총량, stored = 압축·암호화 후 저장 총량(t6).
@@ -522,6 +625,7 @@ mod tests {
             db: None,
             collection: None,
             timeout_secs: None,
+            engine: Engine::default(),
             progress_counter: None,
         };
         assert!(!base.is_selective());
@@ -547,6 +651,7 @@ mod tests {
             db: r.db.clone(),
             collection: r.collection.clone(),
             timeout_secs: None,
+            engine: r.engine,
             progress_counter: None,
         }
     }
@@ -577,6 +682,7 @@ mod tests {
             /* stored */ 250,
             "deadbeef",
             None,
+            "mongodump",
             &meta,
         );
         assert!(m.selective, "선택적 백업 manifest.selective=true");

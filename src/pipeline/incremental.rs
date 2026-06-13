@@ -35,7 +35,7 @@ use crate::manifest::schema::{
 };
 use crate::manifest::store::{data_path, manifest_path, manifest_sha_path, ManifestStore};
 use crate::pipeline::backup::{
-    run_full_backup_with_meta, BackupMeta, BackupOutcome, BackupRequest,
+    run_full_backup_with_meta, BackupMeta, BackupOutcome, BackupRequest, Engine,
 };
 use crate::pipeline::checksum::Sha256Reader;
 use crate::pipeline::stage::StageStack;
@@ -49,6 +49,8 @@ pub struct IncrementalRequest {
     pub mongodump_program: String,
     /// MongoDB 접속 타임아웃(초). `None`이면 기본 5초.
     pub timeout_secs: Option<u64>,
+    /// gap 승격 시 만들 풀 백업의 덤프 엔진(프로파일 설정과 일치).
+    pub engine: Engine,
 }
 
 /// 증분 백업 결과 — 일반 증분이거나 gap으로 승격된 풀 백업.
@@ -342,6 +344,7 @@ where
         db: None,
         collection: None,
         timeout_secs: request.timeout_secs,
+        engine: request.engine,
         // 풀 승격 경로는 진행 카운터를 별도 주입하지 않는다(핸들러가 필요 시 외부에서 설정).
         progress_counter: None,
     };

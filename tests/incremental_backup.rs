@@ -30,7 +30,7 @@ use x_backup::manifest::schema::{
     FORMAT_VERSION,
 };
 use x_backup::manifest::store::ManifestStore;
-use x_backup::pipeline::backup::{run_full_backup, BackupMeta, BackupRequest};
+use x_backup::pipeline::backup::{run_full_backup, BackupMeta, BackupRequest, Engine};
 use x_backup::pipeline::incremental::{
     run_incremental_backup, IncrementalOutcome, IncrementalRequest,
 };
@@ -106,8 +106,10 @@ async fn full_then_incremental_records_chain_and_captures_txn() {
     let full_req = BackupRequest {
         uri: Secret::new(uri.clone()),
         mongodump_program: "mongodump".to_string(),
+        timeout_secs: None,
         db: None,
         collection: None,
+        engine: Engine::Mongodump,
         progress_counter: None,
     };
     let full = run_full_backup(&full_req, &storage, StageStack::new())
@@ -131,6 +133,8 @@ async fn full_then_incremental_records_chain_and_captures_txn() {
     let incr_req = IncrementalRequest {
         uri: Secret::new(uri.clone()),
         mongodump_program: "mongodump".to_string(),
+        timeout_secs: None,
+        engine: Engine::Mongodump,
     };
     let outcome = run_incremental_backup(&incr_req, &storage, identity_factory())
         .await
@@ -219,8 +223,10 @@ async fn incremental_empty_slice_records_manifest_only() {
     let full_req = BackupRequest {
         uri: Secret::new(uri.clone()),
         mongodump_program: "mongodump".to_string(),
+        timeout_secs: None,
         db: None,
         collection: None,
+        engine: Engine::Mongodump,
         progress_counter: None,
     };
     let full = run_full_backup(&full_req, &storage, StageStack::new())
@@ -233,6 +239,8 @@ async fn incremental_empty_slice_records_manifest_only() {
     let incr_req = IncrementalRequest {
         uri: Secret::new(uri.clone()),
         mongodump_program: "mongodump".to_string(),
+        timeout_secs: None,
+        engine: Engine::Mongodump,
     };
     let outcome = run_incremental_backup(&incr_req, &storage, identity_factory())
         .await
@@ -342,6 +350,8 @@ async fn gap_promotes_to_full_with_exit_4() {
     let incr_req = IncrementalRequest {
         uri: Secret::new(uri.clone()),
         mongodump_program: "mongodump".to_string(),
+        timeout_secs: None,
+        engine: Engine::Mongodump,
     };
     // 평문 팩토리(승격 풀 백업도 평문으로 산출).
     let outcome = run_incremental_backup(&incr_req, &storage, identity_factory())

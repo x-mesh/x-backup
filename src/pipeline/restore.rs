@@ -293,17 +293,24 @@ async fn stream_restore(
     let data_rel = data_path(&plan.backup_id);
     let raw = storage.get_stream(&data_rel).await?;
     let restored = stages.apply(raw);
-    // 진행 카운터가 주입됐으면 mongorestore stdin으로 흘리는 바이트를 누산한다(R16).
+    // 진행 카운터가 주입됐으면 복원 입력으로 흘리는 바이트를 누산한다(R16).
     // (역스택 출력 = 복원 입력 바이트. data.bin 저장 크기와 무관히 실제 통과량을 센다.)
     let mut restored_stream: BoxAsyncRead = match &request.progress_counter {
         Some(counter) => Box::pin(ProgressCountingReader::new(restored, Arc::clone(counter))),
         None => restored,
     };
 
-    // 2) URI를 0600 임시 config로(argv 노출 금지). 핸들은 restore 종료까지 유지.
+    // 2) 엔진 분기 — manifest의 archive_format으로 백업을 만든 엔진을 식별한다.
+    //    네이티브 포맷이면 드라이버로 직접 복원(외부 도구 불필요), 그 외는 mongorestore.
+    let archive_format = manifest.tool_versions.archive_format.as_deref();
+    if archive_format == Some(crate::engine::native::archive::FORMAT_ID) {
+        return native_stream_restore(request, &mut restored_stream, plan, drop_existing).await;
+    }
+
+    // 3) (mongodump 경로) URI를 0600 임시 config로(argv 노출 금지). 핸들은 restore 종료까지 유지.
     let uri_config = UriConfigFile::create(&request.target_uri)?;
 
-    // 3) mongorestore 스폰(--archive=- stdin, --drop은 가드 통과 시에만).
+    // 4) mongorestore 스폰(--archive=- stdin, --drop은 가드 통과 시에만).
     let spec = RestoreSpec {
         program: request.mongorestore_program.clone(),
         uri_config_path: uri_config.path().to_string(),
@@ -313,7 +320,7 @@ async fn stream_restore(
     let mut restore = RestoreProcess::spawn(&spec)?;
     let mut stdin = restore.take_stdin()?;
 
-    // 4) 파이프라인 바이트를 stdin으로 흘린다. 끝나면 stdin을 닫아 EOF를 보낸다.
+    // 5) 파이프라인 바이트를 stdin으로 흘린다. 끝나면 stdin을 닫아 EOF를 보낸다.
     let copy_result = tokio::io::copy(&mut restored_stream, &mut stdin).await;
     // stdin을 명시적으로 닫는다(Drop이 닫지만 shutdown으로 flush 보장).
     use tokio::io::AsyncWriteExt;
@@ -328,8 +335,36 @@ async fn stream_restore(
         )));
     }
 
-    // 5) mongorestore 종료 코드 판정(exit code only).
+    // 6) mongorestore 종료 코드 판정(exit code only).
     restore.wait().await
+}
+
+/// 네이티브 아카이브를 드라이버로 직접 복원한다(외부 mongorestore 불필요).
+///
+/// [`native_restore`](crate::engine::native::restore::native_restore)에 역스택 출력 스트림을
+/// 그대로 넘긴다 — createCollection(옵션)·createIndexes·insert_many로 복원한다.
+async fn native_stream_restore(
+    request: &RestoreRequest,
+    reader: &mut BoxAsyncRead,
+    plan: &RestorePlan,
+    drop_existing: bool,
+) -> Result<()> {
+    let options =
+        crate::engine::mongo::conn::client_options(&request.target_uri, request.timeout_secs)
+            .await?;
+    let client = mongodb::Client::with_options(options).map_err(|e| {
+        XBackupError::Failure(format!("복구 대상 MongoDB 클라이언트 생성 실패: {e}"))
+    })?;
+
+    let inserted = crate::engine::native::restore::native_restore(
+        reader,
+        &client,
+        drop_existing,
+        plan.ns_include.as_deref(),
+    )
+    .await?;
+    tracing::debug!(backup_id = %plan.backup_id, inserted, "네이티브 복구: 문서 삽입 완료");
+    Ok(())
 }
 
 /// 저장된 모든 백업 중 **최신 풀 백업**의 manifest를 고른다.

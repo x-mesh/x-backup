@@ -18,7 +18,7 @@
 use x_backup::config::secret::Secret;
 use x_backup::manifest::store::{data_path, manifest_path, manifest_sha_path, parse_sidecar};
 use x_backup::manifest::ManifestStore;
-use x_backup::pipeline::backup::{run_full_backup, BackupRequest};
+use x_backup::pipeline::backup::{run_full_backup, BackupRequest, Engine};
 use x_backup::pipeline::stage::StageStack;
 use x_backup::storage::LocalFs;
 
@@ -40,8 +40,10 @@ async fn full_backup_produces_three_artifacts() {
     let request = BackupRequest {
         uri: Secret::new(test_uri()),
         mongodump_program: "mongodump".to_string(),
+        timeout_secs: None,
         db: None,
         collection: None,
+        engine: Engine::Mongodump,
         progress_counter: None,
     };
 

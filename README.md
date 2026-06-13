@@ -6,11 +6,11 @@
 
 > MongoDB backup and restore CLI — full and incremental (oplog) backups, PITR, local or S3-compatible storage, encrypted by default. A single Rust binary.
 
-x-backup backs up a running MongoDB (standalone or replica set) into an encrypted form you can verify and actually restore from. It drives `mongodump` and `mongorestore` and streams every stage, so memory stays flat no matter how large the dataset is. A 6 GiB backup peaks at 54.6 MiB RSS ([measured](docs/memory-profile.md)).
+x-backup backs up a running MongoDB (standalone or replica set) into an encrypted form you can verify and actually restore from. By default it talks to MongoDB directly through the Rust driver — **no `mongodump`/`mongorestore` required** — and streams every stage, so memory stays flat no matter how large the dataset is. A 6 GiB backup peaks at 54.6 MiB RSS ([measured](docs/memory-profile.md)).
 
 ## Features
 
-- ✅ **Full backup** — streamed `mongodump --archive --oplog`, point-in-time consistent
+- ✅ **Full backup** — driver-native streaming archive (data + indexes + collection options), no external tools; `mongodump --archive --oplog` available as an opt-in engine
 - ✅ **Incremental backup** — captures the oplog directly; on a gap it promotes to a full backup automatically (exit 4)
 - ✅ **PITR** — restore to a moment with `--at <RFC3339>` (base restore + oplog replay, gated on chain verification)
 - ✅ **Storage** — local disk or S3-compatible (MinIO, R2, OCI), streaming multipart upload with abort cleanup
@@ -55,7 +55,7 @@ git clone git@github.com:x-mesh/x-backup.git && cd x-backup
 make build        # → target/release/x-backup
 ```
 
-You need `mongodump` and `mongorestore` (MongoDB Database Tools 100.x) on your PATH. `make tools` installs them locally under `.tools/` with sha256 verification.
+The default `native` engine needs no external tools. `mongodump`/`mongorestore` (MongoDB Database Tools 100.x) are only required if you opt into the `mongodump` engine (see [Backup engine](#backup-engine)); `make tools` installs them locally under `.tools/` with sha256 verification.
 
 ## Update
 
@@ -92,7 +92,8 @@ x-backup migrate --profile prod --target mongodb://newcluster --force # direct c
 
 `migrate` copies one MongoDB straight into another — `mongodump | mongorestore` streamed
 directly, no intermediate file. Use it for one-off moves where you don't need a stored,
-verifiable backup.
+verifiable backup. Unlike `backup`/`restore`, `migrate` always uses the mongodump engine,
+so it needs `mongodump` and `mongorestore` on PATH (a driver-native migrate is a roadmap item).
 
 ```bash
 x-backup migrate --profile prod --target mongodb://newcluster --dry-run
@@ -166,7 +167,7 @@ Any value can be overridden by an `XB_`-prefixed environment variable (`XB_DESTI
 
 ### Multiple destinations
 
-Back up to several places at once with `[[...destinations]]` (an array). mongodump runs
+Back up to several places at once with `[[...destinations]]` (an array). The backup runs
 once; the artifact is then replicated **byte-for-byte** to each destination, so every copy
 has the same checksum and the same backup id — `verify`/`restore` work against any of them.
 
@@ -190,6 +191,28 @@ policy is **primary required, the rest are warnings**: if the primary fails the 
 fails; if a secondary fails the backup still succeeds with exit 4 (warning) naming the
 failed destination. Restore reads from the primary by default; `restore --from <name>`
 picks a specific replica.
+
+### Backup engine
+
+Each profile picks how it reads and writes MongoDB with `mode.engine`. The default is
+`native` — no external binaries needed.
+
+```toml
+[profiles.prod.mode]
+engine = "native"     # native (default) | mongodump
+```
+
+| Engine | External tools | Archive format | What it captures | Use when |
+|--------|---------------|----------------|------------------|----------|
+| `native` (default) | none | `xb-native-v1` | data + indexes + collection options (capped, validator, collation, …) | the default — zero dependencies, single binary |
+| `mongodump` | `mongodump` / `mongorestore` on PATH | mongodump `--archive` | whatever mongodump emits, plus consistent in-archive `--oplog` | you specifically want mongodump's archive or its in-dump oplog snapshot |
+
+Both engines stream through the same compress → encrypt pipeline and record oplog
+timestamps for chaining, so incremental/PITR work the same way. The engine that produced a
+backup is recorded in the manifest (`tool_versions.archive_format`), and `restore` dispatches
+automatically — a `native` archive is restored through the driver, a mongodump archive
+through `mongorestore`. You can restore an old mongodump backup even after switching the
+profile to `native`.
 
 ### Exit codes
 

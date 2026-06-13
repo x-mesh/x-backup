@@ -66,6 +66,15 @@ pub struct ModeConfig {
     /// 백업 전 status 자동 선행 여부.
     #[serde(default = "default_true")]
     pub precheck: bool,
+    /// 백업/복구 엔진(native | mongodump). 기본 `native`(외부 도구 불필요).
+    ///
+    /// - `native`: 드라이버로 직접 백업/복구(데이터+인덱스+옵션, 자체 아카이브 포맷).
+    /// - `mongodump`: 외부 `mongodump`/`mongorestore` 오케스트레이션(시점 일관 `--oplog` 지원).
+    ///
+    /// 복구는 백업이 어떤 엔진으로 만들어졌는지(manifest.archive_format)를 따라가므로,
+    /// 이 값은 *새 백업*과 *증분 PITR replay 경로* 선택에만 영향을 준다.
+    #[serde(default = "default_engine")]
+    pub engine: String,
 }
 
 impl Default for ModeConfig {
@@ -74,6 +83,7 @@ impl Default for ModeConfig {
             backup_type: default_backup_type(),
             output: default_output(),
             precheck: default_true(),
+            engine: default_engine(),
         }
     }
 }
@@ -230,6 +240,9 @@ fn default_backup_type() -> String {
 }
 fn default_output() -> String {
     "progress".to_string()
+}
+fn default_engine() -> String {
+    "native".to_string()
 }
 fn default_compression_algorithm() -> String {
     "zstd".to_string()

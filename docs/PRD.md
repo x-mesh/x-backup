@@ -12,7 +12,8 @@
 운영 중인 MongoDB를 **암호화·검증 가능·복구 가능**한 형태로 백업하고, 로컬 또는 원격(S3 호환)에서 일관되게 복구하는 단일 바이너리 CLI를 제공한다.
 
 ### 1.2 설계 원칙
-- 본 도구는 `mongodump`/`mongorestore`를 **오케스트레이션**한다. 백업 속도는 dump 툴·I/O·네트워크가 결정하며, Rust의 실익은 *단일 바이너리 배포 · 견고한 에러 처리 · async 파이프라인 · 암호화/압축 생태계*다.
+- **기본은 드라이버 네이티브 엔진**(외부 의존 없음). MongoDB Rust 드라이버로 직접 데이터·인덱스·컬렉션 옵션을 읽어 자체 아카이브 포맷(`xb-native-v1`)으로 스트리밍한다. 단일 바이너리만으로 백업/복구가 완결된다. `mongodump`/`mongorestore` **오케스트레이션은 opt-in 엔진**(`mode.engine = "mongodump"`)으로 유지한다 — mongodump 아카이브나 덤프 내장 `--oplog` 일관 스냅샷이 필요한 경우. 엔진 선택과 복구 분기는 §10.1 참조.
+- Rust의 실익은 *단일 바이너리 배포 · 견고한 에러 처리 · async 파이프라인 · 암호화/압축 생태계*이며, 네이티브 엔진은 여기에 *외부 도구 의존 제거*를 더한다.
 - **"백업 존재 ≠ 복구 가능".** 무결성 검증(`verify`)을 1급 기능으로 둔다.
 - **암호화는 기본 경로.** 평문 백업은 명시적 `--no-encrypt`가 있어야만 가능.
 - **증분은 oplog에 종속적.** 토폴로지 전제를 조용히 우회하지 않고 명시적으로 처리한다.
@@ -350,6 +351,20 @@ Manifest        : 메타·체크섬·oplog ts·체인 기록/조회
 - 후보 크레이트(빌드 시 버전·관리상태 재검증): `tokio`, `clap`, `zstd`, `age` 또는 `aes-gcm`, S3 클라이언트(예: `aws-sdk-s3` 또는 멀티백엔드 추상화), `sha2`, `serde`/`serde_json`, `indicatif`, `tracing`.
 > 크레이트는 후보이며 **현 시점 단정하지 않는다.**
 
+### 10.1 백업 엔진 선택 (native | mongodump)
+
+프로파일 `mode.engine`으로 dump/restore를 수행할 엔진을 고른다. **기본 `native`.**
+
+| 엔진 | 외부 도구 | 아카이브 포맷 | 캡처(1차 스코프) | dump 경로 | restore 경로 |
+|------|----------|--------------|-----------------|----------|-------------|
+| `native`(기본) | 없음 | `xb-native-v1` | 데이터 + 인덱스 + 컬렉션 옵션(capped·validator·collation 등) | 드라이버 커서 → 태그+BSON 프레임 스트림(`DuplexStream` + spawn task, 상수 메모리) | 프레임 파싱 → `create`(옵션) + `createIndexes` + `insert_many` 배치 |
+| `mongodump` | `mongodump`/`mongorestore` | mongodump `--archive` | mongodump 산출물 + 아카이브 내장 `--oplog` 일관 스냅샷 | `mongodump --archive=-` stdout | `mongorestore --archive=-` stdin |
+
+- **공통:** 두 엔진 모두 동일한 압축→암호화 파이프라인(§7)을 통과하고, 풀 백업 시 체이닝용 oplog 타임스탬프를 드라이버로 기록한다(엔진 무관). 증분 캡처는 항상 드라이버 oplog 리더(§6.3)다.
+- **복구 분기:** 백업을 만든 엔진은 manifest `tool_versions.archive_format`에 기록된다. `restore`는 이 값으로 자동 분기한다 — `xb-native-v1`이면 드라이버 네이티브 복구, 그 외(mongodump)는 `mongorestore`. 프로파일 엔진을 바꿔도 과거 백업은 원래 엔진 경로로 복구된다.
+- **네이티브 1차 스코프 제외:** view·timeseries 등 비일반 컬렉션은 건너뛰고 경고한다(후속 확장). mongodump 엔진의 아카이브 내장 일관 `--oplog` 스냅샷은 네이티브에 없다(네이티브는 풀 백업 시점의 oplog *타임스탬프*만 기록).
+- **migrate 명령:** 현재 항상 mongodump 엔진(파일 없는 `mongodump | mongorestore` 파이프)을 사용한다 — 드라이버 네이티브 migrate는 로드맵.
+
 ---
 
 ## 11. 비기능 요구사항
@@ -358,7 +373,7 @@ Manifest        : 메타·체크섬·oplog ts·체인 기록/조회
 - **이식성:** 단일 정적 바이너리. Linux x86_64/arm64 우선, macOS 개발 지원.
 - **보안:** 시크릿 로그 미출력. 기본 암호화. 임시 파일 권한 제한. **자식 프로세스(`mongodump`/`mongorestore`)에 시크릿을 argv로 전달 금지**(`ps`에 평문 노출) — 환경변수 또는 권한 제한된 임시 config 파일로 전달.
 - **관측성:** 구조화 로그(JSON 옵션). 마지막 성공 시각·소요·크기 메트릭 노출은 로드맵.
-- **외부 의존:** `mongodump`/`mongorestore` 존재·버전, 서버 토폴로지·oplog·권한을 `status`로 사전 점검(FR-8).
+- **외부 의존:** 기본 `native` 엔진은 외부 도구 의존이 없다(드라이버만 사용). `mongodump` 엔진을 선택한 경우에만 `mongodump`/`mongorestore` 존재·버전을 `status` 사전 점검에 포함한다(FR-8) — 네이티브 엔진은 도구 존재 점검을 건너뛴다. 서버 토폴로지·oplog·권한 점검은 엔진과 무관히 수행한다.
 
 ### 11.1 수용 기준 (1차 릴리스 게이트)
 측정 가능한 완료 조건. 수치는 기준 환경 확정 시 조정할 수 있으나, 항목 자체는 릴리스 전 실측 충족을 요구한다.

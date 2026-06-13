@@ -7,3 +7,4 @@
 //! TODO(후속 태스크 t5/t8/t14): restore(mongorestore)·증분 oplog 캡처·status 점검.
 
 pub mod mongo;
+pub mod native;

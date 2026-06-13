@@ -387,7 +387,13 @@ impl StatusChecker {
     /// 하나라도 `Fail`이면 [`StatusReport::overall`]이 `Fail`이 되어 호출자가 exit 3으로
     /// 백업을 미시작한다(PRD §FR-8). 경고(예: oplog 윈도우)는 여기서 보지 않는다 —
     /// 전체 status가 담당.
-    pub async fn precheck_subset(&self, profile: &str, mongodump_program: &str) -> StatusReport {
+    /// `mongodump_program`이 `Some`이면 외부 도구 존재를 점검한다(mongodump 엔진). 네이티브
+    /// 엔진은 외부 도구가 필요 없으므로 `None`을 넘겨 도구 점검을 생략한다.
+    pub async fn precheck_subset(
+        &self,
+        profile: &str,
+        mongodump_program: Option<&str>,
+    ) -> StatusReport {
         let mut items = Vec::new();
         items.push(self.check_connection().await);
 
@@ -399,7 +405,10 @@ impl StatusChecker {
         let hello = self.run_admin(doc! { "hello": 1 }).await;
         items.push(self.check_topology_core(&hello));
         items.push(self.check_privileges().await);
-        items.push(check_tool_presence(mongodump_program));
+        // 네이티브 엔진은 외부 도구 불필요 — mongodump 점검을 건너뛴다.
+        if let Some(program) = mongodump_program {
+            items.push(check_tool_presence(program));
+        }
 
         StatusReport::new(profile, items)
     }

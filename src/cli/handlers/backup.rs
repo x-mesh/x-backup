@@ -18,7 +18,7 @@ use crate::crypto::build_encrypt_stage;
 use crate::engine::mongo::status::{CheckStatus, StatusChecker};
 use crate::error::{Result, XBackupError};
 use crate::manifest::schema::CompressionMeta;
-use crate::pipeline::backup::{run_full_backup_with_meta, BackupMeta, BackupRequest};
+use crate::pipeline::backup::{run_full_backup_with_meta, BackupMeta, BackupRequest, Engine};
 use crate::pipeline::incremental::{
     run_incremental_backup, IncrementalOutcome, IncrementalRequest,
 };
@@ -83,8 +83,10 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
     //   PRD §9). 전체 status보다 가벼운 서브셋([`StatusChecker::precheck_subset`])으로, 백업을
     //   *막는* 결함(Fail)만 본다. 하나라도 Fail이면 PrecheckFailed(exit 3)로 백업을 미시작한다.
     //   --skip-precheck면 우회한다(읽기 전용·무부작용).
+    // 엔진 결정(native | mongodump) — 사전 점검(도구 존재 여부)과 덤프 경로 양쪽이 쓴다.
+    let engine = Engine::parse(&resolved.profile.mode.engine)?;
     if !args.skip_precheck {
-        run_precheck(&uri, &resolved.profile_name, timeout_secs).await?;
+        run_precheck(&uri, &resolved.profile_name, timeout_secs, engine).await?;
     } else {
         tracing::warn!("--skip-precheck 지정 — 백업 사전 점검을 건너뜁니다(FR-8 우회)");
     }
@@ -114,6 +116,7 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
         db: args.db.clone(),
         collection: args.collection.clone(),
         timeout_secs,
+        engine,
         progress_counter: Some(std::sync::Arc::clone(&progress_counter)),
     };
     let (stages, meta) = build_stages(&resolved, &args)?;
@@ -236,6 +239,7 @@ async fn handle_incremental(
         uri: uri.clone(),
         mongodump_program: "mongodump".to_string(),
         timeout_secs: resolved.profile.source.connect_timeout_secs,
+        engine: Engine::parse(&resolved.profile.mode.engine)?,
     };
     // 캡처/승격 양쪽에서 동일 구성의 새 StageStack을 만들 수 있도록 팩토리로 넘긴다.
     let stage_factory = || build_stages(resolved, args);
@@ -326,14 +330,24 @@ async fn handle_incremental(
 /// 전체 `status`보다 가벼운 [`StatusChecker::precheck_subset`]로 백업을 *막는* 결함만 본다.
 /// 보고서 신호등이 `Fail`이면 [`XBackupError::PrecheckFailed`](exit 3)로 백업을 미시작한다.
 /// `Warn`은 백업을 막지 않는다(로그만; 전체 status가 경고를 상세히 다룬다). 읽기 전용이다.
-async fn run_precheck(uri: &Secret, profile: &str, timeout_secs: Option<u64>) -> Result<()> {
+async fn run_precheck(
+    uri: &Secret,
+    profile: &str,
+    timeout_secs: Option<u64>,
+    engine: Engine,
+) -> Result<()> {
     let checker = StatusChecker::connect(uri, timeout_secs)
         .await
         .map_err(|e| {
             // connect 준비 실패(URI 파싱 등)는 사전 점검 실패로 본다(백업 미시작).
             XBackupError::PrecheckFailed(format!("사전 점검 연결 준비 실패: {e}"))
         })?;
-    let report = checker.precheck_subset(profile, "mongodump").await;
+    // 네이티브 엔진은 외부 도구 불필요 — mongodump 존재 점검을 생략한다.
+    let tool = match engine {
+        Engine::Mongodump => Some("mongodump"),
+        Engine::Native => None,
+    };
+    let report = checker.precheck_subset(profile, tool).await;
 
     // 점검 항목을 로그로 남긴다(진단용 — stdout 결과 오염 금지, tracing은 stderr).
     for item in &report.items {

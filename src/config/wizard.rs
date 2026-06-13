@@ -238,6 +238,7 @@ pub fn run_wizard(prompt: &mut dyn Prompt) -> Result<Config> {
             backup_type: "full".to_string(),
             output,
             precheck: true,
+            engine: "native".to_string(),
         },
         source: SourceConfig {
             uri: None,

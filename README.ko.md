@@ -7,12 +7,13 @@
 > MongoDB 백업·복구 CLI — 풀/증분(oplog), PITR, 로컬/S3 호환 스토리지, 암호화 중심. Rust 단일 바이너리.
 
 운영 중인 MongoDB(standalone/replica set)를 **암호화·검증 가능·복구 가능**한 형태로 백업한다.
-`mongodump`/`mongorestore`를 오케스트레이션하며, 전 구간 스트리밍(데이터 크기와 무관한
-상수 메모리 — [실측 보고서](docs/memory-profile.md): 6 GiB 백업 피크 RSS 54.6 MiB)으로 동작한다.
+기본적으로 Rust 드라이버로 MongoDB와 **직접** 통신하므로 **`mongodump`/`mongorestore`가 필요 없다.**
+전 구간 스트리밍(데이터 크기와 무관한 상수 메모리 — [실측 보고서](docs/memory-profile.md):
+6 GiB 백업 피크 RSS 54.6 MiB)으로 동작한다.
 
 ## Features
 
-- ✅ **풀 백업** — `mongodump --archive --oplog` 스트리밍, 시점 일관성
+- ✅ **풀 백업** — 드라이버 네이티브 스트리밍 아카이브(데이터 + 인덱스 + 컬렉션 옵션), 외부 도구 불필요. `mongodump --archive --oplog`는 opt-in 엔진으로 선택 가능
 - ✅ **증분 백업** — oplog 직접 캡처, gap 감지 시 풀 백업 자동 승격(exit 4)
 - ✅ **PITR** — `--at <RFC3339>` 시점 복구 (base + oplog replay, 체인 검증 전제)
 - ✅ **스토리지** — 로컬 디스크 / S3 호환(MinIO·R2·OCI), 스트리밍 멀티파트 + abort
@@ -57,7 +58,8 @@ git clone git@github.com:x-mesh/x-backup.git && cd x-backup
 make build        # → target/release/x-backup
 ```
 
-전제: `mongodump`/`mongorestore`(MongoDB Database Tools 100.x)가 PATH에 필요하다 —
+기본 `native` 엔진은 외부 도구가 필요 없다. `mongodump`/`mongorestore`(MongoDB Database
+Tools 100.x)는 `mongodump` 엔진을 선택할 때만 PATH에 필요하다([백업 엔진](#백업-엔진) 참조) —
 `make tools`로 프로젝트 로컬(.tools/)에 sha256 검증 설치 가능.
 
 ## Update
@@ -95,6 +97,8 @@ x-backup migrate --profile prod --target mongodb://newcluster --force # 파일 �
 
 `migrate`는 한 MongoDB를 다른 MongoDB로 바로 복사한다 — `mongodump | mongorestore`를
 중간 파일 없이 직접 스트리밍한다. 저장·검증 가능한 백업본이 필요 없는 일회성 이전에 쓴다.
+`backup`/`restore`와 달리 `migrate`는 항상 mongodump 엔진을 사용하므로 `mongodump`/
+`mongorestore`가 PATH에 필요하다(드라이버 네이티브 migrate는 로드맵 항목).
 
 ```bash
 x-backup migrate --profile prod --target mongodb://newcluster --dry-run
@@ -166,7 +170,7 @@ recipient_file = "/etc/x-backup/age.pub"   # 공개키만 — 개인키는 복�
 
 ### 여러 destination
 
-`[[...destinations]]`(배열)로 여러 곳에 동시 백업한다. mongodump는 한 번만 돌고,
+`[[...destinations]]`(배열)로 여러 곳에 동시 백업한다. 백업은 한 번만 돌고,
 산출물을 각 destination으로 **바이트 단위 동일하게** 복제하므로 모든 복제본이 같은
 체크섬·같은 백업 id를 갖는다 — 어느 복제본에서든 `verify`/`restore`가 동일하게 동작한다.
 
@@ -189,6 +193,27 @@ credentials_env = "S3_CREDS"
 나머지는 경고**다: primary가 실패하면 백업 실패, 보조가 실패하면 백업은 성공하되
 exit 4(경고)로 실패한 destination을 알린다. 복구는 기본적으로 primary에서 읽고,
 `restore --from <name>`으로 특정 복제본을 고른다.
+
+### 백업 엔진
+
+프로파일마다 `mode.engine`으로 MongoDB를 읽고 쓰는 방식을 고른다. 기본값은 `native`로,
+외부 바이너리가 필요 없다.
+
+```toml
+[profiles.prod.mode]
+engine = "native"     # native(기본) | mongodump
+```
+
+| 엔진 | 외부 도구 | 아카이브 포맷 | 캡처 대상 | 사용 시점 |
+|------|----------|--------------|----------|----------|
+| `native`(기본) | 없음 | `xb-native-v1` | 데이터 + 인덱스 + 컬렉션 옵션(capped·validator·collation 등) | 기본 — 의존성 없는 단일 바이너리 |
+| `mongodump` | PATH의 `mongodump`/`mongorestore` | mongodump `--archive` | mongodump가 내보내는 것 + 아카이브 내장 `--oplog` 일관 스냅샷 | mongodump 아카이브나 덤프 내장 oplog가 꼭 필요할 때 |
+
+두 엔진 모두 동일한 압축 → 암호화 파이프라인을 통과하고 체이닝용 oplog 타임스탬프를
+기록하므로 증분/PITR 동작은 같다. 백업을 만든 엔진은 manifest(`tool_versions.archive_format`)에
+기록되고, `restore`가 자동으로 분기한다 — `native` 아카이브는 드라이버로, mongodump
+아카이브는 `mongorestore`로 복구한다. 프로파일을 `native`로 바꾼 뒤에도 예전 mongodump
+백업을 복구할 수 있다.
 
 ### Exit codes
 

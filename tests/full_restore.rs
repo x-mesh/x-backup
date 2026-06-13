@@ -33,7 +33,7 @@ use x_backup::manifest::schema::{
     BackupManifest, BackupStatus, BackupType, Topology, FORMAT_VERSION,
 };
 use x_backup::manifest::store::{data_path, ManifestStore};
-use x_backup::pipeline::backup::{run_full_backup, BackupRequest};
+use x_backup::pipeline::backup::{run_full_backup, BackupRequest, Engine};
 use x_backup::pipeline::restore::{run_restore, RestoreRequest};
 use x_backup::pipeline::stage::StageStack;
 use x_backup::storage::{BoxAsyncRead, LocalFs, Storage};
@@ -135,8 +135,10 @@ async fn backup_then_restore_matches_counts_and_hash() {
     let backup_request = BackupRequest {
         uri: Secret::new(src.clone()),
         mongodump_program: mongodump_program(),
+        timeout_secs: None,
         db: None,
         collection: None,
+        engine: Engine::Mongodump,
         progress_counter: None,
     };
     let backup = run_full_backup(&backup_request, &storage, StageStack::new())
@@ -161,6 +163,7 @@ async fn backup_then_restore_matches_counts_and_hash() {
     let restore_request = RestoreRequest {
         target_uri: Secret::new(tgt.clone()),
         mongorestore_program: mongorestore_program(),
+        timeout_secs: None,
         backup_id: Some(backup.backup_id.clone()),
         only: None,
         force: true,
@@ -199,8 +202,10 @@ async fn dry_run_does_not_modify_target() {
         &BackupRequest {
             uri: Secret::new(src.clone()),
             mongodump_program: mongodump_program(),
+            timeout_secs: None,
             db: None,
             collection: None,
+            engine: Engine::Mongodump,
             progress_counter: None,
         },
         &storage,
@@ -218,6 +223,7 @@ async fn dry_run_does_not_modify_target() {
     let request = RestoreRequest {
         target_uri: Secret::new(tgt.clone()),
         mongorestore_program: mongorestore_program(),
+        timeout_secs: None,
         backup_id: Some(backup.backup_id.clone()),
         only: None,
         force: false,
@@ -317,6 +323,7 @@ async fn restore_half_matches_with_real_mongorestore() {
     let request = RestoreRequest {
         target_uri: Secret::new(tgt.clone()),
         mongorestore_program: mongorestore_program(),
+        timeout_secs: None,
         backup_id: Some(backup_id.to_string()),
         only: None,
         force: true,

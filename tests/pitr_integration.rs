@@ -29,7 +29,7 @@ use bson::{doc, Document};
 use mongodb::Client;
 
 use x_backup::config::secret::Secret;
-use x_backup::pipeline::backup::{run_full_backup, BackupMeta, BackupRequest};
+use x_backup::pipeline::backup::{run_full_backup, BackupMeta, BackupRequest, Engine};
 use x_backup::pipeline::incremental::{
     run_incremental_backup, IncrementalOutcome, IncrementalRequest,
 };
@@ -132,8 +132,10 @@ async fn pitr_recovers_to_point_between_writes() {
     let full_req = BackupRequest {
         uri: Secret::new(uri.clone()),
         mongodump_program: mongodump_program(),
+        timeout_secs: None,
         db: None,
         collection: None,
+        engine: Engine::Mongodump,
         progress_counter: None,
     };
     let full = run_full_backup(&full_req, &storage, StageStack::new())
@@ -148,6 +150,8 @@ async fn pitr_recovers_to_point_between_writes() {
     let incr_req = IncrementalRequest {
         uri: Secret::new(uri.clone()),
         mongodump_program: mongodump_program(),
+        timeout_secs: None,
+        engine: Engine::Mongodump,
     };
     let incr1 = run_incremental_backup(&incr_req, &storage, identity_factory())
         .await
@@ -193,6 +197,7 @@ async fn pitr_recovers_to_point_between_writes() {
     let pitr_req = PitrRequest {
         target_uri: Secret::new(uri.clone()),
         mongorestore_program: mongorestore_program(),
+        timeout_secs: None,
         at: at_rfc3339.clone(),
         force: true, // 빈 대상이지만 명시(가드 통과).
         dry_run: false,
@@ -244,8 +249,10 @@ async fn pitr_dry_run_does_not_modify_target() {
         &BackupRequest {
             uri: Secret::new(uri.clone()),
             mongodump_program: mongodump_program(),
+            timeout_secs: None,
             db: None,
             collection: None,
+            engine: Engine::Mongodump,
             progress_counter: None,
         },
         &storage,
@@ -260,6 +267,8 @@ async fn pitr_dry_run_does_not_modify_target() {
         &IncrementalRequest {
             uri: Secret::new(uri.clone()),
             mongodump_program: mongodump_program(),
+            timeout_secs: None,
+            engine: Engine::Mongodump,
         },
         &storage,
         identity_factory(),
@@ -277,6 +286,7 @@ async fn pitr_dry_run_does_not_modify_target() {
         &PitrRequest {
             target_uri: Secret::new(uri.clone()),
             mongorestore_program: mongorestore_program(),
+            timeout_secs: None,
             at: at_rfc3339,
             force: false,
             dry_run: true,

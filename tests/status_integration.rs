@@ -31,7 +31,7 @@ fn test_uri() -> String {
 #[tokio::test]
 #[ignore = "requires mongodump + replica set; run with --features integration-tests"]
 async fn full_status_emits_all_check_items() {
-    let checker = StatusChecker::connect(&Secret::new(test_uri()))
+    let checker = StatusChecker::connect(&Secret::new(test_uri()), None)
         .await
         .expect("status 연결");
 
@@ -88,7 +88,7 @@ async fn full_status_emits_all_check_items() {
 #[tokio::test]
 #[ignore = "requires mongodump + replica set; run with --features integration-tests"]
 async fn full_status_serializes_json() {
-    let checker = StatusChecker::connect(&Secret::new(test_uri()))
+    let checker = StatusChecker::connect(&Secret::new(test_uri()), None)
         .await
         .expect("status 연결");
     let report = checker.full_report("test", "mongodump", "15m", false).await;
@@ -107,10 +107,10 @@ async fn full_status_serializes_json() {
 #[tokio::test]
 #[ignore = "requires mongodump + replica set; run with --features integration-tests"]
 async fn precheck_subset_passes_on_healthy_replica_set() {
-    let checker = StatusChecker::connect(&Secret::new(test_uri()))
+    let checker = StatusChecker::connect(&Secret::new(test_uri()), None)
         .await
         .expect("status 연결");
-    let report = checker.precheck_subset("test", "mongodump").await;
+    let report = checker.precheck_subset("test", Some("mongodump")).await;
 
     // 서브셋은 연결·토폴로지·권한·도구 존재만 본다.
     let keys: BTreeSet<&str> = report.items.iter().map(|i| i.key).collect();
