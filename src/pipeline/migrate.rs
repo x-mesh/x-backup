@@ -1,27 +1,33 @@
 //! 직접 마이그레이션 파이프라인 — source MongoDB → target MongoDB로 **파일 없이** 복사.
 //!
-//! 백업/복구와 달리 저장 산출물(manifest·체크섬·암호화)을 만들지 않는다. mongodump의
-//! archive stdout을 mongorestore의 stdin으로 곧장 흘린다(한 번에, 디스크 경유 없음):
+//! 백업/복구와 달리 저장 산출물(manifest·체크섬·암호화)을 만들지 않는다. 엔진에 따라
+//! 두 경로가 있다(프로파일 `mode.engine`, 기본 `native`):
 //! ```text
-//! mongodump --archive=- (source) ─▶ stdout │ stdin ◀─ mongorestore --archive=- (target)
+//! native    : NativeDumper(source) ─▶ xb-native-v1 스트림 ─▶ native_restore(target)  [외부 도구 불필요]
+//! mongodump : mongodump --archive=- (source) ─▶ stdout │ stdin ◀─ mongorestore --archive=- (target)
 //! ```
+//! 어느 경로든 디스크를 경유하지 않고 한 번에 흐른다(상수 메모리).
 //!
 //! ## 일관성 주의
-//! `--oplog`를 쓰지 않으므로(직접 복사 경로에는 oplogReplay 단계가 없다) 컬렉션 간
-//! 단일 시점 일관성은 보장하지 않는다 — 평범한 `mongodump | mongorestore`와 동일한
-//! 프로파일이다. 쓰기가 많은 운영 replica set을 정확한 시점으로 옮기려면 파일 경유
-//! 경로(`backup` → `restore --target`, `--oplog`/PITR 지원)를 쓴다.
+//! 직접 복사 경로에는 oplogReplay 단계가 없어(native·mongodump 모두 `--oplog` 미사용)
+//! 컬렉션 간 단일 시점 일관성은 보장하지 않는다. 쓰기가 많은 운영 replica set을 정확한
+//! 시점으로 옮기려면 파일 경유 경로(`backup` → `restore --target`, `--oplog`/PITR)를 쓴다.
 //!
-//! ## 시크릿·프로세스 안전(백업/복구와 동일)
-//! - source/target URI는 0600 임시 config(`--uri` 파일)로 전달 — `ps`에 평문 노출 없음.
-//! - 양쪽 자식 프로세스의 stderr는 독립 drain, 종료는 exit code로만 판정, 실패 시
-//!   kill+wait로 정리(좀비 방지).
+//! ## 시크릿·프로세스 안전
+//! - native: 드라이버가 직접 연결(자식 프로세스 없음). URI는 시크릿으로만 다룬다.
+//! - mongodump: source/target URI를 0600 임시 config(`--uri` 파일)로 전달(`ps` 노출 없음),
+//!   양쪽 자식 stderr는 독립 drain, 종료는 exit code로 판정, 실패 시 kill+wait로 정리.
+
+use mongodb::Client;
 
 use crate::config::secret::Secret;
 use crate::engine::mongo::{
-    DumpProcess, DumpSpec, MongoMeta, RestoreProcess, RestoreSpec, UriConfigFile,
+    conn, DumpProcess, DumpSpec, MongoMeta, RestoreProcess, RestoreSpec, UriConfigFile,
 };
+use crate::engine::native::backup::NativeDumper;
+use crate::engine::native::restore::native_restore;
 use crate::error::{Result, XBackupError};
+use crate::pipeline::backup::Engine;
 
 /// 마이그레이션 요청.
 pub struct MigrateRequest {
@@ -29,9 +35,11 @@ pub struct MigrateRequest {
     pub source_uri: Secret,
     /// target(대상) MongoDB URI 시크릿.
     pub target_uri: Secret,
-    /// mongodump 실행파일 경로(보통 `"mongodump"`).
+    /// 전송 엔진(native | mongodump). 기본 native(프로파일 `mode.engine`).
+    pub engine: Engine,
+    /// mongodump 실행파일 경로(보통 `"mongodump"`; mongodump 엔진에서만 사용).
     pub mongodump_program: String,
-    /// mongorestore 실행파일 경로(보통 `"mongorestore"`).
+    /// mongorestore 실행파일 경로(보통 `"mongorestore"`; mongodump 엔진에서만 사용).
     pub mongorestore_program: String,
     /// 선택적 마이그레이션 — 특정 DB만(`--db`).
     pub db: Option<String>,
@@ -199,11 +207,61 @@ where
         }
     }
 
+    // 엔진별 전송. native는 드라이버 직접(외부 도구 없음), mongodump는 자식 프로세스 파이프.
+    match request.engine {
+        Engine::Native => native_transfer(request, &plan).await?,
+        Engine::Mongodump => mongodump_transfer(request, &plan).await?,
+    }
+
+    let source_topology = plan.source_topology.clone();
+    Ok((
+        plan,
+        Some(MigrateOutcome {
+            source_topology,
+            target_had_data,
+        }),
+    ))
+}
+
+/// native 전송 — `NativeDumper`(source) 스트림을 `native_restore`(target)로 곧장 흘린다.
+///
+/// 백업 경로와 동일한 패턴: 덤프 task가 xb-native-v1 프레임을 [`DuplexStream`]에 쓰고,
+/// 복구가 그 스트림을 읽어 create(옵션)+createIndexes+insert_many로 target에 적재한다.
+/// EOF 후 덤프 핸들을 회수해 source 측 오류를 전파한다(외부 도구·디스크 없음).
+///
+/// [`DuplexStream`]: tokio::io::DuplexStream
+async fn native_transfer(request: &MigrateRequest, plan: &MigratePlan) -> Result<()> {
+    let dumper = NativeDumper::connect(&request.source_uri, request.timeout_secs).await?;
+    let mut stream = dumper.dump_stream(request.db.clone(), request.collection.clone());
+    let handle = stream.handle();
+
+    // target 드라이버 클라이언트(복구 경로와 동일 정책).
+    let options = conn::client_options(&request.target_uri, request.timeout_secs)
+        .await
+        .map_err(|e| XBackupError::PrecheckFailed(format!("target 연결 준비 실패: {e}")))?;
+    let client = Client::with_options(options)
+        .map_err(|e| XBackupError::Failure(format!("target 클라이언트 생성 실패: {e}")))?;
+
+    let restore_res = native_restore(&mut stream, &client, request.drop, plan.ns.as_deref()).await;
+    // 리더를 닫아 덤프 task가 EOF/BrokenPipe로 끝나게 한 뒤 결과를 회수한다.
+    drop(stream);
+    let dump_res = handle.finish().await;
+
+    let inserted = restore_res?; // target 적재 오류 우선 전파.
+    dump_res?; // 그 다음 source 덤프 오류.
+    tracing::info!(inserted, "네이티브 마이그레이션 완료(파일 없음)");
+    Ok(())
+}
+
+/// mongodump 전송 — `mongodump --archive=-` stdout을 `mongorestore --archive=-` stdin으로 복사.
+///
+/// 직접 복사 경로라 `--oplog`는 쓰지 않는다(모듈 문서 참조). source/target URI는 0600 임시
+/// config로 전달하고, 실패 시 양쪽 자식을 kill+wait로 정리한다(좀비 방지).
+async fn mongodump_transfer(request: &MigrateRequest, plan: &MigratePlan) -> Result<()> {
     // source/target URI를 각각 0600 임시 config로(argv 노출 금지). 핸들은 종료까지 유지.
     let source_cfg = UriConfigFile::create(&request.source_uri)?;
     let target_cfg = UriConfigFile::create(&request.target_uri)?;
 
-    // mongodump(source) 스폰 — 직접 복사 경로라 --oplog는 쓰지 않는다(모듈 문서 참조).
     let dump_spec = DumpSpec {
         program: request.mongodump_program.clone(),
         uri_config_path: source_cfg.path().to_string(),
@@ -244,16 +302,7 @@ where
         restore.abort().await;
         return Err(dump_err);
     }
-    restore.wait().await?;
-
-    let source_topology = plan.source_topology.clone();
-    Ok((
-        plan,
-        Some(MigrateOutcome {
-            source_topology,
-            target_had_data,
-        }),
-    ))
+    restore.wait().await
 }
 
 /// 데이터 있는 target에 대한 마이그레이션 가드 판정(순수 — 테스트 용이).

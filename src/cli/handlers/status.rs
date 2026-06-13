@@ -9,6 +9,9 @@
 use std::path::PathBuf;
 
 use crate::cli::args::StatusArgs;
+use crate::cli::table::{
+    display_width, pad, paint, use_color, BOLD, CYAN, RED, RESET, UNDERLINE, YELLOW,
+};
 use crate::config::env::collect_overrides_from_process;
 use crate::config::merged::MergeInput;
 use crate::config::ResolvedConfig;
@@ -172,35 +175,8 @@ fn overall_short(status: CheckStatus) -> &'static str {
 }
 
 // ───────────────────────── --all 비교(diff) 뷰 ─────────────────────────
-
-/// ANSI 색을 쓸지 — stdout이 TTY이고 `NO_COLOR`가 없을 때만.
-fn use_color() -> bool {
-    use std::io::IsTerminal;
-    std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
-}
-
-/// 동아시아 폭(Hangul·CJK·전각) 문자는 2칸, 그 외 1칸으로 표시 폭을 계산한다.
-fn display_width(s: &str) -> usize {
-    s.chars().map(|c| if is_wide(c) { 2 } else { 1 }).sum()
-}
-
-/// 터미널에서 2칸을 차지하는 광폭 문자인지(East Asian Wide, 간이 판정).
-fn is_wide(c: char) -> bool {
-    matches!(c as u32,
-        0x1100..=0x115F | 0x2E80..=0x303E | 0x3041..=0x33FF | 0x3400..=0x4DBF |
-        0x4E00..=0x9FFF | 0xA000..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF |
-        0xFE30..=0xFE4F | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6)
-}
-
-/// 표시 폭 기준으로 우측 공백 패딩(좌측 정렬).
-fn pad(s: &str, width: usize) -> String {
-    let w = display_width(s);
-    if w >= width {
-        s.to_string()
-    } else {
-        format!("{s}{}", " ".repeat(width - w))
-    }
-}
+//
+// 표시 폭 정렬(display_width/pad)·색(use_color/paint/색 코드)은 [`crate::cli::table`] 공용.
 
 /// `--all` 비교 뷰 — 왼쪽 첫 열(source 기준)과 나머지 프로파일을 차원별로 나란히 비교한다.
 ///
@@ -262,7 +238,7 @@ fn render_comparison(reports: &[StatusReport]) {
     // 4) 헤더.
     println!(
         "status --all 비교 — 기준(왼쪽): {}",
-        paint(&baseline.profile, BOLD, color)
+        paint(&baseline.profile, &[BOLD], color)
     );
     println!("{rule}");
     print!("  {}  ", pad("점검", label_w));
@@ -283,7 +259,7 @@ fn render_comparison(reports: &[StatusReport]) {
             .any(|r| cell_text(r, key).map(|(t, _)| t) != base_val);
 
         let gutter = if row_differs {
-            paint("Δ", CYAN, color)
+            paint("Δ", &[CYAN], color)
         } else {
             " ".to_string()
         };
@@ -332,23 +308,6 @@ fn render_comparison(reports: &[StatusReport]) {
         for n in notes {
             println!("{n}");
         }
-    }
-}
-
-// ANSI 색 코드(use_color()가 false면 미적용).
-const RESET: &str = "\x1b[0m";
-const BOLD: &str = "\x1b[1m";
-const UNDERLINE: &str = "\x1b[4m";
-const RED: &str = "\x1b[31m";
-const YELLOW: &str = "\x1b[33m";
-const CYAN: &str = "\x1b[36m";
-
-/// 단일 코드로 텍스트를 감싼다(color=false면 원문 그대로).
-fn paint(s: &str, code: &str, color: bool) -> String {
-    if color {
-        format!("{code}{s}{RESET}")
-    } else {
-        s.to_string()
     }
 }
 
@@ -503,22 +462,7 @@ mod tests {
         assert!(json.contains("\"value\":\"7.0.35\""));
     }
 
-    #[test]
-    fn display_width_counts_hangul_as_two() {
-        assert_eq!(display_width("abc"), 3);
-        assert_eq!(display_width("버전"), 4); // 한글 2자 × 2칸
-        assert_eq!(display_width("7.0.35"), 6);
-        // 중점(·)은 광폭이 아니다(1칸).
-        assert_eq!(display_width("연결·인증"), 9); // 연결(4)+·(1)+인증(4)
-    }
-
-    #[test]
-    fn pad_uses_display_width() {
-        // "버전"=4칸 → 폭 8이면 공백 4개.
-        assert_eq!(pad("버전", 8), "버전    ");
-        // 이미 폭 이상이면 그대로.
-        assert_eq!(pad("wiredTiger", 6), "wiredTiger");
-    }
+    // display_width/pad 자체 검증은 cli::table 모듈 테스트에 있다.
 
     #[test]
     fn fmt_cell_color_marks_diff_with_ansi() {

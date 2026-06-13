@@ -90,10 +90,12 @@ x-backup migrate --profile prod --target mongodb://newcluster --force # direct c
 
 ### Migrate (direct copy, no file)
 
-`migrate` copies one MongoDB straight into another — `mongodump | mongorestore` streamed
-directly, no intermediate file. Use it for one-off moves where you don't need a stored,
-verifiable backup. Unlike `backup`/`restore`, `migrate` always uses the mongodump engine,
-so it needs `mongodump` and `mongorestore` on PATH (a driver-native migrate is a roadmap item).
+`migrate` copies one MongoDB straight into another — streamed directly, no intermediate
+file. Use it for one-off moves where you don't need a stored, verifiable backup. Like
+`backup`/`restore`, it honours the profile's [engine](#backup-engine): the default `native`
+engine streams driver-to-driver with **no external tools**; the `mongodump` engine pipes
+`mongodump | mongorestore` instead. Either way it copies data, indexes, and collection
+options.
 
 ```bash
 x-backup migrate --profile prod --target mongodb://newcluster --dry-run
@@ -108,10 +110,10 @@ endpoints in `config.toml` instead of pasting URIs.
 **Target rules** (migrate means *replace*, and it never wipes the whole target):
 - **Empty target** → just copies, no flags needed.
 - **Target with data** → `--drop` is **required**. Without it, migrate is refused (exit 2):
-  a no-`--drop` copy would be a half-merge (mongorestore inserts; same-`_id` docs are kept,
-  stale docs remain) — almost never what a migration wants. With `--drop`, each collection
-  **present in the source** is dropped and recreated; other collections in the target are
-  left alone. The target database/instance is never fully dropped.
+  a no-`--drop` copy would be a half-merge (inserts without dropping; same-`_id` docs are
+  kept, stale docs remain) — almost never what a migration wants. With `--drop`, each
+  collection **present in the source** is dropped and recreated; other collections in the
+  target are left alone. The target database/instance is never fully dropped.
 - `--drop` is destructive, so it also needs `--force` (or an interactive confirm). A clean
   replace of the migrated collections is therefore `--drop --force`.
 

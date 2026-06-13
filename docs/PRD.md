@@ -363,7 +363,7 @@ Manifest        : 메타·체크섬·oplog ts·체인 기록/조회
 - **공통:** 두 엔진 모두 동일한 압축→암호화 파이프라인(§7)을 통과하고, 풀 백업 시 체이닝용 oplog 타임스탬프를 드라이버로 기록한다(엔진 무관). 증분 캡처는 항상 드라이버 oplog 리더(§6.3)다.
 - **복구 분기:** 백업을 만든 엔진은 manifest `tool_versions.archive_format`에 기록된다. `restore`는 이 값으로 자동 분기한다 — `xb-native-v1`이면 드라이버 네이티브 복구, 그 외(mongodump)는 `mongorestore`. 프로파일 엔진을 바꿔도 과거 백업은 원래 엔진 경로로 복구된다.
 - **네이티브 1차 스코프 제외:** view·timeseries 등 비일반 컬렉션은 건너뛰고 경고한다(후속 확장). mongodump 엔진의 아카이브 내장 일관 `--oplog` 스냅샷은 네이티브에 없다(네이티브는 풀 백업 시점의 oplog *타임스탬프*만 기록).
-- **migrate 명령:** 현재 항상 mongodump 엔진(파일 없는 `mongodump | mongorestore` 파이프)을 사용한다 — 드라이버 네이티브 migrate는 로드맵.
+- **migrate 명령:** backup/restore와 동일하게 프로파일 `mode.engine`을 따른다(기본 native). native면 `NativeDumper`(source) → `native_restore`(target)를 in-process로 직접 흘려 외부 도구 없이 복사하고, mongodump면 `mongodump | mongorestore` 파이프를 쓴다. 어느 쪽이든 파일·디스크 경유 없이 데이터+인덱스+옵션을 복사한다.
 
 ---
 

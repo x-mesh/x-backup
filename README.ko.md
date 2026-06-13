@@ -95,10 +95,11 @@ x-backup migrate --profile prod --target mongodb://newcluster --force # 파일 �
 
 ### Migrate (파일 없이 직접 복사)
 
-`migrate`는 한 MongoDB를 다른 MongoDB로 바로 복사한다 — `mongodump | mongorestore`를
-중간 파일 없이 직접 스트리밍한다. 저장·검증 가능한 백업본이 필요 없는 일회성 이전에 쓴다.
-`backup`/`restore`와 달리 `migrate`는 항상 mongodump 엔진을 사용하므로 `mongodump`/
-`mongorestore`가 PATH에 필요하다(드라이버 네이티브 migrate는 로드맵 항목).
+`migrate`는 한 MongoDB를 다른 MongoDB로 중간 파일 없이 바로 스트리밍 복사한다. 저장·검증
+가능한 백업본이 필요 없는 일회성 이전에 쓴다. `backup`/`restore`처럼 프로파일의
+[엔진](#백업-엔진)을 따른다 — 기본 `native` 엔진은 **외부 도구 없이** 드라이버끼리 직접
+스트리밍하고, `mongodump` 엔진은 `mongodump | mongorestore` 파이프를 쓴다. 어느 쪽이든
+데이터·인덱스·컬렉션 옵션을 복사한다.
 
 ```bash
 x-backup migrate --profile prod --target mongodb://newcluster --dry-run

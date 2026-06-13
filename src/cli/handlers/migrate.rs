@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use crate::cli::args::MigrateArgs;
 use crate::cli::output::{OutputFlags, OutputMode};
+use crate::cli::table::{self, Align, Table};
 use crate::config::env::collect_overrides_from_process;
 use crate::config::merged::MergeInput;
 use crate::config::secret::Secret;
@@ -75,9 +76,12 @@ pub async fn handle(config_path: Option<PathBuf>, args: MigrateArgs) -> Result<(
         Some(resolved.profile.mode.output.as_str()),
     );
 
+    // 전송 엔진은 source 프로파일의 mode.engine을 따른다(기본 native — 외부 도구 불필요).
+    let engine = crate::pipeline::backup::Engine::parse(&resolved.profile.mode.engine)?;
     let request = MigrateRequest {
         source_uri,
         target_uri,
+        engine,
         mongodump_program: "mongodump".to_string(),
         mongorestore_program: "mongorestore".to_string(),
         db: args.db.clone(),
@@ -171,25 +175,33 @@ fn print_plan(plan: &MigratePlan, json: bool) {
         None => println!("  대상 ns: 전체"),
     }
 
-    // 네임스페이스별 source vs target diff 표.
+    // 네임스페이스별 source vs target diff 표(표시 폭 정렬 + 동작별 색).
     if rows.is_empty() {
         println!("  (source에 사용자 데이터 없음)");
     } else {
-        println!(
-            "  {:<28} {:>8} {:>8}  동작",
-            "네임스페이스", "source", "target"
+        let color = table::use_color();
+        let mut t = Table::new(
+            &["네임스페이스", "source", "target", "동작"],
+            &[Align::Left, Align::Right, Align::Right, Align::Left],
         );
-        for (ns, s, t) in &rows {
-            let action = if *s == 0 {
-                "삭제 대상(source에 없음)".to_string()
-            } else if *t == 0 {
-                format!("+{s} (신규)")
+        for (ns, s, tgt) in &rows {
+            // migrate는 source→target 복사다. source에 없는 target 컬렉션은 **건드리지 않는다**
+            // (--drop은 전송하는 컬렉션만 drop). 따라서 s==0은 "유지(미전송)"가 맞다.
+            let (action, code): (String, &'static str) = if *s == 0 {
+                ("유지(source 없음 — 미전송)".to_string(), table::DIM)
+            } else if *tgt == 0 {
+                (format!("+{s} 신규"), table::GREEN)
             } else {
-                format!("교체(--drop) — target {t}건 덮어씀")
+                (
+                    format!("교체(--drop) — target {tgt}건 덮어씀"),
+                    table::YELLOW,
+                )
             };
-            println!("  {ns:<28} {s:>8} {t:>8}  {action}");
+            let cells = vec![ns.clone(), s.to_string(), tgt.to_string(), action];
+            t.row_styled(cells, vec![code]);
         }
-        println!("  {:-<54}", "");
+        println!("{}", t.render("  ", color));
+        println!("  {:─<width$}", "", width = t.total_width().min(72));
         println!(
             "  합계: source={}  target={}  전송 예정={}",
             plan.source_total(),
