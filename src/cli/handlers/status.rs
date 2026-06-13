@@ -50,7 +50,9 @@ pub async fn handle(config_path: Option<PathBuf>, args: StatusArgs) -> Result<()
     report_to_result(&report)
 }
 
-/// `--all` — config의 모든 프로파일을 점검해 한 줄씩 요약하고 최악 신호등으로 종료한다.
+/// `--all` — config의 모든 프로파일을 점검한다. 사람용 출력은 **프로파일별 전체 상세**
+/// (단일 `status`와 동일한 신호등 표)를 차례로 찍은 뒤, 마지막에 한 줄씩 종합 표를 붙인다.
+/// 종료 코드는 최악 신호등을 따른다. `-v`는 로그 레벨일 뿐 이 보고서 상세도와 무관하다.
 async fn handle_all(config_toml: Option<&str>, json: bool) -> Result<()> {
     let raw = config_toml.ok_or_else(|| {
         XBackupError::Usage("--all에는 config 파일이 필요합니다(프로파일 목록)".into())
@@ -78,13 +80,22 @@ async fn handle_all(config_toml: Option<&str>, json: bool) -> Result<()> {
                     "profile": r.profile,
                     "overall": format!("{:?}", r.overall).to_lowercase(),
                     "items": r.items.iter().map(|i| serde_json::json!({
-                        "key": i.key, "status": format!("{:?}", i.status).to_lowercase(),
+                        "key": i.key,
+                        "label": i.label,
+                        "status": format!("{:?}", i.status).to_lowercase(),
+                        "message": i.message,
                     })).collect::<Vec<_>>(),
                 })
             })
             .collect();
         println!("{}", serde_json::json!({ "profiles": items }));
     } else {
+        // 1) 프로파일별 전체 상세(단일 status와 동일한 표) — 왜 WARN/FAIL인지까지 보인다.
+        for r in &reports {
+            render_human(r);
+            println!();
+        }
+        // 2) 마지막에 한눈에 보는 종합 표(스크린샷·exit code 맥락용).
         println!("{:<14} {:<8} 요약", "profile", "overall");
         println!("{:-<60}", "");
         for r in &reports {
