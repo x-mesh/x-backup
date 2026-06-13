@@ -52,7 +52,8 @@ pub async fn handle(config_path: Option<PathBuf>, args: InitArgs) -> Result<()> 
             // status 핸들러는 같은 config 경로를 읽어 연결·권한을 점검한다.
             // 경고/실패도 정상 종료 코드로 표현되므로 여기서 에러를 흡수하지 않고 전파한다.
             let status_args = StatusArgs {
-                profile: profile_name,
+                profile: Some(profile_name),
+                all: false,
                 json: false,
             };
             return crate::cli::handlers::status::handle(Some(target), status_args).await;

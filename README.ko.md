@@ -78,6 +78,8 @@ private 단계에서는 `GITHUB_TOKEN`(또는 `gh auth login`)이 필요하다.
 ```bash
 x-backup init                                   # 대화형 마법사 → config.toml
 x-backup status  --profile prod                 # 백업 가능 상태 점검(신호등)
+x-backup status  --all                          # 모든 프로파일 한 번에 점검
+x-backup peek    --profile prod                 # 데이터 육안 확인: 컬렉션별 문서 수 + 최신 문서
 x-backup backup  --profile prod                 # 풀 백업 → 압축 → 암호화 → 저장
 x-backup backup  --profile prod --type incr     # oplog 증분
 x-backup list    --profile prod                 # 카탈로그(체인 상태 포함)

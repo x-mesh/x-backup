@@ -140,7 +140,7 @@ export_env() {
 
 # --profile을 받는 서브커맨드 목록.
 takes_profile() {
-  case "$1" in backup|restore|list|status|prune|migrate) return 0 ;; *) return 1 ;; esac
+  case "$1" in backup|restore|list|status|prune|migrate|peek) return 0 ;; *) return 1 ;; esac
 }
 
 # --- 컨테이너 헬스 확인 -----------------------------------------------------
@@ -294,8 +294,10 @@ main() {
       if [ -n "$injected_profile" ]; then
         # 선행 -p/--profile로 지정한 프로파일을 올바른 위치에 끼운다.
         set -- --profile "$injected_profile" "$@"
-      elif takes_profile "$cmd" && ! printf '%s\n' "$@" | grep -q -- '--profile'; then
-        # 아무 데도 --profile이 없으면 기본 프로파일을 주입한다.
+      elif takes_profile "$cmd" \
+        && ! printf '%s\n' "$@" | grep -q -- '--profile' \
+        && ! printf '%s\n' "$@" | grep -q -- '--all'; then
+        # --profile도 --all도 없으면 기본 프로파일을 주입한다(--all과는 충돌이므로 제외).
         set -- --profile "$PROFILE" "$@"
       fi
       exec "$BIN" "$cmd" "$@"

@@ -122,9 +122,29 @@ pub async fn handle(config_path: Option<PathBuf>, args: MigrateArgs) -> Result<(
     Ok(())
 }
 
-/// dry-run 계획 출력(연결·버전·충돌 — 무변경). 시크릿은 출력하지 않는다.
+/// 네임스페이스별 source/target 문서 수를 합쳐 (ns, source, target) 행으로 만든다(정렬).
+fn merge_ns_rows(plan: &MigratePlan) -> Vec<(String, u64, u64)> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    for (ns, c) in &plan.source_counts {
+        map.entry(ns.clone()).or_default().0 = *c;
+    }
+    for (ns, c) in &plan.target_counts {
+        map.entry(ns.clone()).or_default().1 = *c;
+    }
+    map.into_iter().map(|(ns, (s, t))| (ns, s, t)).collect()
+}
+
+/// dry-run 계획 출력(연결·버전·네임스페이스별 source vs target diff — 무변경). 시크릿 미출력.
 fn print_plan(plan: &MigratePlan, json: bool) {
+    let rows = merge_ns_rows(plan);
     if json {
+        let ns_items: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(ns, s, t)| {
+                serde_json::json!({ "ns": ns, "source": s, "target": t, "transfer": s })
+            })
+            .collect();
         let summary = serde_json::json!({
             "dry_run": true,
             "source_server_version": plan.source_server_version,
@@ -133,31 +153,58 @@ fn print_plan(plan: &MigratePlan, json: bool) {
             "ns": plan.ns,
             "conflicting_namespaces": plan.conflicting_namespaces,
             "version_warning": plan.version_warning,
+            "namespaces": ns_items,
+            "source_total": plan.source_total(),
+            "target_total": plan.target_total(),
+            "transfer_total": plan.source_total(),
         });
         println!("{summary}");
         return;
     }
     println!("마이그레이션 계획(dry-run) — 실제 전송 없음");
     println!(
-        "  source: {} ({})",
-        plan.source_server_version, plan.source_topology
+        "  source: {} ({})    target: {}",
+        plan.source_server_version, plan.source_topology, plan.target_server_version
     );
-    println!("  target: {}", plan.target_server_version);
     match &plan.ns {
         Some(ns) => println!("  대상 ns: {ns}(선택적)"),
         None => println!("  대상 ns: 전체"),
     }
+
+    // 네임스페이스별 source vs target diff 표.
+    if rows.is_empty() {
+        println!("  (source에 사용자 데이터 없음)");
+    } else {
+        println!(
+            "  {:<28} {:>8} {:>8}  동작",
+            "네임스페이스", "source", "target"
+        );
+        for (ns, s, t) in &rows {
+            let action = if *s == 0 {
+                "삭제 대상(source에 없음)".to_string()
+            } else if *t == 0 {
+                format!("+{s} (신규)")
+            } else {
+                format!("교체(--drop) — target {t}건 덮어씀")
+            };
+            println!("  {ns:<28} {s:>8} {t:>8}  {action}");
+        }
+        println!("  {:-<54}", "");
+        println!(
+            "  합계: source={}  target={}  전송 예정={}",
+            plan.source_total(),
+            plan.target_total(),
+            plan.source_total()
+        );
+    }
+
     if plan.conflicting_namespaces.is_empty() {
         println!("  target 충돌: 없음(빈 대상) — 그대로 복사 가능");
     } else {
         println!(
-            "  target 충돌: {}개 — {}",
+            "  target 충돌: {}개({}) → --drop --force 필요(없으면 거부)",
             plan.conflicting_namespaces.len(),
             plan.conflicting_namespaces.join(", ")
-        );
-        println!(
-            "  주의:        데이터 있는 target은 --drop 필수(교체) + --force/대화형 확인. \
-             --drop 없는 복사는 거부됩니다(어중간한 merge 방지)."
         );
     }
     if let Some(w) = &plan.version_warning {

@@ -69,6 +69,42 @@ pub struct MigratePlan {
     pub conflicting_namespaces: Vec<String>,
     /// 서버 버전 비호환 경고(있으면).
     pub version_warning: Option<String>,
+    /// source 네임스페이스별 추정 문서 수(마이그레이션 범위 내, 정렬).
+    pub source_counts: Vec<(String, u64)>,
+    /// target 네임스페이스별 추정 문서 수(마이그레이션 범위 내, 정렬).
+    pub target_counts: Vec<(String, u64)>,
+}
+
+impl MigratePlan {
+    /// source 총 문서 수(전송 예정 규모).
+    pub fn source_total(&self) -> u64 {
+        self.source_counts.iter().map(|(_, c)| c).sum()
+    }
+    /// target 총 문서 수(현재 대상에 있는 양).
+    pub fn target_total(&self) -> u64 {
+        self.target_counts.iter().map(|(_, c)| c).sum()
+    }
+}
+
+/// 마이그레이션 범위(`db`/`db.collection` 필터)에 맞게 네임스페이스 카운트를 거른다.
+///
+/// - `None`(전체) → 그대로.
+/// - `Some("db")` → `db.`로 시작하는 것만.
+/// - `Some("db.coll")` → 정확히 일치하는 것만.
+fn filter_counts(counts: Vec<(String, u64)>, ns: &Option<String>) -> Vec<(String, u64)> {
+    match ns {
+        None => counts,
+        Some(filter) if filter.contains('.') => {
+            counts.into_iter().filter(|(n, _)| n == filter).collect()
+        }
+        Some(db) => {
+            let prefix = format!("{db}.");
+            counts
+                .into_iter()
+                .filter(|(n, _)| n.starts_with(&prefix))
+                .collect()
+        }
+    }
 }
 
 /// 선택적 마이그레이션 네임스페이스 문자열을 만든다(`db` 또는 `db.collection`).
@@ -103,6 +139,11 @@ pub async fn plan_migrate(request: &MigrateRequest) -> Result<MigratePlan> {
         .await
         .unwrap_or_default();
 
+    // 네임스페이스별 추정 문서 수(source/target) — dry-run 상세 비교용. 마이그레이션
+    // 범위(ns 필터)로 거른다. 카운트 조회 실패는 치명적이지 않게 빈 목록으로 둔다.
+    let source_counts = filter_counts(source.namespace_counts().await.unwrap_or_default(), &ns);
+    let target_counts = filter_counts(target.namespace_counts().await.unwrap_or_default(), &ns);
+
     Ok(MigratePlan {
         source_topology: format!("{:?}", source_meta.topology()),
         source_server_version: source_meta.server_version,
@@ -110,6 +151,8 @@ pub async fn plan_migrate(request: &MigrateRequest) -> Result<MigratePlan> {
         ns,
         conflicting_namespaces: conflicting,
         version_warning,
+        source_counts,
+        target_counts,
     })
 }
 

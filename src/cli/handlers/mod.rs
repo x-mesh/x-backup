@@ -7,6 +7,7 @@ pub mod backup;
 pub mod init;
 pub mod list;
 pub mod migrate;
+pub mod peek;
 pub mod prune;
 pub mod restore;
 pub mod status;

@@ -57,6 +57,8 @@ pub enum Command {
     Prune(PruneArgs),
     /// 대상 서버 상태를 점검한다(읽기 전용·무부작용).
     Status(StatusArgs),
+    /// 데이터를 육안으로 확인한다 — 컬렉션별 문서 수 + 최신 문서(읽기 전용).
+    Peek(PeekArgs),
     /// source→target으로 파일 없이 직접 마이그레이션한다(mongodump|mongorestore).
     Migrate(MigrateArgs),
     /// x-backup 자신을 최신 릴리스로 갱신한다(설치 소스 자동 감지).
@@ -250,9 +252,29 @@ pub struct PruneArgs {
 /// `status` — 대상 서버 상태 점검(FR-8, R14).
 #[derive(Debug, Args)]
 pub struct StatusArgs {
+    /// 사용할 프로파일 이름. `--all`이면 생략 가능.
+    #[arg(long, value_name = "NAME", required_unless_present = "all")]
+    pub profile: Option<String>,
+    /// config의 모든 프로파일을 한 번에 점검한다(한 줄 요약 + 최악 exit code).
+    #[arg(long, conflicts_with = "profile")]
+    pub all: bool,
+    /// 결과를 JSON으로 출력한다.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `peek` — 데이터 육안 확인(읽기 전용). 컬렉션별 문서 수 + 최신 문서.
+#[derive(Debug, Args)]
+pub struct PeekArgs {
     /// 사용할 프로파일 이름.
     #[arg(long, value_name = "NAME")]
     pub profile: String,
+    /// 특정 네임스페이스만(`db.collection`). 지정 시 그 컬렉션의 최신 N건을 보여준다.
+    #[arg(long, value_name = "DB.COLLECTION")]
+    pub ns: Option<String>,
+    /// 보여줄 최신 문서 수(`--ns` 지정 시 적용, 기본 1).
+    #[arg(short = 'n', long, value_name = "N", default_value_t = 1)]
+    pub limit: i64,
     /// 결과를 JSON으로 출력한다.
     #[arg(long)]
     pub json: bool,

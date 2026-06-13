@@ -22,6 +22,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Verify(args) => handlers::verify::handle(config, args).await,
         Command::Prune(args) => handlers::prune::handle(config, args).await,
         Command::Status(args) => handlers::status::handle(config, args).await,
+        Command::Peek(args) => handlers::peek::handle(config, args).await,
         Command::Migrate(args) => handlers::migrate::handle(config, args).await,
         Command::Update(args) => handlers::update::handle(args).await,
     }
@@ -55,7 +56,8 @@ mod tests {
     #[tokio::test]
     async fn status_handler_routes_through_exit_code() {
         let result = dispatch(cli_with(Command::Status(StatusArgs {
-            profile: "prod".into(),
+            profile: Some("prod".into()),
+            all: false,
             json: false,
         })))
         .await;

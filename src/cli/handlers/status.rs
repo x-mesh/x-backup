@@ -20,29 +20,111 @@ pub const DEFAULT_MONGODUMP: &str = "mongodump";
 
 /// `status` 핸들러 진입점.
 pub async fn handle(config_path: Option<PathBuf>, args: StatusArgs) -> Result<()> {
-    // 1) config 로드 + 레이어 병합(file + ENV).
+    // config 파일은 한 번만 읽는다(--all은 여러 프로파일에 재사용).
     let config_toml = match &config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
             XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
         })?),
         None => None,
     };
+
+    if args.all {
+        return handle_all(config_toml.as_deref(), args.json).await;
+    }
+
+    // 단일 프로파일(--all 아니면 --profile 필수 — clap이 강제).
+    let profile = args
+        .profile
+        .as_deref()
+        .ok_or_else(|| XBackupError::Usage("--profile 또는 --all이 필요합니다".into()))?;
+    let report = build_report(config_toml.as_deref(), profile).await?;
+
+    // 출력 — --json 구조화 또는 사람용 표.
+    if args.json {
+        render_json(&report)?;
+    } else {
+        render_human(&report);
+    }
+
+    // 신호등 → 종료 코드. fail이면 PrecheckFailed(exit 3), warn이면 Warning(exit 4), ok면 0.
+    report_to_result(&report)
+}
+
+/// `--all` — config의 모든 프로파일을 점검해 한 줄씩 요약하고 최악 신호등으로 종료한다.
+async fn handle_all(config_toml: Option<&str>, json: bool) -> Result<()> {
+    let raw = config_toml.ok_or_else(|| {
+        XBackupError::Usage("--all에는 config 파일이 필요합니다(프로파일 목록)".into())
+    })?;
+    let config = crate::config::file::Config::from_toml_str(raw)?;
+    let mut names: Vec<String> = config.profiles.keys().cloned().collect();
+    names.sort();
+    if names.is_empty() {
+        return Err(XBackupError::Usage(
+            "config에 프로파일이 없습니다([profiles.<name>])".into(),
+        ));
+    }
+
+    let mut reports = Vec::with_capacity(names.len());
+    for name in &names {
+        reports.push(build_report(config_toml, name).await?);
+    }
+
+    // 출력.
+    if json {
+        let items: Vec<serde_json::Value> = reports
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "profile": r.profile,
+                    "overall": format!("{:?}", r.overall).to_lowercase(),
+                    "items": r.items.iter().map(|i| serde_json::json!({
+                        "key": i.key, "status": format!("{:?}", i.status).to_lowercase(),
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!({ "profiles": items }));
+    } else {
+        println!("{:<14} {:<8} 요약", "profile", "overall");
+        println!("{:-<60}", "");
+        for r in &reports {
+            println!(
+                "{:<14} {:<8} {}",
+                r.profile,
+                overall_short(r.overall),
+                summary_line(r)
+            );
+        }
+        println!("{:-<60}", "");
+    }
+
+    // 최악 신호등으로 종료 코드 결정.
+    let worst = reports
+        .iter()
+        .map(|r| r.overall)
+        .max_by_key(|s| match s {
+            CheckStatus::Ok => 0,
+            CheckStatus::Warn => 1,
+            CheckStatus::Fail => 2,
+        })
+        .unwrap_or(CheckStatus::Ok);
+    report_to_result(&StatusReport::new("(전체)", overall_placeholder(worst)))
+}
+
+/// 한 프로파일의 점검 보고서를 만든다(connect 실패도 보고서로 표현 — Err로 끊지 않음).
+async fn build_report(config_toml: Option<&str>, profile: &str) -> Result<StatusReport> {
     let overrides = collect_overrides_from_process();
     let resolved = ResolvedConfig::build(MergeInput {
-        config_toml: config_toml.as_deref(),
-        profile_name: &args.profile,
+        config_toml,
+        profile_name: profile,
         overrides: &overrides,
     })?;
-
-    // 2) URI 시크릿 확보(uri_env 해석값).
     let uri = resolved.resolved_uri.clone().ok_or_else(|| {
         XBackupError::Config(format!(
-            "프로파일 '{}'에 source.uri_env가 없거나 해석되지 않았습니다",
+            "프로파일 '{}'에 source.uri/uri_env가 없습니다",
             resolved.profile_name
         ))
     })?;
-
-    // 3) 전체 점검 실행(연결 실패도 보고서로 표현 — 여기서는 Err로 일찍 끊지 않는다).
     let interval = resolved.profile.features.incremental.interval.clone();
     let prefer_secondary = resolved.profile.source.prefer_secondary;
 
@@ -58,7 +140,6 @@ pub async fn handle(config_path: Option<PathBuf>, args: StatusArgs) -> Result<()
                     )
                     .await
             }
-            // connect 자체 실패(URI 파싱 등)는 단일 연결 실패 항목 보고서로 만든다.
             Err(e) => StatusReport::new(
                 &resolved.profile_name,
                 vec![crate::engine::mongo::status::CheckItem::fail(
@@ -68,16 +149,34 @@ pub async fn handle(config_path: Option<PathBuf>, args: StatusArgs) -> Result<()
                 )],
             ),
         };
+    Ok(report)
+}
 
-    // 4) 출력 — --json 구조화 또는 사람용 표.
-    if args.json {
-        render_json(&report)?;
-    } else {
-        render_human(&report);
+/// 신호등 합산을 [`report_to_result`]에 태우기 위한 단일 항목 보고서(--all 종합용).
+fn overall_placeholder(overall: CheckStatus) -> Vec<crate::engine::mongo::status::CheckItem> {
+    use crate::engine::mongo::status::CheckItem;
+    vec![match overall {
+        CheckStatus::Ok => CheckItem::ok("all", "전체", "모든 프로파일 정상"),
+        CheckStatus::Warn => CheckItem::warn("all", "전체", "경고 동반 프로파일 있음"),
+        CheckStatus::Fail => CheckItem::fail("all", "전체", "실패 프로파일 있음"),
+    }]
+}
+
+/// --all 한 줄 요약: 첫 경고/실패 항목의 라벨(없으면 정상).
+fn summary_line(report: &StatusReport) -> String {
+    match report.items.iter().find(|i| i.status != CheckStatus::Ok) {
+        Some(item) => format!("{}: {}", signal(item.status), item.label),
+        None => "정상".to_string(),
     }
+}
 
-    // 5) 신호등 → 종료 코드. fail이면 PrecheckFailed(exit 3), warn이면 Warning(exit 4), ok면 0.
-    report_to_result(&report)
+/// --all 표용 짧은 overall 라벨.
+fn overall_short(status: CheckStatus) -> &'static str {
+    match status {
+        CheckStatus::Ok => "OK",
+        CheckStatus::Warn => "WARN",
+        CheckStatus::Fail => "FAIL",
+    }
 }
 
 /// 신호등 합산을 [`Result`]로 변환한다 — main의 exit code 매핑에 태운다.

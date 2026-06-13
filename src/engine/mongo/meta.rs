@@ -139,6 +139,60 @@ impl MongoMeta {
         Ok(namespaces)
     }
 
+    /// 사용자 네임스페이스별 **추정 문서 수**를 반환한다(정렬된 `(ns, count)`).
+    ///
+    /// `estimatedDocumentCount`(컬렉션 메타데이터 기반)를 써서 전수 스캔 없이 빠르게
+    /// 센다 — peek·migrate dry-run·status의 데이터 규모 표시에 공유한다. 시스템 DB·
+    /// `system.*` 컬렉션은 제외한다([`user_namespaces`](Self::user_namespaces)와 동일 기준).
+    pub async fn namespace_counts(&self) -> Result<Vec<(String, u64)>> {
+        let namespaces = self.user_namespaces(None).await?;
+        let mut out = Vec::with_capacity(namespaces.len());
+        for ns in namespaces {
+            let (db, coll) = match ns.split_once('.') {
+                Some(parts) => parts,
+                None => continue,
+            };
+            let count = self
+                .client
+                .database(db)
+                .collection::<bson::Document>(coll)
+                .estimated_document_count()
+                .await
+                .map_err(|e| XBackupError::Failure(format!("문서 수 조회 실패({ns}): {e}")))?;
+            out.push((ns, count));
+        }
+        Ok(out)
+    }
+
+    /// 한 네임스페이스의 최신 문서 N건을 반환한다(`_id` 내림차순). 데이터 육안 확인용(peek).
+    ///
+    /// `_id` 역순 정렬로 "가장 최근에 들어온" 문서를 본다(ObjectId·증가 정수 _id 기준).
+    /// 읽기 전용이며, 호출자가 길이를 잘라 표시한다.
+    pub async fn latest_documents(
+        &self,
+        db: &str,
+        coll: &str,
+        limit: i64,
+    ) -> Result<Vec<bson::Document>> {
+        use futures::TryStreamExt;
+        let options = mongodb::options::FindOptions::builder()
+            .sort(doc! { "_id": -1 })
+            .limit(limit)
+            .build();
+        let cursor = self
+            .client
+            .database(db)
+            .collection::<bson::Document>(coll)
+            .find(doc! {})
+            .with_options(options)
+            .await
+            .map_err(|e| XBackupError::Failure(format!("{db}.{coll} 조회 실패: {e}")))?;
+        cursor
+            .try_collect()
+            .await
+            .map_err(|e| XBackupError::Failure(format!("{db}.{coll} 문서 수집 실패: {e}")))
+    }
+
     /// `local.oplog.rs`의 최신 엔트리 ts를 반환한다(natural order 내림차순 1건).
     ///
     /// standalone 등 oplog 부재 시 `None`. dump 전후로 호출해 oplog 구간을 산정한다.
