@@ -125,6 +125,33 @@ recipient_file = "/etc/x-backup/age.pub"   # public key only; keep the private k
 
 Any value can be overridden by an `XB_`-prefixed environment variable (`XB_DESTINATION__S3__BUCKET=...`). Precedence is `CLI > ENV > config.toml > built-in default`.
 
+### Multiple destinations
+
+Back up to several places at once with `[[...destinations]]` (an array). mongodump runs
+once; the artifact is then replicated **byte-for-byte** to each destination, so every copy
+has the same checksum and the same backup id — `verify`/`restore` work against any of them.
+
+```toml
+[[profiles.prod.destinations]]      # first entry = primary (required)
+name = "local"
+type = "local"
+path = "/var/backups/mongo"
+
+[[profiles.prod.destinations]]      # secondary (best-effort)
+name = "offsite"
+type = "s3"
+[profiles.prod.destinations.s3]
+endpoint        = "https://s3.example.com"
+bucket          = "db-backups"
+credentials_env = "S3_CREDS"
+```
+
+When `destinations` is non-empty it takes precedence over the single `destination`. The
+policy is **primary required, the rest are warnings**: if the primary fails the backup
+fails; if a secondary fails the backup still succeeds with exit 4 (warning) naming the
+failed destination. Restore reads from the primary by default; `restore --from <name>`
+picks a specific replica.
+
 ### Exit codes
 
 | Code | Meaning |

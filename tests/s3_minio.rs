@@ -351,6 +351,7 @@ async fn local_and_s3_are_interchangeable_via_trait() {
         std::env::set_var(env_name, container.credentials_raw());
     }
     let s3_dest = DestinationConfig {
+        name: None,
         r#type: Some("s3".to_string()),
         path: None,
         s3: Some(S3Config {

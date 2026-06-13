@@ -11,13 +11,14 @@ use crate::cli::args::RestoreArgs;
 use crate::cli::output::{OutputFlags, OutputMode};
 use crate::cli::progress::{new_counter, ProgressKind, ProgressReporter};
 use crate::config::env::collect_overrides_from_process;
+use crate::config::file::Profile;
 use crate::config::merged::MergeInput;
 use crate::config::secret::Secret;
 use crate::config::ResolvedConfig;
 use crate::error::{Result, XBackupError};
 use crate::pipeline::pitr::{run_pitr, PitrPlan, PitrRequest};
 use crate::pipeline::restore::{run_restore, RestorePlan, RestoreRequest};
-use crate::storage::LocalFs;
+use crate::storage::{from_config, Storage};
 
 /// `restore` 핸들러 진입점.
 pub async fn handle(config_path: Option<PathBuf>, args: RestoreArgs) -> Result<()> {
@@ -55,30 +56,10 @@ pub async fn handle(config_path: Option<PathBuf>, args: RestoreArgs) -> Result<(
         })?,
     };
 
-    // 3) destination 검증 — t5는 local만(S3는 t7). 백업이 저장된 위치에서 읽는다.
-    let dest = &resolved.profile.destination;
-    match dest.r#type.as_deref() {
-        Some("local") => {}
-        Some("s3") => {
-            return Err(XBackupError::Usage(
-                "destination type=s3는 아직 미지원입니다(t7) — type=local만 동작".into(),
-            ))
-        }
-        Some(other) => {
-            return Err(XBackupError::Config(format!(
-                "알 수 없는 destination type: '{other}'(local만 지원)"
-            )))
-        }
-        None => {
-            return Err(XBackupError::Config(
-                "destination.type이 지정되지 않았습니다(local 필요)".into(),
-            ))
-        }
-    }
-    let root = dest.path.as_deref().ok_or_else(|| {
-        XBackupError::Config("destination.path가 지정되지 않았습니다(local 경로)".into())
-    })?;
-    let storage = LocalFs::new(root)?;
+    // 3) destination 구성 — local/s3 모두 from_config로. 멀티 destination이면 --from으로
+    //    특정 복제본을 고를 수 있고(미지정 시 primary), 모든 복제본은 동일 바이트라 어디서
+    //    읽어도 같다.
+    let storage = select_restore_storage(&resolved.profile, args.from.as_deref())?;
 
     // 출력 모드 결정(R15) — CLI > config(mode.output) > stderr TTY 자동.
     let mode = OutputMode::resolve_from_env(
@@ -125,7 +106,7 @@ pub async fn handle(config_path: Option<PathBuf>, args: RestoreArgs) -> Result<(
             progress_counter,
         )
     };
-    let result = run_restore(&request, &storage, is_tty, prompt_confirm).await;
+    let result = run_restore(&request, storage.as_ref(), is_tty, prompt_confirm).await;
     reporter.finish().await;
     let outcome = result?;
 
@@ -239,7 +220,7 @@ async fn handle_pitr(config_path: Option<PathBuf>, args: RestoreArgs, at: String
     };
 
     let is_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-    let outcome = run_pitr(&request, &storage, is_tty, prompt_confirm).await?;
+    let outcome = run_pitr(&request, storage.as_ref(), is_tty, prompt_confirm).await?;
 
     if request.dry_run {
         print_pitr_plan(&outcome.plan, args.json);
@@ -273,7 +254,7 @@ async fn handle_pitr(config_path: Option<PathBuf>, args: RestoreArgs, at: String
 fn resolve_target_and_storage(
     config_path: &Option<PathBuf>,
     args: &RestoreArgs,
-) -> Result<(Secret, LocalFs)> {
+) -> Result<(Secret, Box<dyn Storage>)> {
     let config_toml = match config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
             XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
@@ -297,30 +278,32 @@ fn resolve_target_and_storage(
         })?,
     };
 
-    let dest = &resolved.profile.destination;
-    match dest.r#type.as_deref() {
-        Some("local") => {}
-        Some("s3") => {
-            return Err(XBackupError::Usage(
-                "destination type=s3는 아직 미지원입니다(t7) — type=local만 동작".into(),
-            ))
-        }
-        Some(other) => {
-            return Err(XBackupError::Config(format!(
-                "알 수 없는 destination type: '{other}'(local만 지원)"
-            )))
-        }
-        None => {
-            return Err(XBackupError::Config(
-                "destination.type이 지정되지 않았습니다(local 필요)".into(),
-            ))
-        }
-    }
-    let root = dest.path.as_deref().ok_or_else(|| {
-        XBackupError::Config("destination.path가 지정되지 않았습니다(local 경로)".into())
-    })?;
-    let storage = LocalFs::new(root)?;
+    let storage = select_restore_storage(&resolved.profile, args.from.as_deref())?;
     Ok((target_uri, storage))
+}
+
+/// 복구에 쓸 destination 백엔드를 고른다 — 멀티 destination 중 `--from`(이름 또는
+/// `type#idx`)으로 특정 복제본을, 미지정 시 primary(첫 destination)를 [`from_config`]로
+/// 구성한다. 모든 복제본은 동일 바이트이므로 어디서 읽어도 결과가 같다.
+fn select_restore_storage(profile: &Profile, from: Option<&str>) -> Result<Box<dyn Storage>> {
+    let dests = profile.effective_destinations();
+    let chosen = match from {
+        None => dests[0],
+        Some(name) => dests
+            .iter()
+            .enumerate()
+            .find(|(i, d)| d.name.as_deref() == Some(name) || d.label(*i) == name)
+            .map(|(_, d)| *d)
+            .ok_or_else(|| {
+                let avail: Vec<String> =
+                    dests.iter().enumerate().map(|(i, d)| d.label(i)).collect();
+                XBackupError::Config(format!(
+                    "--from '{name}'에 해당하는 destination이 없습니다(가용: {})",
+                    avail.join(", ")
+                ))
+            })?,
+    };
+    from_config(chosen)
 }
 
 /// PITR dry-run 계획을 출력한다(base·증분 체인·결정 종료 ts·예상 크기 — 무변경). 시크릿 미출력.

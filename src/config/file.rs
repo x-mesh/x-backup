@@ -31,10 +31,27 @@ pub struct Profile {
     pub mode: ModeConfig,
     #[serde(default)]
     pub source: SourceConfig,
+    /// 단일 백업 위치(하위호환). `destinations`(복수)가 비어 있을 때만 쓰인다.
     #[serde(default)]
     pub destination: DestinationConfig,
+    /// 복수 백업 위치 — `[[profiles.<name>.destinations]]`. 비어 있지 않으면
+    /// 이 목록이 우선하고 `destination`(단일)은 무시된다. 첫 항목이 primary다.
+    #[serde(default)]
+    pub destinations: Vec<DestinationConfig>,
     #[serde(default)]
     pub features: FeaturesConfig,
+}
+
+impl Profile {
+    /// 실효 백업 위치 목록 — `destinations`(복수)가 있으면 그것, 없으면 단일
+    /// `destination`을 1개짜리 목록으로. 항상 첫 항목이 primary(필수)다(FR: 멀티 dest).
+    pub fn effective_destinations(&self) -> Vec<&DestinationConfig> {
+        if self.destinations.is_empty() {
+            vec![&self.destination]
+        } else {
+            self.destinations.iter().collect()
+        }
+    }
 }
 
 /// 동작 모드 — `[profiles.<name>.mode]`.
@@ -86,6 +103,9 @@ pub struct SourceConfig {
 /// 백업 위치 — `[profiles.<name>.destination]`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DestinationConfig {
+    /// 식별용 이름(여러 destination일 때 보고·`restore --from` 선택에 사용). 선택.
+    #[serde(default)]
+    pub name: Option<String>,
     /// 백엔드 유형(local | s3).
     #[serde(default)]
     pub r#type: Option<String>,
@@ -95,6 +115,16 @@ pub struct DestinationConfig {
     /// S3 호환 백엔드 설정(type = "s3").
     #[serde(default)]
     pub s3: Option<S3Config>,
+}
+
+impl DestinationConfig {
+    /// 보고·선택용 표시 이름 — `name`이 있으면 그것, 없으면 `type#idx`로 합성한다.
+    pub fn label(&self, idx: usize) -> String {
+        match &self.name {
+            Some(n) => n.clone(),
+            None => format!("{}#{idx}", self.r#type.as_deref().unwrap_or("dest")),
+        }
+    }
 }
 
 /// S3 호환 스토리지 설정 — `[profiles.<name>.destination.s3]`.
@@ -306,5 +336,46 @@ on_gap   = "promote_full"
         assert!(p.mode.precheck);
         assert!(p.features.encryption.enabled);
         assert_eq!(p.features.compression.algorithm, "zstd");
+    }
+
+    /// effective_destinations: destinations(복수)가 없으면 단일 destination 1개로.
+    #[test]
+    fn effective_destinations_falls_back_to_single() {
+        let cfg = Config::from_toml_str(
+            "[profiles.p.destination]\ntype = \"local\"\npath = \"/var/b\"\n",
+        )
+        .unwrap();
+        let dests = cfg.profile("p").unwrap().effective_destinations();
+        assert_eq!(dests.len(), 1);
+        assert_eq!(dests[0].path.as_deref(), Some("/var/b"));
+    }
+
+    /// effective_destinations: destinations(복수)가 있으면 그 목록이 우선, 첫 항목이 primary.
+    #[test]
+    fn effective_destinations_prefers_array() {
+        let toml = "\
+[[profiles.p.destinations]]
+name = \"primary\"
+type = \"local\"
+path = \"/var/b1\"
+
+[[profiles.p.destinations]]
+name = \"offsite\"
+type = \"local\"
+path = \"/var/b2\"
+";
+        let cfg = Config::from_toml_str(toml).unwrap();
+        let dests = cfg.profile("p").unwrap().effective_destinations();
+        assert_eq!(dests.len(), 2);
+        assert_eq!(dests[0].name.as_deref(), Some("primary"));
+        assert_eq!(dests[1].name.as_deref(), Some("offsite"));
+        // 이름 없는 경우 label은 type#idx로 합성.
+        let unnamed = DestinationConfig {
+            name: None,
+            r#type: Some("s3".to_string()),
+            path: None,
+            s3: None,
+        };
+        assert_eq!(unnamed.label(1), "s3#1");
     }
 }

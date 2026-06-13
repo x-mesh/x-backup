@@ -128,6 +128,32 @@ recipient_file = "/etc/x-backup/age.pub"   # 공개키만 — 개인키는 복�
 모든 값은 `XB_` 접두사 환경변수로 오버라이드된다(`XB_DESTINATION__S3__BUCKET=...`).
 우선순위: `CLI > ENV > config.toml > 기본값`.
 
+### 여러 destination
+
+`[[...destinations]]`(배열)로 여러 곳에 동시 백업한다. mongodump는 한 번만 돌고,
+산출물을 각 destination으로 **바이트 단위 동일하게** 복제하므로 모든 복제본이 같은
+체크섬·같은 백업 id를 갖는다 — 어느 복제본에서든 `verify`/`restore`가 동일하게 동작한다.
+
+```toml
+[[profiles.prod.destinations]]      # 첫 항목 = primary(필수)
+name = "local"
+type = "local"
+path = "/var/backups/mongo"
+
+[[profiles.prod.destinations]]      # 보조(best-effort)
+name = "offsite"
+type = "s3"
+[profiles.prod.destinations.s3]
+endpoint        = "https://s3.example.com"
+bucket          = "db-backups"
+credentials_env = "S3_CREDS"
+```
+
+`destinations`(복수)가 있으면 단일 `destination`보다 우선한다. 정책은 **primary 필수,
+나머지는 경고**다: primary가 실패하면 백업 실패, 보조가 실패하면 백업은 성공하되
+exit 4(경고)로 실패한 destination을 알린다. 복구는 기본적으로 primary에서 읽고,
+`restore --from <name>`으로 특정 복제본을 고른다.
+
 ### Exit codes
 
 | 코드 | 의미 |

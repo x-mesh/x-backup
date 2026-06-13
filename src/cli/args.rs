@@ -125,6 +125,10 @@ pub struct RestoreArgs {
     /// 복구 대상 MongoDB URI(미지정 시 프로파일 source). 타깃 분리 복구용.
     #[arg(long, value_name = "MONGO_URI")]
     pub target: Option<String>,
+    /// 어느 destination에서 읽을지(멀티 destination일 때). 이름 또는 `type#idx`.
+    /// 미지정 시 primary(첫 destination).
+    #[arg(long, value_name = "NAME")]
+    pub from: Option<String>,
     /// PITR 목표 시점(RFC 3339 UTC wall-clock). 이하 최대 oplog ts로 내림 매핑(FR-3).
     #[arg(long, value_name = "TIMESTAMP")]
     pub at: Option<String>,

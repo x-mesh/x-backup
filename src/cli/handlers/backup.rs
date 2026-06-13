@@ -10,6 +10,7 @@ use crate::cli::output::{OutputFlags, OutputMode};
 use crate::cli::progress::{new_counter, ProgressKind, ProgressReporter};
 use crate::compress::{ZstdCompressStage, ALGORITHM_ZSTD};
 use crate::config::env::collect_overrides_from_process;
+use crate::config::file::DestinationConfig;
 use crate::config::merged::MergeInput;
 use crate::config::secret::Secret;
 use crate::config::ResolvedConfig;
@@ -22,7 +23,7 @@ use crate::pipeline::incremental::{
     run_incremental_backup, IncrementalOutcome, IncrementalRequest,
 };
 use crate::pipeline::stage::{StageStack, ENV_AES_KEY_HEX};
-use crate::storage::LocalFs;
+use crate::storage::{from_config, replicate_artifact, Storage};
 
 /// `backup` 핸들러 진입점.
 pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()> {
@@ -53,34 +54,17 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
         ))
     })?;
 
-    // 3) destination 검증 — t4는 local만 동작(S3는 t7).
-    let dest = &resolved.profile.destination;
-    match dest.r#type.as_deref() {
-        Some("local") => {}
-        Some("s3") => {
-            return Err(XBackupError::Usage(
-                "destination type=s3는 아직 미지원입니다(t7) — type=local만 동작".into(),
-            ))
-        }
-        Some(other) => {
-            return Err(XBackupError::Config(format!(
-                "알 수 없는 destination type: '{other}'(local만 지원)"
-            )))
-        }
-        None => {
-            return Err(XBackupError::Config(
-                "destination.type이 지정되지 않았습니다(local 필요)".into(),
-            ))
-        }
-    }
-    let root = dest.path.as_deref().ok_or_else(|| {
-        XBackupError::Config("destination.path가 지정되지 않았습니다(local 경로)".into())
-    })?;
-    // object_store LocalFileSystem은 루트가 미리 존재해야 한다 — 없으면 생성.
-    std::fs::create_dir_all(root).map_err(|e| {
-        XBackupError::Config(format!("destination 디렉터리 준비 실패({root}): {e}"))
-    })?;
-    let storage = LocalFs::new(root)?;
+    // 3) destination 구성 — local/s3 모두 from_config로 일반화. 멀티 destination이면
+    //    첫 항목이 primary(필수), 나머지는 보조(순차 fan-out으로 복제 — 아래).
+    //    primary 구성 실패는 백업을 막는 하드 에러, 보조 구성/복제 실패는 경고(exit 4).
+    let dests: Vec<DestinationConfig> = resolved
+        .profile
+        .effective_destinations()
+        .into_iter()
+        .cloned()
+        .collect();
+    let primary = from_config(&dests[0])?;
+    let secondaries = &dests[1..];
 
     // 출력 모드 결정(R15) — CLI(--json>--quiet>--progress) > config(mode.output) > TTY 자동.
     // 진행 표시·요약 출력 분기에 일관 사용한다.
@@ -113,7 +97,8 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
                     .into(),
             ));
         }
-        return handle_incremental(&resolved, &args, &uri, &storage, mode).await;
+        return handle_incremental(&resolved, &args, &uri, primary.as_ref(), secondaries, mode)
+            .await;
     }
 
     // 4) 파이프라인 단계 구성(t6): compress → encrypt 고정 순서(PRD §8.4). 단계와
@@ -137,9 +122,19 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
         },
         progress_counter,
     );
-    let result = run_full_backup_with_meta(&request, &storage, stages, meta).await;
+    let result = run_full_backup_with_meta(&request, primary.as_ref(), stages, meta).await;
     reporter.finish().await;
     let outcome = result?;
+
+    // 4.5) 보조 destination으로 순차 복제(멀티 destination). primary는 성공했으므로,
+    //      복제 실패는 경고(exit 4)로만 보고한다("primary 필수 + 나머지 경고" 정책).
+    let replicate_warning = replicate_and_warn(
+        primary.as_ref(),
+        secondaries,
+        &outcome.backup_id,
+        outcome.stored_size_bytes > 0,
+    )
+    .await;
 
     // 5) 요약 출력(stdout — 결과 전용). 진행은 stderr, 결과/--json은 stdout으로 분리.
     if mode.emits_json() {
@@ -148,6 +143,7 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
             "stored_size_bytes": outcome.stored_size_bytes,
             "checksum_sha256": outcome.checksum_sha256,
             "topology": format!("{:?}", outcome.topology),
+            "destinations": dests.len(),
         });
         println!("{summary}");
     } else if mode.shows_human_summary() {
@@ -155,6 +151,13 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
         println!("  id:       {}", outcome.backup_id);
         println!("  크기:     {} bytes", outcome.stored_size_bytes);
         println!("  체크섬:   sha256:{}", outcome.checksum_sha256);
+        if dests.len() > 1 {
+            println!(
+                "  destination: {}곳(primary + 보조 {})",
+                dests.len(),
+                dests.len() - 1
+            );
+        }
         if let Some(range) = &outcome.oplog_range {
             println!(
                 "  oplog:    {{t:{},i:{}}} → {{t:{},i:{}}}",
@@ -163,7 +166,51 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
         }
     }
 
+    // 보조 복제 실패가 있으면 경고로 마감(exit 4) — primary 백업은 이미 성공.
+    if let Some(w) = replicate_warning {
+        return Err(XBackupError::Warning(w));
+    }
     Ok(())
+}
+
+/// 보조 destination들로 백업 산출물을 순차 복제하고, 실패가 있으면 경고 메시지를 만든다.
+///
+/// "primary 필수 + 나머지 경고" 정책: primary는 이미 성공한 상태에서 호출된다. 각 보조
+/// destination을 [`from_config`]로 구성해 [`replicate_artifact`]로 복제하되, 구성·복제
+/// 실패는 치명적이지 않게 모아서 한 줄 경고로 반환한다(호출자가 exit 4로 보고). 모두
+/// 성공하면 `None`.
+async fn replicate_and_warn(
+    primary: &dyn Storage,
+    secondaries: &[DestinationConfig],
+    backup_id: &str,
+    has_data: bool,
+) -> Option<String> {
+    let mut failures = Vec::new();
+    for (i, dest) in secondaries.iter().enumerate() {
+        let label = dest.label(i + 1); // primary가 #0이므로 보조는 #1부터.
+        match from_config(dest) {
+            Ok(st) => match replicate_artifact(primary, st.as_ref(), backup_id, has_data).await {
+                Ok(()) => tracing::info!(dest = %label, "보조 destination 복제 완료"),
+                Err(e) => {
+                    tracing::error!(dest = %label, "보조 destination 복제 실패: {e}");
+                    failures.push(format!("{label}: {e}"));
+                }
+            },
+            Err(e) => {
+                tracing::error!(dest = %label, "보조 destination 구성 실패: {e}");
+                failures.push(format!("{label}: {e}"));
+            }
+        }
+    }
+    if failures.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "primary 백업은 성공했으나 보조 destination {}곳 복제 실패: {}",
+            failures.len(),
+            failures.join(" / ")
+        ))
+    }
 }
 
 /// 증분 백업 분기(`--type incr`) — 드라이버 oplog 캡처 → 저장 → manifest, gap 시 풀 승격.
@@ -178,7 +225,8 @@ async fn handle_incremental(
     resolved: &ResolvedConfig,
     args: &BackupArgs,
     uri: &Secret,
-    storage: &LocalFs,
+    primary: &dyn Storage,
+    secondaries: &[DestinationConfig],
     mode: OutputMode,
 ) -> Result<()> {
     let request = IncrementalRequest {
@@ -188,7 +236,7 @@ async fn handle_incremental(
     // 캡처/승격 양쪽에서 동일 구성의 새 StageStack을 만들 수 있도록 팩토리로 넘긴다.
     let stage_factory = || build_stages(resolved, args);
 
-    let outcome = run_incremental_backup(&request, storage, stage_factory).await?;
+    let outcome = run_incremental_backup(&request, primary, stage_factory).await?;
 
     match outcome {
         IncrementalOutcome::Captured {
@@ -198,6 +246,9 @@ async fn handle_incremental(
             oplog_range,
             stored_size_bytes,
         } => {
+            // 보조 destination 복제(빈 슬라이스면 data.bin 없음 → has_data=false).
+            let replicate_warning =
+                replicate_and_warn(primary, secondaries, &backup_id, stored_size_bytes > 0).await;
             if mode.emits_json() {
                 let summary = serde_json::json!({
                     "backup_type": "incremental",
@@ -224,9 +275,16 @@ async fn handle_incremental(
                     println!("  (변경 없음 — 빈 슬라이스: manifest만 기록)");
                 }
             }
+            // 보조 복제 실패는 경고(exit 4) — 증분 캡처 자체는 성공.
+            if let Some(w) = replicate_warning {
+                return Err(XBackupError::Warning(w));
+            }
             Ok(())
         }
         IncrementalOutcome::PromotedToFull { outcome, reason } => {
+            // 승격으로 만들어진 풀 백업도 보조 destination으로 복제한다(풀이라 has_data=true).
+            let replicate_warning =
+                replicate_and_warn(primary, secondaries, &outcome.backup_id, true).await;
             // 승격은 데이터상 성공이지만 "증분이 아니라 풀이 됨"을 경고로 알린다(exit 4, SC2).
             if mode.emits_json() {
                 let summary = serde_json::json!({
@@ -245,10 +303,16 @@ async fn handle_incremental(
                 println!("  사유:     {reason}");
             }
             // exit 4(경고 동반 성공) — main이 Warning을 exit 4로 매핑한다.
-            Err(XBackupError::Warning(format!(
+            // 승격 경고에 보조 복제 실패가 있으면 함께 알린다(둘 다 exit 4).
+            let mut msg = format!(
                 "증분이 gap으로 풀 백업({})으로 승격되었습니다: {reason}",
                 outcome.backup_id
-            )))
+            );
+            if let Some(w) = replicate_warning {
+                msg.push_str(" / ");
+                msg.push_str(&w);
+            }
+            Err(XBackupError::Warning(msg))
         }
     }
 }

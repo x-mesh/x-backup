@@ -110,6 +110,10 @@ pub fn from_config(dest: &DestinationConfig) -> Result<Box<dyn Storage>, XBackup
             let path = dest.path.as_deref().ok_or_else(|| {
                 XBackupError::Config("local destination에 path가 필요합니다".to_string())
             })?;
+            // object_store LocalFileSystem은 루트가 미리 존재해야 한다 — 없으면 생성.
+            std::fs::create_dir_all(path).map_err(|e| {
+                XBackupError::Config(format!("destination 디렉터리 준비 실패({path}): {e}"))
+            })?;
             Ok(Box::new(LocalFs::new(path)?))
         }
         "s3" => {
@@ -133,6 +137,37 @@ pub fn from_config(dest: &DestinationConfig) -> Result<Box<dyn Storage>, XBackup
             "지원하지 않는 destination.type: '{other}'(local | s3만 지원)"
         ))),
     }
+}
+
+/// 한 백업(`backup_id`)의 산출물을 `from` → `to`로 **바이트 그대로 복제**한다(멀티 destination).
+///
+/// 순차 fan-out의 복제 단계: primary에 스트리밍 백업해 만든 산출물을 보조 destination으로
+/// 그대로 옮긴다. 같은 바이트를 복사하므로 모든 destination이 동일한 체크섬·manifest를
+/// 갖는다(어디서 verify/restore해도 동일). 순서는 primary와 동일하게 "data 먼저,
+/// manifest·사이드카 나중"이다(pitfall 7-1 — manifest가 가리키는 data가 항상 존재).
+///
+/// `has_data`가 false면(빈 증분 슬라이스: `oplog_count=0`, data.bin 없음) data 복제를 건너뛴다.
+pub async fn replicate_artifact(
+    from: &dyn Storage,
+    to: &dyn Storage,
+    backup_id: &str,
+    has_data: bool,
+) -> Result<(), XBackupError> {
+    use crate::manifest::store::{data_path, manifest_path, manifest_sha_path};
+
+    if has_data {
+        let data = data_path(backup_id);
+        let r = from.get_stream(&data).await?;
+        to.put_stream(&data, r, None).await?;
+    }
+    let manifest = manifest_path(backup_id);
+    let r = from.get_stream(&manifest).await?;
+    to.put_stream(&manifest, r, None).await?;
+
+    let sidecar = manifest_sha_path(backup_id);
+    let r = from.get_stream(&sidecar).await?;
+    to.put_stream(&sidecar, r, None).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -169,6 +204,7 @@ mod tests {
     async fn from_config_builds_local_backend() {
         let dir = tempfile::tempdir().unwrap();
         let dest = DestinationConfig {
+            name: None,
             r#type: Some("local".to_string()),
             path: Some(dir.path().to_string_lossy().to_string()),
             s3: None,
@@ -201,6 +237,7 @@ mod tests {
         }
 
         let dest = DestinationConfig {
+            name: None,
             r#type: Some("s3".to_string()),
             path: None,
             s3: Some(S3Config {
@@ -233,6 +270,7 @@ mod tests {
     #[test]
     fn from_config_rejects_missing_type() {
         assert_config_error(&DestinationConfig {
+            name: None,
             r#type: None,
             path: None,
             s3: None,
@@ -243,6 +281,7 @@ mod tests {
     #[test]
     fn from_config_rejects_unknown_type() {
         assert_config_error(&DestinationConfig {
+            name: None,
             r#type: Some("gcs".to_string()),
             path: None,
             s3: None,
@@ -253,6 +292,7 @@ mod tests {
     #[test]
     fn from_config_local_requires_path() {
         assert_config_error(&DestinationConfig {
+            name: None,
             r#type: Some("local".to_string()),
             path: None,
             s3: None,
@@ -264,6 +304,7 @@ mod tests {
     fn from_config_s3_requires_credentials_env_set() {
         use crate::config::file::S3Config;
         assert_config_error(&DestinationConfig {
+            name: None,
             r#type: Some("s3".to_string()),
             path: None,
             s3: Some(S3Config {
@@ -274,5 +315,96 @@ mod tests {
                 credentials_env: Some("XBACKUP_DEFINITELY_UNSET_ENV_VAR_12345".to_string()),
             }),
         });
+    }
+
+    fn local_dest(path: &str) -> DestinationConfig {
+        DestinationConfig {
+            name: None,
+            r#type: Some("local".to_string()),
+            path: Some(path.to_string()),
+            s3: None,
+        }
+    }
+
+    /// replicate_artifact: 한 백업의 산출물 3종이 다른 백엔드로 바이트 동일하게 복제된다.
+    #[tokio::test]
+    async fn replicate_copies_identical_bytes_across_backends() {
+        use crate::manifest::store::{data_path, manifest_path, manifest_sha_path};
+        use tokio::io::AsyncReadExt;
+
+        let from_dir = tempfile::tempdir().unwrap();
+        let to_dir = tempfile::tempdir().unwrap();
+        let from = from_config(&local_dest(&from_dir.path().to_string_lossy())).unwrap();
+        let to = from_config(&local_dest(&to_dir.path().to_string_lossy())).unwrap();
+
+        let id = "bk-replicate";
+        let data = b"encrypted-archive-bytes\x00\x01\x02".to_vec();
+        let manifest = br#"{"format_version":1}"#.to_vec();
+        let sidecar = b"deadbeef".to_vec();
+        for (path, bytes) in [
+            (data_path(id), &data),
+            (manifest_path(id), &manifest),
+            (manifest_sha_path(id), &sidecar),
+        ] {
+            from.put_stream(&path, Box::pin(std::io::Cursor::new(bytes.clone())), None)
+                .await
+                .unwrap();
+        }
+
+        replicate_artifact(from.as_ref(), to.as_ref(), id, true)
+            .await
+            .unwrap();
+
+        // 복제본 3종이 원본과 바이트 동일한지 확인.
+        for (path, expected) in [
+            (data_path(id), &data),
+            (manifest_path(id), &manifest),
+            (manifest_sha_path(id), &sidecar),
+        ] {
+            let mut got = Vec::new();
+            to.get_stream(&path)
+                .await
+                .unwrap()
+                .read_to_end(&mut got)
+                .await
+                .unwrap();
+            assert_eq!(&got, expected, "{path} 복제 바이트 불일치");
+        }
+    }
+
+    /// replicate_artifact: has_data=false면 data.bin은 복제하지 않는다(빈 증분 슬라이스).
+    #[tokio::test]
+    async fn replicate_skips_data_when_absent() {
+        use crate::manifest::store::{data_path, manifest_path, manifest_sha_path};
+
+        let from_dir = tempfile::tempdir().unwrap();
+        let to_dir = tempfile::tempdir().unwrap();
+        let from = from_config(&local_dest(&from_dir.path().to_string_lossy())).unwrap();
+        let to = from_config(&local_dest(&to_dir.path().to_string_lossy())).unwrap();
+
+        let id = "bk-empty";
+        // data.bin은 만들지 않고 manifest·사이드카만(빈 슬라이스).
+        from.put_stream(
+            &manifest_path(id),
+            Box::pin(std::io::Cursor::new(b"{}".to_vec())),
+            None,
+        )
+        .await
+        .unwrap();
+        from.put_stream(
+            &manifest_sha_path(id),
+            Box::pin(std::io::Cursor::new(b"x".to_vec())),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // has_data=false → data.bin 없이도 성공.
+        replicate_artifact(from.as_ref(), to.as_ref(), id, false)
+            .await
+            .unwrap();
+        assert!(to.get_stream(&manifest_path(id)).await.is_ok());
+        // data.bin은 복제되지 않았어야 한다.
+        assert!(to.get_stream(&data_path(id)).await.is_err());
     }
 }

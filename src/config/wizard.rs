@@ -142,6 +142,7 @@ pub fn run_wizard(prompt: &mut dyn Prompt) -> Result<Config> {
         "local" => {
             let path = ask_default(prompt, "로컬 백업 경로", "/var/backups/mongo")?;
             DestinationConfig {
+                name: None,
                 r#type: Some("local".to_string()),
                 path: Some(path),
                 s3: None,
@@ -159,6 +160,7 @@ pub fn run_wizard(prompt: &mut dyn Prompt) -> Result<Config> {
                 "S3_CREDS",
             )?;
             DestinationConfig {
+                name: None,
                 r#type: Some("s3".to_string()),
                 path: None,
                 s3: Some(S3Config {
@@ -243,6 +245,7 @@ pub fn run_wizard(prompt: &mut dyn Prompt) -> Result<Config> {
             prefer_secondary,
         },
         destination,
+        destinations: Vec::new(),
         features: FeaturesConfig {
             compression: CompressionConfig {
                 level,
