@@ -147,12 +147,16 @@ fn print_plan(plan: &MigratePlan, json: bool) {
         None => println!("  대상 ns: 전체"),
     }
     if plan.conflicting_namespaces.is_empty() {
-        println!("  target 충돌: 없음(빈 대상)");
+        println!("  target 충돌: 없음(빈 대상) — 그대로 복사 가능");
     } else {
         println!(
-            "  target 충돌: {}개 — {} (실제 실행은 --force/--drop 또는 대화형 확인 필요)",
+            "  target 충돌: {}개 — {}",
             plan.conflicting_namespaces.len(),
             plan.conflicting_namespaces.join(", ")
+        );
+        println!(
+            "  주의:        데이터 있는 target은 --drop 필수(교체) + --force/대화형 확인. \
+             --drop 없는 복사는 거부됩니다(어중간한 merge 방지)."
         );
     }
     if let Some(w) = &plan.version_warning {
@@ -160,15 +164,18 @@ fn print_plan(plan: &MigratePlan, json: bool) {
     }
 }
 
-/// target에 기존 데이터가 있을 때 대화형 확인(TTY). 덮어쓰기 전 명시적 동의를 받는다.
+/// target에 기존 데이터가 있을 때 대화형 확인(TTY). --drop으로 교체하기 전 동의를 받는다.
+///
+/// 이 시점에 도달했다면 이미 --drop이 지정된 상태다(데이터 있는 target은 --drop 필수).
+/// 즉 확인은 "merge"가 아니라 **해당 컬렉션 교체(drop 후 재생성)**에 대한 동의다.
 fn prompt_confirm(plan: &MigratePlan) -> bool {
     use std::io::Write;
     eprintln!(
-        "경고: target에 기존 데이터가 있습니다({}개 네임스페이스): {}",
+        "경고: target의 다음 {}개 네임스페이스를 drop하고 source로 교체합니다: {}",
         plan.conflicting_namespaces.len(),
         plan.conflicting_namespaces.join(", ")
     );
-    eprint!("이 데이터를 덮어쓰고 마이그레이션하시겠습니까? [y/N] ");
+    eprint!("진행하시겠습니까? [y/N] ");
     let _ = std::io::stderr().flush();
     let mut input = String::new();
     if std::io::stdin().read_line(&mut input).is_err() {

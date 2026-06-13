@@ -104,13 +104,17 @@ target은 URI 직접(`--target`) 또는 다른 프로파일의 source(`--target-
 같은 config에서 해석)로 줄 수 있다 — URI를 붙여넣지 않고 양쪽 접속을 config.toml에
 둘 수 있다.
 
-**덮어쓰기 동작**(target 전체를 지우지 않는다):
-- `--drop` 없이: 문서를 insert한다. 같은 `_id`의 기존 문서는 **유지(덮어쓰지 않음,
-  duplicate-key로 건너뜀)**. source에 없는 컬렉션은 그대로 둔다.
-- `--drop` 있으면: **source에 있는 컬렉션만** drop 후 재생성한다. target의 다른
-  컬렉션은 손대지 않는다. target DB/인스턴스 전체를 지우지는 않는다.
-- target에 데이터가 있으면 `--drop` 여부와 무관하게 `--force`(또는 대화형 확인)를
-  요구한다. 즉 옮기는 컬렉션을 깨끗이 교체하려면 `--drop --force`다.
+**target 규칙**(migrate는 *교체*이고, target 전체를 지우지 않는다):
+- **빈 target** → 플래그 없이 그냥 복사된다.
+- **데이터 있는 target** → `--drop` **필수**. 없으면 거부(exit 2)한다 — `--drop` 없는
+  복사는 어중간한 merge(insert만, 같은 `_id`는 기존 유지, 옛 문서 잔존)라 마이그레이션
+  의도와 거의 안 맞기 때문. `--drop`이면 **source에 있는 컬렉션만** drop 후 재생성하고
+  target의 다른 컬렉션은 손대지 않는다. target DB/인스턴스 전체는 지우지 않는다.
+- `--drop`은 파괴적이라 `--force`(또는 대화형 확인)도 필요하다. 즉 깨끗한 교체는 `--drop --force`.
+
+증분 마이그레이션은 없다 — `migrate`는 일회성 복사다. 시점 이전이나 체인이 필요하면
+파일 경로(`backup` → `restore --at`)를 쓴다. 라이브 마이그레이션(oplog tailing 무중단
+cutover)은 로드맵 항목이며 미구현이다.
 
 백업이 아니라 복사다: manifest·체크섬·at-rest 암호화·PITR이 없다. 쓰기가 많은
 replica set을 정확한 시점으로 옮기거나 검증 가능한 산출물을 남기려면 파일 경로
@@ -273,4 +277,5 @@ gap 가드가 동작하는 것이지 오류가 아니다. churn으로 데이터�
 
 ## Roadmap
 
-PostgreSQL 어댑터(2차) · GFS retention · Prometheus 메트릭 · KMS/HSM 키 연동 — [PRD §12](docs/PRD.md)
+PostgreSQL 어댑터(2차) · GFS retention · Prometheus 메트릭 · KMS/HSM 키 연동 ·
+라이브 마이그레이션(oplog tailing 무중단 cutover) — [PRD §12](docs/PRD.md)

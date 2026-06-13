@@ -102,13 +102,19 @@ The target can be a literal URI (`--target`) or another profile's source
 (`--target-profile <name>`, resolved from the same config) — so you can keep both
 endpoints in `config.toml` instead of pasting URIs.
 
-**Overwrite semantics** (it does *not* wipe the whole target):
-- without `--drop`: documents are inserted; an existing doc with the same `_id` is **kept,
-  not overwritten** (duplicate-key, skipped). Collections not in the source are untouched.
-- with `--drop`: each collection **present in the source** is dropped and recreated; other
-  collections in the target are left alone. The target database/instance is never fully dropped.
-- the guard requires `--force` (or an interactive confirm) whenever the target already has
-  data, independent of `--drop`. So a clean replace of the migrated collections is `--drop --force`.
+**Target rules** (migrate means *replace*, and it never wipes the whole target):
+- **Empty target** → just copies, no flags needed.
+- **Target with data** → `--drop` is **required**. Without it, migrate is refused (exit 2):
+  a no-`--drop` copy would be a half-merge (mongorestore inserts; same-`_id` docs are kept,
+  stale docs remain) — almost never what a migration wants. With `--drop`, each collection
+  **present in the source** is dropped and recreated; other collections in the target are
+  left alone. The target database/instance is never fully dropped.
+- `--drop` is destructive, so it also needs `--force` (or an interactive confirm). A clean
+  replace of the migrated collections is therefore `--drop --force`.
+
+There is no incremental migration — `migrate` is a one-shot copy. For a point-in-time move
+or an ongoing chain, use the file path (`backup` → `restore --at`). Live migration
+(oplog-tailing with near-zero-downtime cutover) is a roadmap item, not implemented.
 
 It is a copy, not a backup: no manifest, checksum, encryption-at-rest, or PITR. For a
 point-in-time-consistent move of a busy replica set, or to keep a verifiable artifact,
@@ -272,4 +278,5 @@ The docs are written in Korean.
 
 ## Roadmap
 
-PostgreSQL adapter (next), GFS retention, Prometheus metrics, KMS/HSM key integration — see [PRD §12](docs/PRD.md).
+PostgreSQL adapter (next), GFS retention, Prometheus metrics, KMS/HSM key integration,
+live migration (oplog-tailing, near-zero-downtime cutover) — see [PRD §12](docs/PRD.md).

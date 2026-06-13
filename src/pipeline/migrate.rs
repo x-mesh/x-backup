@@ -130,16 +130,27 @@ where
         return Ok((plan, None));
     }
 
-    // 가드레일(restore와 동일): target에 기존 데이터가 있으면 --force 또는 대화형 확인.
+    // 가드레일: 데이터가 있는 target은 **--drop 필수**다(순수 판정은 [`migrate_guard`]).
     let target_had_data = !plan.conflicting_namespaces.is_empty();
-    if target_had_data && !force {
-        let approved = is_tty && confirm(&plan);
-        if !approved {
-            return Err(XBackupError::Failure(
-                "target에 기존 데이터가 있습니다 — --force 또는 대화형 확인 없이는 \
-                 마이그레이션을 거부합니다(프로덕션 가드레일)."
-                    .into(),
-            ));
+    match migrate_guard(target_had_data, request.drop, force) {
+        GuardOutcome::Proceed => {}
+        GuardOutcome::NeedDrop => {
+            return Err(XBackupError::Usage(format!(
+                "target에 기존 데이터가 있습니다({}개 네임스페이스). 마이그레이션은 교체를 \
+                 의미하므로 --drop이 필요합니다(--drop 없는 복사는 어중간한 merge가 됩니다). \
+                 빈 target으로 옮기거나 --drop --force를 쓰세요.",
+                plan.conflicting_namespaces.len()
+            )));
+        }
+        GuardOutcome::NeedConfirm => {
+            // --drop은 파괴적이므로 --force가 없으면 TTY 대화형 확인을 받는다.
+            if !(is_tty && confirm(&plan)) {
+                return Err(XBackupError::Failure(
+                    "target 기존 데이터를 --drop으로 교체하려면 --force 또는 대화형 확인이 \
+                     필요합니다(프로덕션 가드레일)."
+                        .into(),
+                ));
+            }
         }
     }
 
@@ -200,6 +211,32 @@ where
     ))
 }
 
+/// 데이터 있는 target에 대한 마이그레이션 가드 판정(순수 — 테스트 용이).
+#[derive(Debug, PartialEq, Eq)]
+enum GuardOutcome {
+    /// 진행 가능(빈 target, 또는 --drop + --force).
+    Proceed,
+    /// 데이터 있는 target인데 --drop이 없음 → 거부(merge 방지).
+    NeedDrop,
+    /// --drop은 있으나 --force가 없음 → TTY 대화형 확인 필요.
+    NeedConfirm,
+}
+
+/// migrate 가드 규칙: 빈 target은 무조건 진행. 데이터 있으면 --drop 필수이고,
+/// --force가 없으면 대화형 확인이 필요하다.
+fn migrate_guard(target_had_data: bool, drop: bool, force: bool) -> GuardOutcome {
+    if !target_had_data {
+        return GuardOutcome::Proceed;
+    }
+    if !drop {
+        return GuardOutcome::NeedDrop;
+    }
+    if !force {
+        return GuardOutcome::NeedConfirm;
+    }
+    GuardOutcome::Proceed
+}
+
 /// 서버 버전 메이저가 다르면 경고 문자열, 같으면 None.
 fn version_compat_warning(source: &str, target: &str) -> Option<String> {
     let major = |v: &str| v.split('.').next().unwrap_or("").to_string();
@@ -234,5 +271,21 @@ mod tests {
         assert!(version_compat_warning("6.0.5", "7.0.1").is_some());
         assert!(version_compat_warning("7.0.35", "7.0.1").is_none());
         assert!(version_compat_warning("7.0.0", "7.2.0").is_none());
+    }
+
+    /// 가드 규칙: 빈 target은 항상 진행, 데이터 있으면 --drop 필수, --drop 있고 --force
+    /// 없으면 확인 필요, --drop+--force면 진행.
+    #[test]
+    fn migrate_guard_matrix() {
+        // 빈 target — drop/force 무관하게 진행.
+        assert_eq!(migrate_guard(false, false, false), GuardOutcome::Proceed);
+        assert_eq!(migrate_guard(false, true, true), GuardOutcome::Proceed);
+        // 데이터 있는 target — --drop 없으면 거부(merge 방지).
+        assert_eq!(migrate_guard(true, false, false), GuardOutcome::NeedDrop);
+        assert_eq!(migrate_guard(true, false, true), GuardOutcome::NeedDrop);
+        // --drop 있으나 --force 없음 → 대화형 확인.
+        assert_eq!(migrate_guard(true, true, false), GuardOutcome::NeedConfirm);
+        // --drop + --force → 진행.
+        assert_eq!(migrate_guard(true, true, true), GuardOutcome::Proceed);
     }
 }
