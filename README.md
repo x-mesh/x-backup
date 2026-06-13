@@ -249,6 +249,10 @@ Any real x-backup subcommand passes straight through (`scripts/xb backup --type 
 `scripts/xb status --json`). To export the env and call `x-backup` directly instead:
 `eval "$(scripts/xb env)"`. Plaintext backups: `XB_NO_ENCRYPT=1 scripts/xb setup`.
 
+The generated config has two profiles — `demo` (source `:27017`) and `target` (`:27117`) —
+so you can check either side. `--profile` works in any position (the wrapper places it
+correctly): `scripts/xb --profile target status` or `scripts/xb status --profile target`.
+
 On a near-empty oplog (a fresh container), an increment may promote itself to a full
 backup — that is the gap guard working, not an error. Churning data in first keeps the
 oplog window healthy.

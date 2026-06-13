@@ -252,6 +252,10 @@ scripts/xb incr-demo            # 위 과정을 한 번에:
 `scripts/xb status --json`). 환경만 export해서 `x-backup`을 직접 쓰려면
 `eval "$(scripts/xb env)"`. 평문 백업은 `XB_NO_ENCRYPT=1 scripts/xb setup`.
 
+생성된 config에는 프로파일이 둘 있다 — `demo`(source `:27017`)와 `target`(`:27117`) —
+그래서 양쪽 상태를 다 볼 수 있다. `--profile`은 위치에 상관없이 동작한다(래퍼가 올바른
+자리에 끼워 준다): `scripts/xb --profile target status` 또는 `scripts/xb status --profile target`.
+
 oplog가 거의 빈 갓 띄운 컨테이너에서는 증분이 스스로 풀 백업으로 승격될 수 있다 —
 gap 가드가 동작하는 것이지 오류가 아니다. churn으로 데이터를 먼저 쌓으면 oplog
 윈도우가 건강해진다.

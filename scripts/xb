@@ -249,6 +249,18 @@ usage() {
 
 # --- 라우팅 -----------------------------------------------------------------
 main() {
+  # 위치 무관 편의: 서브커맨드 *앞*의 -p/--profile <name>(또는 --profile=name)을 흡수한다.
+  # x-backup의 --profile은 서브커맨드별 인자라 'x-backup --profile X status'는 거부되는데,
+  # 래퍼가 이를 받아 올바른 위치('status --profile X')로 다시 끼워 준다.
+  local injected_profile=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -p | --profile) injected_profile="${2:-}"; shift 2 ;;
+      --profile=*)    injected_profile="${1#--profile=}"; shift ;;
+      *) break ;;
+    esac
+  done
+
   local cmd="${1:-help}"; shift || true
   case "$cmd" in
     setup)           cmd_setup "$@" ;;
@@ -262,9 +274,13 @@ main() {
     down)            cmd_down "$@" ;;
     help|-h|--help)  usage ;;
     *)
-      # x-backup 서브커맨드 통과 — env·config 주입, 필요 시 --profile 기본값.
+      # x-backup 서브커맨드 통과 — env·config 주입, --profile 결정.
       resolve_bin; ensure_tools_path; ensure_devenv; export_env
-      if takes_profile "$cmd" && ! printf '%s\n' "$@" | grep -q -- '--profile'; then
+      if [ -n "$injected_profile" ]; then
+        # 선행 -p/--profile로 지정한 프로파일을 올바른 위치에 끼운다.
+        set -- --profile "$injected_profile" "$@"
+      elif takes_profile "$cmd" && ! printf '%s\n' "$@" | grep -q -- '--profile'; then
+        # 아무 데도 --profile이 없으면 기본 프로파일을 주입한다.
         set -- --profile "$PROFILE" "$@"
       fi
       exec "$BIN" "$cmd" "$@"
