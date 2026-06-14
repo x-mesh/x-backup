@@ -31,6 +31,14 @@ impl DbKind {
             DbKind::Mongo
         }
     }
+
+    /// 사람용 표시 라벨(컨텍스트 줄·doctor 출력 등).
+    pub fn label(self) -> &'static str {
+        match self {
+            DbKind::Postgres => "postgresql",
+            DbKind::Mongo => "mongodb",
+        }
+    }
 }
 
 #[cfg(test)]

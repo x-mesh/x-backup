@@ -39,8 +39,16 @@ pub async fn handle(config_path: Option<PathBuf>, args: PeekArgs) -> Result<()> 
 
     let timeout = resolved.profile.source.connect_timeout_secs;
 
+    // 실행 컨텍스트(프로파일·DB) 표시 — 다중 DB 툴.
+    let db = crate::engine::DbKind::from_uri(uri.expose());
+    crate::cli::output::print_run_context(
+        &resolved.profile_name,
+        Some(db),
+        crate::cli::output::context_mode(args.json),
+    );
+
     // DB 종류 분기 — postgres URI면 PG peek(테이블 행 수 + 최신 행), 그 외는 Mongo.
-    if crate::engine::DbKind::from_uri(uri.expose()) == crate::engine::DbKind::Postgres {
+    if db == crate::engine::DbKind::Postgres {
         return peek_pg(&uri, timeout, &args).await;
     }
 

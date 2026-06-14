@@ -104,6 +104,38 @@ impl OutputMode {
     }
 }
 
+/// `--json`만 받는 핸들러(list/status/peek/prune/pitr)에서 컨텍스트 표시 모드를 만든다 —
+/// json이면 Json(컨텍스트 생략), 아니면 stderr TTY 여부로 Progress/Quiet.
+pub fn context_mode(json: bool) -> OutputMode {
+    OutputMode::resolve_from_env(
+        OutputFlags {
+            json,
+            quiet: false,
+            progress: false,
+        },
+        None,
+    )
+}
+
+/// 실행 컨텍스트 한 줄(어떤 프로파일·어떤 DB)을 **stderr**에 표시한다.
+///
+/// x-backup은 MongoDB·PostgreSQL을 한 바이너리로 다루는 다중 DB 툴이라, 모든 명령이 "지금
+/// 어느 프로파일·어느 DB를 건드리는지"를 항상 보여주는 게 안전하다. 결과(stdout)·`--json`을
+/// 오염시키지 않도록 stderr로 내보내고, 사람용(Progress) 모드에서만 표시한다(quiet/json 생략).
+pub fn print_run_context(profile: &str, db: Option<crate::engine::DbKind>, mode: OutputMode) {
+    // json만 제외(기계 판독 오염 방지). progress·quiet 모두 stderr에 한 줄 — 다중 DB 툴에서
+    // "지금 무엇을 건드리는지"는 quiet에서도 보이는 게 안전하다.
+    if mode.emits_json() {
+        return;
+    }
+    use crate::cli::table::{paint, use_color, DIM};
+    let line = match db {
+        Some(d) => format!("▸ 프로파일 {profile} · DB {}", d.label()),
+        None => format!("▸ 프로파일 {profile}"),
+    };
+    eprintln!("{}", paint(&line, &[DIM], use_color()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -56,6 +56,17 @@ pub async fn handle(config_path: Option<PathBuf>, args: StatusArgs) -> Result<()
         .ok_or_else(|| XBackupError::Usage("--profile 또는 --all이 필요합니다".into()))?;
     let report = build_report(config_toml.as_deref(), profile).await?;
 
+    // 실행 컨텍스트(프로파일·DB) — 표시용으로 source URI 엔진을 가볍게 재해석(연결 없음).
+    let db = ResolvedConfig::build(MergeInput {
+        config_toml: config_toml.as_deref(),
+        profile_name: profile,
+        overrides: &collect_overrides_from_process(),
+    })
+    .ok()
+    .and_then(|r| r.resolved_uri)
+    .map(|u| crate::engine::DbKind::from_uri(u.expose()));
+    crate::cli::output::print_run_context(profile, db, crate::cli::output::context_mode(args.json));
+
     // 출력 — --json 구조화 또는 사람용 표.
     if args.json {
         render_json(&report)?;

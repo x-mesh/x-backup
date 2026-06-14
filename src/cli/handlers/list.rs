@@ -16,9 +16,9 @@ use std::path::PathBuf;
 use crate::cli::args::ListArgs;
 use crate::cli::table::{paint, use_color, Align, Table, BOLD, RED, YELLOW};
 use crate::config::env::collect_overrides_from_process;
-use crate::engine::mongo::status::human_bytes;
 use crate::config::merged::MergeInput;
 use crate::config::ResolvedConfig;
+use crate::engine::mongo::status::human_bytes;
 use crate::error::{Result, XBackupError};
 use crate::manifest::chain::verify_chain;
 use crate::manifest::schema::{BackupStatus, BackupType};
@@ -34,6 +34,8 @@ pub struct CatalogRow {
     pub id: String,
     /// 백업 유형 문자열(`full`/`incr`/`orphan`).
     pub kind: String,
+    /// DB 엔진(`postgresql`/`mongodb`; manifest archive_format으로 판별, orphan은 `-`).
+    pub engine: String,
     /// 생성 시각(RFC3339; orphan은 None).
     pub created_at: Option<String>,
     /// 저장 크기(data.bin 바이트). orphan은 실제 data 크기.
@@ -48,6 +50,17 @@ pub struct CatalogRow {
 pub async fn handle(config_path: Option<PathBuf>, args: ListArgs) -> Result<()> {
     let storage = open_storage(&config_path, &args).await?;
     let rows = build_catalog(storage.as_ref()).await?;
+
+    // 컨텍스트(프로파일) 표시 — DB는 행별 DB 칼럼으로 보인다.
+    let config_toml = config_path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    let profile = resolve_profile_name(args.profile.as_deref(), config_toml.as_deref());
+    crate::cli::output::print_run_context(
+        &profile,
+        None,
+        crate::cli::output::context_mode(args.json),
+    );
 
     if args.json {
         print_json(&rows);
@@ -105,6 +118,7 @@ pub async fn build_catalog(storage: &dyn Storage) -> Result<Vec<CatalogRow>> {
         rows.push(CatalogRow {
             id: m.id.clone(),
             kind: kind.to_string(),
+            engine: engine_from_archive(m.tool_versions.archive_format.as_deref()).to_string(),
             created_at: Some(m.created_at.clone()),
             stored_size_bytes: m.stored_size_bytes,
             chain_status,
@@ -155,6 +169,7 @@ async fn detect_orphans(storage: &dyn Storage, known_ids: &[String]) -> Result<V
         rows.push(CatalogRow {
             id: id.to_string(),
             kind: "orphan".to_string(),
+            engine: "-".to_string(), // manifest 없음 → 엔진 불명.
             created_at: e.last_modified.clone(),
             stored_size_bytes: e.size,
             chain_status: "orphan".to_string(),
@@ -224,9 +239,10 @@ fn print_human(rows: &[CatalogRow]) {
     }
     let color = use_color();
     let mut table = Table::new(
-        &["ID", "TYPE", "CREATED", "SIZE", "CHAIN", "BASE"],
+        &["ID", "TYPE", "DB", "CREATED", "SIZE", "CHAIN", "BASE"],
         // SIZE는 우측 정렬(숫자), 나머지는 좌측.
         &[
+            Align::Left,
             Align::Left,
             Align::Left,
             Align::Left,
@@ -239,6 +255,7 @@ fn print_human(rows: &[CatalogRow]) {
         let cells = vec![
             r.id.clone(),
             r.kind.clone(),
+            r.engine.clone(), // DB 엔진(postgresql/mongodb)
             short_created(r.created_at.as_deref()),
             human_bytes(r.stored_size_bytes as i64), // raw bytes → "1.9 MiB"
             chain_label(&r.chain_status).to_string(),
@@ -280,6 +297,14 @@ fn print_human(rows: &[CatalogRow]) {
     }
 }
 
+/// manifest의 archive_format으로 DB 엔진을 판별한다(`xb-pg*`=postgresql, 그 외=mongodb).
+fn engine_from_archive(fmt: Option<&str>) -> &'static str {
+    match fmt {
+        Some(f) if f.starts_with("xb-pg") => "postgresql",
+        _ => "mongodb",
+    }
+}
+
 /// 생성 시각을 초 단위까지로 축약한다(`2026-06-14 14:56:11`) — RFC3339의 마이크로초·TZ는
 /// 카탈로그 가독성을 떨어뜨려 생략한다(없으면 `-`).
 fn short_created(s: Option<&str>) -> String {
@@ -308,6 +333,7 @@ fn print_json(rows: &[CatalogRow]) {
             serde_json::json!({
                 "id": r.id,
                 "type": r.kind,
+                "engine": r.engine,
                 "created_at": r.created_at,
                 "stored_size_bytes": r.stored_size_bytes,
                 "chain_status": r.chain_status,

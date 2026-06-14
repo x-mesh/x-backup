@@ -36,6 +36,14 @@ pub async fn handle(config_path: Option<PathBuf>, args: PruneArgs) -> Result<()>
     let _lock: LockGuard = crate::lock::acquire(&args.profile)?;
 
     let storage = open_storage(&config_path, &args).await?;
+
+    // 컨텍스트(프로파일) 표시 — prune은 store 대상이라 DB는 생략(행별 의미 없음).
+    crate::cli::output::print_run_context(
+        &args.profile,
+        None,
+        crate::cli::output::context_mode(false),
+    );
+
     let policy = RetentionPolicy {
         keep_full: args.keep_full,
         keep_days: args.keep_days,

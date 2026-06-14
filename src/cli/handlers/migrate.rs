@@ -80,6 +80,8 @@ pub async fn handle(config_path: Option<PathBuf>, args: MigrateArgs) -> Result<(
     use crate::engine::DbKind;
     let source_kind = DbKind::from_uri(source_uri.expose());
     let target_kind = DbKind::from_uri(target_uri.expose());
+    // 실행 컨텍스트(소스 프로파일·DB) 표시 — 다중 DB 툴(대상은 아래 계획에 표시).
+    crate::cli::output::print_run_context(&args.profile, Some(source_kind), mode);
     if source_kind != target_kind {
         return Err(XBackupError::Usage(
             "source와 target의 DB 종류가 다릅니다 — 엔진 간 마이그레이션(예: Mongo↔PG)은 \

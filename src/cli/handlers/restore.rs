@@ -74,6 +74,13 @@ pub async fn handle(config_path: Option<PathBuf>, args: RestoreArgs) -> Result<(
         Some(resolved.profile.mode.output.as_str()),
     );
 
+    // 실행 컨텍스트(프로파일·복구 대상 DB) 표시 — 다중 DB 툴.
+    crate::cli::output::print_run_context(
+        &args.profile,
+        Some(crate::engine::DbKind::from_uri(target_uri.expose())),
+        mode,
+    );
+
     // 진행 표시(R16): mongorestore stdin으로 흘리는 바이트를 폴링한다. 복원 입력 총량은
     //   압축 백업이면 복호화·압축해제 후 크기라 사전에 정확히 모르므로 부정형(spinner)으로
     //   처리 바이트·속도를 stderr에 표시한다(dry-run이면 표시 불필요 — 무변경 계획만).
@@ -221,6 +228,13 @@ async fn handle_pitr(config_path: Option<PathBuf>, args: RestoreArgs, at: String
         return handle_pg_pitr(target_uri, storage, timeout_secs, args, at).await;
     }
 
+    // 여기까지 왔으면 Mongo PITR. 실행 컨텍스트 표시.
+    crate::cli::output::print_run_context(
+        &args.profile,
+        Some(crate::engine::DbKind::Mongo),
+        crate::cli::output::context_mode(args.json),
+    );
+
     let request = PitrRequest {
         target_uri,
         mongorestore_program: "mongorestore".to_string(),
@@ -275,6 +289,12 @@ async fn handle_pg_pitr(
             "PG 시점 복구(--at)는 --only(선택적 복구)와 함께 쓸 수 없습니다".into(),
         ));
     }
+
+    crate::cli::output::print_run_context(
+        &args.profile,
+        Some(crate::engine::DbKind::Postgres),
+        crate::cli::output::context_mode(args.json),
+    );
 
     let request = PgPitrRequest {
         target_uri,

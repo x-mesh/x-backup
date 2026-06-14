@@ -81,9 +81,13 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
         Some(resolved.profile.mode.output.as_str()),
     );
 
+    // 실행 컨텍스트(프로파일·DB) 표시 — 다중 DB 툴이라 무엇을 백업하는지 항상 보인다.
+    let db = crate::engine::DbKind::from_uri(uri.expose());
+    crate::cli::output::print_run_context(&resolved.profile_name, Some(db), mode);
+
     // DB 종류 분기 — source URI 스킴이 postgres면 PostgreSQL 경로(드라이버 COPY, oplog/토폴로지
     //   개념 없음)로 빠진다. 그 외(mongodb)는 아래 Mongo 경로.
-    if crate::engine::DbKind::from_uri(uri.expose()) == crate::engine::DbKind::Postgres {
+    if db == crate::engine::DbKind::Postgres {
         return handle_pg_backup(
             &resolved,
             &args,

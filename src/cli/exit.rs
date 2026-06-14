@@ -22,6 +22,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Verify(args) => handlers::verify::handle(config, args).await,
         Command::Prune(args) => handlers::prune::handle(config, args).await,
         Command::Status(args) => handlers::status::handle(config, args).await,
+        Command::Doctor(args) => handlers::doctor::handle(config, args).await,
         Command::Peek(args) => handlers::peek::handle(config, args).await,
         Command::Migrate(args) => handlers::migrate::handle(config, args).await,
         Command::Update(args) => handlers::update::handle(args).await,

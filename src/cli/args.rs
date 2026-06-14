@@ -57,6 +57,8 @@ pub enum Command {
     Prune(PruneArgs),
     /// 대상 서버 상태를 점검한다(읽기 전용·무부작용).
     Status(StatusArgs),
+    /// config를 정적 점검한다(오프라인·전 프로파일·DB 연결 없음).
+    Doctor(DoctorArgs),
     /// 데이터를 육안으로 확인한다 — 컬렉션별 문서 수 + 최신 문서(읽기 전용).
     Peek(PeekArgs),
     /// source→target으로 파일 없이 직접 마이그레이션한다(mongodump|mongorestore).
@@ -253,7 +255,12 @@ pub struct PruneArgs {
 #[derive(Debug, Args)]
 pub struct StatusArgs {
     /// 사용할 프로파일 이름. `--all`이면 생략 가능.
-    #[arg(long, value_name = "NAME", required_unless_present = "all", env = "XB_PROFILE")]
+    #[arg(
+        long,
+        value_name = "NAME",
+        required_unless_present = "all",
+        env = "XB_PROFILE"
+    )]
     pub profile: Option<String>,
     /// config의 모든 프로파일을 한 번에 점검한다(한 줄 요약 + 최악 exit code).
     /// `--profile`/`XB_PROFILE`보다 우선한다(둘 다 있으면 --all로 동작 — 워크스페이스
@@ -272,6 +279,17 @@ pub struct StatusArgs {
     /// watch를 N회 갱신 후 종료(0=무한, 기본 0). 스크립트·테스트용.
     #[arg(long, value_name = "N", default_value_t = 0, requires = "watch")]
     pub count: u64,
+}
+
+/// `doctor` — config 정적 점검(오프라인). DB 연결 없이 모든 프로파일의 설정 문제를 찾는다.
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// 특정 프로파일만 점검(미지정 시 config의 모든 프로파일).
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
+    /// 결과를 JSON으로 출력한다.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `peek` — 데이터 육안 확인(읽기 전용). 컬렉션별 문서 수 + 최신 문서.
