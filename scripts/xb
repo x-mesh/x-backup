@@ -29,8 +29,11 @@
 # 환경만 export해서 진짜 x-backup을 직접 쓰고 싶으면:
 #   eval "$(scripts/xb env)" && x-backup status --profile demo
 #
-# 오버라이드: XB_PROFILE(기본 demo), XB_BIN, XB_NO_ENCRYPT=1(평문 백업),
+# 오버라이드: XB_DEVENV_PROFILE(기본 demo), XB_BIN, XB_NO_ENCRYPT=1(평문 백업),
 #             XB_MONGO_PORT/XB_MONGO_TARGET_PORT.
+# 주의: scripts/xb는 공용 XB_PROFILE(xbenv 워크스페이스가 씀)을 읽지 않는다 — 활성 xbenv의
+#       XB_PROFILE이 새어들어 .devenv에 없는 프로파일을 가리키는 충돌을 피하기 위함. .devenv
+#       프로파일을 바꾸려면 XB_DEVENV_PROFILE를 쓴다.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -39,7 +42,7 @@ CFG="$DEVENV/config.toml"
 STORE="$DEVENV/store"
 AGE_PUB="$DEVENV/age.pub"
 AGE_KEY="$DEVENV/age.key"
-PROFILE="${XB_PROFILE:-demo}"
+PROFILE="${XB_DEVENV_PROFILE:-demo}"
 
 SRC_URI="mongodb://localhost:${XB_MONGO_PORT:-27017}/?replicaSet=rs0&directConnection=true"
 TGT_URI="mongodb://localhost:${XB_MONGO_TARGET_PORT:-27117}/?replicaSet=rs0&directConnection=true"
@@ -131,6 +134,7 @@ EOF
 # 모든 x-backup 호출에 공통으로 주입되는 환경.
 export_env() {
   export XB_CONFIG="$CFG"                  # --config 글로벌 플래그를 대신함
+  export XB_PROFILE="$PROFILE"             # 활성 xbenv의 XB_PROFILE이 새어들어도 .devenv 프로파일로 고정
   # 생성된 config는 source.uri를 직접 갖지만, uri_env="MONGO_URI" 방식 config도
   # 래퍼로 그대로 쓸 수 있게 호환용으로 같이 export한다(있어도 무해).
   export MONGO_URI="$SRC_URI"
