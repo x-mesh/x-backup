@@ -102,3 +102,21 @@ make postgres-down    # 정리
 CI(`postgres` 잡, push main + nightly)도 동일하게 docker compose로 PG를 띄워 `scenario-pg`를
 돌린다(상세: [ci.md](ci.md)). GitHub 서비스 컨테이너는 `command`(`-c wal_level=logical`)
 오버라이드를 지원하지 않아 docker compose를 쓴다.
+
+### 격리 워크스페이스 (`scripts/xbenv`)
+
+Python venv처럼 **디렉터리 하나에 config·키·store를 격리**해 테스트한다. 전역 설정을 건드리지
+않고, `rm -rf`로 흔적 없이 지워진다(`activate`가 `XB_CONFIG`/`XB_PROFILE`/시크릿/PATH를 잡음).
+
+```bash
+scripts/xbenv new ./ws --engine pg     # 워크스페이스 + 격리 DB(xbenv_ws, xbenv_ws_restore) 생성
+source ./ws/activate                    # 활성화 → 프롬프트 (xbenv:ws)
+x-backup backup --type full             # --profile 불필요(XB_PROFILE 자동), pg_logical 켜짐
+x-backup backup --type incr
+x-backup restore --target "$XBENV_TARGET_URI" --at latest --force
+deactivate                              # 환경 원복
+scripts/xbenv destroy ./ws             # 워크스페이스 + 격리 DB + slot 제거
+```
+
+`--engine mongo`면 source=:27017 RS / target=:27117 컨테이너를 가리킨다. 자세한 사용법은
+`scripts/xbenv help`.

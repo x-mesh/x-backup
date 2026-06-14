@@ -72,7 +72,7 @@ pub enum Command {
 #[derive(Debug, Args)]
 pub struct MigrateArgs {
     /// 사용할 프로파일 이름(source 접속 정보).
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", env = "XB_PROFILE")]
     pub profile: String,
     /// 대상(target) MongoDB URI. `--target-profile`과 택일(둘 중 하나 필수).
     #[arg(long, value_name = "MONGO_URI", conflicts_with = "target_profile")]
@@ -128,7 +128,7 @@ pub struct InitArgs {
 #[derive(Debug, Args)]
 pub struct BackupArgs {
     /// 사용할 프로파일 이름.
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", env = "XB_PROFILE")]
     pub profile: String,
     /// 백업 유형(full/incr). 미지정 시 config의 기본값을 따른다.
     #[arg(long = "type", value_enum)]
@@ -163,7 +163,7 @@ pub struct BackupArgs {
 #[derive(Debug, Args)]
 pub struct RestoreArgs {
     /// 사용할 프로파일 이름.
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", env = "XB_PROFILE")]
     pub profile: String,
     /// 복구할 백업 ID. 미지정 시 최신 풀 백업을 자동 선택한다(FR-3).
     #[arg(long, value_name = "BACKUP_ID")]
@@ -233,7 +233,7 @@ pub struct VerifyArgs {
 #[derive(Debug, Args)]
 pub struct PruneArgs {
     /// 사용할 프로파일 이름.
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", env = "XB_PROFILE")]
     pub profile: String,
     /// 최근 풀백업 N개를 보존한다.
     #[arg(long, value_name = "N")]
@@ -253,7 +253,7 @@ pub struct PruneArgs {
 #[derive(Debug, Args)]
 pub struct StatusArgs {
     /// 사용할 프로파일 이름. `--all`이면 생략 가능.
-    #[arg(long, value_name = "NAME", required_unless_present = "all")]
+    #[arg(long, value_name = "NAME", required_unless_present = "all", env = "XB_PROFILE")]
     pub profile: Option<String>,
     /// config의 모든 프로파일을 한 번에 점검한다(한 줄 요약 + 최악 exit code).
     #[arg(long, conflicts_with = "profile")]
@@ -276,7 +276,7 @@ pub struct StatusArgs {
 #[derive(Debug, Args)]
 pub struct PeekArgs {
     /// 사용할 프로파일 이름.
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", env = "XB_PROFILE")]
     pub profile: String,
     /// 특정 네임스페이스만(`db.collection`). 지정 시 그 컬렉션의 최신 N건을 보여준다.
     #[arg(long, value_name = "DB.COLLECTION")]
