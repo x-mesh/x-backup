@@ -10,6 +10,8 @@ name: CI
 #                     `--features integration-tests`.
 #   - s3            : push to main + nightly. `--features s3-integration --test s3_minio`.
 #                     테스트가 MinIO 컨테이너를 스스로 기동/정리한다(Docker만 필요).
+#   - postgres      : push to main + nightly. docker compose로 PostgreSQL(wal_level=logical)
+#                     기동 후 PG E2E(풀→증분(pgoutput)→PITR) 시나리오(make scenario-pg).
 #   - musl          : 모든 PR/push. cross 0.2.5로 정적 musl 릴리스 빌드 + artifact.
 #
 # Rust 버전 핀: 리포에 rust-toolchain.toml이 없으므로 워크플로에서 핀한다.
@@ -195,6 +197,44 @@ jobs:
 
       - name: cargo test (s3-integration, MinIO)
         run: cargo test --features s3-integration --test s3_minio -- --nocapture
+
+  # ── 3.5) PostgreSQL E2E: logical decoding 증분 + PITR (push main + nightly) ─
+  # PG 증분(pgoutput)은 wal_level=logical 서버가 필요한데, GitHub 서비스 컨테이너는
+  # command(-c wal_level=logical) 오버라이드를 지원하지 않는다. 그래서 docker compose
+  # (docker/docker-compose.postgres.yaml — command로 wal_level=logical 설정)로 띄우고
+  # scripts/scenario-pg-e2e.sh를 돌린다(make scenario-pg = build + postgres-up + 시나리오).
+  # 시나리오는 컨테이너 내 psql(docker exec)로 시드/검증하므로 호스트 psql은 불필요하다.
+  postgres:
+    name: postgres (logical decoding E2E)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name == 'push' || github.event_name == 'schedule'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned 1.93.0)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: postgres
+
+      - name: Verify Docker is available (compose brings up PostgreSQL)
+        run: docker info >/dev/null
+
+      # make scenario-pg = build(release) + postgres-up(compose, wal_level=logical, --wait)
+      # + scripts/scenario-pg-e2e.sh(풀→증분×2→빈 슬라이스→구조검증→풀복구→PITR 전체/중간
+      # →시퀀스 재동기화, 21 단언). 성공 시 스크립트가 slot·테스트 DB를 정리한다.
+      - name: PostgreSQL E2E (full → incremental → PITR)
+        run: make scenario-pg
+
+      - name: Tear down PostgreSQL
+        if: always()
+        run: make postgres-down
 
   # ── 4) musl 정적 빌드 (모든 PR/push) ─────────────────────────────────────
   # acceptance-report §5 방식: cross 0.2.5 + ghcr.io/cross-rs/x86_64-unknown-linux-musl.

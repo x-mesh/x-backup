@@ -1,23 +1,24 @@
 # CI 워크플로 (GitHub Actions)
 
 > 대상: `.github/workflows/ci.yml` · 작성: 2026-06-13 · 태스크: CI 자동화
-> x-backup의 검증(단위 282 / 통합=replica set / S3=MinIO / musl=cross)을 GitHub Actions로 자동화한다.
+> x-backup의 검증(단위 343 / 통합=replica set / S3=MinIO / PG=docker compose / musl=cross)을 GitHub Actions로 자동화한다.
 
 ## 1. 트리거
 
 | 트리거 | 실행 잡 |
 |---|---|
-| `pull_request` → main | `lint-and-test`, `musl` |
-| `push` → main | 전체 (`lint-and-test`, `integration`, `s3`, `musl`) |
+| `pull_request` → main | `lint-and-test`, `msrv`, `musl` |
+| `push` → main | 전체 (`lint-and-test`, `msrv`, `integration`, `s3`, `postgres`, `musl`) |
 | `schedule` (nightly 03:17 UTC) | 전체 |
 
 - `concurrency`: 같은 ref의 진행 중 실행을 자동 취소(`cancel-in-progress: true`).
 - `permissions: contents: read` (최소 권한).
 - 잡별 `timeout-minutes` 명시(30~40).
 
-무거운 잡(`integration`, `s3`)을 PR에서 빼고 main push + nightly로만 돌리는 이유: Docker
-컨테이너·mongodb-database-tools 다운로드·MinIO 기동이 PR 피드백 루프를 느리게 한다. PR은
-fmt/clippy/단위/E2E(no-DB)/musl로 빠르게 검증하고, 통합/S3는 머지 후·야간에 보강한다.
+무거운 잡(`integration`, `s3`, `postgres`)을 PR에서 빼고 main push + nightly로만 돌리는 이유:
+Docker 컨테이너·mongodb-database-tools 다운로드·MinIO/PostgreSQL 기동이 PR 피드백 루프를
+느리게 한다. PR은 fmt/clippy/단위/E2E(no-DB)/musl로 빠르게 검증하고, 통합/S3/PG는 머지
+후·야간에 보강한다.
 
 ## 2. 잡 구성
 
@@ -26,7 +27,7 @@ DB·Docker 불필요. 로컬과 동일 커맨드:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --lib                 # 단위 282
+cargo test --lib                 # 단위 343
 cargo test --test exit_codes_e2e # DB 불필요 E2E(종료 코드, SC6) 7
 ```
 통합/S3 스위트는 `#![cfg(feature = ...)]`로 격리돼 있어 feature 미지정 시 **컴파일 대상에서
@@ -69,6 +70,23 @@ cargo test --features s3-integration --test s3_minio -- --nocapture
   컨테이너를 미리 띄우지 않는다 — Docker만 있으면 된다(ubuntu-latest 러너에 사전 설치).
 - docker 미가용 시 테스트가 자동 skip(경고 출력)하도록 작성돼 있다.
 
+### `postgres` (push main + nightly)
+PG 증분(logical decoding/pgoutput)은 `wal_level=logical` 서버가 필요하다.
+```bash
+docker info >/dev/null          # Docker 가용성 확인(compose가 PG를 띄운다)
+make scenario-pg                # = build + postgres-up(compose) + scripts/scenario-pg-e2e.sh
+make postgres-down              # 정리(if: always())
+```
+- **서비스 컨테이너 대신 docker compose를 쓰는 이유:** GitHub 서비스 컨테이너는 컨테이너
+  `command` 오버라이드를 지원하지 않아 `postgres -c wal_level=logical`로 띄울 수 없다.
+  `docker/docker-compose.postgres.yaml`이 `command`로 `wal_level=logical`을 설정하고
+  `--wait`로 healthy까지 대기한다.
+- `scripts/scenario-pg-e2e.sh`는 **풀 → 증분(pgoutput) ×2 → 빈 슬라이스 → 구조 검증 →
+  풀 복구 → PITR(전체/중간) → 시퀀스 재동기화**까지 21개 단언을 수행한다. 시드·검증은
+  컨테이너 안 `psql`(`docker exec`)로 하므로 **호스트 psql은 불필요**하다.
+- 성공 시 스크립트가 replication slot·테스트 DB를 정리한다(WAL 누수 방지). 실패 시
+  산출물·컨테이너를 남기고, `make postgres-down`이 `if: always()`로 컨테이너를 정리한다.
+
 ### `musl` (모든 PR/push)
 ```bash
 cargo install cross --version 0.2.5 --locked
@@ -93,13 +111,14 @@ YAML은 `python3 -c "import yaml; yaml.safe_load(...)"`로 파싱 검증했고 `
 
 | 항목 | 로컬 실측(toolchain 1.93.0) | GitHub 첫 실행에서 확인 필요 |
 |---|---|---|
-| `cargo test --lib` | ✅ 282 passed | — |
+| `cargo test --lib` | ✅ 343 passed | — |
 | `cargo test --test exit_codes_e2e` | ✅ 7 passed | — |
 | `cargo clippy --all-targets --all-features -D warnings` | ✅ 0 경고(1.93.0) | — |
 | `cargo fmt --all -- --check` | ❌ **실패**(아래 주의) | 소스 포맷 정리 후 green |
 | mongodb-database-tools URL+sha256 | ✅ URL 200·sha256 실측 일치 | tar 추출 경로/PATH 등록 |
 | replica set fixture `up`/`down` | (로컬 미기동) | RS 기동·통합 테스트 첫 실행 |
 | s3 MinIO 자체 기동 | (로컬 미기동) | `host.docker.internal` 게이트웨이 |
+| postgres `make scenario-pg` | ✅ 로컬 21단언 PASS(PG16, slot·DB 정리) | GHA 러너 docker compose v2·python3 |
 | `cross build … musl` | (acceptance-report §5에서 별도 실측) | 캐시 없는 첫 빌드 시간/ghcr pull |
 
 ### ⚠ 알려진 선결 조건: `cargo fmt --all -- --check` 실패

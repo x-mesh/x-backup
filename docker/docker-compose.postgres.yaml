@@ -23,9 +23,13 @@ services:
     ports:
       - "${XB_PG_PORT:-5432}:5432"
     healthcheck:
+      # -h 127.0.0.1(TCP)로 검사한다 — 빈 볼륨 첫 기동 시 entrypoint의 임시 init 서버는
+      # listen_addresses=''(유닉스 소켓 전용)라 TCP가 없다. -h 없이 소켓으로 검사하면 그
+      # 임시 서버에 매칭돼 `--wait`가 진짜(wal_level=logical) 서버 기동 전에 반환될 수 있다.
+      # TCP 게이팅으로 본서버까지 확실히 대기한다.
       test:
         - CMD-SHELL
-        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+        - pg_isready -h 127.0.0.1 -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
       interval: 2s
       timeout: 5s
       retries: 30
