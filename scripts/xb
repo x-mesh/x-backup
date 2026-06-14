@@ -161,10 +161,12 @@ cmd_setup() {
 }
 
 cmd_env() {
-  ensure_devenv
+  resolve_bin; ensure_devenv
   echo "export XB_CONFIG='$CFG'"
+  echo "export XB_PROFILE='$PROFILE'"        # --profile 없이 bare 명령 동작(env=XB_PROFILE)
   echo "export MONGO_URI='$SRC_URI'"
   echo "export XB_AGE_IDENTITY_FILE='$AGE_KEY'"
+  echo "export PATH='$(dirname "$BIN"):'\$PATH"   # 방금 빌드한 dev x-backup을 PATH 우선
   [ -d "$ROOT/.tools/bin" ] && echo "export PATH='$ROOT/.tools/bin:'\$PATH"
   echo "# 타깃(복구용): $TGT_URI"
 }
