@@ -12,15 +12,15 @@ x-backup backs up a running MongoDB (standalone or replica set) or PostgreSQL in
 
 - ✅ **Full backup** — driver-native streaming archive (data + indexes + collection options), no external tools; `mongodump --archive --oplog` available as an opt-in engine
 - ✅ **Incremental backup** — captures the oplog directly; on a gap it promotes to a full backup automatically (exit 4)
-- ✅ **PITR** — restore to a moment with `--at <RFC3339>` (base restore + oplog replay, gated on chain verification)
+- ✅ **PITR** — restore to a moment with `--at <RFC3339>|latest` (base restore + replay of MongoDB oplog or PostgreSQL logical-decoding changes, gated on chain verification)
 - ✅ **Storage** — local disk or S3-compatible (MinIO, R2, OCI), streaming multipart upload with abort cleanup
 - ✅ **Encrypted by default** — `age` (X25519; only the public key lives on the backup host) or AES-256-GCM, compressed with zstd before encryption
 - ✅ **Integrity** — manifest + sha256, with `verify` (structural check, no key needed), `--deep`, and `--chain`
-- ✅ **Operations** — `status` preflight (connection, topology, privileges, version/FCV, clock skew, oplog window, data shape, **last backup age**, **destination writability + free space**), `--all` source-vs-target diff, `--watch` live monitor, chain-safe `prune`, concurrent-run locking, a defined exit-code contract (0–5)
+- ✅ **Operations** — `doctor` offline config check (all profiles, no DB connection), `status` preflight (connection, topology, privileges, version/FCV, clock skew, oplog window, data shape, **last backup age**, **destination writability + free space**), `--all` source-vs-target diff, `--watch` live monitor, chain-safe `prune`, concurrent-run locking, a defined exit-code contract (0–5)
 - ✅ **PostgreSQL** — driver-native full backup/restore via the COPY protocol (data + tables + constraints + indexes + sequences), no `pg_dump`/`pg_restore`. Same pipeline (compress → encrypt → store), same `status`/`list`/`verify`/`restore`
 - ✅ **Headless** — auto-quiet when not a TTY, `--json` output, built for cron and CI
 
-Scope: MongoDB replica sets get full and incremental backups, standalone gets full only, and sharded clusters are detected and refused. PostgreSQL gets full backup, restore, migrate, status/peek/watch (incremental/PITR is a roadmap item). See [PostgreSQL](#postgresql).
+Scope: MongoDB replica sets get full and incremental backups, standalone gets full only, and sharded clusters are detected and refused. PostgreSQL gets full backup, restore, migrate, status/peek/watch, plus incremental backup and PITR via logical decoding (opt-in). See [PostgreSQL](#postgresql).
 
 ## Install
 
@@ -75,6 +75,7 @@ While the repository is private, this needs `GITHUB_TOKEN` (or a prior `gh auth 
 
 ```bash
 x-backup init                                   # interactive wizard → config.toml
+x-backup doctor                                 # offline config check: all profiles, no DB connection
 x-backup status  --profile prod                 # is the server ready to back up?
 x-backup status  --all                          # side-by-side diff of every profile (source vs target)
 x-backup status  --profile prod --watch         # live monitor: per-namespace doc/size deltas (Ctrl-C)
@@ -86,9 +87,14 @@ x-backup verify  --id <backup-id>               # structural check, no key requi
 x-backup restore --profile prod --target mongodb://staging --dry-run
 x-backup restore --profile prod --target mongodb://staging --force
 x-backup restore --profile prod --at 2026-06-01T00:00:00Z --force   # PITR
-x-backup prune   --profile prod --keep-full 7 --dry-run
+x-backup prune   --profile prod --keep-last 100 --dry-run
 x-backup migrate --profile prod --target mongodb://newcluster --force # direct copy, no file
 ```
+
+Every command prints a one-line context to stderr — the active profile and DB engine,
+e.g. `▸ 프로파일 prod · DB postgresql` — so you always know what you're touching in a
+multi-DB config (skipped under `--json`). `--profile` can also come from the `XB_PROFILE`
+env var, and `--config` from `XB_CONFIG`.
 
 ### Migrate (direct copy, no file)
 
@@ -165,6 +171,13 @@ level     = 10
 enabled        = true
 algorithm      = "age"
 recipient_file = "/etc/x-backup/age.pub"   # public key only; keep the private key on the restore host
+
+[profiles.prod.retention]        # prune defaults (CLI flags override these)
+keep_last = 100                  # keep the newest 100 backups (per chain)
+keep_days = 30                   # ...and anything from the last 30 days
+
+# [profiles.prod.features.incremental]    # PostgreSQL only — opt in to logical-decoding incr/PITR
+# pg_logical = true                       # needs server wal_level=logical (see PostgreSQL below)
 ```
 
 Any value can be overridden by an `XB_`-prefixed environment variable (`XB_DESTINATION__S3__BUCKET=...`). Precedence is `CLI > ENV > config.toml > built-in default`.
@@ -231,13 +244,23 @@ uri_env = "PG_URI"               # e.g. postgresql://user:pass@host:5432/mydb
 [profiles.pg.destination]
 type = "local"
 path = "/var/backups/pg"
+
+[profiles.pg.features.incremental]
+pg_logical = true                # opt in to incremental/PITR via logical decoding
+                                 # (requires server wal_level=logical)
+
+[profiles.pg.retention]
+keep_last = 100
+keep_days = 30
 ```
 
 All the DB-agnostic commands work the same as MongoDB:
 
 ```bash
 x-backup backup  --profile pg                    # COPY-based full backup → compress → encrypt → store
+x-backup backup  --profile pg --type incr        # logical-decoding increment (needs pg_logical = true)
 x-backup restore --profile pg --target postgresql://host:5432/restored --force
+x-backup restore --profile pg --target postgresql://host/restored --at latest --force   # PITR (latest = all)
 x-backup status  --profile pg [--all] [--watch]  # version, db size, table/row counts, last backup; live Δ
 x-backup peek    --profile pg [--ns schema.table]# eyeball data: per-table counts + latest rows
 x-backup migrate --profile pg --target postgresql://host/other --drop --force   # driver COPY, PG → PG
@@ -260,11 +283,14 @@ falls back to plaintext for servers without it, while `sslmode=require`/`verify-
 TLS. Data moves as text COPY (the portable format pg_dump uses), so restoring across
 PostgreSQL major versions is safe; a major-version mismatch is logged as a warning.
 
-Not yet covered (roadmap): ownership/grants, comments, aggregate/window functions, user-defined
-base/range types, and incremental/PITR (`restore --at` is refused for PostgreSQL — PITR means WAL
-archiving, a different mechanism from MongoDB's oplog). Restoring into a non-empty database should
-use `--force` (drops and recreates each backed-up table); an empty target needs no flag. `migrate`
-is PG → PG only (no cross-engine).
+Incremental backup and PITR work via **logical decoding** (not WAL archiving): opt in with the
+server's `wal_level=logical` plus `[profiles.<name>.features.incremental] pg_logical = true`. A full
+backup then creates a replication slot, `backup --type incr` captures the changes since, and
+`restore --at <RFC3339>|latest` replays them up to the target time (`latest` replays everything).
+
+Not yet covered (roadmap): ownership/grants, comments, aggregate/window functions, and user-defined
+base/range types. Restoring into a non-empty database should use `--force` (drops and recreates each
+backed-up table); an empty target needs no flag. `migrate` is PG → PG only (no cross-engine).
 
 ### Live monitor (`status --watch`)
 
@@ -280,6 +306,40 @@ x-backup status --profile prod --watch --count 5       # take 5 samples then exi
 ```
 
 Pair it with `scripts/xb churn` to watch increments land in real time. `Ctrl-C` exits cleanly.
+
+### Listing backups (`list`)
+
+`list` shows the catalog for a profile, **newest-first** by default. The first line is the
+store location it's reading from, and each backup carries a **DB** column (`postgresql`/`mongodb`)
+alongside its type and chain status. Filter and sort it:
+
+```bash
+x-backup list --profile prod                     # newest-first catalog, with store location + DB column
+x-backup list --profile prod --type incr         # only increments (full | incr | orphan)
+x-backup list --profile pg   --engine pg         # only PostgreSQL backups (pg/mongo aliases ok)
+x-backup list --profile prod --sort size         # biggest first (created | size; created is default)
+x-backup list --profile prod --asc --limit 10    # oldest 10 (default order is descending)
+x-backup list --profile prod --json              # machine-readable; includes a `store` field
+```
+
+`--sort` is `created` (default) or `size`; the default order is descending (newest/biggest first),
+and `--asc` flips it. `--limit N` caps the rows after sorting/filtering.
+
+### Pruning (`prune`)
+
+`prune` deletes old backups by retention rule, always chain-safe — it works per chain, so a live
+increment's base full backup is never deleted out from under it. Rules:
+
+```bash
+x-backup prune --profile prod --keep-last 100 --dry-run   # keep the newest 100 backups
+x-backup prune --profile prod --keep-full 7 --force       # keep the newest 7 full chains
+x-backup prune --profile prod --keep-days 30 --force      # keep anything from the last 30 days
+```
+
+`--keep-last N`, `--keep-full N`, and `--keep-days D` can be combined. When a CLI flag is absent,
+`prune` falls back to the profile's `[profiles.<name>.retention]` (`keep_last` / `keep_full` /
+`keep_days`) as the default; CLI flags override config. With no rule from either source, `prune`
+deletes nothing and reports the error.
 
 ### Exit codes
 
@@ -297,7 +357,7 @@ To treat 4 as success in cron: `x-backup backup ...; rc=$?; [ $rc -eq 4 ] && rc=
 ## Restore semantics
 
 - `restore` (no `--at`) restores the **base full backup snapshot only**.
-- `restore --at <time>` is PITR: it restores the base, then replays incremental oplog up to that time (the largest ts at or before it). It requires `verify --chain` to pass, and it cannot be combined with `--only` (selective restore), a `mongorestore` limitation.
+- `restore --at <time>|latest` is PITR: it restores the base, then replays increments up to that time — MongoDB oplog (the largest ts at or before it) or PostgreSQL logical-decoding changes; `latest` replays everything. It requires `verify --chain` to pass, and it cannot be combined with `--only` (selective restore).
 - `verify --deep` runs only on a host that holds the private key (key isolation, PRD §8.5). The backup host carries only the public key, so a compromised backup host still cannot decrypt past backups.
 
 ## Development
@@ -312,7 +372,10 @@ make mongodb-up         # two test replica sets (source :27017 + target :27117)
 make test-integration   # Docker replica set integration tests
 make test-s3            # MinIO S3 integration tests
 make scenario           # E2E scenario (full → incr → verify → restore → PITR, 22 assertions)
-make postgres-up        # PostgreSQL, for the upcoming adapter
+make postgres-up        # PostgreSQL test server
+make xbenv-pg           # isolated PostgreSQL test workspace (then: source <dir>/activate)
+make xbenv-mongo        # isolated MongoDB test workspace
+make xbenv-clean        # remove the isolated workspaces
 ```
 
 ### Manual testing against the containers
@@ -361,6 +424,11 @@ On a near-empty oplog (a fresh container), an increment may promote itself to a 
 backup — that is the gap guard working, not an error. Churning data in first keeps the
 oplog window healthy.
 
+For isolated, throwaway test setups (a Python-venv-style model), `scripts/xbenv` creates a
+self-contained workspace you `source <dir>/activate` into — it sets `XB_PROFILE`/`XB_CONFIG`
+for that shell. `make xbenv-pg` / `make xbenv-mongo` spin one up per engine and `make
+xbenv-clean` removes them (details in [docs/postgres.md](docs/postgres.md)).
+
 ## Docs
 
 The docs are written in Korean.
@@ -376,5 +444,5 @@ The docs are written in Korean.
 
 ## Roadmap
 
-PostgreSQL adapter (next), GFS retention, Prometheus metrics, KMS/HSM key integration,
-live migration (oplog-tailing, near-zero-downtime cutover) — see [PRD §12](docs/PRD.md).
+GFS retention, Prometheus metrics, KMS/HSM key integration, live migration (oplog-tailing,
+near-zero-downtime cutover) — see [PRD §12](docs/PRD.md).

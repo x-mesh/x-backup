@@ -1,7 +1,7 @@
 //! `verify` 서브커맨드 핸들러 — 구조/심층/체인 무결성 검증(PRD §FR-7, §8.5).
 //!
-//! 스코프(t10): destination type=local. S3는 t7 백엔드가 동일 [`Storage`] trait를
-//! 구현하면 그대로 동작하지만, 핸들러 배선은 backup/restore와 동일하게 local 우선이다.
+//! destination은 local/s3 모두 동작한다(동일 [`Storage`] trait). verify는 저장 바이트만
+//! 보므로 DB 종류(Mongo/PG)와 무관하다(체크섬·디코드 검증).
 //!
 //! ## 키 격리(§8.5)
 //! 기본 verify(구조)는 **키 없이** 동작한다 — 체크섬은 저장 바이트 기준이라 복호화가

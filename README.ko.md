@@ -16,15 +16,15 @@
 
 - ✅ **풀 백업** — 드라이버 네이티브 스트리밍 아카이브(데이터 + 인덱스 + 컬렉션 옵션), 외부 도구 불필요. `mongodump --archive --oplog`는 opt-in 엔진으로 선택 가능
 - ✅ **증분 백업** — oplog 직접 캡처, gap 감지 시 풀 백업 자동 승격(exit 4)
-- ✅ **PITR** — `--at <RFC3339>` 시점 복구 (base + oplog replay, 체인 검증 전제)
+- ✅ **PITR** — `--at <RFC3339>|latest` 시점 복구 (base + replay, 체인 검증 전제). MongoDB(oplog)·PostgreSQL(logical decoding) 모두 지원
 - ✅ **스토리지** — 로컬 디스크 / S3 호환(MinIO·R2·OCI), 스트리밍 멀티파트 + abort
 - ✅ **암호화 기본** — `age`(X25519, 공개키만 백업 호스트에 배치) / AES-256-GCM 대안, zstd 압축 후 암호화
 - ✅ **무결성** — manifest + sha256, `verify`(키 불필요 구조 검증) / `--deep` / `--chain`
-- ✅ **운영** — `status` 사전 점검(연결·토폴로지·권한·버전/FCV·시계차·oplog 윈도우·데이터 형상·**마지막 백업 나이**·**destination 쓰기 가능+여유 공간**), `--all` source/target 비교, `--watch` 라이브 모니터, `prune` 체인 안전 삭제, 동시 실행 잠금, exit code 규약 0~5
+- ✅ **운영** — `doctor` config 정적 점검(오프라인·DB 연결 없음), `status` 사전 점검(연결·토폴로지·권한·버전/FCV·시계차·oplog 윈도우·데이터 형상·**마지막 백업 나이**·**destination 쓰기 가능+여유 공간**), `--all` source/target 비교, `--watch` 라이브 모니터, `prune` 체인 안전 삭제(`--keep-last`·config retention), 동시 실행 잠금, exit code 규약 0~5
 - ✅ **PostgreSQL** — COPY 프로토콜 기반 드라이버 네이티브 풀 백업/복구(데이터 + 테이블 + 제약 + 인덱스 + 시퀀스), `pg_dump`/`pg_restore` 불필요. 동일 파이프라인(압축→암호화→저장)·동일 `status`/`list`/`verify`/`restore`
 - ✅ **headless** — 비-TTY 자동 quiet, `--json`, cron/CI 친화
 
-지원 범위: MongoDB replica set(풀+증분)/standalone(풀만)/샤딩은 감지 시 거부. PostgreSQL은 풀 백업+복구+status(증분/PITR은 로드맵). [PostgreSQL](#postgresql-1) 참조.
+지원 범위: MongoDB replica set(풀+증분)/standalone(풀만)/샤딩은 감지 시 거부. PostgreSQL은 풀 백업+복구+status에 더해 증분(logical decoding)·PITR(opt-in). [PostgreSQL](#postgresql-1) 참조.
 
 ## Install
 
@@ -81,6 +81,7 @@ private 단계에서는 `GITHUB_TOKEN`(또는 `gh auth login`)이 필요하다.
 
 ```bash
 x-backup init                                   # 대화형 마법사 → config.toml
+x-backup doctor  --config config.toml           # config 정적 점검(오프라인·전 프로파일·DB 연결 없음)
 x-backup status  --profile prod                 # 백업 가능 상태 점검(신호등)
 x-backup status  --all                          # 모든 프로파일 비교(source vs target)
 x-backup status  --profile prod --watch         # 라이브 모니터: 네임스페이스별 문서/크기 Δ (Ctrl-C)
@@ -92,9 +93,11 @@ x-backup verify  --id <backup-id>               # 키 없는 구조 검증
 x-backup restore --profile prod --target mongodb://staging --dry-run
 x-backup restore --profile prod --target mongodb://staging --force
 x-backup restore --profile prod --at 2026-06-01T00:00:00Z --force   # PITR
-x-backup prune   --profile prod --keep-full 7 --dry-run
+x-backup prune   --profile prod --keep-last 100 --dry-run   # 최신 N벌 보존(또는 --keep-full/--keep-days, config retention)
 x-backup migrate --profile prod --target mongodb://newcluster --force # 파일 없이 직접 복사
 ```
+
+다중 DB 툴이라, 모든 명령은 실행 시 stderr에 활성 프로파일·DB를 한 줄로 보여준다(`▸ 프로파일 prod · DB postgresql`) — 지금 무엇을 건드리는지 항상 보이게(`--json`이면 생략). `--profile`은 `XB_PROFILE` 환경변수로도 줄 수 있다(`--config`/`XB_CONFIG`와 동일).
 
 ### Migrate (파일 없이 직접 복사)
 
@@ -167,6 +170,10 @@ level     = 10
 enabled        = true
 algorithm      = "age"
 recipient_file = "/etc/x-backup/age.pub"   # 공개키만 — 개인키는 복구 호스트에 격리
+
+[profiles.prod.retention]        # prune의 기본값(CLI 플래그가 없을 때, CLI 우선)
+keep_last = 100                  # 최신 100벌 보존(체인 단위)
+keep_days = 30                   # 최근 30일 이내 체인 보존
 ```
 
 모든 값은 `XB_` 접두사 환경변수로 오버라이드된다(`XB_DESTINATION__S3__BUCKET=...`).
@@ -231,13 +238,22 @@ uri_env = "PG_URI"               # 예: postgresql://user:pass@host:5432/mydb
 [profiles.pg.destination]
 type = "local"
 path = "/var/backups/pg"
+
+[profiles.pg.features.incremental]
+pg_logical = true                # PG 증분/PITR opt-in(서버 wal_level=logical 필요)
+
+[profiles.pg.retention]          # prune 기본값(CLI 플래그 없을 때, CLI 우선)
+keep_last = 100
+keep_days = 30
 ```
 
 DB 비의존 명령은 MongoDB와 동일하게 동작한다:
 
 ```bash
 x-backup backup  --profile pg                    # COPY 기반 풀 백업 → 압축 → 암호화 → 저장
+x-backup backup  --profile pg --type incr        # logical decoding 증분(pg_logical=true 전제)
 x-backup restore --profile pg --target postgresql://host:5432/restored --force
+x-backup restore --profile pg --target postgresql://host/restored --at latest --force  # PITR(latest=전체)
 x-backup status  --profile pg [--all] [--watch]  # 버전·DB 크기·테이블/행 수·마지막 백업; 라이브 Δ
 x-backup peek    --profile pg [--ns schema.table]# 데이터 육안 확인: 테이블 행 수 + 최신 행
 x-backup migrate --profile pg --target postgresql://host/other --drop --force   # 드라이버 COPY, PG → PG
@@ -256,10 +272,29 @@ x-backup list/verify/prune ...                    # manifest 기반(DB 비의존
 평문으로 폴백, `require`/`verify-full`은 TLS를 강제한다. 데이터는 text COPY(pg_dump가 쓰는
 이식성 포맷)로 옮기므로 PostgreSQL 메이저 버전이 달라도 복구가 안전하다(메이저 불일치는 경고).
 
-아직 미지원(로드맵): 소유권/권한·코멘트·집계/윈도우 함수·사용자 정의 base/range 타입, 그리고
-증분/PITR(`restore --at`은 PG에서 거부 — PITR은 WAL 아카이빙으로 oplog와 다른 메커니즘).
+증분·PITR: PG PITR은 **logical decoding**(pgoutput)으로 동작한다 — WAL 아카이빙이 아니다.
+서버 `wal_level=logical` + 프로파일 `[profiles.<name>.features.incremental] pg_logical = true`로
+opt-in하면, 풀 백업이 replication slot을 만들어 그 시점부터 WAL을 잡고, `backup --type incr`가
+변경을 캡처하며, `restore --at <RFC3339>|latest`가 base 복원 후 증분을 목표 시점까지 재생한다
+(`latest`=전체 재생). PITR 정밀도는 변경 단위 commit 타임스탬프로 마이크로초까지 간다.
+
+아직 미지원(로드맵): 소유권/권한·코멘트·집계/윈도우 함수·사용자 정의 base/range 타입.
 데이터가 있는 DB로 복구할 땐 `--force`(백업에 든 테이블을 drop 후 재생성)를 쓰고, 빈 대상은
 플래그가 필요 없다. `migrate`는 PG → PG만(엔진 간 불가).
+
+### 카탈로그 (`list`)
+
+`list`는 store(destination)의 백업·증분 체인을 한 표로 보여준다. 첫 줄에 **store 위치**를,
+백업마다 **DB**(postgresql/mongodb) 칼럼을 함께 출력하며, 기본은 **최신순** 정렬이다.
+
+```bash
+x-backup list --profile prod                       # 최신순(기본), store 위치 + DB 칼럼
+x-backup list --profile prod --sort size           # 큰 것이 위(--sort created|size, 기본 created)
+x-backup list --profile prod --asc                 # 오름차순(기본은 내림차순=최신/큰 것이 위)
+x-backup list --profile prod --type incr           # 유형 필터(full|incr|orphan)
+x-backup list --profile prod --engine pg --limit 5 # DB 엔진 필터(postgresql|mongodb, pg/mongo 약어) + 상위 N개
+x-backup list --profile prod --json                # store 필드 포함 JSON
+```
 
 ### 라이브 모니터 (`status --watch`)
 
@@ -275,6 +310,23 @@ x-backup status --profile prod --watch --count 5       # 5회 샘플 후 종료(
 ```
 
 `scripts/xb churn`과 함께 쓰면 증분이 실시간으로 쌓이는 걸 볼 수 있다. `Ctrl-C`로 종료.
+
+### 보존·삭제 (`prune`)
+
+`prune`은 보존 기준에 따라 오래된 백업을 **체인 단위**로 안전 삭제한다. 기준은 세 가지다:
+
+- `--keep-full N` — 최신 풀백업 체인 N개 보존
+- `--keep-days D` — 최근 D일 이내 체인 보존
+- `--keep-last N` — 최신 N벌 보존(체인 단위 누적이라, 살아있는 증분의 base는 단독으로 삭제되지 않는다)
+
+CLI 플래그가 없으면 config의 `[profiles.<name>.retention]`(`keep_full`/`keep_days`/`keep_last`)을
+기본값으로 쓴다(**CLI 우선**). 기준이 하나도 없으면 아무것도 삭제하지 않는다(안전).
+
+```bash
+x-backup prune --profile prod --keep-last 100 --dry-run   # 삭제 대상만 출력(무변경)
+x-backup prune --profile prod --keep-full 7 --force       # 최신 7체인만 남기고 삭제
+x-backup prune --profile prod --force                     # config retention을 기본값으로
+```
 
 ### Exit codes
 
@@ -309,7 +361,11 @@ make mongodb-up         # 테스트용 replica set 2식(소스:27017 + 타깃:27
 make test-integration   # Docker replica set 통합 테스트
 make test-s3            # MinIO S3 통합 테스트
 make scenario           # E2E 시나리오(풀→증분→verify→복구→PITR, 22 assertions)
-make postgres-up        # 2차 PostgreSQL 어댑터 대비
+make postgres-up        # 테스트용 PostgreSQL :5432 기동(PG 엔진 백업/복구/status)
+make scenario-pg        # PostgreSQL E2E(풀→증분(pgoutput)→복구→PITR 전체·중간→시퀀스 재동기화)
+make xbenv-pg           # PG 격리 테스트 워크스페이스 준비 + activate 안내
+make xbenv-mongo        # Mongo 격리 테스트 워크스페이스 준비 + activate 안내
+make xbenv-clean        # 격리 워크스페이스 제거
 ```
 
 ### 컨테이너에 직접 테스트하기
@@ -318,6 +374,10 @@ make postgres-up        # 2차 PostgreSQL 어댑터 대비
 실행하면 `.devenv/`에 `config.toml`과 age 키쌍을 만들고, 필요한 env(`XB_CONFIG`,
 `MONGO_URI`, `XB_AGE_IDENTITY_FILE`)·도구 PATH·`--profile`을 자동으로 주입한다 —
 설정을 손으로 엮을 필요가 없다.
+
+격리된 워크스페이스가 필요하면 `scripts/xbenv`(Python venv형 모델)를 쓴다 — 워크스페이스마다
+config·키·`XB_PROFILE`을 따로 두고 `source <dir>/activate`로 활성화한다. `make xbenv-pg`/
+`xbenv-mongo`/`xbenv-clean`으로 간편하게 준비·정리할 수 있다(상세는 [docs/postgres.md](docs/postgres.md)).
 
 ```bash
 make mongodb-up           # 컨테이너 기동
@@ -371,5 +431,5 @@ gap 가드가 동작하는 것이지 오류가 아니다. churn으로 데이터�
 
 ## Roadmap
 
-PostgreSQL 어댑터(2차) · GFS retention · Prometheus 메트릭 · KMS/HSM 키 연동 ·
+GFS retention · Prometheus 메트릭 · KMS/HSM 키 연동 ·
 라이브 마이그레이션(oplog tailing 무중단 cutover) — [PRD §12](docs/PRD.md)

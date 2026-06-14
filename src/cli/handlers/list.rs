@@ -1,15 +1,17 @@
 //! `list` 서브커맨드 핸들러 — 가용 백업·증분 체인 카탈로그(PRD §FR-7, R22).
 //!
-//! destination의 모든 manifest를 모아 카탈로그를 출력한다. 각 항목은 id·유형(full/incr)·
-//! 생성 시각·저장 크기·체인 상태(ok/broken/incomplete)를 보여준다. manifest 없이 data만
-//! 있는 디렉터리는 **orphan**(유령 산출물, pitfall 7-1)으로 표시한다. `--json`을 지원한다.
+//! destination의 모든 manifest를 모아 카탈로그를 출력한다. 첫 줄에 store 위치, 각 항목은
+//! id·유형(full/incr)·**DB 엔진**(postgresql/mongodb)·생성 시각·저장 크기·체인 상태
+//! (ok/broken/incomplete)를 보여주며 기본 최신순으로 정렬한다. manifest 없이 data만 있는
+//! 디렉터리는 **orphan**(유령 산출물, pitfall 7-1)으로 표시한다. `--sort`(created|size)·
+//! `--asc`·`--type`·`--engine`·`--limit` 필터/정렬과 `--json`을 지원한다.
 //!
 //! ## 체인 상태 판정
 //! - 풀백업: 자신을 base로 한 체인이 연속이면 `ok`, 끊겼으면 `broken`(증분이 없으면 ok).
 //! - 증분: 자신이 속한 체인 연속성으로 판정.
 //! - incomplete manifest: 항상 `incomplete`(체인 판정과 무관하게 사용 위험 표시).
 //!
-//! 스코프(t10): destination type=local. S3는 t7이 동일 Storage trait로 동작.
+//! destination은 local/s3 모두 동작한다(동일 [`Storage`](crate::storage::Storage) trait).
 
 use std::path::PathBuf;
 
