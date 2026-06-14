@@ -2,7 +2,8 @@
 //!
 //! - [`mongo`]: MongoDB 메타 질의(status·oplog ts) + mongodump/native 덤프 경로.
 //! - [`native`]: Mongo 드라이버 네이티브 아카이브(`xb-native-v1`).
-//! - [`postgres`]: PostgreSQL 드라이버 COPY 백업/복구(`xb-pg-v1`, 2차).
+//! - [`postgres`]: PostgreSQL 드라이버 백업/복구/증분/PITR(`xb-pg-v1` 풀 + `xb-pg-incr-v1`
+//!   증분, logical decoding, 2차).
 //!
 //! 전면 `Engine` trait 대신 핸들러 레벨에서 DB 종류([`crate::engine::DbKind`])로 분기하고,
 //! 덤프/복구/status에만 얇은 seam을 둔다(작동하는 Mongo 코드의 전면 재작성 회피).

@@ -10,7 +10,9 @@
 //! 제약(PK/UNIQUE/FK/CHECK)·인덱스·시퀀스(파라미터+last_value/is_called)·확장·사용자 정의
 //! 타입(enum/도메인/복합)·함수/프로시저·트리거·뷰/머티뷰·파티셔닝(부모 PARTITION BY +
 //! 자식 PARTITION OF, 다중 레벨)·행 데이터(COPY text).
-//! 잡지 않는 것(후속): 소유권/권한·코멘트·집계/윈도우 함수·user-defined base/range 타입·증분/PITR(WAL).
+//! 잡지 않는 것(경고만): 소유권/권한·코멘트·집계/윈도우 함수·user-defined base/range 타입.
+//! 증분/PITR은 이 풀 덤프 모듈이 아니라 logical decoding 기반
+//! [`incremental`](super::incremental)이 담당한다.
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};

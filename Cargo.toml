@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 # rust-version: mongodb v3.7 요구사항(1.88+)을 고려해 MSRV를 1.88로 고정한다.
 rust-version = "1.88"
-description = "MongoDB 백업·복구 CLI — 풀/증분(oplog), 로컬/원격(S3 호환), 암호화 중심"
+description = "MongoDB·PostgreSQL 백업·복구 CLI — 풀/증분(oplog·logical decoding)/PITR, 로컬/원격(S3 호환), 암호화, 외부 의존 없는 단일 정적 바이너리"
 license = "MIT"
 
 [features]

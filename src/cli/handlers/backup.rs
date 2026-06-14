@@ -1,7 +1,9 @@
 //! `backup` 서브커맨드 핸들러 — config 로드 → 파이프라인 실행 → 요약 출력.
 //!
-//! 스코프(t4): destination type=local 풀 백업만. S3는 t7, 증분은 t8,
-//! 사전 점검(status 선행)은 t11이 채운다(아래 TODO 주석).
+//! 풀/증분 백업(Mongo oplog · PostgreSQL logical decoding), 로컬/S3 destination + 멀티
+//! destination 복제, 압축·암호화, 자동 사전 점검(status 선행)을 지원한다. DB 종류는 source
+//! URI 스킴으로 분기한다([`crate::engine::DbKind`] — Mongo는 아래 본 경로, PG는
+//! [`handle_pg_backup`]).
 
 use std::path::PathBuf;
 
@@ -199,7 +201,8 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
 ///
 /// Mongo 경로의 storage/mode/replicate/summary 골격을 공유하되, 덤프는
 /// [`run_pg_full_backup`](crate::pipeline::backup::run_pg_full_backup)가 담당한다(oplog/토폴로지
-/// 없음). 증분은 PG 1차 미지원이라 거부한다.
+/// 없음). 증분(`--type incr`)은 `features.incremental.pg_logical` 활성 시
+/// [`handle_pg_incremental`]로 분기한다(미활성이면 안내와 함께 거부).
 #[allow(clippy::too_many_arguments)]
 async fn handle_pg_backup(
     resolved: &ResolvedConfig,

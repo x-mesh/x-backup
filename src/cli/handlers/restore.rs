@@ -1,8 +1,9 @@
 //! `restore` 서브커맨드 핸들러 — config 로드 → 복구 파이프라인 실행 → 요약 출력.
 //!
-//! 스코프(t5): destination type=local 풀 복구. `--target`(분리 복구)·`--id`/최신 자동
-//! 선택·`--only`(선택적)·`--force`/대화형 가드·`--dry-run`·`--skip-precheck`를 지원한다.
-//! PITR(`--at`)은 t9, S3 destination은 t7 소유다(아래 명시적 거부).
+//! 풀 복구 + 시점 복구(PITR, `--at`). `--target`(분리 복구)·`--id`/최신 자동 선택·
+//! `--only`(선택적)·`--force`/대화형 가드·`--dry-run`·`--skip-precheck`를 지원하고 로컬/S3
+//! destination을 모두 다룬다. PITR은 MongoDB(oplog 재생)·PostgreSQL(logical decoding 재생)
+//! 양쪽을 지원한다([`handle_pitr`] → Mongo는 [`run_pitr`], PG는 [`handle_pg_pitr`]).
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -27,7 +28,8 @@ pub async fn handle(config_path: Option<PathBuf>, args: RestoreArgs) -> Result<(
     // PITR·풀 복구 양쪽을 덮도록 --at 분기보다 먼저 잡고, 가드(_lock)를 끝까지 유지한다.
     let _lock = crate::lock::acquire(&args.profile)?;
 
-    // PITR(--at) 분기(t9) — base 풀 복원 + 증분 oplog 슬라이스 재생으로 시점 복구.
+    // PITR(--at) 분기 — base 풀 복원 + 증분 슬라이스 재생으로 시점 복구(Mongo oplog / PG
+    // logical decoding). 대상 DB 종류는 handle_pitr 안에서 분기한다.
     if let Some(at) = args.at.clone() {
         return handle_pitr(config_path, args, at).await;
     }
@@ -201,9 +203,11 @@ fn prompt_confirm(plan: &RestorePlan) -> bool {
 
 // ── PITR(--at) 분기 (t9) ──────────────────────────────────────────────────
 
-/// PITR 복구 핸들러 — `--at` 분기. base 풀 복원 후 증분 oplog 슬라이스를 목표 시점까지 재생.
+/// PITR 복구 핸들러 — `--at` 분기. base 풀 복원 후 증분 슬라이스를 목표 시점까지 재생한다.
+/// 대상이 PostgreSQL이면 [`handle_pg_pitr`](logical decoding 재생)로 위임하고, 그 외(Mongo)는
+/// oplog 재생([`run_pitr`])을 수행한다.
 ///
-/// 절차: PITR+--only 즉시 거부(exit 2) → config·URI·storage 해석 → [`run_pitr`] →
+/// 절차: PITR+--only 즉시 거부(exit 2) → config·URI·storage 해석 → (PG면 위임) → [`run_pitr`] →
 /// 결정 종료 ts({t,i}+wall-clock)·체인 보고 출력.
 async fn handle_pitr(config_path: Option<PathBuf>, args: RestoreArgs, at: String) -> Result<()> {
     // PITR + --only 병용 즉시 거부(pitfall 1-4: --oplogReplay는 ns 필터와 병용 불가, PRD Edge Case).
