@@ -16,7 +16,7 @@ x-backup backs up a running MongoDB (standalone or replica set) into an encrypte
 - ✅ **Storage** — local disk or S3-compatible (MinIO, R2, OCI), streaming multipart upload with abort cleanup
 - ✅ **Encrypted by default** — `age` (X25519; only the public key lives on the backup host) or AES-256-GCM, compressed with zstd before encryption
 - ✅ **Integrity** — manifest + sha256, with `verify` (structural check, no key needed), `--deep`, and `--chain`
-- ✅ **Operations** — `status` preflight (traffic-light summary), chain-safe `prune`, concurrent-run locking, a defined exit-code contract (0–5)
+- ✅ **Operations** — `status` preflight (connection, topology, privileges, version/FCV, clock skew, oplog window, data shape, **last backup age**, **destination writability + free space**), `--all` source-vs-target diff, `--watch` live monitor, chain-safe `prune`, concurrent-run locking, a defined exit-code contract (0–5)
 - ✅ **Headless** — auto-quiet when not a TTY, `--json` output, built for cron and CI
 
 Scope: replica sets get full and incremental backups, standalone gets full only, and sharded clusters are detected and refused (out of scope).

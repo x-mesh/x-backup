@@ -19,7 +19,7 @@
 - ✅ **스토리지** — 로컬 디스크 / S3 호환(MinIO·R2·OCI), 스트리밍 멀티파트 + abort
 - ✅ **암호화 기본** — `age`(X25519, 공개키만 백업 호스트에 배치) / AES-256-GCM 대안, zstd 압축 후 암호화
 - ✅ **무결성** — manifest + sha256, `verify`(키 불필요 구조 검증) / `--deep` / `--chain`
-- ✅ **운영** — `status` 사전 점검(신호등), `prune` 체인 안전 삭제, 동시 실행 잠금, exit code 규약 0~5
+- ✅ **운영** — `status` 사전 점검(연결·토폴로지·권한·버전/FCV·시계차·oplog 윈도우·데이터 형상·**마지막 백업 나이**·**destination 쓰기 가능+여유 공간**), `--all` source/target 비교, `--watch` 라이브 모니터, `prune` 체인 안전 삭제, 동시 실행 잠금, exit code 규약 0~5
 - ✅ **headless** — 비-TTY 자동 quiet, `--json`, cron/CI 친화
 
 지원 범위: replica set(풀+증분) / standalone(풀만) / 샤딩 클러스터는 감지 시 거부(스코프 외).

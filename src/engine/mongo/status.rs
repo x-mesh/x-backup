@@ -9,8 +9,14 @@
 //!    replica set이면 `replSetGetStatus`로 PRIMARY 존재·SECONDARY lag 요약.
 //! 5. **oplog 윈도우**: `local.oplog.rs` 최소~최신 ts 시간 폭. config interval 대비 여유.
 //! 6. **저장 엔진**: `serverStatus`의 `storageEngine.name`.
-//! 7. **예상 크기**: 전 DB `dbStats` 합산(dataSize/storageSize).
+//! 7. **예상 크기 + 데이터 형상**: 전 DB `dbStats` 한 번 합산 → dataSize/storageSize/indexSize와
+//!    문서 수·컬렉션 수·인덱스 수(추가 쿼리 없이 같은 합산에서).
 //! 8. **(선택) secondary 가용성**: prefer_secondary 구성 시 읽기 가능한 secondary 존재 여부.
+//! 9. **FCV**: `getParameter featureCompatibilityVersion`(서버 버전과 별개 호환성 경계).
+//! 10. **서버 시계**: `hello.localTime` vs 로컬 시각(clock skew — PITR/oplog 안전성).
+//!
+//! "마지막 백업"(destination 최신 manifest)·"destination 점검"(쓰기 가능·여유 공간)은 source가
+//! 아닌 저장소 쪽 정보라 핸들러([`crate::cli::handlers::status`])에서 보고서에 덧붙인다.
 //!
 //! ## 읽기 전용·무부작용
 //! 모든 명령은 조회 전용(`hello`/`buildInfo`/`connectionStatus`/`replSetGetStatus`/
@@ -23,12 +29,24 @@
 use std::collections::BTreeSet;
 
 use bson::{doc, Document, Timestamp};
+use chrono::Utc;
 use mongodb::options::FindOneOptions;
 use mongodb::Client;
 use serde::Serialize;
 
 use crate::config::secret::Secret;
 use crate::error::{Result, XBackupError};
+
+/// 사용자 DB `dbStats` 합산 — 문서·컬렉션·인덱스 수와 데이터·저장·인덱스 크기(바이트).
+#[derive(Debug, Default, Clone, Copy)]
+struct DbTotals {
+    objects: i64,
+    collections: i64,
+    indexes: i64,
+    data_size: i64,
+    storage_size: i64,
+    index_size: i64,
+}
 
 /// 단일 점검 항목의 판정 결과(신호등 한 칸).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -454,15 +472,34 @@ impl StatusChecker {
         items.push(self.check_privileges().await);
         // 3) 버전 정합.
         items.push(self.check_version(mongodump_program).await);
+        // 3.5) FCV(호환성 경계).
+        items.push(self.check_fcv().await);
         // 6) 저장 엔진.
         items.push(self.check_storage_engine().await);
+        // 3.6) 서버 시계(clock skew).
+        items.push(self.check_clock().await);
 
         // 샤딩이면 oplog/크기/secondary 점검은 스코프 외이므로 생략(거부가 우선).
         if !is_sharded_target {
             // 5) oplog 윈도우.
             items.push(self.check_oplog_window(&hello, interval).await);
-            // 7) 예상 크기.
-            items.push(self.check_estimated_size().await);
+            // 7) 데이터 형상 + 예상 크기 — dbStats 한 번 합산으로 함께 만든다.
+            match self.db_stats_totals().await {
+                Ok(totals) => {
+                    items.extend(Self::shape_items(&totals));
+                    items.push(Self::estimated_size_item(&totals));
+                }
+                Err(e) => {
+                    items.push(
+                        CheckItem::warn(
+                            "estimated_size",
+                            "예상 크기",
+                            format!("dbStats 합산 실패(권한 부족 가능): {e}"),
+                        )
+                        .with_value("조회 실패"),
+                    );
+                }
+            }
             // 8) (선택) secondary 가용성.
             if prefer_secondary {
                 items.push(self.check_secondary_availability(&hello));
@@ -751,22 +788,15 @@ impl StatusChecker {
         }
     }
 
-    /// 7) 예상 백업 크기 — 전 DB dbStats 합산(dataSize/storageSize).
-    async fn check_estimated_size(&self) -> CheckItem {
-        let db_names = match self.client.list_database_names().await {
-            Ok(names) => names,
-            Err(e) => {
-                return CheckItem::warn(
-                    "estimated_size",
-                    "예상 크기",
-                    format!("DB 목록 조회 실패(권한 부족 가능): {e}"),
-                )
-                .with_value("조회 실패")
-            }
-        };
-
-        let mut total_data: i64 = 0;
-        let mut total_storage: i64 = 0;
+    /// 사용자 DB의 `dbStats`를 한 번 쓸어 합산한다(문서·컬렉션·인덱스 수, 데이터·인덱스 크기).
+    ///
+    /// `dbStats` 한 콜이 `objects`·`collections`·`indexes`·`dataSize`·`storageSize`·`indexSize`를
+    /// 모두 돌려주므로, 크기·데이터 형상 항목을 추가 쿼리 없이 같은 합산에서 만든다.
+    async fn db_stats_totals(&self) -> Result<DbTotals> {
+        let db_names = self.client.list_database_names().await.map_err(|e| {
+            XBackupError::Failure(format!("DB 목록 조회 실패(권한 부족 가능): {e}"))
+        })?;
+        let mut t = DbTotals::default();
         for name in &db_names {
             // 시스템 DB(local 등)는 백업 대상 추정에서 제외.
             if matches!(name.as_str(), "admin" | "config" | "local") {
@@ -778,24 +808,122 @@ impl StatusChecker {
                 .run_command(doc! { "dbStats": 1 })
                 .await
             {
-                total_data += read_num(&stats, "dataSize");
-                total_storage += read_num(&stats, "storageSize");
+                t.objects += read_num(&stats, "objects");
+                t.collections += read_num(&stats, "collections");
+                t.indexes += read_num(&stats, "indexes");
+                t.data_size += read_num(&stats, "dataSize");
+                t.storage_size += read_num(&stats, "storageSize");
+                t.index_size += read_num(&stats, "indexSize");
             }
         }
+        Ok(t)
+    }
 
+    /// 7) 예상 크기 — dataSize/storageSize(+ 인덱스 크기)를 [`DbTotals`]에서 만든다.
+    fn estimated_size_item(totals: &DbTotals) -> CheckItem {
         CheckItem::ok(
             "estimated_size",
             "예상 크기",
             format!(
-                "dataSize={} ({}), storageSize={} ({})",
-                total_data,
-                human_bytes(total_data),
-                total_storage,
-                human_bytes(total_storage),
+                "dataSize={} ({}), storageSize={} ({}), indexSize={}",
+                totals.data_size,
+                human_bytes(totals.data_size),
+                totals.storage_size,
+                human_bytes(totals.storage_size),
+                human_bytes(totals.index_size),
             ),
         )
         // 비교는 dataSize 기준(논리 데이터량 — 백업 대상 크기에 가장 근접).
-        .with_value(human_bytes(total_data))
+        .with_value(human_bytes(totals.data_size))
+    }
+
+    /// 데이터 형상 항목 — 문서 수·컬렉션 수·인덱스 수(+ 인덱스 크기). 비교 뷰의 drift 확인용.
+    fn shape_items(totals: &DbTotals) -> Vec<CheckItem> {
+        vec![
+            CheckItem::ok(
+                "doc_count",
+                "문서 수",
+                format!("추정 문서 {}건(estimatedDocumentCount 합)", totals.objects),
+            )
+            .with_value(totals.objects.to_string()),
+            CheckItem::ok(
+                "collection_count",
+                "컬렉션 수",
+                format!("사용자 컬렉션 {}개", totals.collections),
+            )
+            .with_value(totals.collections.to_string()),
+            CheckItem::ok(
+                "index_count",
+                "인덱스 수",
+                format!(
+                    "인덱스 {}개, 인덱스 크기 {}",
+                    totals.indexes,
+                    human_bytes(totals.index_size)
+                ),
+            )
+            .with_value(totals.indexes.to_string()),
+        ]
+    }
+
+    /// 3.5) FCV(featureCompatibilityVersion) — 서버 버전과 별개의 호환성 경계.
+    async fn check_fcv(&self) -> CheckItem {
+        let resp = self
+            .run_admin(doc! { "getParameter": 1, "featureCompatibilityVersion": 1 })
+            .await;
+        match resp {
+            Ok(doc) => {
+                let fcv = doc
+                    .get_document("featureCompatibilityVersion")
+                    .ok()
+                    .and_then(|d| d.get_str("version").ok())
+                    .unwrap_or("unknown")
+                    .to_string();
+                CheckItem::ok("fcv", "FCV", format!("featureCompatibilityVersion={fcv}"))
+                    .with_value(fcv)
+            }
+            // FCV 조회는 권한이 필요할 수 있어 실패는 경고로 강등(백업을 막지 않음).
+            Err(e) => CheckItem::warn("fcv", "FCV", format!("FCV 조회 실패(권한 부족 가능): {e}"))
+                .with_value("조회 실패"),
+        }
+    }
+
+    /// 3.6) 서버 시계 — `hello.localTime`과 로컬 시각의 차(clock skew). PITR/oplog 안전성 신호.
+    ///
+    /// 왕복 지연만큼 오차가 있으므로 근사값이다. |skew| ≥ 5초면 경고(시계 동기 권장).
+    async fn check_clock(&self) -> CheckItem {
+        let before = Utc::now().timestamp_millis();
+        let hello = self.run_admin(doc! { "hello": 1 }).await;
+        let after = Utc::now().timestamp_millis();
+        // bson DateTime → epoch millis(chrono feature 비의존).
+        let server_ms = hello
+            .as_ref()
+            .ok()
+            .and_then(|d| d.get_datetime("localTime").ok())
+            .map(|dt| dt.timestamp_millis());
+        let server_ms = match server_ms {
+            Some(s) => s,
+            None => {
+                return CheckItem::warn("clock", "서버 시계", "서버 시각을 읽지 못함".to_string())
+                    .with_value("불명")
+            }
+        };
+        // 클라이언트 시각의 중간값(왕복 보정)과 서버 시각의 차.
+        let mid = before + (after - before) / 2;
+        let skew_ms = server_ms - mid;
+        let skew_s = skew_ms as f64 / 1000.0;
+        let sign = if skew_ms >= 0 { "+" } else { "-" };
+        let disp = format!("{sign}{:.1}s", skew_s.abs());
+        let msg = format!("서버가 로컬 대비 {disp} (왕복 보정 근사)");
+        if skew_ms.abs() >= 5_000 {
+            CheckItem::warn(
+                "clock",
+                "서버 시계",
+                format!("{msg} — 5초 이상 차이, NTP 동기 권장(oplog/PITR 정확도)"),
+            )
+            .with_value(disp)
+        } else {
+            CheckItem::ok("clock", "서버 시계", msg).with_value(disp)
+        }
     }
 
     /// 8) (선택) secondary 가용성 — prefer_secondary 구성 시 읽기 가능한 secondary 존재 여부.

@@ -16,12 +16,16 @@ use crate::cli::table::{
     UNDERLINE, YELLOW,
 };
 use crate::config::env::collect_overrides_from_process;
+use crate::config::file::Profile;
 use crate::config::merged::MergeInput;
 use crate::config::secret::Secret;
 use crate::config::ResolvedConfig;
 use crate::engine::mongo::status::{human_bytes, CheckStatus, StatusChecker, StatusReport};
 use crate::engine::mongo::MongoMeta;
 use crate::error::{Result, XBackupError};
+use crate::manifest::schema::{BackupManifest, BackupType};
+use crate::manifest::ManifestStore;
+use crate::storage::{from_config, BoxAsyncRead, Storage};
 
 /// backup 자동 사전 점검에서 쓰는 mongodump 실행파일 이름(backup 핸들러와 동일 기본값).
 pub const DEFAULT_MONGODUMP: &str = "mongodump";
@@ -162,7 +166,211 @@ async fn build_report(config_toml: Option<&str>, profile: &str) -> Result<Status
                 )],
             ),
         };
-    Ok(report)
+
+    // destination 쪽 점검(source 연결과 무관) — 마지막 백업·destination 쓰기 가능 여부를
+    // 보고서에 덧붙인다. 백업 도구로서 "내 백업이 최신/대상이 정상인가"를 같이 보여준다.
+    let crate::engine::mongo::status::StatusReport {
+        profile: name,
+        mut items,
+        ..
+    } = report;
+    items.push(last_backup_item(&resolved.profile).await);
+    items.push(destination_item(&resolved.profile).await);
+    Ok(StatusReport::new(name, items))
+}
+
+/// destination의 최신 manifest를 읽어 "마지막 백업" 항목을 만든다(나이·타입·크기). 무변경.
+async fn last_backup_item(profile: &Profile) -> crate::engine::mongo::status::CheckItem {
+    use crate::engine::mongo::status::CheckItem;
+    let dests = profile.effective_destinations();
+    let dest = match dests.first() {
+        Some(d) => *d,
+        None => {
+            return CheckItem::warn(
+                "last_backup",
+                "마지막 백업",
+                "destination 미설정".to_string(),
+            )
+            .with_value("미설정")
+        }
+    };
+    let storage = match from_config(dest) {
+        Ok(s) => s,
+        Err(e) => {
+            return CheckItem::warn(
+                "last_backup",
+                "마지막 백업",
+                format!("destination 접근 실패: {e}"),
+            )
+            .with_value("접근 실패")
+        }
+    };
+    match latest_manifest_any(storage.as_ref()).await {
+        Some(m) => {
+            let age = format_age_rfc3339(&m.created_at);
+            let typ = match m.backup_type {
+                BackupType::Full => "full",
+                BackupType::Incremental => "incr",
+            };
+            CheckItem::ok(
+                "last_backup",
+                "마지막 백업",
+                format!(
+                    "{typ}, {}, {age} 전 (id {})",
+                    human_bytes(m.stored_size_bytes as i64),
+                    short_id(&m.id)
+                ),
+            )
+            .with_value(format!("{age} 전"))
+        }
+        None => CheckItem::warn(
+            "last_backup",
+            "마지막 백업",
+            "백업 이력이 없습니다".to_string(),
+        )
+        .with_value("없음"),
+    }
+}
+
+/// destination 쓰기 가능 여부를 작은 객체 put→delete로 점검한다(+ local 여유 공간).
+///
+/// 지금은 source만 점검하던 한계를 보완 — 대상이 안 닿거나 권한이 없으면 백업이 실패한다.
+/// 상태는 경고(Warn)로 보고한다(env별 일시 문제로 status 전체를 exit 3으로 끊지 않도록).
+async fn destination_item(profile: &Profile) -> crate::engine::mongo::status::CheckItem {
+    use crate::engine::mongo::status::CheckItem;
+    let dests = profile.effective_destinations();
+    let dest = match dests.first() {
+        Some(d) => *d,
+        None => {
+            return CheckItem::warn(
+                "destination",
+                "destination",
+                "destination 미설정".to_string(),
+            )
+            .with_value("미설정")
+        }
+    };
+    let storage = match from_config(dest) {
+        Ok(s) => s,
+        Err(e) => {
+            return CheckItem::warn(
+                "destination",
+                "destination",
+                format!("destination 생성 실패: {e}"),
+            )
+            .with_value("생성 실패")
+        }
+    };
+
+    let kind = dest.r#type.as_deref().unwrap_or("?");
+    let probe_key = ".xb-status-write-probe";
+    let data: BoxAsyncRead = Box::pin(std::io::Cursor::new(b"xb".to_vec()));
+    let write_ok = storage.put_stream(probe_key, data, Some(2)).await;
+    // 흔적 제거(성공·실패 무관 — best-effort).
+    let _ = storage.delete(probe_key).await;
+
+    match write_ok {
+        Ok(_) => {
+            let extra = if kind == "local" {
+                dest.path
+                    .as_deref()
+                    .and_then(free_space_bytes)
+                    .map(|b| format!(", 여유 {}", human_bytes(b as i64)))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let loc = dest.path.as_deref().unwrap_or(kind);
+            CheckItem::ok(
+                "destination",
+                "destination",
+                format!("쓰기 가능({kind}: {loc}){extra}"),
+            )
+            .with_value("OK")
+        }
+        Err(e) => CheckItem::warn(
+            "destination",
+            "destination",
+            format!("쓰기 실패({kind}): {e}"),
+        )
+        .with_value("쓰기 실패"),
+    }
+}
+
+/// destination의 모든 백업 중 **created_at 최신** manifest를 고른다(타입 무관). 없으면 None.
+async fn latest_manifest_any(storage: &dyn Storage) -> Option<BackupManifest> {
+    let store = ManifestStore::new(storage);
+    let entries = storage.list("").await.ok()?;
+    let suffix = "/manifest.json";
+    let mut ids: Vec<String> = entries
+        .iter()
+        .filter_map(|e| {
+            e.path
+                .strip_suffix(suffix)
+                .filter(|id| !id.is_empty() && !id.contains('/'))
+                .map(|s| s.to_string())
+        })
+        .collect();
+    ids.sort();
+    ids.dedup();
+
+    let mut best: Option<BackupManifest> = None;
+    for id in ids {
+        if let Ok(m) = store.read(&id).await {
+            // created_at은 RFC3339(UTC, 동일 오프셋)라 문자열 비교가 시간순과 일치한다.
+            let newer = best
+                .as_ref()
+                .map(|b| m.created_at > b.created_at)
+                .unwrap_or(true);
+            if newer {
+                best = Some(m);
+            }
+        }
+    }
+    best
+}
+
+/// RFC3339 시각 문자열을 현재와 비교해 사람이 읽는 경과 시간으로 만든다("2시간" 등).
+fn format_age_rfc3339(created_at: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(created_at) {
+        Ok(dt) => {
+            let secs = (chrono::Utc::now() - dt.with_timezone(&chrono::Utc))
+                .num_seconds()
+                .max(0) as u64;
+            format_age_secs(secs)
+        }
+        Err(_) => "?".to_string(),
+    }
+}
+
+/// 경과 초를 가장 큰 단위로 근사 표기한다.
+fn format_age_secs(s: u64) -> String {
+    if s < 60 {
+        format!("{s}초")
+    } else if s < 3600 {
+        format!("{}분", s / 60)
+    } else if s < 86_400 {
+        format!("{}시간", s / 3600)
+    } else {
+        format!("{}일", s / 86_400)
+    }
+}
+
+/// 백업 id의 앞 8자(표시용 단축).
+fn short_id(id: &str) -> &str {
+    &id[..8.min(id.len())]
+}
+
+/// 경로가 속한 파일시스템의 여유 바이트(local destination 전용). 실패 시 None.
+fn free_space_bytes(path: &str) -> Option<u64> {
+    use std::ffi::CString;
+    let c = CString::new(path).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c.as_ptr(), &mut st) };
+    if rc != 0 {
+        return None;
+    }
+    Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
 }
 
 /// 신호등 합산을 [`report_to_result`]에 태우기 위한 단일 항목 보고서(--all 종합용).
@@ -932,5 +1140,19 @@ mod tests {
         let (txt, code) = delta_bytes(1024, Some(2048));
         assert!(txt.starts_with('-') && code == RED);
         assert_eq!(delta_bytes(1024, Some(1024)), ("0".to_string(), DIM));
+    }
+
+    #[test]
+    fn age_scales_units() {
+        assert_eq!(format_age_secs(30), "30초");
+        assert_eq!(format_age_secs(150), "2분");
+        assert_eq!(format_age_secs(7200), "2시간");
+        assert_eq!(format_age_secs(172800), "2일");
+    }
+
+    #[test]
+    fn short_id_truncates_to_eight() {
+        assert_eq!(short_id("019ec4a4-1234-7000-abcd"), "019ec4a4");
+        assert_eq!(short_id("abc"), "abc");
     }
 }
