@@ -19,8 +19,12 @@
 #
 # 명령:
 #   new <dir> [--engine mongo|pg] [--name NAME] [--force]
+#   adopt <dir> [--name PROFILE]   # 기존 config 디렉터리(.devenv 등)를 복사 없이 activate로 감싸기
 #   destroy <dir> [--yes]
 #   help
+#
+# 기존 .devenv(scripts/xb)를 그대로 쓰려면 복사하지 말고: scripts/xbenv adopt .devenv
+#   → .devenv/activate 생성(프로파일·키는 .devenv 것 그대로) → source .devenv/activate
 #
 # 활성화 중에는 XB_PROFILE이 설정되므로 모든 서브커맨드가 --profile 없이 동작한다. 단
 # `status --all`은 XB_PROFILE과 충돌하므로 `env -u XB_PROFILE x-backup status --all`로 쓴다
@@ -120,6 +124,7 @@ write_config() {
 # 2부: 활성/비활성 로직(quoted heredoc — 전부 리터럴, 1부 변수만 참조).
 write_activate() {
   local dir="$1" name="$2" engine="$3" src="$4" tgt="$5"
+  local agekey="${6:-$dir/keys/age.key}"
   cat > "$dir/activate" <<EOF
 # x-backup 워크스페이스 '$name'($engine) — \`source\`로 활성화. 비활성화: deactivate
 _XBENV_DIR="$dir"
@@ -127,6 +132,7 @@ _XBENV_NAME="$name"
 _XBENV_ENGINE="$engine"
 _XBENV_SRC="$src"
 _XBENV_TGT="$tgt"
+_XBENV_AGEKEY="$agekey"
 _XBENV_RELBIN="$REPO/target/release"
 _XBENV_TOOLSBIN="$REPO/.tools/bin"
 EOF
@@ -140,7 +146,7 @@ deactivate() {
   if [ "${_XBENV_HAD_PROFILE:-0}" = 1 ]; then export XB_PROFILE="$_XBENV_OLD_PROFILE"; else unset XB_PROFILE 2>/dev/null || true; fi
   unset XB_WORKSPACE XBENV_ENGINE XBENV_SOURCE_URI XBENV_TARGET_URI
   unset _XBENV_OLD_CONFIG _XBENV_OLD_AGE _XBENV_OLD_PROFILE _XBENV_HAD_CONFIG _XBENV_HAD_AGE _XBENV_HAD_PROFILE
-  unset _XBENV_DIR _XBENV_NAME _XBENV_ENGINE _XBENV_SRC _XBENV_TGT _XBENV_RELBIN _XBENV_TOOLSBIN
+  unset _XBENV_DIR _XBENV_NAME _XBENV_ENGINE _XBENV_SRC _XBENV_TGT _XBENV_AGEKEY _XBENV_RELBIN _XBENV_TOOLSBIN
   unset -f deactivate 2>/dev/null || true
 }
 
@@ -158,9 +164,9 @@ export XB_WORKSPACE="$_XBENV_DIR"
 export XBENV_ENGINE="$_XBENV_ENGINE"
 export XB_CONFIG="$_XBENV_DIR/config.toml"
 export XB_PROFILE="$_XBENV_NAME"
-export XB_AGE_IDENTITY_FILE="$_XBENV_DIR/keys/age.key"
-export XBENV_SOURCE_URI="$_XBENV_SRC"
-export XBENV_TARGET_URI="$_XBENV_TGT"
+[ -n "$_XBENV_AGEKEY" ] && [ -f "$_XBENV_AGEKEY" ] && export XB_AGE_IDENTITY_FILE="$_XBENV_AGEKEY"
+[ -n "$_XBENV_SRC" ] && export XBENV_SOURCE_URI="$_XBENV_SRC"
+[ -n "$_XBENV_TGT" ] && export XBENV_TARGET_URI="$_XBENV_TGT"
 [ -d "$_XBENV_RELBIN" ]  && PATH="$_XBENV_RELBIN:$PATH"
 [ -d "$_XBENV_TOOLSBIN" ] && PATH="$_XBENV_TOOLSBIN:$PATH"
 export PATH
@@ -234,6 +240,49 @@ cmd_new() {
 EOF
 }
 
+# ── adopt ───────────────────────────────────────────────────────────────────
+# 기존 config.toml이 있는 디렉터리(.devenv 등)에 activate만 생성해 xbenv 스타일로 쓴다.
+# config·키·store는 건드리지 않고(복사 없음), 프로파일·키 위치는 그 디렉터리 것을 그대로
+# 따른다. .xbenv 메타를 만들지 않으므로 `xbenv destroy` 대상이 아니다(기존 데이터 보호).
+cmd_adopt() {
+  local dir="" name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name="${2:-}"; shift 2 ;;
+      --name=*) name="${1#--name=}"; shift ;;
+      -*) err "알 수 없는 옵션: $1" ;;
+      *) [ -z "$dir" ] && dir="$1" || err "디렉터리 인자가 둘 이상"; shift ;;
+    esac
+  done
+  [ -n "$dir" ] || err "사용법: xbenv adopt <dir> [--name PROFILE]  (기존 config.toml이 있는 디렉터리)"
+  [ -d "$dir" ] || err "$dir 디렉터리가 아님"
+  dir="$(cd "$dir" && pwd)"
+  [ -f "$dir/config.toml" ] || err "$dir/config.toml 이 없습니다 — adopt는 기존 config가 있는 디렉터리용(새로 만들려면 xbenv new)."
+
+  # 프로파일: --name > config의 default_profile.
+  if [ -z "$name" ]; then
+    name="$(grep -E '^[[:space:]]*default_profile[[:space:]]*=' "$dir/config.toml" | head -1 | sed -E 's/.*=[[:space:]]*"?([^"#]+)"?.*/\1/' | tr -d '[:space:]')"
+  fi
+  [ -n "$name" ] || err "config.toml에 default_profile이 없습니다 — --name <프로파일>로 지정하세요."
+
+  # age 키(있으면): keys/age.key(xbenv) 또는 age.key(.devenv) 우선.
+  local agekey=""
+  for c in "$dir/keys/age.key" "$dir/age.key"; do [ -f "$c" ] && { agekey="$c"; break; }; done
+
+  ensure_bin
+  # config가 직접 uri를 갖는 경우가 많으므로 src/tgt는 비워 둔다(activate가 XBENV_* 강제 안 함).
+  write_activate "$dir" "$name" "adopted" "" "" "$agekey"
+
+  log "adopt 완료: $dir (profile=$name${agekey:+, age=$agekey})"
+  cat >&2 <<EOF
+
+  활성화:   source "$dir/activate"
+  사용:     x-backup status / list / backup / restore ... (profile=$name)
+  비활성화: deactivate
+  (config·키·store는 그대로 둡니다. 'xbenv destroy'는 adopt 디렉터리를 지우지 않습니다.)
+EOF
+}
+
 # ── destroy ─────────────────────────────────────────────────────────────────
 cmd_destroy() {
   local dir="" yes=0
@@ -283,7 +332,8 @@ cmd_destroy() {
 cmd="${1:-help}"; shift || true
 case "$cmd" in
   new)            cmd_new "$@" ;;
+  adopt)          cmd_adopt "$@" ;;
   destroy|rm)     cmd_destroy "$@" ;;
   help|-h|--help) usage ;;
-  *) err "알 수 없는 명령: $cmd (new|destroy|help)" ;;
+  *) err "알 수 없는 명령: $cmd (new|adopt|destroy|help)" ;;
 esac
