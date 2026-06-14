@@ -246,20 +246,20 @@ x-backup list/verify/prune ...                    # manifest 기반(DB 비의존
 
 잡는 것(데이터 중심): **테이블 데이터**(text COPY, 값 정확)·**여러 스키마**의 **테이블 구조**
 (컬럼/타입/NOT NULL/기본값)·**`GENERATED … AS IDENTITY`**·**`GENERATED … STORED`** 컬럼·
-**제약**(PK/UNIQUE/FK/CHECK)·**인덱스**·**시퀀스**(serial·identity, `last_value`/`is_called` —
-데이터 max로 리셋해 복구 후 `INSERT`가 충돌하지 않음). 복구는 스키마+테이블을 재생성하고 COPY로
-적재(generated 컬럼은 제외해 자동 재계산)한 뒤, 제약·인덱스를 적용하고 시퀀스를 리셋한다.
+**제약**(PK/UNIQUE/FK/CHECK)·**인덱스**·**시퀀스**(serial·identity, 파라미터 전체 + `last_value` —
+데이터 max로 리셋해 복구 후 `INSERT` 충돌 없음)·**확장**(`CREATE EXTENSION`)·**사용자 정의 타입**
+(enum/도메인/복합)·**뷰 + 머티리얼라이즈드뷰**(머티뷰는 `WITH DATA`로 채움). 복구는 선행 객체
+(확장·타입)를 의존성 재시도로 먼저 깔고, 스키마+테이블 재생성 → COPY 적재(generated 제외해 자동
+재계산) → 제약·인덱스 → 시퀀스 리셋 → 뷰/머티뷰(재시도 순서)를 적용한다.
 
 연결은 rustls TLS + `sslmode` 협상을 쓴다 — 기본 `prefer`는 TLS를 시도하고 미지원 서버엔
 평문으로 폴백, `require`/`verify-full`은 TLS를 강제한다. 데이터는 text COPY(pg_dump가 쓰는
 이식성 포맷)로 옮기므로 PostgreSQL 메이저 버전이 달라도 복구가 안전하다(메이저 불일치는 경고).
 
-아직 미지원(로드맵): 사용자 정의 타입(복합/enum/도메인 — `CREATE TYPE` 미덤프, 경고만)·시퀀스
-비기본 파라미터(increment/min/max — 값은 보존, 옵션은 미보존)·뷰·머티리얼라이즈드뷰·함수/트리거·
-확장·소유권/권한·파티셔닝(파티션 부모는 경고 후 건너뜀), 그리고 증분/PITR(`restore --at`은 PG에서
-거부 — PITR은 WAL 아카이빙으로 oplog와 다른 메커니즘). 데이터가 있는 DB로 복구할 땐
-`--force`(백업에 든 테이블을 drop 후 재생성)를 쓰고, 빈 대상은 플래그가 필요 없다.
-`migrate`는 PG → PG만(엔진 간 불가).
+아직 미지원(로드맵): 함수/저장 프로시저·트리거·소유권/권한·파티셔닝(파티션 부모는 경고 후
+건너뜀)·사용자 정의 base/range 타입, 그리고 증분/PITR(`restore --at`은 PG에서 거부 — PITR은 WAL
+아카이빙으로 oplog와 다른 메커니즘). 데이터가 있는 DB로 복구할 땐 `--force`(백업에 든 테이블을
+drop 후 재생성)를 쓰고, 빈 대상은 플래그가 필요 없다. `migrate`는 PG → PG만(엔진 간 불가).
 
 ### 라이브 모니터 (`status --watch`)
 

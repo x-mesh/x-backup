@@ -63,6 +63,10 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
     let mut setvals: Vec<(String, i64, bool)> = Vec::new();
     // IDENTITY 컬럼 (ns, 컬럼평문이름) — 적재 후 시퀀스를 max로 리셋(리뷰 #4).
     let mut identity_resets: Vec<(String, String)> = Vec::new();
+    // 선행 DDL(확장·타입) 버퍼 — 첫 시퀀스/테이블 전에 재시도 적용. 후행 DDL(뷰)은 맨 끝.
+    let mut pre_ddls: Vec<String> = Vec::new();
+    let mut post_ddls: Vec<String> = Vec::new();
+    let mut pre_applied = false;
 
     loop {
         match archive::read_frame(reader).await? {
@@ -71,7 +75,22 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
                     "PG 아카이브 헤더가 중복됩니다".into(),
                 ))
             }
+            Frame::Pre(d) => {
+                if let Ok(sql) = d.get_str("sql") {
+                    pre_ddls.push(sql.to_string());
+                }
+            }
+            Frame::Post(d) => {
+                if let Ok(sql) = d.get_str("sql") {
+                    post_ddls.push(sql.to_string());
+                }
+            }
             Frame::Sequence(s) => {
+                // 시퀀스/테이블 전에 선행 DDL(확장·타입)을 의존성 순서대로 적용한다.
+                if !pre_applied {
+                    apply_with_retry(client, &pre_ddls, "선행 DDL(확장/타입)").await?;
+                    pre_applied = true;
+                }
                 let name = s
                     .get_str("name")
                     .map_err(|_| XBackupError::Failure("시퀀스 프레임에 name이 없습니다".into()))?;
@@ -86,12 +105,21 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
                             XBackupError::Failure(format!("{schema} 스키마 생성 실패: {e}"))
                         })?;
                 }
-                run_ignore_exists(client, &format!("CREATE SEQUENCE {name}"))
+                // 파라미터를 보존한 CREATE SEQUENCE DDL(없으면 기본 생성).
+                let create = s
+                    .get_str("create_sql")
+                    .map(String::from)
+                    .unwrap_or_else(|_| format!("CREATE SEQUENCE {name}"));
+                run_ignore_exists(client, &create)
                     .await
                     .map_err(|e| XBackupError::Failure(format!("{name} 시퀀스 생성 실패: {e}")))?;
                 setvals.push((name.to_string(), last_value, is_called));
             }
             Frame::Table(meta) => {
+                if !pre_applied {
+                    apply_with_retry(client, &pre_ddls, "선행 DDL(확장/타입)").await?;
+                    pre_applied = true;
+                }
                 let ns = meta
                     .get_str("ns")
                     .map_err(|_| XBackupError::Failure("테이블 프레임에 ns가 없습니다".into()))?
@@ -251,7 +279,42 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
             .await;
     }
 
+    // 선행 DDL이 아직 안 돌았으면(시퀀스·테이블이 하나도 없는 백업) 여기서 적용.
+    if !pre_applied {
+        apply_with_retry(client, &pre_ddls, "선행 DDL(확장/타입)").await?;
+    }
+    // 후행 DDL(뷰·머티리얼라이즈드뷰) — 테이블·데이터가 모두 준비된 뒤 재시도 적용.
+    apply_with_retry(client, &post_ddls, "후행 DDL(뷰)").await?;
+
     Ok(inserted)
+}
+
+/// DDL 묶음을 의존성 순서에 무관하게 적용한다 — 매 라운드 남은 것을 시도하고 실패는 모아 재시도,
+/// 진전이 없으면 마지막 에러로 중단. 뷰·타입 간 상호 의존(순서 문제)을 흡수한다.
+async fn apply_with_retry(client: &Client, ddls: &[String], what: &str) -> Result<()> {
+    let mut pending: Vec<&String> = ddls.iter().collect();
+    while !pending.is_empty() {
+        let mut still: Vec<&String> = Vec::new();
+        let mut last_err: Option<String> = None;
+        for sql in &pending {
+            match run_ignore_exists(client, sql).await {
+                Ok(()) => {}
+                Err(e) => {
+                    last_err = Some(format!("{e}\n  SQL: {sql}"));
+                    still.push(sql);
+                }
+            }
+        }
+        // 한 라운드에서 하나도 못 줄였으면 순환/진짜 오류 — 중단.
+        if still.len() == pending.len() {
+            return Err(XBackupError::Failure(format!(
+                "{what} 적용 실패(의존성 해소 불가): {}",
+                last_err.unwrap_or_default()
+            )));
+        }
+        pending = still;
+    }
+    Ok(())
 }
 
 /// 백업 소스와 복구 대상의 메이저 버전이 다르면 경고한다(차단하지 않음 — text COPY는 보통 호환).

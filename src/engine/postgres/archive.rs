@@ -5,10 +5,13 @@
 //! BSON처럼 self-delimiting이 아니라 **길이 프리픽스**를 둔다.
 //!
 //! ```text
-//! [H 헤더] [Q 시퀀스]* ( [T 테이블] [D 데이터청크]* [X 테이블끝] )* [E 끝]
+//! [H 헤더] [R 선행DDL]* [Q 시퀀스]* ( [T 테이블] [D 데이터청크]* [X 테이블끝] )* [O 후행DDL]* [E 끝]
 //! ```
 //! - `H`(헤더): `{ format, created_at, pg_version }` — 1회.
-//! - `Q`(시퀀스): `{ name, last_value }` — 테이블 생성 전에 만들어 nextval 기본값을 해소.
+//! - `R`(선행 DDL): `{ sql }` — 테이블보다 먼저 실행(확장·enum/도메인/복합 타입). 의존성 순서는
+//!   복구가 재시도로 흡수.
+//! - `O`(후행 DDL): `{ sql }` — 테이블·데이터 적재 후 실행(뷰·머티리얼라이즈드뷰). 마찬가지로 재시도.
+//! - `Q`(시퀀스): `{ name, schema, last_value, is_called, create_sql }` — 테이블 생성 전.
 //! - `T`(테이블): `{ ns, quoted, schema, create_sql, constraints:[], indexes:[], copy_cols:[],
 //!   identity_cols:[] }` — 테이블마다 1회. quoted/schema로 복구가 정확히 식별, copy_cols로 COPY
 //!   컬럼을 한정(STORED generated 제외), identity_cols로 복구 후 시퀀스 리셋.
@@ -26,6 +29,8 @@ use crate::error::{Result, XBackupError};
 pub const FORMAT_ID: &str = "xb-pg-v1";
 
 const TAG_HEADER: u8 = b'H';
+const TAG_PRE: u8 = b'R';
+const TAG_POST: u8 = b'O';
 const TAG_SEQUENCE: u8 = b'Q';
 const TAG_TABLE: u8 = b'T';
 const TAG_DATA: u8 = b'D';
@@ -40,6 +45,10 @@ const MAX_FRAME_BYTES: u32 = 256 * 1024 * 1024;
 pub enum Frame {
     /// 스트림 헤더.
     Header(Document),
+    /// 선행 DDL(확장·타입) — 테이블 전 실행.
+    Pre(Document),
+    /// 후행 DDL(뷰·머티리얼라이즈드뷰) — 테이블·데이터 후 실행.
+    Post(Document),
     /// 시퀀스 메타.
     Sequence(Document),
     /// 테이블 메타(DDL).
@@ -63,6 +72,16 @@ pub async fn write_header<W: AsyncWrite + Unpin>(
     write_doc_frame(w, TAG_HEADER, &doc).await
 }
 
+/// 선행 DDL 프레임을 쓴다(확장·타입 등 — 테이블보다 먼저 실행).
+pub async fn write_pre<W: AsyncWrite + Unpin>(w: &mut W, sql: &str) -> Result<()> {
+    write_doc_frame(w, TAG_PRE, &bson::doc! { "sql": sql }).await
+}
+
+/// 후행 DDL 프레임을 쓴다(뷰·머티리얼라이즈드뷰 등 — 테이블·데이터 후 실행).
+pub async fn write_post<W: AsyncWrite + Unpin>(w: &mut W, sql: &str) -> Result<()> {
+    write_doc_frame(w, TAG_POST, &bson::doc! { "sql": sql }).await
+}
+
 /// 시퀀스 메타 프레임을 쓴다(`name`, `schema`, `last_value`, `is_called`).
 ///
 /// `schema`(quote됨)는 복구가 시퀀스 생성 전 `CREATE SCHEMA IF NOT EXISTS`로 비-기본 스키마를
@@ -72,11 +91,13 @@ pub async fn write_sequence<W: AsyncWrite + Unpin>(
     w: &mut W,
     name: &str,
     schema: &str,
+    create_sql: &str,
     last_value: i64,
     is_called: bool,
 ) -> Result<()> {
     let doc = bson::doc! {
-        "name": name, "schema": schema, "last_value": last_value, "is_called": is_called,
+        "name": name, "schema": schema, "create_sql": create_sql,
+        "last_value": last_value, "is_called": is_called,
     };
     write_doc_frame(w, TAG_SEQUENCE, &doc).await
 }
@@ -171,6 +192,8 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame> {
         TAG_END => Ok(Frame::End),
         TAG_TABLE_END => Ok(Frame::TableEnd),
         TAG_HEADER => Ok(Frame::Header(read_doc(r).await?)),
+        TAG_PRE => Ok(Frame::Pre(read_doc(r).await?)),
+        TAG_POST => Ok(Frame::Post(read_doc(r).await?)),
         TAG_SEQUENCE => Ok(Frame::Sequence(read_doc(r).await?)),
         TAG_TABLE => Ok(Frame::Table(read_doc(r).await?)),
         TAG_DATA => Ok(Frame::Data(read_data(r).await?)),
@@ -240,9 +263,16 @@ mod tests {
         write_header(&mut buf, "2026-06-14T00:00:00Z", "16.2")
             .await
             .unwrap();
-        write_sequence(&mut buf, "public.t_id_seq", "\"public\"", 1000, true)
-            .await
-            .unwrap();
+        write_sequence(
+            &mut buf,
+            "public.t_id_seq",
+            "\"public\"",
+            "CREATE SEQUENCE \"public\".\"t_id_seq\"",
+            1000,
+            true,
+        )
+        .await
+        .unwrap();
         write_table(
             &mut buf,
             &TableFrame {

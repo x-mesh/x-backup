@@ -113,9 +113,14 @@ async fn write_archive(
         .map_err(|e| XBackupError::Failure(format!("server_version 조회 실패: {e}")))?;
     archive::write_header(writer, &chrono::Utc::now().to_rfc3339(), &version).await?;
 
-    // 파티션 부모 테이블은 1차 미지원 — 조용히 빠지지 않게 경고한다(리뷰 #6). 자식 파티션은
+    // 파티션 부모 테이블은 1차 미지원 — 조용히 빠지지 않게 경고한다. 자식 파티션은
     // 일반 테이블로 잡혀 데이터는 보존되나 파티션 구조는 복원되지 않는다.
     warn_partitioned(client, schema_filter.as_deref()).await;
+
+    // 선행 DDL — 확장 → 사용자 정의 타입(enum/도메인/복합). 테이블 컬럼이 이 타입을 쓰므로
+    // 테이블보다 먼저. 복구는 의존성 순서를 재시도로 흡수하므로 여기 순서는 best-effort.
+    write_extensions(client, writer).await?;
+    write_types(client, writer, schema_filter.as_deref()).await?;
 
     // 시퀀스 — 테이블 생성 전에 만들어 nextval 기본값을 해소한다.
     write_sequences(client, writer, schema_filter.as_deref()).await?;
@@ -159,7 +164,135 @@ async fn write_archive(
         tracing::debug!(ns = %def.ns, "PG 백업: 테이블 직렬화 완료");
     }
 
+    // 후행 DDL — 뷰 → 머티리얼라이즈드뷰(WITH DATA로 적재된 테이블에서 채워짐). 복구는 재시도로
+    // 뷰 간 의존성 순서를 흡수한다.
+    write_views(client, writer, schema_filter.as_deref()).await?;
+
     archive::write_end(writer).await
+}
+
+/// 설치된 확장을 선행 DDL로 쓴다(`CREATE EXTENSION IF NOT EXISTS`). plpgsql(기본)은 제외.
+async fn write_extensions(client: &Client, writer: &mut DuplexStream) -> Result<()> {
+    let rows = client
+        .query(
+            "SELECT format('CREATE EXTENSION IF NOT EXISTS %I WITH SCHEMA %I', e.extname, n.nspname) \
+             FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace \
+             WHERE e.extname <> 'plpgsql' ORDER BY e.extname",
+            &[],
+        )
+        .await
+        .map_err(|e| XBackupError::Failure(format!("확장 목록 조회 실패: {e}")))?;
+    for r in rows {
+        archive::write_pre(writer, &r.get::<_, String>(0)).await?;
+    }
+    Ok(())
+}
+
+/// 사용자 정의 타입(enum/도메인/복합)을 선행 DDL로 쓴다. 확장이 제공하는 타입은 제외(확장이 재생성).
+async fn write_types(
+    client: &Client,
+    writer: &mut DuplexStream,
+    schema_filter: Option<&str>,
+) -> Result<()> {
+    // enum — 라벨을 정렬 순서대로.
+    let enum_sql = format!(
+        "SELECT format('CREATE TYPE %I.%I AS ENUM (%s)', n.nspname, t.typname, \
+                string_agg(quote_literal(e.enumlabel), ', ' ORDER BY e.enumsortorder)) \
+         FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+         JOIN pg_enum e ON e.enumtypid = t.oid \
+         WHERE t.typtype = 'e' AND n.nspname NOT IN ({SYSTEM_SCHEMAS}) \
+         AND ($1::text IS NULL OR n.nspname = $1) \
+         AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = t.oid \
+            AND d.refclassid = 'pg_extension'::regclass AND d.deptype = 'e') \
+         GROUP BY n.nspname, t.typname ORDER BY n.nspname, t.typname"
+    );
+    for r in client
+        .query(enum_sql.as_str(), &[&schema_filter])
+        .await
+        .map_err(|e| XBackupError::Failure(format!("enum 타입 조회 실패: {e}")))?
+    {
+        archive::write_pre(writer, &r.get::<_, String>(0)).await?;
+    }
+
+    // 도메인 — base 타입 + NOT NULL + DEFAULT + CHECK 제약.
+    let domain_sql = format!(
+        "SELECT format('CREATE DOMAIN %I.%I AS %s', n.nspname, t.typname, \
+                format_type(t.typbasetype, t.typtypmod)) \
+            || coalesce(' DEFAULT ' || t.typdefault, '') \
+            || CASE WHEN t.typnotnull THEN ' NOT NULL' ELSE '' END \
+            || coalesce((SELECT ' ' || string_agg(pg_get_constraintdef(c.oid), ' ') \
+                         FROM pg_constraint c WHERE c.contypid = t.oid), '') \
+         FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+         WHERE t.typtype = 'd' AND n.nspname NOT IN ({SYSTEM_SCHEMAS}) \
+         AND ($1::text IS NULL OR n.nspname = $1) \
+         AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = t.oid \
+            AND d.refclassid = 'pg_extension'::regclass AND d.deptype = 'e') \
+         ORDER BY n.nspname, t.typname"
+    );
+    for r in client
+        .query(domain_sql.as_str(), &[&schema_filter])
+        .await
+        .map_err(|e| XBackupError::Failure(format!("도메인 타입 조회 실패: {e}")))?
+    {
+        archive::write_pre(writer, &r.get::<_, String>(0)).await?;
+    }
+
+    // 복합 타입 — 멤버 컬럼.
+    let comp_sql = format!(
+        "SELECT format('CREATE TYPE %I.%I AS (%s)', n.nspname, t.typname, \
+                (SELECT string_agg(format('%I %s', a.attname, format_type(a.atttypid, a.atttypmod)), ', ' \
+                        ORDER BY a.attnum) \
+                 FROM pg_attribute a WHERE a.attrelid = t.typrelid AND a.attnum > 0 AND NOT a.attisdropped)) \
+         FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+         JOIN pg_class c ON c.oid = t.typrelid \
+         WHERE t.typtype = 'c' AND c.relkind = 'c' AND n.nspname NOT IN ({SYSTEM_SCHEMAS}) \
+         AND ($1::text IS NULL OR n.nspname = $1) \
+         AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = t.oid \
+            AND d.refclassid = 'pg_extension'::regclass AND d.deptype = 'e') \
+         ORDER BY n.nspname, t.typname"
+    );
+    for r in client
+        .query(comp_sql.as_str(), &[&schema_filter])
+        .await
+        .map_err(|e| XBackupError::Failure(format!("복합 타입 조회 실패: {e}")))?
+    {
+        archive::write_pre(writer, &r.get::<_, String>(0)).await?;
+    }
+    Ok(())
+}
+
+/// 뷰·머티리얼라이즈드뷰를 후행 DDL로 쓴다(정의는 `pg_views`/`pg_matviews`). 머티뷰는 WITH DATA로.
+async fn write_views(
+    client: &Client,
+    writer: &mut DuplexStream,
+    schema_filter: Option<&str>,
+) -> Result<()> {
+    let view_sql = format!(
+        "SELECT format('CREATE VIEW %I.%I AS %s', schemaname, viewname, definition) \
+         FROM pg_views WHERE schemaname NOT IN ({SYSTEM_SCHEMAS}) \
+         AND ($1::text IS NULL OR schemaname = $1)"
+    );
+    for r in client
+        .query(view_sql.as_str(), &[&schema_filter])
+        .await
+        .map_err(|e| XBackupError::Failure(format!("뷰 조회 실패: {e}")))?
+    {
+        archive::write_post(writer, &r.get::<_, String>(0)).await?;
+    }
+
+    let mv_sql = format!(
+        "SELECT format('CREATE MATERIALIZED VIEW %I.%I AS %s', schemaname, matviewname, definition) \
+         FROM pg_matviews WHERE schemaname NOT IN ({SYSTEM_SCHEMAS}) \
+         AND ($1::text IS NULL OR schemaname = $1)"
+    );
+    for r in client
+        .query(mv_sql.as_str(), &[&schema_filter])
+        .await
+        .map_err(|e| XBackupError::Failure(format!("머티리얼라이즈드뷰 조회 실패: {e}")))?
+    {
+        archive::write_post(writer, &r.get::<_, String>(0)).await?;
+    }
+    Ok(())
 }
 
 /// 사용자 시퀀스를 introspection해 프레임으로 쓴다(last_value 보존).
@@ -171,9 +304,15 @@ async fn write_sequences(
     // last_value가 NULL이면 한 번도 호출 안 된 시퀀스 → is_called=false, 값은 1로 본다(리뷰 #5).
     // 식별자 quote도 같은 쿼리에서(format('%I.%I')) 처리해 라운드트립을 줄인다.
     // IDENTITY 컬럼의 내부 시퀀스(deptype='i')는 제외 — IDENTITY DDL이 재생성하므로 중복 방지.
+    // 파라미터(타입·증분·min/max·start·cache·cycle)를 보존한 CREATE SEQUENCE DDL을 만든다.
     let sql = format!(
         "SELECT format('%I.%I', s.schemaname, s.sequencename), quote_ident(s.schemaname), \
-                coalesce(s.last_value, 1), (s.last_value IS NOT NULL) \
+                format('CREATE SEQUENCE %I.%I AS %s INCREMENT BY %s MINVALUE %s MAXVALUE %s \
+                        START WITH %s CACHE %s%s', \
+                       s.schemaname, s.sequencename, s.data_type, s.increment_by, \
+                       s.min_value, s.max_value, s.start_value, s.cache_size, \
+                       CASE WHEN s.cycle THEN ' CYCLE' ELSE '' END), \
+                coalesce(s.last_value, s.start_value), (s.last_value IS NOT NULL) \
          FROM pg_sequences s \
          WHERE s.schemaname NOT IN ({SYSTEM_SCHEMAS}) \
          AND ($1::text IS NULL OR s.schemaname = $1) \
@@ -190,9 +329,11 @@ async fn write_sequences(
     for row in rows {
         let quoted: String = row.get(0);
         let schema: String = row.get(1);
-        let last_value: i64 = row.get(2);
-        let is_called: bool = row.get(3);
-        archive::write_sequence(writer, &quoted, &schema, last_value, is_called).await?;
+        let create_sql: String = row.get(2);
+        let last_value: i64 = row.get(3);
+        let is_called: bool = row.get(4);
+        archive::write_sequence(writer, &quoted, &schema, &create_sql, last_value, is_called)
+            .await?;
     }
     Ok(())
 }
@@ -261,15 +402,15 @@ async fn introspect_table(client: &Client, (schema, table): &(String, String)) -
     let oid: u32 = row.get(1);
     let schema_quoted: String = row.get(2);
 
-    // 컬럼 → CREATE TABLE. attidentity(IDENTITY)/attgenerated(STORED generated)/타입종류(typtype)도
-    // 함께 가져온다(리뷰 #3/#4/#6). quote_ident는 같은 쿼리에서(리뷰 #4).
+    // 컬럼 → CREATE TABLE. attidentity(IDENTITY)/attgenerated(STORED generated)도 함께 가져온다
+    // (리뷰 #3/#4). quote_ident는 같은 쿼리에서(리뷰 #4). enum/도메인/복합 타입은 write_types가
+    // 선행 DDL로 덤프하므로 여기서 특별 처리는 없다(사용자 정의 range/base 타입만 미지원).
     let col_rows = client
         .query(
             "SELECT quote_ident(a.attname), pg_catalog.format_type(a.atttypid, a.atttypmod), \
                     a.attnotnull, pg_get_expr(d.adbin, d.adrelid), \
-                    a.attidentity, a.attgenerated, t.typtype, a.attname \
+                    a.attidentity, a.attgenerated, a.attname \
              FROM pg_attribute a \
-             JOIN pg_type t ON t.oid = a.atttypid \
              LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
              WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY a.attnum",
@@ -287,18 +428,7 @@ async fn introspect_table(client: &Client, (schema, table): &(String, String)) -
         let default: Option<String> = c.get(3);
         let attidentity: i8 = c.get(4); // 'a'=always 'd'=by default 0=아님
         let attgenerated: i8 = c.get(5); // 's'=STORED generated 0=아님
-        let typtype: i8 = c.get(6); // 'b'=base 'c'=composite 'e'=enum 'd'=domain 'r'=range ...
-        let attname: String = c.get(7);
-
-        // 복합/enum/도메인 타입은 CREATE TYPE를 1차에서 덤프하지 않는다 — 복구 시 타입 부재로
-        // 실패할 수 있어 경고한다(리뷰 #6, 로드맵).
-        if matches!(typtype as u8 as char, 'c' | 'e' | 'd') {
-            tracing::warn!(
-                ns = %ns, column = %attname, kind = %(typtype as u8 as char),
-                "PG 백업: 사용자 정의 타입(복합/enum/도메인) 컬럼 — CREATE TYPE는 1차 미덤프. \
-                 복구 대상에 동일 타입이 없으면 복구가 실패할 수 있습니다"
-            );
-        }
+        let attname: String = c.get(6);
 
         let mut def = format!("{ident} {typ}");
         if attgenerated as u8 as char == 's' {

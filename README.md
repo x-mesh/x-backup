@@ -246,21 +246,21 @@ x-backup list/verify/prune ...                    # manifest-based (DB-agnostic)
 
 What it captures (data-centric): **table data** (text COPY, exact values), **table structure**
 across **multiple schemas** (columns/types/NOT NULL/defaults), **`GENERATED … AS IDENTITY`**
-and **`GENERATED … STORED`** columns, **constraints** (PK/UNIQUE/FK/CHECK), **indexes**, and
-**sequences** (serial and identity, with `last_value`/`is_called`, reset to the data's max so the
-next `INSERT` doesn't collide). Restore recreates the schemas + tables, bulk-loads via COPY
-(omitting generated columns so they recompute), then applies constraints/indexes and resets
-sequences.
+and **`GENERATED … STORED`** columns, **constraints** (PK/UNIQUE/FK/CHECK), **indexes**,
+**sequences** (serial and identity, full parameters + `last_value`, reset to the data's max so the
+next `INSERT` doesn't collide), **extensions** (`CREATE EXTENSION`), **user-defined types**
+(enum/domain/composite), and **views + materialized views** (matviews populated `WITH DATA`).
+Restore replays pre-objects (extensions, types) with dependency retry, recreates schemas + tables,
+bulk-loads via COPY (omitting generated columns so they recompute), applies constraints/indexes,
+resets sequences, then replays views/matviews (also retry-ordered).
 
 Connections use rustls TLS with `sslmode` negotiation — the default (`prefer`) tries TLS and
 falls back to plaintext for servers without it, while `sslmode=require`/`verify-full` enforce
 TLS. Data moves as text COPY (the portable format pg_dump uses), so restoring across
 PostgreSQL major versions is safe; a major-version mismatch is logged as a warning.
 
-Not yet covered (roadmap): user-defined types (composite/enum/domain — `CREATE TYPE` isn't
-dumped, logged as a warning), non-default sequence parameters (increment/min/max — values are
-preserved, options aren't), views, materialized views, functions/triggers, extensions,
-ownership/grants, partitioning (partition parents are skipped with a warning), and
+Not yet covered (roadmap): functions/stored procedures, triggers, ownership/grants, partitioning
+(partition parents are skipped with a warning), user-defined base/range types, and
 incremental/PITR (`restore --at` is refused for PostgreSQL — PITR means WAL archiving, a
 different mechanism from MongoDB's oplog). Restoring into a non-empty database should use
 `--force` (drops and recreates each backed-up table); an empty target needs no flag. `migrate`
