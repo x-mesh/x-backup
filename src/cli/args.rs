@@ -256,7 +256,9 @@ pub struct StatusArgs {
     #[arg(long, value_name = "NAME", required_unless_present = "all", env = "XB_PROFILE")]
     pub profile: Option<String>,
     /// config의 모든 프로파일을 한 번에 점검한다(한 줄 요약 + 최악 exit code).
-    #[arg(long, conflicts_with = "profile")]
+    /// `--profile`/`XB_PROFILE`보다 우선한다(둘 다 있으면 --all로 동작 — 워크스페이스
+    /// 활성(XB_PROFILE) 중에도 `status --all`이 충돌 없이 동작하도록).
+    #[arg(long)]
     pub all: bool,
     /// 결과를 JSON으로 출력한다.
     #[arg(long)]
