@@ -94,9 +94,14 @@ aes-gcm = "0.10"
 aead = { version = "0.5", features = ["stream"] }
 # 진행 표시(t13, FR-9/R16) — indicatif progress bar/spinner를 **stderr**에 그린다
 # (stdout은 결과·--json 전용, pitfall 9-1). default-features로 충분(unicode-width 등).
-# 마법사(init)는 별도 대화형 크레이트(dialoguer) 대신 std stdin을 직접 읽는다 —
+# init 마법사의 단순 라인 Q&A는 별도 대화형 크레이트 대신 std stdin을 직접 읽는다 —
 # 입력 시퀀스 주입(테스트)이 trait 추상화로 더 단순하고 의존성을 줄이기 위함이다.
 indicatif = "0.18"
+# 인터랙티브 백업 선택(restore --id 미지정 + TTY) — fuzzy finder(라이브 필터 + 화살표).
+# 단순 라인 Q&A(init)와 달리 목록 탐색·fuzzy 매칭은 직접 구현 비용이 커 dialoguer를 쓴다.
+# mongodump 같은 런타임 외부 바이너리가 아니라 정적 링크되는 Rust 크레이트라(순수 Rust+libc)
+# 단일 바이너리·musl 정적 빌드 원칙에 영향이 없다. fuzzy-select feature만 켠다.
+dialoguer = { version = "0.11", default-features = false, features = ["fuzzy-select"] }
 # 동시 실행 잠금(t12, FR-12) — stale lock 판정의 PID 생존 확인(kill(pid,0)).
 # std에는 시그널 전송 API가 없어 libc::kill을 직접 호출한다. 이미 transitive로
 # 잠겨 있던 0.2 라인을 직접 의존으로 끌어올린다(추가 빌드 비용 없음).

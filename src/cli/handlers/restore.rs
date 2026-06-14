@@ -64,6 +64,14 @@ pub async fn handle(config_path: Option<PathBuf>, args: RestoreArgs) -> Result<(
     //    읽어도 같다.
     let storage = select_restore_storage(&resolved.profile, args.from.as_deref())?;
 
+    // TTY 여부 — 대화형 선택/확인 가능 여부. stdin/stderr 모두 터미널일 때만 인터랙션한다
+    //   (선택·확인 입력은 stdin, 표시는 stderr; stdout은 결과 전용).
+    let is_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+
+    // 복구할 백업 결정: --id 있으면 그대로, 없고 대화형(TTY·비-json·비-quiet)이면 fuzzy
+    //   피커로 고르게 한다(최신이 기본). 비대화형/기계출력은 최신 풀백업 자동선택으로 폴백.
+    let backup_id = resolve_backup_id(&args, storage.as_ref(), is_tty).await?;
+
     // 출력 모드 결정(R15) — CLI > config(mode.output) > stderr TTY 자동.
     let mode = OutputMode::resolve_from_env(
         OutputFlags {
@@ -90,7 +98,7 @@ pub async fn handle(config_path: Option<PathBuf>, args: RestoreArgs) -> Result<(
     let request = RestoreRequest {
         target_uri,
         mongorestore_program: "mongorestore".to_string(),
-        backup_id: args.id.clone(),
+        backup_id,
         only: args.only.clone(),
         force: args.force,
         dry_run: args.dry_run,
@@ -102,9 +110,6 @@ pub async fn handle(config_path: Option<PathBuf>, args: RestoreArgs) -> Result<(
             Some(std::sync::Arc::clone(&progress_counter))
         },
     };
-
-    // TTY 여부 — 대화형 확인 가능 여부. stdout 대신 stdin TTY로 본다(확인 입력을 받음).
-    let is_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
 
     let reporter = if request.dry_run {
         ProgressReporter::disabled(progress_counter)
@@ -147,6 +152,34 @@ pub async fn handle(config_path: Option<PathBuf>, args: RestoreArgs) -> Result<(
     }
 
     Ok(())
+}
+
+/// 복구할 백업 ID를 정한다 — `--id` 우선, 없고 대화형이면 fuzzy 피커, 그 외는 `None`(최신 자동).
+///
+/// - `--id` 지정: 그대로 사용한다.
+/// - 비대화형(비-TTY)·기계출력(`--json`)·조용(`--quiet`): 인터랙션 없이 `None`을 돌려준다
+///   — `build_plan`이 최신 풀백업을 자동 선택한다(기존 동작 보존, cron/CI 안전).
+/// - 대화형: 풀+완료 후보를 fuzzy 피커로 고르게 한다(최신이 기본). 후보가 없으면 `None`으로
+///   폴백해 `latest_full_manifest`가 명확한 에러를 내게 하고, 사용자가 취소(Esc)하면 거부(exit 1).
+async fn resolve_backup_id(
+    args: &RestoreArgs,
+    storage: &dyn Storage,
+    is_tty: bool,
+) -> Result<Option<String>> {
+    if let Some(id) = &args.id {
+        return Ok(Some(id.clone()));
+    }
+    if !is_tty || args.json || args.quiet {
+        return Ok(None);
+    }
+    let choices = crate::cli::picker::full_backup_choices(storage).await?;
+    if choices.is_empty() {
+        return Ok(None);
+    }
+    match crate::cli::picker::pick_backup(&choices)? {
+        Some(id) => Ok(Some(id)),
+        None => Err(XBackupError::Failure("백업 선택을 취소했습니다".into())),
+    }
 }
 
 /// dry-run 계획을 출력한다(체인·대상·예상 크기·충돌 — PRD §FR-3). 시크릿은 출력하지 않는다.
