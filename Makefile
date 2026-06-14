@@ -18,9 +18,9 @@ TOOLS_PATH    := $(abspath $(TOOLS_DIR))/bin
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build build-debug lint fmt test test-integration test-s3 \
-        mongodb-up mongodb-down postgres-up postgres-down tools scenario clean \
-        devenv devenv-down
+.PHONY: help build build-debug lint fmt test test-integration test-s3 test-pg \
+        mongodb-up mongodb-down postgres-up postgres-down tools scenario scenario-pg \
+        clean devenv devenv-down
 
 help: ## 타깃 목록 출력
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -54,6 +54,9 @@ test-integration: tools ## 통합 테스트 — 자체 fixture(:27017) 사용. c
 test-s3: ## S3(MinIO) 통합 테스트 — 테스트가 MinIO 컨테이너를 자체 기동·정리
 	cargo test --features s3-integration --test s3_minio
 
+test-pg: ## PostgreSQL 엔진 단위 테스트(engine::postgres 모듈) — DB·Docker 불필요
+	cargo test --lib engine::postgres
+
 # ── 테스트용 DB 컨테이너 ──────────────────────────────────────────────
 
 mongodb-up: ## MongoDB replica set 기동(소스 :27017 + 복구 타깃 :27117, healthy까지 대기)
@@ -83,6 +86,9 @@ $(TOOLS_DIR)/bin/mongodump:
 
 scenario: build tools mongodb-up ## E2E 시나리오 실행(docs/test-scenario.md) — 풀/증분/검증/복구/PITR
 	PATH="$(TOOLS_PATH):$$PATH" scripts/scenario-e2e.sh
+
+scenario-pg: build postgres-up ## PostgreSQL E2E — 풀/증분(pgoutput)/복구/PITR(전체·중간)/시퀀스 재동기화
+	scripts/scenario-pg-e2e.sh
 
 # ── 대화형 테스트 환경(scripts/xb 래퍼) ───────────────────────────────
 

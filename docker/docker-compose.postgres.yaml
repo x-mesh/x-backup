@@ -9,6 +9,13 @@ services:
   postgres:
     image: ${XB_PG_IMAGE:-postgres:16}
     container_name: x-backup-postgres
+    # wal_level=logical: PG 증분(logical decoding/pgoutput)의 전제 — replication slot 생성에 필요.
+    # 풀/복구만 써도 무해(약간의 WAL 오버헤드). max_replication_slots/max_wal_senders는 PG16
+    # 기본 10이라 충분하다.
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
     environment:
       POSTGRES_USER: ${XB_PG_USER:-xbackup}
       POSTGRES_PASSWORD: ${XB_PG_PASSWORD:-xbackup-dev} # 로컬 전용 기본값
