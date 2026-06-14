@@ -1,6 +1,5 @@
-# 테스트용 PostgreSQL — 2차 PostgreSQL 어댑터(PRD §12 로드맵) 대비 환경.
+# 테스트용 PostgreSQL — PG 엔진(드라이버 COPY 백업/복구/status) 검증 환경.
 #
-# 현재 x-backup 1차는 MongoDB 전용이므로 이 compose는 어댑터 개발·실험용이다.
 # 기본 자격증명은 로컬 테스트 전용 — 외부 노출 금지. 운영 값은 환경변수로 주입:
 #   XB_PG_PORT / XB_PG_USER / XB_PG_PASSWORD / XB_PG_DB
 #

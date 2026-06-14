@@ -4,9 +4,9 @@
 
 # x-backup
 
-> MongoDB backup and restore CLI — full and incremental (oplog) backups, PITR, local or S3-compatible storage, encrypted by default. A single Rust binary.
+> MongoDB & PostgreSQL backup and restore CLI — full and incremental (oplog) backups, PITR, local or S3-compatible storage, encrypted by default. A single Rust binary, **no external dump tools**.
 
-x-backup backs up a running MongoDB (standalone or replica set) into an encrypted form you can verify and actually restore from. By default it talks to MongoDB directly through the Rust driver — **no `mongodump`/`mongorestore` required** — and streams every stage, so memory stays flat no matter how large the dataset is. A 6 GiB backup peaks at 54.6 MiB RSS ([measured](docs/memory-profile.md)).
+x-backup backs up a running MongoDB (standalone or replica set) or PostgreSQL into an encrypted form you can verify and actually restore from. By default it talks to the database directly through the Rust driver — **no `mongodump`/`mongorestore` or `pg_dump`/`pg_restore` required** — and streams every stage, so memory stays flat no matter how large the dataset is. A 6 GiB backup peaks at 54.6 MiB RSS ([measured](docs/memory-profile.md)). The database is chosen automatically from the source URI scheme (`mongodb://` vs `postgresql://`).
 
 ## Features
 
@@ -17,9 +17,10 @@ x-backup backs up a running MongoDB (standalone or replica set) into an encrypte
 - ✅ **Encrypted by default** — `age` (X25519; only the public key lives on the backup host) or AES-256-GCM, compressed with zstd before encryption
 - ✅ **Integrity** — manifest + sha256, with `verify` (structural check, no key needed), `--deep`, and `--chain`
 - ✅ **Operations** — `status` preflight (connection, topology, privileges, version/FCV, clock skew, oplog window, data shape, **last backup age**, **destination writability + free space**), `--all` source-vs-target diff, `--watch` live monitor, chain-safe `prune`, concurrent-run locking, a defined exit-code contract (0–5)
+- ✅ **PostgreSQL** — driver-native full backup/restore via the COPY protocol (data + tables + constraints + indexes + sequences), no `pg_dump`/`pg_restore`. Same pipeline (compress → encrypt → store), same `status`/`list`/`verify`/`restore`
 - ✅ **Headless** — auto-quiet when not a TTY, `--json` output, built for cron and CI
 
-Scope: replica sets get full and incremental backups, standalone gets full only, and sharded clusters are detected and refused (out of scope).
+Scope: MongoDB replica sets get full and incremental backups, standalone gets full only, and sharded clusters are detected and refused. PostgreSQL gets full backup + restore + status (incremental/PITR is a roadmap item). See [PostgreSQL](#postgresql).
 
 ## Install
 
@@ -216,6 +217,39 @@ backup is recorded in the manifest (`tool_versions.archive_format`), and `restor
 automatically — a `native` archive is restored through the driver, a mongodump archive
 through `mongorestore`. You can restore an old mongodump backup even after switching the
 profile to `native`.
+
+### PostgreSQL
+
+Point a profile's `source.uri` at `postgresql://…` (or `postgres://…`) and x-backup uses its
+PostgreSQL engine automatically — **no `pg_dump`/`pg_restore`**. It backs up through the
+driver's COPY protocol (the same path those tools use internally), so it stays a single
+self-contained binary.
+
+```toml
+[profiles.pg.source]
+uri_env = "PG_URI"               # e.g. postgresql://user:pass@host:5432/mydb
+[profiles.pg.destination]
+type = "local"
+path = "/var/backups/pg"
+```
+
+```bash
+x-backup backup  --profile pg                    # COPY-based full backup → compress → encrypt → store
+x-backup restore --profile pg --target postgresql://host:5432/restored --force
+x-backup status  --profile pg                    # version, db size, table/row counts, last backup
+x-backup list/verify ...                          # same as MongoDB (DB-agnostic)
+```
+
+What it captures (data-centric): **table data** (COPY binary, exact types), **table structure**
+(columns/types/NOT NULL/defaults), **constraints** (PK/UNIQUE/FK/CHECK), **indexes**, and
+**sequences** (with `last_value`, so the next `INSERT` doesn't collide). Restore recreates the
+schema then bulk-loads via COPY, applying constraints and indexes after the data.
+
+Not yet covered (roadmap): views, materialized views, functions/triggers, extensions,
+ownership/grants, partitioning; and incremental/PITR (which for PostgreSQL means WAL
+archiving — a different mechanism from MongoDB's oplog). Connections are NoTls for now.
+Restoring into a non-empty database should use `--force` (drops and recreates each backed-up
+table); an empty target needs no flag.
 
 ### Live monitor (`status --watch`)
 

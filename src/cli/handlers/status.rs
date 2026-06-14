@@ -144,9 +144,14 @@ async fn build_report(config_toml: Option<&str>, profile: &str) -> Result<Status
     })?;
     let interval = resolved.profile.features.incremental.interval.clone();
     let prefer_secondary = resolved.profile.source.prefer_secondary;
+    let timeout = resolved.profile.source.connect_timeout_secs;
 
-    let report =
-        match StatusChecker::connect(&uri, resolved.profile.source.connect_timeout_secs).await {
+    // DB 종류 분기 — postgres URI면 PG status, 그 외는 Mongo status.
+    let report = if crate::engine::DbKind::from_uri(uri.expose()) == crate::engine::DbKind::Postgres
+    {
+        crate::engine::postgres::status::full_report(&resolved.profile_name, &uri, timeout).await
+    } else {
+        match StatusChecker::connect(&uri, timeout).await {
             Ok(checker) => {
                 checker
                     .full_report(
@@ -165,7 +170,8 @@ async fn build_report(config_toml: Option<&str>, profile: &str) -> Result<Status
                     format!("연결 준비 실패: {e}"),
                 )],
             ),
-        };
+        }
+    };
 
     // destination 쪽 점검(source 연결과 무관) — 마지막 백업·destination 쓰기 가능 여부를
     // 보고서에 덧붙인다. 백업 도구로서 "내 백업이 최신/대상이 정상인가"를 같이 보여준다.

@@ -101,6 +101,11 @@ indicatif = "0.18"
 # std에는 시그널 전송 API가 없어 libc::kill을 직접 호출한다. 이미 transitive로
 # 잠겨 있던 0.2 라인을 직접 의존으로 끌어올린다(추가 빌드 비용 없음).
 libc = "0.2"
+# PostgreSQL 드라이버(2차) — 외부 pg_dump/pg_restore 없이 COPY 프로토콜로 테이블 데이터를
+# 스트리밍 백업/복구하고, status(버전·크기·테이블 수)를 SQL로 조회한다. 로컬 1차는 NoTls.
+tokio-postgres = "0.7"
+# COPY FROM STDIN sink에 넘길 Bytes 타입(드라이버와 동일 계열).
+bytes = "1"
 
 [dev-dependencies]
 # Storage trait mock 자동 생성(단위 테스트에서 파이프라인 로직 주입).

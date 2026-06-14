@@ -480,6 +480,104 @@ async fn cleanup(storage: &dyn Storage, backup_id: &str) {
     }
 }
 
+/// PostgreSQL 풀 백업 — 드라이버 COPY 아카이브(`xb-pg-v1`)를 압축→암호화→저장 파이프라인에
+/// 흘린다. Mongo 경로와 달리 oplog/토폴로지가 없다(topology=Standalone로 기록). 복구는
+/// manifest.archive_format로 PG 엔진을 고른다. 파이프라인 합성·체크섬·정리는 Mongo와 동형.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_pg_full_backup(
+    uri: &crate::config::secret::Secret,
+    timeout_secs: Option<u64>,
+    db: Option<String>,
+    collection: Option<String>,
+    storage: &dyn Storage,
+    stages: StageStack,
+    meta: BackupMeta,
+    progress_counter: Option<Arc<AtomicU64>>,
+) -> Result<BackupOutcome> {
+    use crate::engine::postgres::{archive as pg_archive, backup::PgDumper};
+
+    let selective = db.is_some() || collection.is_some();
+    let dumper = PgDumper::connect(uri, timeout_secs).await?;
+    let server_version = dumper
+        .server_version()
+        .await
+        .map(|v| format!("postgresql {v}"))
+        .unwrap_or_else(|| "postgresql".to_string());
+    let dump = dumper.dump_stream(db, collection);
+    let dump_handle = dump.handle();
+    let dump_stream: BoxAsyncRead = Box::pin(dump);
+
+    // 파이프라인 합성(Mongo 경로와 동일): 입력 카운터 → 단계 → sha256 tee → 저장 카운터.
+    let counted = CountingReader::new(dump_stream);
+    let original_size_handle = counted.handle();
+    let staged: BoxAsyncRead = stages.apply(Box::pin(counted));
+    let checksummed = Sha256Reader::new(staged);
+    let checksum_handle = checksummed.handle();
+    let stored_counted = match &progress_counter {
+        Some(counter) => CountingReader::with_counter(Box::pin(checksummed), Arc::clone(counter)),
+        None => CountingReader::new(Box::pin(checksummed)),
+    };
+    let stored_size_handle = stored_counted.handle();
+
+    let backup_id = Uuid::now_v7().to_string();
+    let data_rel = data_path(&backup_id);
+    let put_result = storage
+        .put_stream(&data_rel, Box::pin(stored_counted), None)
+        .await;
+    if let Err(put_err) = put_result {
+        let _ = dump_handle.finish().await;
+        return Err(put_err);
+    }
+    if let Err(dump_err) = dump_handle.finish().await {
+        cleanup(storage, &backup_id).await;
+        return Err(dump_err);
+    }
+
+    let checksum = checksum_handle
+        .finalize()
+        .ok_or_else(|| XBackupError::Failure("체크섬 확정 실패(이미 소비됨)".into()))?;
+    let stored_size = stored_size_handle.total();
+    let original_size = original_size_handle.total();
+
+    let manifest = BackupManifest {
+        format_version: FORMAT_VERSION,
+        id: backup_id.clone(),
+        created_at: Utc::now().to_rfc3339(),
+        backup_type: BackupType::Full,
+        base_id: None,
+        topology: Topology::Standalone,
+        server_version,
+        tool_versions: ToolVersions {
+            mongodump: None,
+            archive_format: Some(pg_archive::FORMAT_ID.to_string()),
+        },
+        selective,
+        original_size_bytes: original_size,
+        stored_size_bytes: stored_size,
+        compression: meta.compression.clone(),
+        encryption: meta.encryption.clone(),
+        checksum_sha256: checksum.clone(),
+        oplog_range: None,
+        oplog_count: None,
+        promoted_from_gap: false,
+        status: BackupStatus::Complete,
+    };
+    let store = ManifestStore::new(storage);
+    if let Err(write_err) = store.write(&manifest).await {
+        cleanup(storage, &backup_id).await;
+        return Err(write_err);
+    }
+
+    tracing::info!(backup_id = %backup_id, bytes = stored_size, checksum = %checksum, "PG 풀 백업 완료");
+    Ok(BackupOutcome {
+        backup_id,
+        stored_size_bytes: stored_size,
+        checksum_sha256: checksum,
+        topology: Topology::Standalone,
+        oplog_range: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

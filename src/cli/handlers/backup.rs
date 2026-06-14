@@ -79,6 +79,22 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
         Some(resolved.profile.mode.output.as_str()),
     );
 
+    // DB 종류 분기 — source URI 스킴이 postgres면 PostgreSQL 경로(드라이버 COPY, oplog/토폴로지
+    //   개념 없음)로 빠진다. 그 외(mongodb)는 아래 Mongo 경로.
+    if crate::engine::DbKind::from_uri(uri.expose()) == crate::engine::DbKind::Postgres {
+        return handle_pg_backup(
+            &resolved,
+            &args,
+            uri,
+            timeout_secs,
+            primary.as_ref(),
+            secondaries,
+            dests.len(),
+            mode,
+        )
+        .await;
+    }
+
     // backup 실행 전 status 핵심 점검(연결·권한·토폴로지·도구 존재)을 자동 선행한다(FR-8,
     //   PRD §9). 전체 status보다 가벼운 서브셋([`StatusChecker::precheck_subset`])으로, 백업을
     //   *막는* 결함(Fail)만 본다. 하나라도 Fail이면 PrecheckFailed(exit 3)로 백업을 미시작한다.
@@ -173,6 +189,89 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
     }
 
     // 보조 복제 실패가 있으면 경고로 마감(exit 4) — primary 백업은 이미 성공.
+    if let Some(w) = replicate_warning {
+        return Err(XBackupError::Warning(w));
+    }
+    Ok(())
+}
+
+/// PostgreSQL 풀 백업 경로 — 드라이버 COPY 아카이브를 압축·암호화·저장하고 보조 복제까지.
+///
+/// Mongo 경로의 storage/mode/replicate/summary 골격을 공유하되, 덤프는
+/// [`run_pg_full_backup`](crate::pipeline::backup::run_pg_full_backup)가 담당한다(oplog/토폴로지
+/// 없음). 증분은 PG 1차 미지원이라 거부한다.
+#[allow(clippy::too_many_arguments)]
+async fn handle_pg_backup(
+    resolved: &ResolvedConfig,
+    args: &BackupArgs,
+    uri: Secret,
+    timeout_secs: Option<u64>,
+    primary: &dyn Storage,
+    secondaries: &[DestinationConfig],
+    dest_count: usize,
+    mode: OutputMode,
+) -> Result<()> {
+    if matches!(args.backup_type, Some(crate::cli::args::BackupType::Incr)) {
+        return Err(XBackupError::Usage(
+            "PostgreSQL은 증분 백업을 아직 지원하지 않습니다(1차: 풀 백업/복구). \
+             WAL 기반 PITR은 로드맵입니다."
+                .into(),
+        ));
+    }
+
+    let (stages, meta) = build_stages(resolved, args)?;
+    let progress_counter = new_counter();
+    let reporter = ProgressReporter::start(
+        mode,
+        ProgressKind::Indeterminate {
+            label: "PG 백업".into(),
+        },
+        std::sync::Arc::clone(&progress_counter),
+    );
+    let result = crate::pipeline::backup::run_pg_full_backup(
+        &uri,
+        timeout_secs,
+        args.db.clone(),
+        args.collection.clone(),
+        primary,
+        stages,
+        meta,
+        Some(progress_counter),
+    )
+    .await;
+    reporter.finish().await;
+    let outcome = result?;
+
+    let replicate_warning = replicate_and_warn(
+        primary,
+        secondaries,
+        &outcome.backup_id,
+        outcome.stored_size_bytes > 0,
+    )
+    .await;
+
+    if mode.emits_json() {
+        let summary = serde_json::json!({
+            "backup_id": outcome.backup_id,
+            "stored_size_bytes": outcome.stored_size_bytes,
+            "checksum_sha256": outcome.checksum_sha256,
+            "database": "postgresql",
+            "destinations": dest_count,
+        });
+        println!("{summary}");
+    } else if mode.shows_human_summary() {
+        println!("백업 완료(PostgreSQL)");
+        println!("  id:       {}", outcome.backup_id);
+        println!("  크기:     {} bytes", outcome.stored_size_bytes);
+        println!("  체크섬:   sha256:{}", outcome.checksum_sha256);
+        if dest_count > 1 {
+            println!(
+                "  destination: {dest_count}곳(primary + 보조 {})",
+                dest_count - 1
+            );
+        }
+    }
+
     if let Some(w) = replicate_warning {
         return Err(XBackupError::Warning(w));
     }

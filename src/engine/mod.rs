@@ -1,10 +1,49 @@
 //! Engine 계층 — DB별 백업/복구 어댑터(PRD §10).
 //!
-//! 1차는 [`mongo`] 어댑터만 구현한다. `Engine` trait 추상화는 2차 PostgreSQL을
-//! 무변경으로 얹기 위한 것이나, 1차 수직 슬라이스에서는 MongoDB 구체 타입을 직접
-//! 사용한다(과도한 선추상화 회피) — trait 일반화는 2차 착수 시 도입한다.
+//! - [`mongo`]: MongoDB 메타 질의(status·oplog ts) + mongodump/native 덤프 경로.
+//! - [`native`]: Mongo 드라이버 네이티브 아카이브(`xb-native-v1`).
+//! - [`postgres`]: PostgreSQL 드라이버 COPY 백업/복구(`xb-pg-v1`, 2차).
 //!
-//! TODO(후속 태스크 t5/t8/t14): restore(mongorestore)·증분 oplog 캡처·status 점검.
+//! 전면 `Engine` trait 대신 핸들러 레벨에서 DB 종류([`crate::engine::DbKind`])로 분기하고,
+//! 덤프/복구/status에만 얇은 seam을 둔다(작동하는 Mongo 코드의 전면 재작성 회피).
 
 pub mod mongo;
 pub mod native;
+pub mod postgres;
+
+/// 백업 대상 DB 종류 — source URI 스킴으로 판별한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbKind {
+    /// MongoDB(`mongodb://`, `mongodb+srv://`).
+    Mongo,
+    /// PostgreSQL(`postgres://`, `postgresql://`).
+    Postgres,
+}
+
+impl DbKind {
+    /// URI 스킴으로 DB 종류를 판별한다. 인식 못 하면 Mongo로 본다(1차 기본).
+    pub fn from_uri(uri: &str) -> Self {
+        let lower = uri.trim_start().to_ascii_lowercase();
+        if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
+            DbKind::Postgres
+        } else {
+            DbKind::Mongo
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn db_kind_from_uri_scheme() {
+        assert_eq!(DbKind::from_uri("postgresql://u:p@h/db"), DbKind::Postgres);
+        assert_eq!(DbKind::from_uri("postgres://h/db"), DbKind::Postgres);
+        assert_eq!(
+            DbKind::from_uri("mongodb://h/?replicaSet=rs0"),
+            DbKind::Mongo
+        );
+        assert_eq!(DbKind::from_uri("mongodb+srv://h/db"), DbKind::Mongo);
+    }
+}

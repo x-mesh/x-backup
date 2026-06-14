@@ -62,7 +62,7 @@ mongodb-up: ## MongoDB replica set 기동(소스 :27017 + 복구 타깃 :27117, 
 mongodb-down: ## MongoDB 컨테이너·볼륨 정리
 	$(COMPOSE_MONGO) down -v
 
-postgres-up: ## PostgreSQL :5432 기동(2차 어댑터 대비 — 1차 x-backup은 미지원)
+postgres-up: ## PostgreSQL :5432 기동(PG 엔진 백업/복구/status 테스트용)
 	$(COMPOSE_PG) up -d --wait
 
 postgres-down: ## PostgreSQL 정리

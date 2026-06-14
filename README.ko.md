@@ -4,12 +4,13 @@
 
 # x-backup
 
-> MongoDB 백업·복구 CLI — 풀/증분(oplog), PITR, 로컬/S3 호환 스토리지, 암호화 중심. Rust 단일 바이너리.
+> MongoDB·PostgreSQL 백업·복구 CLI — 풀/증분(oplog), PITR, 로컬/S3 호환 스토리지, 암호화 중심. Rust 단일 바이너리, **외부 덤프 도구 불필요.**
 
-운영 중인 MongoDB(standalone/replica set)를 **암호화·검증 가능·복구 가능**한 형태로 백업한다.
-기본적으로 Rust 드라이버로 MongoDB와 **직접** 통신하므로 **`mongodump`/`mongorestore`가 필요 없다.**
-전 구간 스트리밍(데이터 크기와 무관한 상수 메모리 — [실측 보고서](docs/memory-profile.md):
-6 GiB 백업 피크 RSS 54.6 MiB)으로 동작한다.
+운영 중인 MongoDB(standalone/replica set) 또는 PostgreSQL을 **암호화·검증 가능·복구 가능**한
+형태로 백업한다. 기본적으로 Rust 드라이버로 DB와 **직접** 통신하므로
+**`mongodump`/`mongorestore`·`pg_dump`/`pg_restore`가 필요 없다.** 전 구간 스트리밍(데이터
+크기와 무관한 상수 메모리 — [실측 보고서](docs/memory-profile.md): 6 GiB 백업 피크 RSS
+54.6 MiB)으로 동작한다. DB 종류는 source URI 스킴(`mongodb://` vs `postgresql://`)으로 자동 선택된다.
 
 ## Features
 
@@ -20,9 +21,10 @@
 - ✅ **암호화 기본** — `age`(X25519, 공개키만 백업 호스트에 배치) / AES-256-GCM 대안, zstd 압축 후 암호화
 - ✅ **무결성** — manifest + sha256, `verify`(키 불필요 구조 검증) / `--deep` / `--chain`
 - ✅ **운영** — `status` 사전 점검(연결·토폴로지·권한·버전/FCV·시계차·oplog 윈도우·데이터 형상·**마지막 백업 나이**·**destination 쓰기 가능+여유 공간**), `--all` source/target 비교, `--watch` 라이브 모니터, `prune` 체인 안전 삭제, 동시 실행 잠금, exit code 규약 0~5
+- ✅ **PostgreSQL** — COPY 프로토콜 기반 드라이버 네이티브 풀 백업/복구(데이터 + 테이블 + 제약 + 인덱스 + 시퀀스), `pg_dump`/`pg_restore` 불필요. 동일 파이프라인(압축→암호화→저장)·동일 `status`/`list`/`verify`/`restore`
 - ✅ **headless** — 비-TTY 자동 quiet, `--json`, cron/CI 친화
 
-지원 범위: replica set(풀+증분) / standalone(풀만) / 샤딩 클러스터는 감지 시 거부(스코프 외).
+지원 범위: MongoDB replica set(풀+증분)/standalone(풀만)/샤딩은 감지 시 거부. PostgreSQL은 풀 백업+복구+status(증분/PITR은 로드맵). [PostgreSQL](#postgresql-1) 참조.
 
 ## Install
 
@@ -216,6 +218,37 @@ engine = "native"     # native(기본) | mongodump
 기록되고, `restore`가 자동으로 분기한다 — `native` 아카이브는 드라이버로, mongodump
 아카이브는 `mongorestore`로 복구한다. 프로파일을 `native`로 바꾼 뒤에도 예전 mongodump
 백업을 복구할 수 있다.
+
+### PostgreSQL
+
+프로파일의 `source.uri`를 `postgresql://…`(또는 `postgres://…`)로 두면 PostgreSQL 엔진이
+자동 선택된다 — **`pg_dump`/`pg_restore` 불필요**. 드라이버의 COPY 프로토콜(이 도구들이
+내부적으로 쓰는 바로 그 경로)로 백업하므로 단일 바이너리로 완결된다.
+
+```toml
+[profiles.pg.source]
+uri_env = "PG_URI"               # 예: postgresql://user:pass@host:5432/mydb
+[profiles.pg.destination]
+type = "local"
+path = "/var/backups/pg"
+```
+
+```bash
+x-backup backup  --profile pg                    # COPY 기반 풀 백업 → 압축 → 암호화 → 저장
+x-backup restore --profile pg --target postgresql://host:5432/restored --force
+x-backup status  --profile pg                    # 버전·DB 크기·테이블/행 수·마지막 백업
+x-backup list/verify ...                          # MongoDB와 동일(DB 비의존)
+```
+
+잡는 것(데이터 중심): **테이블 데이터**(COPY 바이너리, 타입 정확)·**테이블 구조**
+(컬럼/타입/NOT NULL/기본값)·**제약**(PK/UNIQUE/FK/CHECK)·**인덱스**·**시퀀스**
+(`last_value` 포함 — 복구 후 다음 `INSERT`가 충돌하지 않음). 복구는 스키마를 재생성한 뒤
+COPY로 적재하고, 제약·인덱스는 데이터 뒤에 적용한다.
+
+아직 미지원(로드맵): 뷰·머티리얼라이즈드뷰·함수/트리거·확장·소유권/권한·파티셔닝, 그리고
+증분/PITR(PostgreSQL에선 WAL 아카이빙 — oplog와 다른 메커니즘). 연결은 현재 NoTls다.
+데이터가 있는 DB로 복구할 땐 `--force`(백업에 든 테이블을 drop 후 재생성)를 쓰고, 빈 대상은
+플래그가 필요 없다.
 
 ### 라이브 모니터 (`status --watch`)
 

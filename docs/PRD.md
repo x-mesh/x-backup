@@ -390,7 +390,8 @@ Manifest        : 메타·체크섬·oplog ts·체인 기록/조회
 
 | 항목 | 단계 |
 |------|------|
-| **PostgreSQL 어댑터(논리/물리+WAL)** | **2차** |
+| **PostgreSQL 어댑터 — 데이터 풀 백업/복구/status(드라이버 COPY, 외부 도구 0)** | **2차 — 구현됨** |
+| PostgreSQL 증분/PITR(WAL 아카이빙)·뷰/함수/트리거 등 풀 충실도 | 2차 — 후속 |
 | Slack 알림(성공/실패/소요/크기) | 2차 |
 | 정책 기반 retention/rotation(GFS) — 최소 `prune`은 1차(FR-11) | 2차 |
 | Prometheus 메트릭 노출 | 2차 |

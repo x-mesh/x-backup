@@ -188,9 +188,14 @@ pub async fn run_restore<C>(
 where
     C: FnOnce(&RestorePlan) -> bool,
 {
+    // PostgreSQL 대상은 Mongo 메타 점검을 건너뛴다(드라이버가 다름). 충돌 점검은 PG 복구가
+    //   create-if-not-exists로 처리하며, 비운 대상으로 복구하거나 --force(drop)를 권장한다.
+    let is_pg = crate::engine::DbKind::from_uri(request.target_uri.expose())
+        == crate::engine::DbKind::Postgres;
+
     // 사전 점검 메타: skip-precheck가 아니면 대상에 연결해 점검에 활용한다.
     // dry-run도 충돌 목록을 보여주려면 점검이 필요하므로 동일하게 연결한다.
-    let meta = if request.skip_precheck {
+    let meta = if request.skip_precheck || is_pg {
         None
     } else {
         Some(
@@ -301,10 +306,21 @@ async fn stream_restore(
     };
 
     // 2) 엔진 분기 — manifest의 archive_format으로 백업을 만든 엔진을 식별한다.
-    //    네이티브 포맷이면 드라이버로 직접 복원(외부 도구 불필요), 그 외는 mongorestore.
+    //    네이티브 포맷이면 드라이버로 직접 복원(외부 도구 불필요), PG면 COPY 복원, 그 외는 mongorestore.
     let archive_format = manifest.tool_versions.archive_format.as_deref();
     if archive_format == Some(crate::engine::native::archive::FORMAT_ID) {
         return native_stream_restore(request, &mut restored_stream, plan, drop_existing).await;
+    }
+    if archive_format == Some(crate::engine::postgres::archive::FORMAT_ID) {
+        let inserted = crate::engine::postgres::restore::pg_restore(
+            &mut restored_stream,
+            &request.target_uri,
+            request.timeout_secs,
+            drop_existing,
+        )
+        .await?;
+        tracing::debug!(backup_id = %plan.backup_id, inserted, "PG 복구: 행 삽입 완료");
+        return Ok(());
     }
 
     // 3) (mongodump 경로) URI를 0600 임시 config로(argv 노출 금지). 핸들은 restore 종료까지 유지.
