@@ -244,26 +244,26 @@ x-backup migrate --profile pg --target postgresql://host/other --drop --force   
 x-backup list/verify/prune ...                    # manifest-based (DB-agnostic)
 ```
 
-What it captures (data-centric): **table data** (text COPY, exact values), **table structure**
-across **multiple schemas** (columns/types/NOT NULL/defaults), **`GENERATED … AS IDENTITY`**
-and **`GENERATED … STORED`** columns, **constraints** (PK/UNIQUE/FK/CHECK), **indexes**,
-**sequences** (serial and identity, full parameters + `last_value`, reset to the data's max so the
-next `INSERT` doesn't collide), **extensions** (`CREATE EXTENSION`), **user-defined types**
-(enum/domain/composite), and **views + materialized views** (matviews populated `WITH DATA`).
-Restore replays pre-objects (extensions, types) with dependency retry, recreates schemas + tables,
-bulk-loads via COPY (omitting generated columns so they recompute), applies constraints/indexes,
-resets sequences, then replays views/matviews (also retry-ordered).
+What it captures: **table data** (text COPY, exact values) and a broad slice of the schema —
+**multiple schemas**, columns (incl. **`GENERATED … AS IDENTITY`** / **`… STORED`**),
+**constraints** (PK/UNIQUE/FK/CHECK), **indexes**, **sequences** (serial + identity, full
+parameters + value, reset to the data's max), **extensions**, **user-defined types**
+(enum/domain/composite), **functions/procedures**, **triggers**, **views + materialized views**
+(matviews populated `WITH DATA`), and **declarative partitioning** (parent `PARTITION BY` +
+children `PARTITION OF`, multi-level; new rows route correctly after restore). Restore replays
+pre-objects (extensions, types, functions) with dependency retry, recreates schemas + tables,
+bulk-loads via COPY (generated columns recompute), applies constraints/indexes, resets sequences,
+then replays views/matviews/triggers (also retry-ordered).
 
 Connections use rustls TLS with `sslmode` negotiation — the default (`prefer`) tries TLS and
 falls back to plaintext for servers without it, while `sslmode=require`/`verify-full` enforce
 TLS. Data moves as text COPY (the portable format pg_dump uses), so restoring across
 PostgreSQL major versions is safe; a major-version mismatch is logged as a warning.
 
-Not yet covered (roadmap): functions/stored procedures, triggers, ownership/grants, partitioning
-(partition parents are skipped with a warning), user-defined base/range types, and
-incremental/PITR (`restore --at` is refused for PostgreSQL — PITR means WAL archiving, a
-different mechanism from MongoDB's oplog). Restoring into a non-empty database should use
-`--force` (drops and recreates each backed-up table); an empty target needs no flag. `migrate`
+Not yet covered (roadmap): ownership/grants, comments, aggregate/window functions, user-defined
+base/range types, and incremental/PITR (`restore --at` is refused for PostgreSQL — PITR means WAL
+archiving, a different mechanism from MongoDB's oplog). Restoring into a non-empty database should
+use `--force` (drops and recreates each backed-up table); an empty target needs no flag. `migrate`
 is PG → PG only (no cross-engine).
 
 ### Live monitor (`status --watch`)

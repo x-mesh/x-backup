@@ -391,8 +391,8 @@ Manifest        : 메타·체크섬·oplog ts·체인 기록/조회
 | 항목 | 단계 |
 |------|------|
 | **PostgreSQL 어댑터 — 풀 백업/복구/migrate/status/peek/watch(드라이버 COPY, 외부 도구 0)** | **2차 — 구현됨** |
-| PostgreSQL 스키마 충실도 — 멀티스키마·IDENTITY·generated·확장·enum/도메인/복합 타입·뷰/머티뷰·시퀀스 파라미터 | **2차 — 구현됨** |
-| PostgreSQL 잔여 — 함수/트리거·소유권/권한·파티셔닝·user-defined base/range 타입·증분/PITR(WAL) | 2차 — 후속 |
+| PostgreSQL 스키마 충실도 — 멀티스키마·IDENTITY·generated·확장·enum/도메인/복합 타입·함수/프로시저·트리거·뷰/머티뷰·파티셔닝·시퀀스 파라미터 | **2차 — 구현됨** |
+| PostgreSQL 잔여 — 소유권/권한·코멘트·집계/윈도우 함수·user-defined base/range 타입·증분/PITR(WAL) | 2차 — 후속 |
 | Slack 알림(성공/실패/소요/크기) | 2차 |
 | 정책 기반 retention/rotation(GFS) — 최소 `prune`은 1차(FR-11) | 2차 |
 | Prometheus 메트릭 노출 | 2차 |

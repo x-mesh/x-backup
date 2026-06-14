@@ -5,10 +5,12 @@
 //! `COPY ... TO STDOUT (FORMAT text)`의 불투명 바이트를 [`DuplexStream`]에 흘린다. 전 구간
 //! 스트리밍(상수 메모리). text 포맷이라 메이저 버전 간 이식성이 안전하다.
 //!
-//! ## 1차 스코프(데이터 중심)
-//! 잡는 것: 테이블(컬럼·타입·NOT NULL·DEFAULT)·제약(PK/UNIQUE/FK/CHECK, `pg_get_constraintdef`)·
-//! 비제약 인덱스(`pg_get_indexdef`)·시퀀스(last_value/is_called)·행 데이터(COPY text).
-//! 잡지 않는 것(후속): 뷰·머티리얼라이즈드뷰·함수·트리거·확장·소유권/권한·파티셔닝·코멘트.
+//! ## 스코프
+//! 잡는 것: 멀티 스키마 테이블(컬럼·타입·NOT NULL·DEFAULT·IDENTITY·STORED generated)·
+//! 제약(PK/UNIQUE/FK/CHECK)·인덱스·시퀀스(파라미터+last_value/is_called)·확장·사용자 정의
+//! 타입(enum/도메인/복합)·함수/프로시저·트리거·뷰/머티뷰·파티셔닝(부모 PARTITION BY +
+//! 자식 PARTITION OF, 다중 레벨)·행 데이터(COPY text).
+//! 잡지 않는 것(후속): 소유권/권한·코멘트·집계/윈도우 함수·user-defined base/range 타입·증분/PITR(WAL).
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -97,6 +99,8 @@ struct TableDef {
     copy_cols: Vec<String>,
     /// IDENTITY 컬럼 평문 이름(복구 후 시퀀스 리셋용).
     identity_cols: Vec<String>,
+    /// 직접 데이터가 있는지 — 파티션 부모(relkind='p')는 false(데이터는 자식에).
+    has_data: bool,
 }
 
 /// 대상 데이터베이스 전체를 아카이브 프레임으로 직렬화해 writer에 쓴다.
@@ -112,10 +116,6 @@ async fn write_archive(
         .map(|r| r.get(0))
         .map_err(|e| XBackupError::Failure(format!("server_version 조회 실패: {e}")))?;
     archive::write_header(writer, &chrono::Utc::now().to_rfc3339(), &version).await?;
-
-    // 파티션 부모 테이블은 1차 미지원 — 조용히 빠지지 않게 경고한다. 자식 파티션은
-    // 일반 테이블로 잡혀 데이터는 보존되나 파티션 구조는 복원되지 않는다.
-    warn_partitioned(client, schema_filter.as_deref()).await;
 
     // 선행 DDL — 확장 → 타입 → 함수/프로시저. 테이블 컬럼·DEFAULT·CHECK·트리거가 이들을 쓰므로
     // 테이블보다 먼저. 복구는 의존성 순서를 재시도로 흡수하므로 여기 순서는 best-effort.
@@ -147,19 +147,20 @@ async fn write_archive(
 
         // 데이터 — COPY text 불투명 바이트를 그대로 흘린다(해석 없음). text는 메이저 버전 간
         // 이식성이 안전하다(리뷰 #2). STORED generated 컬럼은 COPY 불가라 copy_cols에서 제외.
-        let cols = def.copy_cols.join(", ");
-        let copy_sql = format!("COPY {} ({cols}) TO STDOUT (FORMAT text)", def.quoted);
-        let stream = client
-            .copy_out(copy_sql.as_str())
-            .await
-            .map_err(|e| XBackupError::Failure(format!("{} COPY OUT 실패: {e}", def.ns)))?;
-        futures::pin_mut!(stream);
-        while let Some(chunk) = stream
-            .try_next()
-            .await
-            .map_err(|e| XBackupError::Failure(format!("{} COPY 청크 읽기 실패: {e}", def.ns)))?
-        {
-            archive::write_data_bytes(writer, &chunk).await?;
+        // 파티션 부모(has_data=false)는 직접 데이터가 없어 COPY를 건너뛴다(자식 데이터 중복 방지).
+        if def.has_data && !def.copy_cols.is_empty() {
+            let cols = def.copy_cols.join(", ");
+            let copy_sql = format!("COPY {} ({cols}) TO STDOUT (FORMAT text)", def.quoted);
+            let stream = client
+                .copy_out(copy_sql.as_str())
+                .await
+                .map_err(|e| XBackupError::Failure(format!("{} COPY OUT 실패: {e}", def.ns)))?;
+            futures::pin_mut!(stream);
+            while let Some(chunk) = stream.try_next().await.map_err(|e| {
+                XBackupError::Failure(format!("{} COPY 청크 읽기 실패: {e}", def.ns))
+            })? {
+                archive::write_data_bytes(writer, &chunk).await?;
+            }
         }
         archive::write_table_end(writer).await?;
         tracing::debug!(ns = %def.ns, "PG 백업: 테이블 직렬화 완료");
@@ -402,42 +403,31 @@ async fn write_sequences(
     Ok(())
 }
 
-/// 파티션 부모 테이블(relkind='p')을 찾아 경고한다 — 1차 미지원이라 구조가 복원되지 않는다.
-async fn warn_partitioned(client: &Client, schema_filter: Option<&str>) {
-    let sql = format!(
-        "SELECT n.nspname || '.' || c.relname FROM pg_class c \
-         JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE c.relkind = 'p' AND n.nspname NOT IN ({SYSTEM_SCHEMAS}) \
-         AND ($1::text IS NULL OR n.nspname = $1)"
-    );
-    if let Ok(rows) = client.query(sql.as_str(), &[&schema_filter]).await {
-        for row in rows {
-            let ns: String = row.get(0);
-            tracing::warn!(
-                ns = %ns,
-                "PG 백업: 파티션 부모 테이블 — 파티션 구조는 1차 미지원. 자식 데이터는 \
-                 개별 테이블로 백업되나 복구 시 파티셔닝이 재구성되지 않습니다"
-            );
-        }
-    }
-}
-
-/// 대상 사용자 테이블 (schema, table) 목록 — 일반 테이블(relkind='r')만.
+/// 대상 사용자 테이블 (schema, table) 목록 — 일반 테이블 + 파티션 부모/자식(relkind 'r','p').
 ///
-/// 파티션 부모(relkind='p')는 제외한다(자식 파티션이 'r'로 따로 잡혀 데이터 중복을 막음 —
-/// 부모는 [`warn_partitioned`]가 경고). watch/peek의 enumeration과 동일 기준(리뷰 #8).
+/// 파티션 계층 깊이 순으로 정렬해 **부모가 자식보다 먼저** 나오게 한다(자식의 `PARTITION OF`가
+/// 부모 존재를 전제). 재귀 CTE로 비-파티션(깊이 0)에서 파티션을 따라 내려간다(다중 레벨 지원).
 async fn list_tables(
     client: &Client,
     schema_filter: Option<&str>,
     table_filter: Option<&str>,
 ) -> Result<Vec<(String, String)>> {
     let sql = format!(
-        "SELECT n.nspname, c.relname FROM pg_class c \
+        "WITH RECURSIVE h AS ( \
+            SELECT c.oid, 0 AS depth FROM pg_class c \
+            WHERE c.relkind IN ('r','p') AND NOT c.relispartition \
+          UNION ALL \
+            SELECT c.oid, h.depth + 1 FROM pg_class c \
+            JOIN pg_inherits i ON i.inhrelid = c.oid \
+            JOIN h ON h.oid = i.inhparent WHERE c.relispartition \
+         ) \
+         SELECT n.nspname, c.relname FROM h \
+         JOIN pg_class c ON c.oid = h.oid \
          JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE c.relkind = 'r' AND n.nspname NOT IN ({SYSTEM_SCHEMAS}) \
+         WHERE n.nspname NOT IN ({SYSTEM_SCHEMAS}) \
          AND ($1::text IS NULL OR n.nspname = $1) \
          AND ($2::text IS NULL OR c.relname = $2) \
-         ORDER BY n.nspname, c.relname"
+         ORDER BY h.depth, n.nspname, c.relname"
     );
     let rows = client
         .query(sql.as_str(), &[&schema_filter, &table_filter])
@@ -465,6 +455,27 @@ async fn introspect_table(client: &Client, (schema, table): &(String, String)) -
     let quoted: String = row.get(0);
     let oid: u32 = row.get(1);
     let schema_quoted: String = row.get(2);
+
+    // 파티션 정보 — 부모(relkind='p')는 PARTITION BY, 자식(relispartition)은 PARTITION OF.
+    let prow = client
+        .query_one(
+            "SELECT c.relkind = 'p', c.relispartition, \
+                    CASE WHEN c.relkind = 'p' THEN pg_get_partkeydef(c.oid) END, \
+                    CASE WHEN c.relispartition THEN \
+                        (SELECT format('%I.%I', pn.nspname, pc.relname) FROM pg_inherits i \
+                         JOIN pg_class pc ON pc.oid = i.inhparent \
+                         JOIN pg_namespace pn ON pn.oid = pc.relnamespace WHERE i.inhrelid = c.oid) END, \
+                    CASE WHEN c.relispartition THEN pg_get_expr(c.relpartbound, c.oid) END \
+             FROM pg_class c WHERE c.oid = $1",
+            &[&oid],
+        )
+        .await
+        .map_err(|e| XBackupError::Failure(format!("{ns} 파티션 정보 조회 실패: {e}")))?;
+    let is_partitioned_parent: bool = prow.get(0);
+    let is_partition_child: bool = prow.get(1);
+    let part_key: Option<String> = prow.get(2);
+    let part_parent: Option<String> = prow.get(3);
+    let part_bound: Option<String> = prow.get(4);
 
     // 컬럼 → CREATE TABLE. attidentity(IDENTITY)/attgenerated(STORED generated)도 함께 가져온다
     // (리뷰 #3/#4). quote_ident는 같은 쿼리에서(리뷰 #4). enum/도메인/복합 타입은 write_types가
@@ -520,7 +531,44 @@ async fn introspect_table(client: &Client, (schema, table): &(String, String)) -
         }
         cols.push(def);
     }
-    let create_sql = format!("CREATE TABLE {quoted} (\n  {}\n)", cols.join(",\n  "));
+
+    // 파티션 자식은 PARTITION OF로 부모 정의를 상속(컬럼/제약/인덱스 재선언 불필요·금지).
+    // 부모(relkind='p')는 PARTITION BY 절을 붙이고 직접 데이터가 없다(데이터는 자식에 있음).
+    if is_partition_child {
+        let parent = part_parent
+            .ok_or_else(|| XBackupError::Failure(format!("{ns} 파티션 부모를 찾지 못했습니다")))?;
+        let bound = part_bound.unwrap_or_else(|| "DEFAULT".to_string());
+        // 중간 노드(자식이면서 또 파티션 부모)는 PARTITION BY도 덧붙인다(다중 레벨).
+        let mut create_sql = format!("CREATE TABLE {quoted} PARTITION OF {parent} {bound}");
+        if is_partitioned_parent {
+            if let Some(key) = &part_key {
+                create_sql.push_str(&format!(" PARTITION BY {key}"));
+            }
+        }
+        return Ok(TableDef {
+            ns,
+            quoted,
+            schema_quoted,
+            create_sql,
+            // 제약·인덱스는 부모에서 전파되므로 자식엔 두지 않는다. identity도 부모가 관리.
+            constraints: Vec::new(),
+            indexes: Vec::new(),
+            copy_cols,
+            identity_cols: Vec::new(),
+            // 중간 노드도 직접 데이터 없음(리프만 데이터 보유).
+            has_data: !is_partitioned_parent,
+        });
+    }
+
+    let create_sql = if is_partitioned_parent {
+        let key = part_key.unwrap_or_default();
+        format!(
+            "CREATE TABLE {quoted} (\n  {}\n) PARTITION BY {key}",
+            cols.join(",\n  ")
+        )
+    } else {
+        format!("CREATE TABLE {quoted} (\n  {}\n)", cols.join(",\n  "))
+    };
 
     // 제약(PK/UNIQUE/FK/CHECK 등) — pg_get_constraintdef로 정확히. quote_ident도 같은 쿼리에서.
     let con_rows = client
@@ -562,6 +610,8 @@ async fn introspect_table(client: &Client, (schema, table): &(String, String)) -
         indexes,
         copy_cols,
         identity_cols,
+        // 파티션 부모는 직접 데이터가 없다(자식에서 COPY) — COPY TO 시 자식 데이터가 중복 라우팅됨.
+        has_data: !is_partitioned_parent,
     })
 }
 
