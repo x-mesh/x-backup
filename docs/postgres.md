@@ -120,3 +120,22 @@ scripts/xbenv destroy ./ws             # 워크스페이스 + 격리 DB + slot �
 
 `--engine mongo`면 source=:27017 RS / target=:27117 컨테이너를 가리킨다. 자세한 사용법은
 `scripts/xbenv help`.
+
+**make 단축** — 빌드 + 컨테이너 기동 + 워크스페이스 생성을 한 번에(기본 경로 `.xbenv-pg`/
+`.xbenv-mongo`, `DIR=`로 변경):
+
+```bash
+make xbenv-pg        # build + postgres-up + .xbenv-pg 생성 → activate 한 줄 출력
+make xbenv-mongo     # build + mongodb-up + .xbenv-mongo 생성
+make xbenv-clean     # 워크스페이스(+격리 DB) 제거
+```
+
+활성화(`source`)는 부모 셸 환경을 바꿔야 해서 **make 타깃으로는 불가**하다(레시피는 서브셸에서
+실행 — venv도 `source`가 별도인 이유). make는 마지막에 실행할 `source ...` 한 줄을 출력한다.
+한 단어로 끝내려면 셸 rc에 래퍼를 두면 된다:
+
+```bash
+# ~/.zshrc 또는 ~/.bashrc
+xbenv() { make -s "xbenv-$1" && source ".xbenv-$1/activate"; }
+# 사용: xbenv pg   /   xbenv mongo
+```

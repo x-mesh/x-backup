@@ -23,3 +23,6 @@
 
 # scripts/xb 개발 테스트 환경(로컬, 시크릿 키 포함)
 .devenv/
+
+# scripts/xbenv 격리 워크스페이스(로컬, config·키·store 포함)
+.xbenv-*/

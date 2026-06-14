@@ -20,7 +20,7 @@ TOOLS_PATH    := $(abspath $(TOOLS_DIR))/bin
 
 .PHONY: help build build-debug lint fmt test test-integration test-s3 test-pg \
         mongodb-up mongodb-down postgres-up postgres-down tools scenario scenario-pg \
-        clean devenv devenv-down
+        clean devenv devenv-down xbenv-mongo xbenv-pg xbenv-clean
 
 help: ## 타깃 목록 출력
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -98,6 +98,24 @@ devenv: build tools mongodb-up ## 손쉬운 테스트 환경 — 컨테이너+co
 
 devenv-down: ## 테스트 환경 정리(컨테이너 종료 + .devenv 삭제)
 	scripts/xb down
+
+# ── 격리 워크스페이스(scripts/xbenv, venv 모델) ───────────────────────
+# 빌드 + 컨테이너 기동 + 워크스페이스 생성까지 한 번에. 활성화(source)는 부모 셸 환경을
+# 바꿔야 해서 make로 불가하므로(서브셸 한계), 마지막에 실행할 source 한 줄을 출력한다.
+# 경로는 기본 .xbenv-mongo/.xbenv-pg, `DIR=경로`로 변경.
+
+xbenv-mongo: build mongodb-up ## Mongo 격리 워크스페이스 준비 + activate 안내(DIR=로 경로 변경)
+	@d='$(or $(DIR),.xbenv-mongo)'; [ -f "$$d/activate" ] || scripts/xbenv new "$$d" --engine mongo --name mongo; \
+	  printf '\n  활성화: \033[36msource %s/activate\033[0m   (해제: deactivate · 제거: make xbenv-clean)\n' "$$d"
+
+xbenv-pg: build postgres-up ## PG 격리 워크스페이스 준비 + activate 안내(DIR=로 경로 변경)
+	@d='$(or $(DIR),.xbenv-pg)'; [ -f "$$d/activate" ] || scripts/xbenv new "$$d" --engine pg --name pg; \
+	  printf '\n  활성화: \033[36msource %s/activate\033[0m   (해제: deactivate · 제거: make xbenv-clean)\n' "$$d"
+
+xbenv-clean: ## 격리 워크스페이스 제거(.xbenv-mongo/.xbenv-pg, 또는 DIR=)
+	@for d in $(or $(DIR),.xbenv-mongo .xbenv-pg); do \
+	  if [ -e "$$d" ]; then scripts/xbenv destroy "$$d" --yes; fi; \
+	done
 
 clean: ## 빌드 산출물·도구 제거(컨테이너는 *-down 타깃으로)
 	cargo clean
