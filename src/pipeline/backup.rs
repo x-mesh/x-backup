@@ -493,10 +493,33 @@ pub async fn run_pg_full_backup(
     stages: StageStack,
     meta: BackupMeta,
     progress_counter: Option<Arc<AtomicU64>>,
+    profile_name: &str,
+    enable_incremental: bool,
 ) -> Result<BackupOutcome> {
-    use crate::engine::postgres::{archive as pg_archive, backup::PgDumper};
+    use crate::engine::postgres::{
+        archive as pg_archive, backup::PgDumper, conn::PgClient, incremental,
+    };
 
     let selective = db.is_some() || collection.is_some();
+
+    // 증분 활성(features.incremental.pg_logical)이면 **덤프 전에** replication slot+publication을
+    // 만들어 base LSN을 잡는다 — 슬롯이 이 시점부터 WAL을 보존해야 이후 변경을 빠짐없이
+    // 캡처한다(슬롯을 덤프 뒤에 만들면 그 사이 변경이 유실됨; 덤프와의 겹침은 적용이
+    // idempotent라 안전). 선택적 백업은 증분 base 부적격이라 건너뛴다.
+    if enable_incremental && !selective {
+        let admin = PgClient::connect(uri, timeout_secs).await?;
+        ensure_wal_level_logical(admin.client()).await?;
+        let slot = incremental::slot_name(profile_name);
+        let publication = incremental::publication_name(profile_name);
+        let base_lsn =
+            incremental::ensure_slot_and_publication(admin.client(), &slot, &publication).await?;
+        tracing::info!(%slot, %publication, %base_lsn, "PG 증분 slot 준비 완료(풀 백업 base)");
+    } else if enable_incremental && selective {
+        tracing::warn!(
+            "선택적 PG 백업(--db/--collection)은 증분 base 부적격이라 slot을 만들지 않습니다"
+        );
+    }
+
     let dumper = PgDumper::connect(uri, timeout_secs).await?;
     let server_version = dumper
         .server_version()
@@ -576,6 +599,232 @@ pub async fn run_pg_full_backup(
         topology: Topology::Standalone,
         oplog_range: None,
     })
+}
+
+/// `wal_level=logical`을 확인한다 — 아니면 증분 slot을 만들 수 없으므로 명확히 거부(exit 3).
+async fn ensure_wal_level_logical(client: &tokio_postgres::Client) -> Result<()> {
+    let level: String = client
+        .query_one("SHOW wal_level", &[])
+        .await
+        .map(|r| r.get(0))
+        .map_err(|e| XBackupError::PrecheckFailed(format!("wal_level 조회 실패: {e}")))?;
+    if level != "logical" {
+        return Err(XBackupError::PrecheckFailed(format!(
+            "PG 증분에는 wal_level=logical이 필요합니다(현재 '{level}'). \
+             서버에서 `ALTER SYSTEM SET wal_level=logical;` 후 재시작하세요. \
+             증분이 필요 없으면 features.incremental.pg_logical=false로 두세요."
+        )));
+    }
+    Ok(())
+}
+
+/// PG 증분 백업 결과(CLI 출력용).
+#[derive(Debug, Clone)]
+pub struct PgIncrementalOutcome {
+    /// 증분 백업 ID.
+    pub backup_id: String,
+    /// 연결된 base 풀백업 ID.
+    pub base_id: String,
+    /// 캡처한 변경 레코드 수(0이면 빈 슬라이스, data.bin 미생성).
+    pub change_count: u64,
+    /// 저장 바이트(빈 슬라이스면 0).
+    pub stored_size_bytes: u64,
+}
+
+/// PostgreSQL 증분 백업 — logical decoding(pgoutput) slot에서 변경을 캡처해 `xb-pg-incr-v1`
+/// 아카이브로 저장한다. base는 가장 최신 Complete PG 풀백업(스타 모델 — 증분은 모두 그
+/// 풀백업에 체인). 저장 성공 후에만 slot을 전진시킨다(실패 시 재캡처 — 적용이 idempotent).
+///
+/// 무결성 순서: data.bin 저장 → manifest 기록 → slot 전진. manifest 기록 실패면 slot
+/// 미전진이라 다음에 재캡처(부분 산출물은 정리). 전진 실패는 다음 증분이 겹쳐 캡처하나
+/// 복구 적용이 idempotent라 안전.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_pg_incremental_backup(
+    uri: &crate::config::secret::Secret,
+    timeout_secs: Option<u64>,
+    profile_name: &str,
+    storage: &dyn Storage,
+    stages: StageStack,
+    meta: BackupMeta,
+) -> Result<PgIncrementalOutcome> {
+    use crate::engine::postgres::{conn::PgClient, incremental};
+    use crate::manifest::schema::BackupStatus;
+
+    // 1) base 풀백업 선택 — 가장 최신 Complete·비-selective PG 풀백업.
+    let base_id = select_pg_full_base(storage).await?;
+
+    // 2) slot에서 변경 캡처(peek — 비소비).
+    let admin = PgClient::connect(uri, timeout_secs).await?;
+    let server_version = admin
+        .client()
+        .query_one("SHOW server_version", &[])
+        .await
+        .map(|r| format!("postgresql {}", r.get::<_, String>(0)))
+        .unwrap_or_else(|_| "postgresql".to_string());
+    let slot = incremental::slot_name(profile_name);
+    let publication = incremental::publication_name(profile_name);
+    let captured = incremental::capture(admin.client(), &slot, &publication).await?;
+
+    // 3) 변경 0건 — data 없이 manifest만 기록(빈 슬라이스 계약), slot은 마지막 LSN까지 전진.
+    if captured.count == 0 {
+        let backup_id = Uuid::now_v7().to_string();
+        let manifest = pg_incremental_manifest(
+            &backup_id,
+            &base_id,
+            &server_version,
+            /* stored */ 0,
+            &empty_sha256(),
+            /* count */ 0,
+            &BackupMeta::none(),
+        );
+        let store = ManifestStore::new(storage);
+        store.write(&manifest).await?;
+        if let Some(lsn) = &captured.last_lsn {
+            // DML이 아닌 메시지만 있던 구간 — 다시 안 읽도록 전진.
+            if let Err(e) = incremental::advance_slot(admin.client(), &slot, lsn).await {
+                tracing::warn!("빈 슬라이스 slot 전진 실패(다음에 재시도): {e}");
+            }
+        }
+        tracing::info!(backup_id = %backup_id, base_id = %base_id, "PG 증분 — 변경 없음(빈 슬라이스)");
+        return Ok(PgIncrementalOutcome {
+            backup_id,
+            base_id,
+            change_count: 0,
+            stored_size_bytes: 0,
+        });
+    }
+
+    // 4) 캡처 바이트를 파이프라인(압축→암호화)→sha256→저장으로 흘린다(풀과 동형).
+    let last_lsn = captured.last_lsn.clone();
+    let reader: BoxAsyncRead = Box::pin(std::io::Cursor::new(captured.archive));
+    let staged: BoxAsyncRead = stages.apply(reader);
+    let checksummed = Sha256Reader::new(staged);
+    let checksum_handle = checksummed.handle();
+    let stored_counted = CountingReader::new(Box::pin(checksummed));
+    let stored_size_handle = stored_counted.handle();
+
+    let backup_id = Uuid::now_v7().to_string();
+    let data_rel = data_path(&backup_id);
+    if let Err(put_err) = storage
+        .put_stream(&data_rel, Box::pin(stored_counted), None)
+        .await
+    {
+        cleanup(storage, &backup_id).await;
+        return Err(put_err);
+    }
+    let checksum = checksum_handle
+        .finalize()
+        .ok_or_else(|| XBackupError::Failure("체크섬 확정 실패(이미 소비됨)".into()))?;
+    let stored_size = stored_size_handle.total();
+
+    // 5) manifest 기록(data 다음). 실패 시 정리(slot 미전진 → 다음에 재캡처).
+    let manifest = pg_incremental_manifest(
+        &backup_id,
+        &base_id,
+        &server_version,
+        stored_size,
+        &checksum,
+        captured.count,
+        &meta,
+    );
+    let store = ManifestStore::new(storage);
+    if let Err(write_err) = store.write(&manifest).await {
+        cleanup(storage, &backup_id).await;
+        return Err(write_err);
+    }
+
+    // 6) 저장·manifest가 끝났으니 slot 전진(여기 실패는 다음 증분이 겹쳐 캡처 — idempotent).
+    if let Some(lsn) = &last_lsn {
+        if let Err(e) = incremental::advance_slot(admin.client(), &slot, lsn).await {
+            tracing::warn!("slot 전진 실패(다음 증분이 겹쳐 캡처, 복구는 idempotent): {e}");
+        }
+    }
+    let _ = BackupStatus::Complete; // (manifest 헬퍼가 이미 Complete로 기록)
+
+    tracing::info!(backup_id = %backup_id, base_id = %base_id, changes = captured.count, bytes = stored_size, "PG 증분 백업 완료");
+    Ok(PgIncrementalOutcome {
+        backup_id,
+        base_id,
+        change_count: captured.count,
+        stored_size_bytes: stored_size,
+    })
+}
+
+/// PG 증분 manifest 조립 — backup_type=Incremental, base_id, oplog_count(=변경 수 재사용),
+/// archive_format=xb-pg-incr-v1. oplog_range/LSN은 기록하지 않는다(slot이 위치의 진실원).
+fn pg_incremental_manifest(
+    backup_id: &str,
+    base_id: &str,
+    server_version: &str,
+    stored_size: u64,
+    checksum: &str,
+    change_count: u64,
+    meta: &BackupMeta,
+) -> BackupManifest {
+    BackupManifest {
+        format_version: FORMAT_VERSION,
+        id: backup_id.to_string(),
+        created_at: Utc::now().to_rfc3339(),
+        backup_type: BackupType::Incremental,
+        base_id: Some(base_id.to_string()),
+        topology: Topology::Standalone,
+        server_version: server_version.to_string(),
+        tool_versions: ToolVersions {
+            mongodump: None,
+            archive_format: Some(crate::engine::postgres::incremental::INCR_FORMAT_ID.to_string()),
+        },
+        selective: false,
+        original_size_bytes: stored_size,
+        stored_size_bytes: stored_size,
+        compression: meta.compression.clone(),
+        encryption: meta.encryption.clone(),
+        checksum_sha256: checksum.to_string(),
+        oplog_range: None,
+        // 변경 레코드 수를 oplog_count에 재사용 — 빈 슬라이스(Some(0)) 계약을 그대로 따른다.
+        oplog_count: Some(change_count),
+        promoted_from_gap: false,
+        status: BackupStatus::Complete,
+    }
+}
+
+/// 빈 입력의 sha256(빈 슬라이스 data 부재 시 manifest checksum 자리값).
+fn empty_sha256() -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(b""))
+}
+
+/// 가장 최신 Complete·비-selective PG 풀백업(archive_format=xb-pg-v1) ID를 고른다.
+///
+/// PG 증분은 스타 모델로 이 풀백업에 모두 체인된다(slot이 위치를 추적하므로 tip ts는
+/// 불필요). 적격 base가 없으면 Usage 에러(exit 2 — 먼저 풀 백업 필요).
+async fn select_pg_full_base(storage: &dyn Storage) -> Result<String> {
+    use crate::manifest::schema::BackupStatus;
+    let store = ManifestStore::new(storage);
+    let mut ids = crate::pipeline::verify::collect_manifest_ids(storage).await?;
+    ids.sort();
+    ids.reverse(); // UUID v7 사전순=생성순 — 최신부터.
+    for id in &ids {
+        let m = match store.read(id).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::debug!(id = %id, "base 후보 manifest 읽기 실패(건너뜀): {e}");
+                continue;
+            }
+        };
+        let is_pg_full = matches!(m.backup_type, BackupType::Full)
+            && matches!(m.status, BackupStatus::Complete)
+            && !m.selective
+            && m.tool_versions.archive_format.as_deref()
+                == Some(crate::engine::postgres::archive::FORMAT_ID);
+        if is_pg_full {
+            return Ok(m.id);
+        }
+    }
+    Err(XBackupError::Usage(
+        "PG 증분의 base가 될 Complete 풀백업이 없습니다 — 먼저 풀 백업(--type full)을 \
+         features.incremental.pg_logical=true로 한 번 수행하세요."
+            .into(),
+    ))
 }
 
 #[cfg(test)]

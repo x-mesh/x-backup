@@ -220,6 +220,14 @@ pub struct IncrementalConfig {
     /// gap 감지 시 동작(promote_full 등).
     #[serde(default = "default_on_gap")]
     pub on_gap: String,
+    /// PostgreSQL 증분(logical decoding/pgoutput) 사용 여부(기본 false).
+    ///
+    /// true면 PG 풀 백업이 replication slot + publication(FOR ALL TABLES)을 만들어 그 시점부터
+    /// WAL을 잡고, `backup --type incr`로 변경을 캡처한다. **명시적 opt-in**인 이유: 미사용
+    /// slot은 WAL을 무한 보존해 디스크를 채울 수 있고, `wal_level=logical`(재시작 필요) 전제가
+    /// 있기 때문이다. Mongo 증분(oplog)에는 영향이 없다.
+    #[serde(default)]
+    pub pg_logical: bool,
 }
 
 impl Default for IncrementalConfig {
@@ -227,6 +235,7 @@ impl Default for IncrementalConfig {
         Self {
             interval: default_incremental_interval(),
             on_gap: default_on_gap(),
+            pg_logical: false,
         }
     }
 }

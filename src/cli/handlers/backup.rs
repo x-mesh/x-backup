@@ -211,12 +211,37 @@ async fn handle_pg_backup(
     dest_count: usize,
     mode: OutputMode,
 ) -> Result<()> {
+    let enable_incremental = resolved.profile.features.incremental.pg_logical;
+
+    // 증분(--type incr)은 logical decoding 캡처 경로로 분기한다. pg_logical 미활성이면
+    //   slot이 없어 캡처 불가하므로 명확히 안내하고 거부한다(선택적 백업과도 병용 불가).
     if matches!(args.backup_type, Some(crate::cli::args::BackupType::Incr)) {
-        return Err(XBackupError::Usage(
-            "PostgreSQL은 증분 백업을 아직 지원하지 않습니다(1차: 풀 백업/복구). \
-             WAL 기반 PITR은 로드맵입니다."
-                .into(),
-        ));
+        if !enable_incremental {
+            return Err(XBackupError::Usage(
+                "PG 증분(--type incr)은 features.incremental.pg_logical=true가 필요합니다 \
+                 (풀 백업이 replication slot을 만든 상태여야 캡처 가능). 설정을 켜고 풀 백업을 \
+                 한 번 수행한 뒤 증분을 사용하세요."
+                    .into(),
+            ));
+        }
+        if args.db.is_some() || args.collection.is_some() {
+            return Err(XBackupError::Usage(
+                "PG 증분(--type incr)은 선택적 백업(--db/--collection)과 병용할 수 없습니다 \
+                 — 증분은 전체 변경 슬라이스를 캡처합니다."
+                    .into(),
+            ));
+        }
+        return handle_pg_incremental(
+            resolved,
+            args,
+            uri,
+            timeout_secs,
+            primary,
+            secondaries,
+            dest_count,
+            mode,
+        )
+        .await;
     }
 
     let (stages, meta) = build_stages(resolved, args)?;
@@ -237,6 +262,8 @@ async fn handle_pg_backup(
         stages,
         meta,
         Some(progress_counter),
+        &resolved.profile_name,
+        enable_incremental,
     )
     .await;
     reporter.finish().await;
@@ -269,6 +296,79 @@ async fn handle_pg_backup(
                 "  destination: {dest_count}곳(primary + 보조 {})",
                 dest_count - 1
             );
+        }
+    }
+
+    if let Some(w) = replicate_warning {
+        return Err(XBackupError::Warning(w));
+    }
+    Ok(())
+}
+
+/// PostgreSQL 증분 백업 경로 — logical decoding(pgoutput) slot에서 변경을 캡처해 저장한다.
+///
+/// 파이프라인 단계(compress→encrypt)는 풀 백업과 동일하게 [`build_stages`]로 만든다. 캡처
+/// 결과(변경 수·저장 바이트)를 요약하고 보조 destination으로 복제한다(빈 슬라이스면
+/// data.bin 없음 → has_data=false).
+#[allow(clippy::too_many_arguments)]
+async fn handle_pg_incremental(
+    resolved: &ResolvedConfig,
+    args: &BackupArgs,
+    uri: Secret,
+    timeout_secs: Option<u64>,
+    primary: &dyn Storage,
+    secondaries: &[DestinationConfig],
+    dest_count: usize,
+    mode: OutputMode,
+) -> Result<()> {
+    let (stages, meta) = build_stages(resolved, args)?;
+    let progress_counter = new_counter();
+    let reporter = ProgressReporter::start(
+        mode,
+        ProgressKind::Indeterminate {
+            label: "PG 증분".into(),
+        },
+        std::sync::Arc::clone(&progress_counter),
+    );
+    let result = crate::pipeline::backup::run_pg_incremental_backup(
+        &uri,
+        timeout_secs,
+        &resolved.profile_name,
+        primary,
+        stages,
+        meta,
+    )
+    .await;
+    reporter.finish().await;
+    let outcome = result?;
+
+    let replicate_warning = replicate_and_warn(
+        primary,
+        secondaries,
+        &outcome.backup_id,
+        outcome.stored_size_bytes > 0,
+    )
+    .await;
+
+    if mode.emits_json() {
+        let summary = serde_json::json!({
+            "backup_type": "incremental",
+            "backup_id": outcome.backup_id,
+            "base_id": outcome.base_id,
+            "change_count": outcome.change_count,
+            "stored_size_bytes": outcome.stored_size_bytes,
+            "database": "postgresql",
+            "destinations": dest_count,
+        });
+        println!("{summary}");
+    } else if mode.shows_human_summary() {
+        println!("증분 백업 완료(PostgreSQL)");
+        println!("  id:       {}", outcome.backup_id);
+        println!("  base:     {}", outcome.base_id);
+        println!("  변경:     {}건", outcome.change_count);
+        println!("  크기:     {} bytes", outcome.stored_size_bytes);
+        if outcome.change_count == 0 {
+            println!("  (변경 없음 — 빈 슬라이스: manifest만 기록)");
         }
     }
 

@@ -13,6 +13,7 @@
 pub mod archive;
 pub mod backup;
 pub mod conn;
+pub mod incremental;
 pub mod meta;
 pub mod pgoutput;
 pub mod restore;

@@ -16,6 +16,7 @@ use crate::config::merged::MergeInput;
 use crate::config::secret::Secret;
 use crate::config::ResolvedConfig;
 use crate::error::{Result, XBackupError};
+use crate::pipeline::pg_pitr::{run_pg_pitr, PgPitrPlan, PgPitrRequest};
 use crate::pipeline::pitr::{run_pitr, PitrPlan, PitrRequest};
 use crate::pipeline::restore::{run_restore, RestorePlan, RestoreRequest};
 use crate::storage::{from_config, Storage};
@@ -211,14 +212,9 @@ async fn handle_pitr(config_path: Option<PathBuf>, args: RestoreArgs, at: String
     // config·URI·storage·타임아웃 해석(풀 복구 경로와 동일 규칙).
     let (target_uri, storage, timeout_secs) = resolve_target_and_storage(&config_path, &args)?;
 
-    // PITR은 oplog 기반(Mongo 전용) — PostgreSQL은 WAL 아카이빙이 필요하며 미지원이다.
-    //   --at를 PG 대상에 쓰면 조용히 오작동하므로 명확히 거부한다.
+    // PostgreSQL 대상은 logical decoding 기반 PITR로 분기한다(base 풀 복원 + 증분 DML 재생).
     if crate::engine::DbKind::from_uri(target_uri.expose()) == crate::engine::DbKind::Postgres {
-        return Err(XBackupError::Usage(
-            "PostgreSQL은 시점 복구(--at, PITR)를 지원하지 않습니다 — PITR은 oplog 기반(Mongo 전용)이며 \
-             PG는 WAL 아카이빙이 필요합니다(로드맵). 풀 백업 복구는 --at 없이 사용하세요."
-                .into(),
-        ));
+        return handle_pg_pitr(target_uri, storage, timeout_secs, args, at).await;
     }
 
     let request = PitrRequest {
@@ -257,6 +253,126 @@ async fn handle_pitr(config_path: Option<PathBuf>, args: RestoreArgs, at: String
     }
 
     Ok(())
+}
+
+/// PostgreSQL 시점 복구 핸들러 — base 풀 복원 + 증분 슬라이스 재생(`--at <RFC3339>|latest`).
+///
+/// `--id`로 base 풀백업을 고정할 수 있다(미지정 시 최신 PG 풀백업). `--only`(선택적 복구)는
+/// PG PITR에서 미지원이라 거부한다.
+async fn handle_pg_pitr(
+    target_uri: Secret,
+    storage: Box<dyn Storage>,
+    timeout_secs: Option<u64>,
+    args: RestoreArgs,
+    at: String,
+) -> Result<()> {
+    if args.only.is_some() {
+        return Err(XBackupError::Usage(
+            "PG 시점 복구(--at)는 --only(선택적 복구)와 함께 쓸 수 없습니다".into(),
+        ));
+    }
+
+    let request = PgPitrRequest {
+        target_uri,
+        at,
+        base_id: args.id.clone(),
+        force: args.force,
+        dry_run: args.dry_run,
+        timeout_secs,
+    };
+
+    let is_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let outcome = run_pg_pitr(&request, storage.as_ref(), is_tty, prompt_confirm_pg).await?;
+
+    if request.dry_run {
+        print_pg_pitr_plan(&outcome.plan, args.json);
+    } else if args.json {
+        let summary = serde_json::json!({
+            "base_id": outcome.plan.base_id,
+            "incremental_ids": outcome.plan.incremental_ids,
+            "target": outcome.plan.target_label,
+            "replayed_slices": outcome.replayed_slices,
+            "applied_changes": outcome.applied_changes,
+            "database": "postgresql",
+            "restored": true,
+        });
+        println!("{summary}");
+    } else if !args.quiet {
+        println!("PITR 복구 완료(PostgreSQL)");
+        println!("  base id:       {}", outcome.plan.base_id);
+        println!("  재생 슬라이스: {}개", outcome.replayed_slices);
+        println!("  적용 변경:     {}건", outcome.applied_changes);
+        println!("  목표:          {}", outcome.plan.target_label);
+    }
+
+    Ok(())
+}
+
+/// 목록을 최대 5개까지 미리보기로 잘라 표시한다(나머지는 "+N more").
+fn preview_list(list: &[String]) -> String {
+    const MAX: usize = 5;
+    if list.len() <= MAX {
+        list.join(", ")
+    } else {
+        format!("{}, +{} more", list[..MAX].join(", "), list.len() - MAX)
+    }
+}
+
+/// PG PITR 대화형 확인 — 충돌 테이블 목록을 보이고 덮어쓰기 동의를 받는다.
+fn prompt_confirm_pg(conflicts: &[String]) -> bool {
+    use std::io::Write;
+    eprintln!(
+        "경고: 복원 대상에 기존 데이터가 있습니다({}개 테이블): {}",
+        conflicts.len(),
+        preview_list(conflicts)
+    );
+    eprint!("이 데이터를 덮어쓰고 PITR 복구를 진행하시겠습니까? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+    matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// PG PITR dry-run 계획 출력. 시크릿 미출력.
+fn print_pg_pitr_plan(plan: &PgPitrPlan, json: bool) {
+    if json {
+        let summary = serde_json::json!({
+            "dry_run": true,
+            "base_id": plan.base_id,
+            "incremental_ids": plan.incremental_ids,
+            "target": plan.target_label,
+            "conflicting_tables": plan.conflicting_tables,
+            "database": "postgresql",
+        });
+        println!("{summary}");
+        return;
+    }
+    println!("PITR 복구 계획(dry-run, PostgreSQL) — 실제 변경 없음");
+    println!("  base id:       {}", plan.base_id);
+    if plan.incremental_ids.is_empty() {
+        println!("  증분 체인:     없음(base만 복원)");
+    } else {
+        println!(
+            "  증분 체인:     {}개 — {}",
+            plan.incremental_ids.len(),
+            plan.incremental_ids.join(", ")
+        );
+    }
+    println!("  목표:          {}", plan.target_label);
+    if plan.conflicting_tables.is_empty() {
+        println!("  충돌 테이블:   없음(빈 대상)");
+    } else {
+        println!(
+            "  충돌 테이블:   {}개 — {}",
+            plan.conflicting_tables.len(),
+            preview_list(&plan.conflicting_tables)
+        );
+        println!(
+            "  주의:          기존 데이터가 있습니다 — 실제 복구는 --force 또는 대화형 확인 필요"
+        );
+    }
 }
 
 /// config 로드 → 복구 대상 URI·local storage를 해석한다(풀/ PITR 공통 setup).
