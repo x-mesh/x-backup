@@ -597,22 +597,58 @@ fn render_json(report: &StatusReport) -> Result<()> {
 
 /// 점검 결과를 사람이 읽는 신호등 표로 stdout에 출력한다.
 fn render_human(report: &StatusReport) {
-    println!("status 점검 — 프로파일: {}", report.profile);
-    println!("{:-<60}", "");
+    let color = use_color();
+    let title = format!("status 점검 — 프로파일: {}", report.profile);
+    println!("{}", paint(&title, &[BOLD], color));
+
+    // 라벨 칼럼은 **표시 폭**(한글 2배폭) 기준으로 패딩한다 — 문자 수(`{:<14}`)로 맞추면
+    // 한글 라벨이 어긋난다(가시성 저하). [`crate::cli::table::pad`]가 표시 폭으로 정렬한다.
+    let label_w = report
+        .items
+        .iter()
+        .map(|i| display_width(i.label))
+        .max()
+        .unwrap_or(0);
+
+    // 구분선 폭 = 가장 긴 라인의 표시 폭(메시지 포함). 보기 좋게 40~100으로 제한.
+    // 11 = 들여쓰기(2) + 신호 "[OK  ]"(6) + 공백(1) + 라벨 뒤 공백(2).
+    let line_w = report
+        .items
+        .iter()
+        .map(|i| 11 + label_w + display_width(&i.message))
+        .chain(std::iter::once(display_width(&title)))
+        .max()
+        .unwrap_or(60)
+        .clamp(40, 100);
+    let rule = "─".repeat(line_w);
+
+    println!("{rule}");
     for item in &report.items {
         println!(
-            "  {} {:<14} {}",
-            signal(item.status),
-            item.label,
-            item.message
+            "  {} {}  {}",
+            signal_colored(item.status, color),
+            pad(item.label, label_w),
+            item.message,
         );
     }
-    println!("{:-<60}", "");
+    println!("{rule}");
     println!(
-        "  전체: {} {}",
-        signal(report.overall),
-        overall_label(report.overall)
+        "  {} {} {}",
+        paint("전체:", &[BOLD], color),
+        signal_colored(report.overall, color),
+        overall_label(report.overall),
     );
+}
+
+/// 색 입힌 상태 신호([OK]/[WARN]/[FAIL]) — OK=green, WARN=yellow, FAIL=red(굵게).
+/// ANSI 코드는 표시 폭 0이라 신호 뒤 라벨 칼럼 정렬에 영향을 주지 않는다.
+fn signal_colored(status: CheckStatus, color: bool) -> String {
+    let (text, code) = match status {
+        CheckStatus::Ok => ("[OK  ]", GREEN),
+        CheckStatus::Warn => ("[WARN]", YELLOW),
+        CheckStatus::Fail => ("[FAIL]", RED),
+    };
+    paint(text, &[BOLD, code], color)
 }
 
 /// 신호등 기호(사람용 표).
