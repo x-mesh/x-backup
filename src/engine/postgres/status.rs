@@ -70,8 +70,9 @@ pub async fn full_report(profile: &str, uri: &Secret, timeout_secs: Option<u64>)
             .with_value(n.to_string()),
         );
     }
+    // reltuples는 ANALYZE 전이면 -1일 수 있어 GREATEST로 음수를 막는다(리뷰 #7).
     let rows_sql = format!(
-        "SELECT coalesce(sum(c.reltuples), 0)::bigint \
+        "SELECT greatest(0, coalesce(sum(c.reltuples), 0))::bigint \
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
          WHERE c.relkind = 'r' AND n.nspname NOT IN ({SYSTEM_SCHEMAS})"
     );

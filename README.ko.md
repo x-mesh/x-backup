@@ -245,8 +245,12 @@ x-backup list/verify ...                          # MongoDB와 동일(DB 비의�
 (`last_value` 포함 — 복구 후 다음 `INSERT`가 충돌하지 않음). 복구는 스키마를 재생성한 뒤
 COPY로 적재하고, 제약·인덱스는 데이터 뒤에 적용한다.
 
-아직 미지원(로드맵): 뷰·머티리얼라이즈드뷰·함수/트리거·확장·소유권/권한·파티셔닝, 그리고
-증분/PITR(PostgreSQL에선 WAL 아카이빙 — oplog와 다른 메커니즘). 연결은 현재 NoTls다.
+연결은 rustls TLS + `sslmode` 협상을 쓴다 — 기본 `prefer`는 TLS를 시도하고 미지원 서버엔
+평문으로 폴백, `require`/`verify-full`은 TLS를 강제한다. 데이터는 text COPY(pg_dump가 쓰는
+이식성 포맷)로 옮기므로 PostgreSQL 메이저 버전이 달라도 복구가 안전하다(메이저 불일치는 경고).
+
+아직 미지원(로드맵): 뷰·머티리얼라이즈드뷰·함수/트리거·확장·소유권/권한·파티셔닝(파티션
+부모는 경고 후 건너뜀), 그리고 증분/PITR(PostgreSQL에선 WAL 아카이빙 — oplog와 다른 메커니즘).
 데이터가 있는 DB로 복구할 땐 `--force`(백업에 든 테이블을 drop 후 재생성)를 쓰고, 빈 대상은
 플래그가 필요 없다.
 

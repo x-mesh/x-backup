@@ -106,6 +106,11 @@ libc = "0.2"
 tokio-postgres = "0.7"
 # COPY FROM STDIN sink에 넘길 Bytes 타입(드라이버와 동일 계열).
 bytes = "1"
+# PG 연결 TLS(리뷰 #3) — sslmode=prefer(기본)면 TLS 시도 후 미지원 서버엔 평문 폴백,
+# require/verify면 TLS 강제. rustls 0.23 + ring(트리와 동일 provider) + webpki 신뢰 루트.
+tokio-postgres-rustls = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
 
 [dev-dependencies]
 # Storage trait mock 자동 생성(단위 테스트에서 파이프라인 로직 주입).

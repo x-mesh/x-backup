@@ -36,7 +36,7 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
     client: &Client,
     drop: bool,
 ) -> Result<u64> {
-    // 헤더 확인.
+    // 헤더 확인 + 메이저 버전 정합 경고(text COPY라 보통 호환되나, 메이저 차이는 알린다).
     match archive::read_frame(reader).await? {
         Frame::Header(h) => {
             let fmt = h.get_str("format").unwrap_or("");
@@ -46,6 +46,7 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
                     archive::FORMAT_ID
                 )));
             }
+            warn_on_major_mismatch(client, h.get_str("pg_version").unwrap_or("")).await;
         }
         other => {
             return Err(XBackupError::Failure(format!(
@@ -57,7 +58,7 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
     let mut inserted = 0u64;
     let mut deferred_constraints: Vec<String> = Vec::new();
     let mut deferred_indexes: Vec<String> = Vec::new();
-    let mut setvals: Vec<(String, i64)> = Vec::new();
+    let mut setvals: Vec<(String, i64, bool)> = Vec::new();
 
     loop {
         match archive::read_frame(reader).await? {
@@ -71,10 +72,11 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
                     .get_str("name")
                     .map_err(|_| XBackupError::Failure("시퀀스 프레임에 name이 없습니다".into()))?;
                 let last_value = s.get_i64("last_value").unwrap_or(1);
+                let is_called = s.get_bool("is_called").unwrap_or(true);
                 run_ignore_exists(client, &format!("CREATE SEQUENCE {name}"))
                     .await
                     .map_err(|e| XBackupError::Failure(format!("{name} 시퀀스 생성 실패: {e}")))?;
-                setvals.push((name.to_string(), last_value));
+                setvals.push((name.to_string(), last_value, is_called));
             }
             Frame::Table(meta) => {
                 let ns = meta
@@ -106,8 +108,8 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
                         .extend(arr.iter().filter_map(|b| b.as_str().map(String::from)));
                 }
 
-                // COPY IN — 이 테이블의 Data*를 TableEnd까지 적재.
-                let copy_sql = format!("COPY {quoted} FROM STDIN (FORMAT binary)");
+                // COPY IN — 이 테이블의 Data*를 TableEnd까지 적재(text — 백업과 동일 포맷).
+                let copy_sql = format!("COPY {quoted} FROM STDIN (FORMAT text)");
                 let sink = client
                     .copy_in(copy_sql.as_str())
                     .await
@@ -154,16 +156,32 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
             .await
             .map_err(|e| XBackupError::Failure(format!("인덱스 적용 실패: {e}\n  SQL: {sql}")))?;
     }
-    for (name, last_value) in &setvals {
-        // is_called=true로 복원 — 다음 nextval은 last_value+1.
+    for (name, last_value, is_called) in &setvals {
+        // is_called=true면 다음 nextval=last_value+1, false면 last_value(미사용 시퀀스 보존).
         let _ = client
             .batch_execute(&format!(
-                "SELECT setval('{name}'::regclass, {last_value}, true)"
+                "SELECT setval('{name}'::regclass, {last_value}, {is_called})"
             ))
             .await;
     }
 
     Ok(inserted)
+}
+
+/// 백업 소스와 복구 대상의 메이저 버전이 다르면 경고한다(차단하지 않음 — text COPY는 보통 호환).
+async fn warn_on_major_mismatch(client: &Client, source_version: &str) {
+    let target_version: String = match client.query_one("SHOW server_version", &[]).await {
+        Ok(row) => row.get(0),
+        Err(_) => return,
+    };
+    let major = |v: &str| v.trim().split('.').next().unwrap_or("").to_string();
+    let (sm, tm) = (major(source_version), major(target_version.as_str()));
+    if !sm.is_empty() && !tm.is_empty() && sm != tm {
+        tracing::warn!(
+            "PostgreSQL 메이저 버전 불일치 — 백업 소스={source_version}, 복구 대상={target_version}. \
+             text COPY라 대개 호환되나 타입·기본값 차이를 복구 후 확인하세요"
+        );
+    }
 }
 
 /// 이미 존재(중복) 오류는 무시하고 실행한다(drop=false 재적용·idempotent 경로).
@@ -174,6 +192,8 @@ async fn run_ignore_exists(
     match client.batch_execute(sql).await {
         Ok(_) => Ok(()),
         Err(e) => {
+            // "이미 존재"(객체 중복)만 무시한다. UNIQUE_VIOLATION(데이터가 제약 위반)은
+            // 절대 삼키지 않는다 — 무결성 실패를 숨기게 된다(리뷰 #1).
             let dup = e
                 .code()
                 .map(|c| {
@@ -182,7 +202,6 @@ async fn run_ignore_exists(
                         tokio_postgres::error::SqlState::DUPLICATE_TABLE
                             | tokio_postgres::error::SqlState::DUPLICATE_OBJECT
                             | tokio_postgres::error::SqlState::DUPLICATE_SCHEMA
-                            | tokio_postgres::error::SqlState::UNIQUE_VIOLATION
                     )
                 })
                 .unwrap_or(false);

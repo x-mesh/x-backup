@@ -61,13 +61,17 @@ pub async fn write_header<W: AsyncWrite + Unpin>(
     write_doc_frame(w, TAG_HEADER, &doc).await
 }
 
-/// 시퀀스 메타 프레임을 쓴다(`name`, `last_value`).
+/// 시퀀스 메타 프레임을 쓴다(`name`, `last_value`, `is_called`).
+///
+/// `is_called=false`(한 번도 호출 안 된 시퀀스)면 복구가 `setval(.., last_value, false)`로
+/// 복원해 첫 `nextval`이 `last_value`가 되게 한다(미사용 시퀀스 off-by-one 방지).
 pub async fn write_sequence<W: AsyncWrite + Unpin>(
     w: &mut W,
     name: &str,
     last_value: i64,
+    is_called: bool,
 ) -> Result<()> {
-    let doc = bson::doc! { "name": name, "last_value": last_value };
+    let doc = bson::doc! { "name": name, "last_value": last_value, "is_called": is_called };
     write_doc_frame(w, TAG_SEQUENCE, &doc).await
 }
 
@@ -215,7 +219,7 @@ mod tests {
         write_header(&mut buf, "2026-06-14T00:00:00Z", "16.2")
             .await
             .unwrap();
-        write_sequence(&mut buf, "public.t_id_seq", 1000)
+        write_sequence(&mut buf, "public.t_id_seq", 1000, true)
             .await
             .unwrap();
         write_table(
@@ -241,7 +245,10 @@ mod tests {
             f => panic!("헤더 기대, {f:?}"),
         }
         match read_frame(&mut r).await.unwrap() {
-            Frame::Sequence(s) => assert_eq!(s.get_i64("last_value").unwrap(), 1000),
+            Frame::Sequence(s) => {
+                assert_eq!(s.get_i64("last_value").unwrap(), 1000);
+                assert!(s.get_bool("is_called").unwrap());
+            }
             f => panic!("시퀀스 기대, {f:?}"),
         }
         match read_frame(&mut r).await.unwrap() {

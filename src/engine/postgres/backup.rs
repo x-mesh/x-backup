@@ -2,12 +2,12 @@
 //! 스트림으로 낸다(외부 pg_dump 불필요).
 //!
 //! native(Mongo)와 동일 패턴: 별도 task가 스키마를 introspection해 DDL을 쓰고, 테이블마다
-//! `COPY ... TO STDOUT (FORMAT binary)`의 불투명 바이트를 [`DuplexStream`]에 흘린다. 전 구간
-//! 스트리밍(상수 메모리).
+//! `COPY ... TO STDOUT (FORMAT text)`의 불투명 바이트를 [`DuplexStream`]에 흘린다. 전 구간
+//! 스트리밍(상수 메모리). text 포맷이라 메이저 버전 간 이식성이 안전하다.
 //!
 //! ## 1차 스코프(데이터 중심)
 //! 잡는 것: 테이블(컬럼·타입·NOT NULL·DEFAULT)·제약(PK/UNIQUE/FK/CHECK, `pg_get_constraintdef`)·
-//! 비제약 인덱스(`pg_get_indexdef`)·시퀀스(last_value)·행 데이터(COPY binary).
+//! 비제약 인덱스(`pg_get_indexdef`)·시퀀스(last_value/is_called)·행 데이터(COPY text).
 //! 잡지 않는 것(후속): 뷰·머티리얼라이즈드뷰·함수·트리거·확장·소유권/권한·파티셔닝·코멘트.
 
 use std::pin::Pin;
@@ -107,6 +107,10 @@ async fn write_archive(
         .map_err(|e| XBackupError::Failure(format!("server_version 조회 실패: {e}")))?;
     archive::write_header(writer, &chrono::Utc::now().to_rfc3339(), &version).await?;
 
+    // 파티션 부모 테이블은 1차 미지원 — 조용히 빠지지 않게 경고한다(리뷰 #6). 자식 파티션은
+    // 일반 테이블로 잡혀 데이터는 보존되나 파티션 구조는 복원되지 않는다.
+    warn_partitioned(client, schema_filter.as_deref()).await;
+
     // 시퀀스 — 테이블 생성 전에 만들어 nextval 기본값을 해소한다.
     write_sequences(client, writer, schema_filter.as_deref()).await?;
 
@@ -123,8 +127,9 @@ async fn write_archive(
         )
         .await?;
 
-        // 데이터 — COPY binary 불투명 바이트를 그대로 흘린다(해석 없음).
-        let copy_sql = format!("COPY {} TO STDOUT (FORMAT binary)", def.quoted);
+        // 데이터 — COPY text 불투명 바이트를 그대로 흘린다(해석 없음). text는 메이저 버전
+        // 간 이식성이 안전하다(바이너리는 버전 의존적 — 리뷰 #2). pg_dump 기본도 text.
+        let copy_sql = format!("COPY {} TO STDOUT (FORMAT text)", def.quoted);
         let stream = client
             .copy_out(copy_sql.as_str())
             .await
@@ -150,8 +155,11 @@ async fn write_sequences(
     writer: &mut DuplexStream,
     schema_filter: Option<&str>,
 ) -> Result<()> {
+    // last_value가 NULL이면 한 번도 호출 안 된 시퀀스 → is_called=false, 값은 1로 본다(리뷰 #5).
+    // 식별자 quote도 같은 쿼리에서(format('%I.%I')) 처리해 라운드트립을 줄인다.
     let sql = format!(
-        "SELECT schemaname, sequencename, last_value \
+        "SELECT format('%I.%I', schemaname, sequencename), \
+                coalesce(last_value, 1), (last_value IS NOT NULL) \
          FROM pg_sequences WHERE schemaname NOT IN ({SYSTEM_SCHEMAS}) \
          AND ($1::text IS NULL OR schemaname = $1) ORDER BY schemaname, sequencename"
     );
@@ -160,21 +168,32 @@ async fn write_sequences(
         .await
         .map_err(|e| XBackupError::Failure(format!("시퀀스 목록 조회 실패: {e}")))?;
     for row in rows {
-        let schema: String = row.get(0);
-        let name: String = row.get(1);
-        // last_value는 한 번도 호출 안 됐으면 NULL → 1로 보고 setval(is_called=false)는 복구가 처리.
-        let last_value: i64 = row.try_get::<_, i64>(2).unwrap_or(1);
-        let quoted: String = client
-            .query_one(
-                "SELECT format('%I.%I', $1::text, $2::text)",
-                &[&schema, &name],
-            )
-            .await
-            .map(|r| r.get(0))
-            .map_err(|e| XBackupError::Failure(format!("시퀀스 식별자 조회 실패: {e}")))?;
-        archive::write_sequence(writer, &quoted, last_value).await?;
+        let quoted: String = row.get(0);
+        let last_value: i64 = row.get(1);
+        let is_called: bool = row.get(2);
+        archive::write_sequence(writer, &quoted, last_value, is_called).await?;
     }
     Ok(())
+}
+
+/// 파티션 부모 테이블(relkind='p')을 찾아 경고한다 — 1차 미지원이라 구조가 복원되지 않는다.
+async fn warn_partitioned(client: &Client, schema_filter: Option<&str>) {
+    let sql = format!(
+        "SELECT n.nspname || '.' || c.relname FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relkind = 'p' AND n.nspname NOT IN ({SYSTEM_SCHEMAS}) \
+         AND ($1::text IS NULL OR n.nspname = $1)"
+    );
+    if let Ok(rows) = client.query(sql.as_str(), &[&schema_filter]).await {
+        for row in rows {
+            let ns: String = row.get(0);
+            tracing::warn!(
+                ns = %ns,
+                "PG 백업: 파티션 부모 테이블 — 파티션 구조는 1차 미지원. 자식 데이터는 \
+                 개별 테이블로 백업되나 복구 시 파티셔닝이 재구성되지 않습니다"
+            );
+        }
+    }
 }
 
 /// 대상 사용자 테이블 (schema, table) 목록.
@@ -215,10 +234,10 @@ async fn introspect_table(client: &Client, (schema, table): &(String, String)) -
     let quoted: String = row.get(0);
     let oid: u32 = row.get(1);
 
-    // 컬럼 → CREATE TABLE.
+    // 컬럼 → CREATE TABLE. quote_ident를 같은 쿼리에서 처리(컬럼당 라운드트립 제거 — 리뷰 #4).
     let col_rows = client
         .query(
-            "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), \
+            "SELECT quote_ident(a.attname), pg_catalog.format_type(a.atttypid, a.atttypmod), \
                     a.attnotnull, pg_get_expr(d.adbin, d.adrelid) \
              FROM pg_attribute a \
              LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
@@ -230,15 +249,10 @@ async fn introspect_table(client: &Client, (schema, table): &(String, String)) -
         .map_err(|e| XBackupError::Failure(format!("{ns} 컬럼 조회 실패: {e}")))?;
     let mut cols = Vec::new();
     for c in &col_rows {
-        let name: String = c.get(0);
+        let ident: String = c.get(0);
         let typ: String = c.get(1);
         let notnull: bool = c.get(2);
         let default: Option<String> = c.get(3);
-        let ident: String = client
-            .query_one("SELECT quote_ident($1::text)", &[&name])
-            .await
-            .map(|r| r.get(0))
-            .map_err(|e| XBackupError::Failure(format!("{ns} 컬럼 quote 실패: {e}")))?;
         let mut def = format!("{ident} {typ}");
         if let Some(d) = default {
             def.push_str(&format!(" DEFAULT {d}"));
@@ -250,10 +264,10 @@ async fn introspect_table(client: &Client, (schema, table): &(String, String)) -
     }
     let create_sql = format!("CREATE TABLE {quoted} (\n  {}\n)", cols.join(",\n  "));
 
-    // 제약(PK/UNIQUE/FK/CHECK 등) — pg_get_constraintdef로 정확히.
+    // 제약(PK/UNIQUE/FK/CHECK 등) — pg_get_constraintdef로 정확히. quote_ident도 같은 쿼리에서.
     let con_rows = client
         .query(
-            "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint \
+            "SELECT quote_ident(conname), pg_get_constraintdef(oid) FROM pg_constraint \
              WHERE conrelid = $1 ORDER BY oid",
             &[&oid],
         )
@@ -261,13 +275,8 @@ async fn introspect_table(client: &Client, (schema, table): &(String, String)) -
         .map_err(|e| XBackupError::Failure(format!("{ns} 제약 조회 실패: {e}")))?;
     let mut constraints = Vec::new();
     for c in &con_rows {
-        let conname: String = c.get(0);
+        let cident: String = c.get(0);
         let def: String = c.get(1);
-        let cident: String = client
-            .query_one("SELECT quote_ident($1::text)", &[&conname])
-            .await
-            .map(|r| r.get(0))
-            .map_err(|e| XBackupError::Failure(format!("{ns} 제약 quote 실패: {e}")))?;
         constraints.push(format!(
             "ALTER TABLE {quoted} ADD CONSTRAINT {cident} {def}"
         ));

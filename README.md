@@ -245,11 +245,16 @@ What it captures (data-centric): **table data** (COPY binary, exact types), **ta
 **sequences** (with `last_value`, so the next `INSERT` doesn't collide). Restore recreates the
 schema then bulk-loads via COPY, applying constraints and indexes after the data.
 
+Connections use rustls TLS with `sslmode` negotiation — the default (`prefer`) tries TLS and
+falls back to plaintext for servers without it, while `sslmode=require`/`verify-full` enforce
+TLS. Data moves as text COPY (the portable format pg_dump uses), so restoring across
+PostgreSQL major versions is safe; a major-version mismatch is logged as a warning.
+
 Not yet covered (roadmap): views, materialized views, functions/triggers, extensions,
-ownership/grants, partitioning; and incremental/PITR (which for PostgreSQL means WAL
-archiving — a different mechanism from MongoDB's oplog). Connections are NoTls for now.
-Restoring into a non-empty database should use `--force` (drops and recreates each backed-up
-table); an empty target needs no flag.
+ownership/grants, partitioning (partition parents are skipped with a warning); and
+incremental/PITR (which for PostgreSQL means WAL archiving — a different mechanism from
+MongoDB's oplog). Restoring into a non-empty database should use `--force` (drops and recreates
+each backed-up table); an empty target needs no flag.
 
 ### Live monitor (`status --watch`)
 
