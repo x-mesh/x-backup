@@ -285,8 +285,10 @@ async fn write_types(
                 format_type(t.typbasetype, t.typtypmod)) \
             || coalesce(' DEFAULT ' || t.typdefault, '') \
             || CASE WHEN t.typnotnull THEN ' NOT NULL' ELSE '' END \
-            || coalesce((SELECT ' ' || string_agg(pg_get_constraintdef(c.oid), ' ') \
-                         FROM pg_constraint c WHERE c.contypid = t.oid), '') \
+            || coalesce((SELECT ' ' || string_agg( \
+                            'CONSTRAINT ' || quote_ident(c.conname) || ' ' || pg_get_constraintdef(c.oid), \
+                            ' ' ORDER BY c.conname) \
+                         FROM pg_constraint c WHERE c.contypid = t.oid AND c.contype = 'c'), '') \
          FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
          WHERE t.typtype = 'd' AND n.nspname NOT IN ({SYSTEM_SCHEMAS}) \
          AND ($1::text IS NULL OR n.nspname = $1) \
@@ -326,34 +328,28 @@ async fn write_types(
     Ok(())
 }
 
-/// 뷰·머티리얼라이즈드뷰를 후행 DDL로 쓴다(정의는 `pg_views`/`pg_matviews`). 머티뷰는 WITH DATA로.
+/// 뷰·머티리얼라이즈드뷰를 후행 DDL로 쓴다. pg_class 기반으로 확장 소유 객체는 제외(리뷰 #8).
+/// 머티뷰는 WITH DATA(기본)로 생성돼 적재된 테이블에서 채워진다.
 async fn write_views(
     client: &Client,
     writer: &mut DuplexStream,
     schema_filter: Option<&str>,
 ) -> Result<()> {
-    let view_sql = format!(
-        "SELECT format('CREATE VIEW %I.%I AS %s', schemaname, viewname, definition) \
-         FROM pg_views WHERE schemaname NOT IN ({SYSTEM_SCHEMAS}) \
-         AND ($1::text IS NULL OR schemaname = $1)"
+    // 뷰(relkind='v')와 머티뷰(relkind='m')를 같은 패턴으로 — pg_get_viewdef(oid)로 정의.
+    let sql = format!(
+        "SELECT CASE c.relkind WHEN 'v' THEN 'CREATE VIEW ' ELSE 'CREATE MATERIALIZED VIEW ' END \
+                || format('%I.%I', n.nspname, c.relname) || ' AS ' || pg_get_viewdef(c.oid) \
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relkind IN ('v','m') AND n.nspname NOT IN ({SYSTEM_SCHEMAS}) \
+         AND ($1::text IS NULL OR n.nspname = $1) \
+         AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = c.oid \
+            AND d.refclassid = 'pg_extension'::regclass AND d.deptype = 'e') \
+         ORDER BY c.relkind DESC, c.oid"
     );
     for r in client
-        .query(view_sql.as_str(), &[&schema_filter])
+        .query(sql.as_str(), &[&schema_filter])
         .await
-        .map_err(|e| XBackupError::Failure(format!("뷰 조회 실패: {e}")))?
-    {
-        archive::write_post(writer, &r.get::<_, String>(0)).await?;
-    }
-
-    let mv_sql = format!(
-        "SELECT format('CREATE MATERIALIZED VIEW %I.%I AS %s', schemaname, matviewname, definition) \
-         FROM pg_matviews WHERE schemaname NOT IN ({SYSTEM_SCHEMAS}) \
-         AND ($1::text IS NULL OR schemaname = $1)"
-    );
-    for r in client
-        .query(mv_sql.as_str(), &[&schema_filter])
-        .await
-        .map_err(|e| XBackupError::Failure(format!("머티리얼라이즈드뷰 조회 실패: {e}")))?
+        .map_err(|e| XBackupError::Failure(format!("뷰/머티뷰 조회 실패: {e}")))?
     {
         archive::write_post(writer, &r.get::<_, String>(0)).await?;
     }
@@ -383,7 +379,7 @@ async fn write_sequences(
          AND ($1::text IS NULL OR s.schemaname = $1) \
          AND NOT EXISTS ( \
             SELECT 1 FROM pg_class sc JOIN pg_namespace sn ON sn.oid = sc.relnamespace \
-            JOIN pg_depend dep ON dep.objid = sc.oid AND dep.deptype = 'i' \
+            JOIN pg_depend dep ON dep.objid = sc.oid AND dep.deptype IN ('i','e') \
             WHERE sc.relkind = 'S' AND sn.nspname = s.schemaname AND sc.relname = s.sequencename) \
          ORDER BY s.schemaname, s.sequencename"
     );
@@ -427,7 +423,9 @@ async fn list_tables(
          WHERE n.nspname NOT IN ({SYSTEM_SCHEMAS}) \
          AND ($1::text IS NULL OR n.nspname = $1) \
          AND ($2::text IS NULL OR c.relname = $2) \
-         ORDER BY h.depth, n.nspname, c.relname"
+         ORDER BY h.depth, \
+                  (c.relpartbound IS NOT NULL AND pg_get_expr(c.relpartbound, c.oid) = 'DEFAULT'), \
+                  n.nspname, c.relname"
     );
     let rows = client
         .query(sql.as_str(), &[&schema_filter, &table_filter])
@@ -545,15 +543,19 @@ async fn introspect_table(client: &Client, (schema, table): &(String, String)) -
                 create_sql.push_str(&format!(" PARTITION BY {key}"));
             }
         }
+        // 부모에서 전파되는 제약·인덱스는 PARTITION OF가 자동 생성하므로 제외하되, **자식 로컬**
+        //   제약(conislocal=true)·로컬 인덱스(부모 인덱스에서 상속되지 않은 것)는 보존한다(리뷰 #1/#3).
+        let constraints = local_constraints(client, oid, &quoted).await?;
+        let indexes = local_partition_indexes(client, oid).await?;
         return Ok(TableDef {
             ns,
             quoted,
             schema_quoted,
             create_sql,
-            // 제약·인덱스는 부모에서 전파되므로 자식엔 두지 않는다. identity도 부모가 관리.
-            constraints: Vec::new(),
-            indexes: Vec::new(),
+            constraints,
+            indexes,
             copy_cols,
+            // identity는 부모 컬럼에서 상속되므로 자식에선 리셋 대상이 아니다.
             identity_cols: Vec::new(),
             // 중간 노드도 직접 데이터 없음(리프만 데이터 보유).
             has_data: !is_partitioned_parent,
@@ -613,6 +615,46 @@ async fn introspect_table(client: &Client, (schema, table): &(String, String)) -
         // 파티션 부모는 직접 데이터가 없다(자식에서 COPY) — COPY TO 시 자식 데이터가 중복 라우팅됨.
         has_data: !is_partitioned_parent,
     })
+}
+
+/// 파티션 자식의 **로컬** 제약 — 부모에서 상속된 것(conislocal=false)은 PARTITION OF가 자동
+/// 재생성하므로 제외하고, 자식에 직접 정의된 것(conislocal=true)만 ALTER TABLE ADD로 보존(리뷰 #3).
+async fn local_constraints(client: &Client, oid: u32, quoted: &str) -> Result<Vec<String>> {
+    let rows = client
+        .query(
+            "SELECT quote_ident(conname), pg_get_constraintdef(oid) FROM pg_constraint \
+             WHERE conrelid = $1 AND conislocal ORDER BY oid",
+            &[&oid],
+        )
+        .await
+        .map_err(|e| XBackupError::Failure(format!("파티션 로컬 제약 조회 실패: {e}")))?;
+    Ok(rows
+        .iter()
+        .map(|c| {
+            format!(
+                "ALTER TABLE {quoted} ADD CONSTRAINT {} {}",
+                c.get::<_, String>(0),
+                c.get::<_, String>(1)
+            )
+        })
+        .collect())
+}
+
+/// 파티션 자식의 **로컬** 인덱스 — 부모 파티션 인덱스에서 전파된 것(pg_inherits에 자식으로 등록)과
+/// 제약이 만든 인덱스는 제외하고, 자식에 직접 만든 인덱스만 보존(리뷰 #1).
+async fn local_partition_indexes(client: &Client, oid: u32) -> Result<Vec<String>> {
+    let rows = client
+        .query(
+            "SELECT pg_get_indexdef(i.indexrelid) FROM pg_index i \
+             WHERE i.indrelid = $1 \
+             AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid) \
+             AND NOT EXISTS (SELECT 1 FROM pg_inherits h WHERE h.inhrelid = i.indexrelid) \
+             ORDER BY i.indexrelid",
+            &[&oid],
+        )
+        .await
+        .map_err(|e| XBackupError::Failure(format!("파티션 로컬 인덱스 조회 실패: {e}")))?;
+    Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
 }
 
 /// PG 백업 아카이브 바이트 스트림([`AsyncRead`]). 파이프라인에 그대로 흘린다.

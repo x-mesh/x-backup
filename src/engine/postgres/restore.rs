@@ -69,9 +69,11 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
     let mut setvals: Vec<(String, i64, bool)> = Vec::new();
     // IDENTITY 컬럼 (ns, 컬럼평문이름) — 적재 후 시퀀스를 max로 리셋(리뷰 #4).
     let mut identity_resets: Vec<(String, String)> = Vec::new();
-    // 선행 DDL(확장·타입) 버퍼 — 첫 시퀀스/테이블 전에 재시도 적용. 후행 DDL(뷰)은 맨 끝.
+    // 선행 DDL(확장·타입·함수) 버퍼 — 첫 시퀀스/테이블 전에 best-effort 적용. 해소 안 된 것
+    //   (예: RETURNS SETOF <table> 시그니처 함수 — 테이블이 아직 없음)은 후행 단계로 미룬다(리뷰 #2).
     let mut pre_ddls: Vec<String> = Vec::new();
     let mut post_ddls: Vec<String> = Vec::new();
+    let mut unresolved_pre: Vec<String> = Vec::new();
     let mut pre_applied = false;
 
     loop {
@@ -92,9 +94,9 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
                 }
             }
             Frame::Sequence(s) => {
-                // 시퀀스/테이블 전에 선행 DDL(확장·타입)을 의존성 순서대로 적용한다.
+                // 시퀀스/테이블 전에 선행 DDL(확장·타입·함수)을 best-effort 적용. 미해소분은 보관.
                 if !pre_applied {
-                    apply_with_retry(client, &pre_ddls, "선행 DDL(확장/타입)").await?;
+                    unresolved_pre = retry_apply(client, &pre_ddls).await;
                     pre_applied = true;
                 }
                 let name = s
@@ -123,7 +125,7 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
             }
             Frame::Table(meta) => {
                 if !pre_applied {
-                    apply_with_retry(client, &pre_ddls, "선행 DDL(확장/타입)").await?;
+                    unresolved_pre = retry_apply(client, &pre_ddls).await;
                     pre_applied = true;
                 }
                 let ns = meta
@@ -285,12 +287,15 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
             .await;
     }
 
-    // 선행 DDL이 아직 안 돌았으면(시퀀스·테이블이 하나도 없는 백업) 여기서 적용.
+    // 선행 DDL이 아직 안 돌았으면(시퀀스·테이블이 하나도 없는 백업) 여기서 best-effort 적용.
     if !pre_applied {
-        apply_with_retry(client, &pre_ddls, "선행 DDL(확장/타입)").await?;
+        unresolved_pre = retry_apply(client, &pre_ddls).await;
     }
-    // 후행 DDL(뷰·머티리얼라이즈드뷰) — 테이블·데이터가 모두 준비된 뒤 재시도 적용.
-    apply_with_retry(client, &post_ddls, "후행 DDL(뷰)").await?;
+    // 후행 적용: 미해소 선행분(테이블 시그니처 함수 등) + 후행 DDL(뷰·머티뷰·트리거)을 함께.
+    //   이제 테이블이 다 있으므로 테이블 의존 함수도 풀린다. 여전히 안 풀리면 하드 실패(리뷰 #2).
+    let mut tail = std::mem::take(&mut unresolved_pre);
+    tail.extend(post_ddls.iter().cloned());
+    apply_with_retry(client, &tail, "후행 DDL(함수/뷰/트리거)").await?;
 
     Ok(inserted)
 }
@@ -321,6 +326,27 @@ async fn apply_with_retry(client: &Client, ddls: &[String], what: &str) -> Resul
         pending = still;
     }
     Ok(())
+}
+
+/// [`apply_with_retry`]의 best-effort판 — 진전이 멈추면 **중단하지 않고** 미해소 DDL을 돌려준다.
+/// 선행 단계에서 테이블 의존 함수처럼 아직 풀 수 없는 것을 후행으로 미루는 데 쓴다(리뷰 #2).
+async fn retry_apply(client: &Client, ddls: &[String]) -> Vec<String> {
+    let mut pending: Vec<String> = ddls.to_vec();
+    loop {
+        let mut still: Vec<String> = Vec::new();
+        for sql in &pending {
+            if run_ignore_exists(client, sql).await.is_err() {
+                still.push(sql.clone());
+            }
+        }
+        if still.len() == pending.len() {
+            return still; // 진전 없음 — 남은 것을 호출자에게(후행에서 재시도).
+        }
+        if still.is_empty() {
+            return still;
+        }
+        pending = still;
+    }
 }
 
 /// 백업 소스와 복구 대상의 메이저 버전이 다르면 경고한다(차단하지 않음 — text COPY는 보통 호환).
