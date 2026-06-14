@@ -199,7 +199,7 @@ pub async fn apply<R: AsyncRead + Unpin>(
         .batch_execute("SET session_replication_role = replica")
         .await;
 
-    let mut casttype_cache: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let mut meta_cache: HashMap<(String, String), HashMap<String, ColMeta>> = HashMap::new();
     let mut applied = 0u64;
     loop {
         match read_frame(reader).await? {
@@ -211,12 +211,26 @@ pub async fn apply<R: AsyncRead + Unpin>(
                     }
                 }
                 let key = (c.schema.clone(), c.table.clone());
-                if !casttype_cache.contains_key(&key) {
-                    let types = column_casttypes(client, &c.schema, &c.table).await?;
-                    casttype_cache.insert(key.clone(), types);
+                if !meta_cache.contains_key(&key) {
+                    let m = column_meta_map(client, &c.schema, &c.table).await?;
+                    meta_cache.insert(key.clone(), m);
                 }
-                let casttypes = &casttype_cache[&key];
-                if let Some((sql, params)) = build_dml(&c, casttypes) {
+                let map = &meta_cache[&key];
+                // 스트림 컬럼명 순서대로 대상 카탈로그의 타입/identity 메타를 정렬한다 —
+                // pgoutput은 STORED generated 컬럼을 제외하므로 위치가 아닌 **이름**으로 맞춘다.
+                let mut cols = Vec::with_capacity(c.colnames.len());
+                for name in &c.colnames {
+                    match map.get(name) {
+                        Some(meta) => cols.push(meta.clone()),
+                        None => {
+                            return Err(XBackupError::Failure(format!(
+                                "{}.{} 증분 적용: 대상에 컬럼 '{name}'이 없습니다(스키마 불일치)",
+                                c.schema, c.table
+                            )))
+                        }
+                    }
+                }
+                if let Some((sql, params)) = build_dml(&c, &cols) {
                     let refs: Vec<&(dyn ToSql + Sync)> =
                         params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
                     client.execute(&sql, &refs).await.map_err(|e| {
@@ -231,22 +245,100 @@ pub async fn apply<R: AsyncRead + Unpin>(
             IncrFrame::End => break,
         }
     }
+
+    // 변경을 적용한 테이블의 identity/serial 시퀀스를 max(컬럼)으로 재동기화한다.
+    // 증분은 OVERRIDING SYSTEM VALUE로 명시 id를 넣어 시퀀스를 전진시키지 않으므로,
+    // 이대로 두면 복구 후 새 insert가 기존 행과 PK 충돌한다.
+    for (schema, table) in meta_cache.keys() {
+        if let Err(e) = resync_sequences(client, schema, table).await {
+            tracing::warn!("{schema}.{table} 시퀀스 재동기화 실패(무시): {e}");
+        }
+    }
     Ok(applied)
 }
 
-/// 복구 대상 테이블의 컬럼별 캐스트 타입(format_type)을 컬럼 순서대로 조회한다.
-async fn column_casttypes(client: &Client, schema: &str, table: &str) -> Result<Vec<String>> {
+/// 테이블의 identity/serial 시퀀스를 현재 max(컬럼)으로 맞춘다(복구 후 새 insert 충돌 방지).
+async fn resync_sequences(client: &Client, schema: &str, table: &str) -> Result<()> {
+    let q = format!("{}.{}", quote_ident(schema), quote_ident(table));
+    // identity 또는 serial(소유 시퀀스가 있는) 컬럼과 그 시퀀스 이름을 찾는다.
+    // 정규화된 따옴표 식별자(q)를 단일 text 파라미터로 넘긴다($1::text::regclass로 타입 고정).
     let rows = client
         .query(
-            "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod) \
+            "SELECT a.attname, pg_get_serial_sequence($1, a.attname) \
+             FROM pg_attribute a \
+             WHERE a.attrelid = $1::text::regclass \
+             AND a.attnum > 0 AND NOT a.attisdropped \
+             AND pg_get_serial_sequence($1, a.attname) IS NOT NULL",
+            &[&q],
+        )
+        .await
+        .map_err(|e| XBackupError::Failure(format!("시퀀스 조회 실패: {e}")))?;
+
+    for r in &rows {
+        let col: String = r.get(0);
+        let seq: String = r.get(1);
+        // 현재 최대값(없으면 NULL). int2/4/8 모두 i64로 받는다.
+        let max: Option<i64> = client
+            .query_one(
+                &format!("SELECT max({})::bigint FROM {q}", quote_ident(&col)),
+                &[],
+            )
+            .await
+            .map_err(|e| XBackupError::Failure(format!("max 조회 실패: {e}")))?
+            .get(0);
+        // setval(seq, value, is_called): max가 있으면 (max,true)→다음=max+1, 없으면 (1,false)→다음=1.
+        let value = max.unwrap_or(1);
+        let is_called = max.is_some();
+        client
+            .execute(
+                "SELECT setval($1::text::regclass, $2, $3)",
+                &[&seq, &value, &is_called],
+            )
+            .await
+            .map_err(|e| XBackupError::Failure(format!("setval 실패({seq}): {e}")))?;
+    }
+    Ok(())
+}
+
+/// 복구 대상 컬럼 메타 — 캐스트 타입(format_type)과 GENERATED ALWAYS identity 여부.
+#[derive(Debug, Clone)]
+struct ColMeta {
+    /// `$n::<casttype>` 캐스트에 쓸 타입(예: `bigint`, `numeric(12,2)`).
+    casttype: String,
+    /// GENERATED ALWAYS AS IDENTITY 컬럼(attidentity='a'). INSERT엔 OVERRIDING SYSTEM
+    /// VALUE가 필요하고, UPDATE SET에는 넣을 수 없다("can only be updated to DEFAULT").
+    generated_always: bool,
+}
+
+/// 대상 테이블의 컬럼명→메타 맵(타입·identity). 이름으로 조회해 스트림 컬럼 순서에 맞춘다.
+async fn column_meta_map(
+    client: &Client,
+    schema: &str,
+    table: &str,
+) -> Result<HashMap<String, ColMeta>> {
+    let rows = client
+        .query(
+            "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), \
+             (a.attidentity = 'a') AS gen_always \
              FROM pg_attribute a \
              WHERE a.attrelid = (quote_ident($1)||'.'||quote_ident($2))::regclass \
-             AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+             AND a.attnum > 0 AND NOT a.attisdropped",
             &[&schema, &table],
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("{schema}.{table} 컬럼 타입 조회 실패: {e}")))?;
-    Ok(rows.iter().map(|r| r.get::<_, String>(1)).collect())
+        .map_err(|e| XBackupError::Failure(format!("{schema}.{table} 컬럼 메타 조회 실패: {e}")))?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<_, String>(0),
+                ColMeta {
+                    casttype: r.get::<_, String>(1),
+                    generated_always: r.get::<_, bool>(2),
+                },
+            )
+        })
+        .collect())
 }
 
 /// 컬럼 식별자를 표준 quote(쌍따옴표·내부 두 배).
@@ -256,15 +348,21 @@ fn quote_ident(name: &str) -> String {
 
 /// 한 변경을 DML과 바인드 파라미터로 만든다(순수 — 단위 테스트 가능).
 ///
-/// 값은 텍스트로 바인드하고 SQL에서 `$n::타입`으로 캐스트한다(타입은 컬럼 순서대로 `casttypes`).
-/// Insert는 키 충돌 시 upsert(키 없으면 plain), Update/Delete는 키 컬럼으로 식별. 키가 없으면
-/// 식별 불가라 `None`(호출자가 건너뜀).
-fn build_dml(c: &Change, casttypes: &[String]) -> Option<(String, Vec<Option<String>>)> {
-    if c.colnames.len() != casttypes.len() {
-        return None; // 스키마 불일치(컬럼 수) — 안전하게 건너뜀.
+/// 값은 텍스트로 바인드하고 SQL에서 `$n::타입`으로 캐스트한다(`cols`는 스트림 컬럼 순서에
+/// 맞춘 대상 컬럼 메타). 규칙:
+/// - **Insert**: 모든 컬럼을 넣고 `OVERRIDING SYSTEM VALUE`(GENERATED ALWAYS identity에
+///   명시값을 넣기 위함 — identity가 없어도 무해). 키 충돌 시 upsert(키 없으면 plain).
+/// - **Update**: 키 컬럼으로 식별. SET에는 GENERATED ALWAYS identity를 제외한다(불가).
+/// - **Delete**: 키 컬럼으로 식별.
+///
+/// 키가 없으면 식별 불가라 `None`(호출자가 건너뜀). `cols.len() != colnames.len()`(이론상
+/// 호출자가 정렬 보장)면 안전하게 `None`.
+fn build_dml(c: &Change, cols: &[ColMeta]) -> Option<(String, Vec<Option<String>>)> {
+    if c.colnames.len() != cols.len() {
+        return None;
     }
     let q = format!("{}.{}", quote_ident(&c.schema), quote_ident(&c.table));
-    let ty = |i: usize| casttypes[i].clone();
+    let ty = |i: usize| cols[i].casttype.clone();
     let key_positions: Vec<usize> = c
         .keycols
         .iter()
@@ -283,18 +381,22 @@ fn build_dml(c: &Change, casttypes: &[String]) -> Option<(String, Vec<Option<Str
                 .collect::<Vec<_>>()
                 .join(", ");
             let vals = (0..n)
-                .map(|i| format!("${}::{}", i + 1, ty(i)))
+                .map(|i| format!("${}::text::{}", i + 1, ty(i)))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let mut sql = format!("INSERT INTO {q} ({collist}) VALUES ({vals})");
+            // OVERRIDING SYSTEM VALUE: GENERATED ALWAYS identity에 캡처된 명시값을 그대로
+            // 넣기 위함. identity 컬럼이 없으면 PG가 무시한다(안전).
+            let mut sql =
+                format!("INSERT INTO {q} ({collist}) OVERRIDING SYSTEM VALUE VALUES ({vals})");
             if !key_positions.is_empty() {
                 let keylist = key_positions
                     .iter()
                     .map(|&i| quote_ident(&c.colnames[i]))
                     .collect::<Vec<_>>()
                     .join(", ");
+                // upsert SET: 키도 GENERATED ALWAYS도 아닌 컬럼만(둘 다 갱신 불가/무의미).
                 let setlist = (0..n)
-                    .filter(|i| !key_positions.contains(i))
+                    .filter(|i| !key_positions.contains(i) && !cols[*i].generated_always)
                     .map(|i| {
                         let col = quote_ident(&c.colnames[i]);
                         format!("{col} = EXCLUDED.{col}")
@@ -321,20 +423,35 @@ fn build_dml(c: &Change, casttypes: &[String]) -> Option<(String, Vec<Option<Str
             };
             let mut params: Vec<Option<String>> = Vec::new();
             let mut idx = 1;
+            // SET: GENERATED ALWAYS identity 제외(명시값 SET 불가). 나머지 전부.
             let set = (0..c.colnames.len())
+                .filter(|i| !cols[*i].generated_always)
                 .map(|i| {
                     params.push(c.new_vals.get(i).cloned().flatten());
-                    let s = format!("{} = ${}::{}", quote_ident(&c.colnames[i]), idx, ty(i));
+                    let s = format!(
+                        "{} = ${}::text::{}",
+                        quote_ident(&c.colnames[i]),
+                        idx,
+                        ty(i)
+                    );
                     idx += 1;
                     s
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
+            if set.is_empty() {
+                return None; // SET할 컬럼이 없음(전부 키/identity) — no-op.
+            }
             let whr = key_positions
                 .iter()
                 .map(|&i| {
                     params.push(keysrc.get(i).cloned().flatten());
-                    let s = format!("{} = ${}::{}", quote_ident(&c.colnames[i]), idx, ty(i));
+                    let s = format!(
+                        "{} = ${}::text::{}",
+                        quote_ident(&c.colnames[i]),
+                        idx,
+                        ty(i)
+                    );
                     idx += 1;
                     s
                 })
@@ -352,7 +469,12 @@ fn build_dml(c: &Change, casttypes: &[String]) -> Option<(String, Vec<Option<Str
                 .iter()
                 .map(|&i| {
                     params.push(c.key_vals.get(i).cloned().flatten());
-                    let s = format!("{} = ${}::{}", quote_ident(&c.colnames[i]), idx, ty(i));
+                    let s = format!(
+                        "{} = ${}::text::{}",
+                        quote_ident(&c.colnames[i]),
+                        idx,
+                        ty(i)
+                    );
                     idx += 1;
                     s
                 })
@@ -559,33 +681,72 @@ mod tests {
         assert!(matches!(read_frame(&mut r).await.unwrap(), IncrFrame::End));
     }
 
+    /// 테스트용 컬럼 메타(타입, generated_always).
+    fn cm(ty: &str, gen: bool) -> ColMeta {
+        ColMeta {
+            casttype: ty.into(),
+            generated_always: gen,
+        }
+    }
+
     #[test]
     fn dml_insert_upsert() {
-        let types = vec!["integer".to_string(), "text".to_string()];
-        let (sql, params) = build_dml(&ch(Op::Insert), &types).unwrap();
+        let cols = vec![cm("integer", false), cm("text", false)];
+        let (sql, params) = build_dml(&ch(Op::Insert), &cols).unwrap();
         assert!(sql.contains("INSERT INTO \"public\".\"t\" (\"id\", \"name\")"));
-        assert!(sql.contains("$1::integer"));
+        assert!(sql.contains("OVERRIDING SYSTEM VALUE VALUES"));
+        assert!(sql.contains("$1::text::integer"));
         assert!(sql.contains("ON CONFLICT (\"id\") DO UPDATE SET \"name\" = EXCLUDED.\"name\""));
         assert_eq!(params, vec![Some("7".into()), Some("a".into())]);
     }
 
+    /// GENERATED ALWAYS identity 키만 있고 비키 컬럼이 전부 generated면 upsert는 DO NOTHING.
+    #[test]
+    fn dml_insert_generated_always_key_do_nothing() {
+        // id=키+generated_always, 비키 컬럼 없음.
+        let mut c = ch(Op::Insert);
+        c.colnames = vec!["id".into()];
+        c.keycols = vec![true];
+        c.new_vals = vec![Some("7".into())];
+        let cols = vec![cm("bigint", true)];
+        let (sql, _) = build_dml(&c, &cols).unwrap();
+        assert!(sql.contains("OVERRIDING SYSTEM VALUE"));
+        assert!(sql.contains("ON CONFLICT (\"id\") DO NOTHING"), "sql={sql}");
+    }
+
     #[test]
     fn dml_update_by_key() {
-        let types = vec!["integer".to_string(), "text".to_string()];
-        let (sql, params) = build_dml(&ch(Op::Update), &types).unwrap();
+        let cols = vec![cm("integer", false), cm("text", false)];
+        let (sql, params) = build_dml(&ch(Op::Update), &cols).unwrap();
         assert!(sql.starts_with("UPDATE \"public\".\"t\" SET"));
-        assert!(sql.contains("WHERE \"id\" = $3::integer"));
+        assert!(sql.contains("WHERE \"id\" = $3::text::integer"));
         // SET id,name (params 1,2) + WHERE id (param 3).
         assert_eq!(params.len(), 3);
     }
 
+    /// UPDATE는 GENERATED ALWAYS identity 컬럼을 SET에서 제외한다(명시 SET 불가).
+    #[test]
+    fn dml_update_excludes_generated_always_from_set() {
+        let cols = vec![cm("bigint", true), cm("text", false)];
+        let (sql, params) = build_dml(&ch(Op::Update), &cols).unwrap();
+        // SET에는 name만(id는 generated_always라 제외), WHERE에는 id(키).
+        assert!(sql.contains("SET \"name\" = $1::text"), "sql={sql}");
+        assert!(
+            !sql.contains("SET \"id\""),
+            "id가 SET에 들어가면 안 됨: {sql}"
+        );
+        assert!(sql.contains("WHERE \"id\" = $2::text::bigint"), "sql={sql}");
+        // params: SET name(1) + WHERE id(2).
+        assert_eq!(params.len(), 2);
+    }
+
     #[test]
     fn dml_delete_by_key() {
-        let types = vec!["integer".to_string(), "text".to_string()];
-        let (sql, params) = build_dml(&ch(Op::Delete), &types).unwrap();
+        let cols = vec![cm("integer", false), cm("text", false)];
+        let (sql, params) = build_dml(&ch(Op::Delete), &cols).unwrap();
         assert_eq!(
             sql,
-            "DELETE FROM \"public\".\"t\" WHERE \"id\" = $1::integer"
+            "DELETE FROM \"public\".\"t\" WHERE \"id\" = $1::text::integer"
         );
         assert_eq!(params, vec![Some("7".into())]);
     }
@@ -594,6 +755,6 @@ mod tests {
     fn dml_update_no_key_skipped() {
         let mut c = ch(Op::Update);
         c.keycols = vec![false, false];
-        assert!(build_dml(&c, &["integer".into(), "text".into()]).is_none());
+        assert!(build_dml(&c, &[cm("integer", false), cm("text", false)]).is_none());
     }
 }
