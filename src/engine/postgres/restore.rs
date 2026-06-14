@@ -38,6 +38,12 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
     client: &Client,
     drop: bool,
 ) -> Result<u64> {
+    // 함수 본문이 아직 없는 테이블을 참조해도 생성 단계에서 실패하지 않도록 검증을 끈다
+    //   (pg_dump 복구와 동일). 세션 한정.
+    let _ = client
+        .batch_execute("SET check_function_bodies = false")
+        .await;
+
     // 헤더 확인 + 메이저 버전 정합 경고(text COPY라 보통 호환되나, 메이저 차이는 알린다).
     match archive::read_frame(reader).await? {
         Frame::Header(h) => {

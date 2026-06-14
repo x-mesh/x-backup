@@ -117,10 +117,11 @@ async fn write_archive(
     // 일반 테이블로 잡혀 데이터는 보존되나 파티션 구조는 복원되지 않는다.
     warn_partitioned(client, schema_filter.as_deref()).await;
 
-    // 선행 DDL — 확장 → 사용자 정의 타입(enum/도메인/복합). 테이블 컬럼이 이 타입을 쓰므로
+    // 선행 DDL — 확장 → 타입 → 함수/프로시저. 테이블 컬럼·DEFAULT·CHECK·트리거가 이들을 쓰므로
     // 테이블보다 먼저. 복구는 의존성 순서를 재시도로 흡수하므로 여기 순서는 best-effort.
     write_extensions(client, writer).await?;
     write_types(client, writer, schema_filter.as_deref()).await?;
+    write_functions(client, writer, schema_filter.as_deref()).await?;
 
     // 시퀀스 — 테이블 생성 전에 만들어 nextval 기본값을 해소한다.
     write_sequences(client, writer, schema_filter.as_deref()).await?;
@@ -164,11 +165,74 @@ async fn write_archive(
         tracing::debug!(ns = %def.ns, "PG 백업: 테이블 직렬화 완료");
     }
 
-    // 후행 DDL — 뷰 → 머티리얼라이즈드뷰(WITH DATA로 적재된 테이블에서 채워짐). 복구는 재시도로
-    // 뷰 간 의존성 순서를 흡수한다.
+    // 후행 DDL — 뷰 → 머티리얼라이즈드뷰(WITH DATA) → 트리거(테이블·함수가 다 존재한 뒤).
     write_views(client, writer, schema_filter.as_deref()).await?;
+    write_triggers(client, writer, schema_filter.as_deref()).await?;
 
     archive::write_end(writer).await
+}
+
+/// 사용자 함수/프로시저를 선행 DDL로 쓴다(`pg_get_functiondef`). 확장 소유·집계/윈도우는 제외.
+async fn write_functions(
+    client: &Client,
+    writer: &mut DuplexStream,
+    schema_filter: Option<&str>,
+) -> Result<()> {
+    // 집계('a')/윈도우('w')는 pg_get_functiondef 미지원 — 있으면 경고만(1차 미덤프).
+    let warn_sql = format!(
+        "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE p.prokind IN ('a','w') AND n.nspname NOT IN ({SYSTEM_SCHEMAS}) \
+         AND ($1::text IS NULL OR n.nspname = $1) \
+         AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = p.oid \
+            AND d.refclassid = 'pg_extension'::regclass AND d.deptype = 'e')"
+    );
+    if let Ok(row) = client.query_one(warn_sql.as_str(), &[&schema_filter]).await {
+        let n: i64 = row.get(0);
+        if n > 0 {
+            tracing::warn!(count = n, "PG 백업: 집계/윈도우 함수는 1차 미덤프(로드맵)");
+        }
+    }
+
+    let sql = format!(
+        "SELECT pg_get_functiondef(p.oid) \
+         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE p.prokind IN ('f','p') AND n.nspname NOT IN ({SYSTEM_SCHEMAS}) \
+         AND ($1::text IS NULL OR n.nspname = $1) \
+         AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = p.oid \
+            AND d.refclassid = 'pg_extension'::regclass AND d.deptype = 'e') \
+         ORDER BY p.oid"
+    );
+    for r in client
+        .query(sql.as_str(), &[&schema_filter])
+        .await
+        .map_err(|e| XBackupError::Failure(format!("함수 조회 실패: {e}")))?
+    {
+        archive::write_pre(writer, &r.get::<_, String>(0)).await?;
+    }
+    Ok(())
+}
+
+/// 사용자 트리거를 후행 DDL로 쓴다(`pg_get_triggerdef`). 내부 트리거(FK·제약 자동 생성)는 제외.
+async fn write_triggers(
+    client: &Client,
+    writer: &mut DuplexStream,
+    schema_filter: Option<&str>,
+) -> Result<()> {
+    let sql = format!(
+        "SELECT pg_get_triggerdef(t.oid) \
+         FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE NOT t.tgisinternal AND n.nspname NOT IN ({SYSTEM_SCHEMAS}) \
+         AND ($1::text IS NULL OR n.nspname = $1) ORDER BY t.oid"
+    );
+    for r in client
+        .query(sql.as_str(), &[&schema_filter])
+        .await
+        .map_err(|e| XBackupError::Failure(format!("트리거 조회 실패: {e}")))?
+    {
+        archive::write_post(writer, &r.get::<_, String>(0)).await?;
+    }
+    Ok(())
 }
 
 /// 설치된 확장을 선행 DDL로 쓴다(`CREATE EXTENSION IF NOT EXISTS`). plpgsql(기본)은 제외.
