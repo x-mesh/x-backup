@@ -40,6 +40,26 @@ pub struct Profile {
     pub destinations: Vec<DestinationConfig>,
     #[serde(default)]
     pub features: FeaturesConfig,
+    /// 보존 정책 — `[profiles.<name>.retention]`. prune의 기본값으로 쓰인다(CLI 플래그가
+    /// 없을 때). 비어 있으면 prune은 명시적 CLI 기준이 필요하다.
+    #[serde(default)]
+    pub retention: RetentionConfig,
+}
+
+/// 보존 정책 설정 — `[profiles.<name>.retention]`. prune이 CLI 플래그가 없을 때 기본값으로
+/// 사용한다. 모두 선택적이며, 지정된 규칙들의 **합집합**으로 보존한다(하나라도 보존 대상이면
+/// 유지). 백업 세트(체인) 단위로 적용되어 살아있는 증분의 base는 절대 단독 삭제되지 않는다.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct RetentionConfig {
+    /// 최신 풀백업 체인 N개 보존.
+    #[serde(default)]
+    pub keep_full: Option<u32>,
+    /// 최근 D일 이내 체인 보존.
+    #[serde(default)]
+    pub keep_days: Option<u32>,
+    /// 최신 백업 N개 보존(체인 단위로 누적 — 예: 100이면 최신 체인부터 누적 100벌까지 유지).
+    #[serde(default)]
+    pub keep_last: Option<u32>,
 }
 
 impl Profile {

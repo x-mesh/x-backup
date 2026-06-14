@@ -203,12 +203,37 @@ pub struct RestoreArgs {
     pub json: bool,
 }
 
+/// list 정렬 기준.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum ListSort {
+    /// 생성 시각(=id, UUID v7). 기본 — 최신이 위.
+    #[default]
+    Created,
+    /// 저장 크기.
+    Size,
+}
+
 /// `list` — 카탈로그 출력(FR-7, R22).
 #[derive(Debug, Args)]
 pub struct ListArgs {
     /// 대상 프로파일(미지정 시 default_profile).
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
+    /// 정렬 기준(created|size). 기본 created.
+    #[arg(long, value_enum, default_value_t = ListSort::Created)]
+    pub sort: ListSort,
+    /// 오름차순으로 정렬(기본은 내림차순 — 최신/큰 것이 위).
+    #[arg(long)]
+    pub asc: bool,
+    /// 유형 필터(full|incr|orphan).
+    #[arg(long = "type", value_name = "T")]
+    pub type_filter: Option<String>,
+    /// DB 엔진 필터(postgresql|mongodb; pg/mongo 약어 허용).
+    #[arg(long, value_name = "E")]
+    pub engine: Option<String>,
+    /// 출력 개수 제한(정렬·필터 후 상위 N개).
+    #[arg(long, value_name = "N")]
+    pub limit: Option<usize>,
     /// 결과를 JSON으로 출력한다.
     #[arg(long)]
     pub json: bool,
@@ -243,6 +268,9 @@ pub struct PruneArgs {
     /// 최근 D일치 백업을 보존한다.
     #[arg(long, value_name = "D")]
     pub keep_days: Option<u32>,
+    /// 최신 백업 N벌을 보존한다(체인 단위 누적). 미지정 시 config retention.keep_last.
+    #[arg(long, value_name = "N")]
+    pub keep_last: Option<u32>,
     /// 실제 삭제 없이 삭제 대상 목록만 출력한다.
     #[arg(long)]
     pub dry_run: bool,

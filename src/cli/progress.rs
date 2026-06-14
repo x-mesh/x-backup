@@ -237,6 +237,42 @@ impl ProgressReporter {
             let _ = task.await;
         }
     }
+
+    /// 대화형 프롬프트를 안전하게 출력하기 위한 suspend 핸들을 만든다.
+    ///
+    /// 진행 표시 도중 사용자 확인(예: 복구 덮어쓰기 [y/N])을 받아야 할 때, 이 핸들의
+    /// [`ProgressSuspend::run`]으로 프롬프트를 감싸면 바를 잠시 비우고 프롬프트를 그린 뒤
+    /// 다시 그린다. 핸들은 [`finish`](Self::finish) 호출과 독립적으로 살아 있어,
+    /// `run_restore` 같은 곳에 confirm 콜백으로 넘긴 뒤 바깥에서 `finish`해도 안전하다.
+    pub fn suspend_handle(&self) -> ProgressSuspend {
+        ProgressSuspend {
+            bar: self.bar.clone(),
+        }
+    }
+}
+
+/// 진행 바를 잠시 비운(clear) 상태로 클로저를 실행한 뒤 다시 그리는 핸들.
+///
+/// 대화형 프롬프트가 스피너 프레임에 덮여 보이지 않는 문제(폴링 task가 200ms마다 stderr를
+/// 다시 그림)를 막는다. [`ProgressBar::suspend`]는 바의 상태 뮤텍스를 잡은 채 클로저를
+/// 실행하므로, 폴링 task의 `set_position`이 프롬프트 도중 끼어들지 못한다. 바 모드가
+/// 아니면(JSON/quiet) 덮어쓸 바가 없으므로 클로저를 그대로 실행한다.
+#[derive(Clone)]
+pub struct ProgressSuspend {
+    bar: Option<ProgressBar>,
+}
+
+impl ProgressSuspend {
+    /// 바를 잠시 비운 상태에서 `f`를 실행하고 그 반환값을 돌려준다.
+    pub fn run<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        match &self.bar {
+            Some(bar) => bar.suspend(f),
+            None => f(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -301,6 +337,40 @@ mod tests {
         assert!(reporter.bar.is_some(), "progress는 바를 생성해야 함");
         // 카운터를 끝까지 채우고 finish — 패닉 없이 정리되어야 한다.
         counter.store(1000, Ordering::SeqCst);
+        reporter.finish().await;
+    }
+
+    /// suspend 핸들(quiet 모드): 바가 없어도 클로저를 실행하고 반환값을 그대로 돌려준다.
+    #[tokio::test]
+    async fn suspend_handle_runs_closure_without_bar() {
+        let counter = new_counter();
+        let reporter = ProgressReporter::disabled(Arc::clone(&counter));
+        let suspend = reporter.suspend_handle();
+        let ran = std::cell::Cell::new(false);
+        let ret = suspend.run(|| {
+            ran.set(true);
+            7
+        });
+        assert!(ran.get(), "바가 없어도 클로저는 실행돼야 함");
+        assert_eq!(ret, 7, "클로저 반환값을 그대로 돌려줘야 함");
+        reporter.finish().await;
+    }
+
+    /// suspend 핸들(progress 모드): 바가 있어도 클로저를 실행하고 반환값을 돌려준다.
+    /// (바를 비웠다 다시 그리는 경로가 패닉 없이 통과하는지 함께 확인)
+    #[tokio::test]
+    async fn suspend_handle_runs_closure_with_bar() {
+        let counter = new_counter();
+        let reporter = ProgressReporter::start(
+            OutputMode::Progress,
+            ProgressKind::Indeterminate {
+                label: "복구".into(),
+            },
+            Arc::clone(&counter),
+        );
+        let suspend = reporter.suspend_handle();
+        let ret = suspend.run(|| 42);
+        assert_eq!(ret, 42);
         reporter.finish().await;
     }
 

@@ -33,19 +33,22 @@ use crate::manifest::store::{
 use crate::pipeline::verify::collect_manifest_ids;
 use crate::storage::Storage;
 
-/// 보존 규칙(CLI `--keep-full`/`--keep-days`에서 매핑).
+/// 보존 규칙(CLI `--keep-full`/`--keep-days`/`--keep-last` 또는 config retention에서 매핑).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RetentionPolicy {
     /// 최신 풀백업 체인 N개 보존(None이면 이 규칙 미적용).
     pub keep_full: Option<u32>,
     /// 최근 D일 이내 생성 체인 보존(None이면 이 규칙 미적용).
     pub keep_days: Option<u32>,
+    /// 최신 백업 N벌 보존 — 체인 단위로 누적(최신 체인부터 멤버 수를 더해 N에 도달할 때까지
+    /// 유지). 체인을 쪼개지 않으므로 살아있는 증분의 base가 단독 삭제되지 않는다.
+    pub keep_last: Option<u32>,
 }
 
 impl RetentionPolicy {
     /// 보존 기준이 하나도 없으면 true(이 경우 아무것도 삭제하지 않는다).
     pub fn is_unspecified(&self) -> bool {
-        self.keep_full.is_none() && self.keep_days.is_none()
+        self.keep_full.is_none() && self.keep_days.is_none() && self.keep_last.is_none()
     }
 }
 
@@ -178,6 +181,8 @@ pub fn plan_prune(
     let mut targets = Vec::new();
     let mut kept_base_ids = Vec::new();
     let keep_days_cutoff = policy.keep_days.map(|d| now_secs - (d as i64) * 86_400);
+    // keep-last: 최신 체인부터 멤버 수를 누적해 N벌에 도달할 때까지 보존(체인 단위).
+    let mut members_before = 0usize;
 
     for (idx, chain) in chains.iter().enumerate() {
         // 규칙 미지정이면 전부 보존(삭제 금지).
@@ -189,8 +194,13 @@ pub fn plan_prune(
         let kept_by_full = policy.keep_full.is_some_and(|n| idx < n as usize);
         // keep-days: 체인 최신 구성원이 기준 이내면 보존.
         let kept_by_days = keep_days_cutoff.is_some_and(|cut| chain.newest_created >= cut);
+        // keep-last: 이 체인 *앞까지* 누적 멤버 수가 N 미만이면 보존(최신 N벌 커버).
+        let kept_by_last = policy
+            .keep_last
+            .is_some_and(|n| members_before < n as usize);
+        members_before += chain.member_ids.len();
 
-        if kept_by_full || kept_by_days {
+        if kept_by_full || kept_by_days || kept_by_last {
             kept_base_ids.push(chain.base_id.clone());
         } else {
             let reason = prune_reason(policy, idx);
@@ -250,14 +260,20 @@ struct ChainGroup {
 
 /// 삭제 사유 문자열을 만든다(어떤 규칙이 만료시켰는지).
 fn prune_reason(policy: RetentionPolicy, idx: usize) -> String {
-    match (policy.keep_full, policy.keep_days) {
-        (Some(n), Some(d)) => format!(
-            "보존 기준 초과: keep-full {n}(정렬 {}번째)·keep-days {d}일 모두 벗어남",
-            idx + 1
-        ),
-        (Some(n), None) => format!("keep-full {n} 초과(정렬 {}번째 체인)", idx + 1),
-        (None, Some(d)) => format!("keep-days {d}일 이전에 생성된 체인"),
-        (None, None) => "보존 기준 미지정".to_string(), // 도달하지 않음(is_unspecified 가드).
+    let mut parts = Vec::new();
+    if let Some(n) = policy.keep_full {
+        parts.push(format!("keep-full {n}(정렬 {}번째)", idx + 1));
+    }
+    if let Some(d) = policy.keep_days {
+        parts.push(format!("keep-days {d}일"));
+    }
+    if let Some(l) = policy.keep_last {
+        parts.push(format!("keep-last {l}벌"));
+    }
+    if parts.is_empty() {
+        "보존 기준 미지정".to_string() // 도달하지 않음(is_unspecified 가드).
+    } else {
+        format!("보존 기준 초과({})", parts.join(" · "))
     }
 }
 
@@ -494,6 +510,7 @@ mod tests {
         let policy = RetentionPolicy {
             keep_full: Some(1),
             keep_days: None,
+            keep_last: None,
         };
         let plan = plan_prune(&all, &[], policy, 3_000 * DAY);
 
@@ -515,6 +532,7 @@ mod tests {
         let policy = RetentionPolicy {
             keep_full: None,
             keep_days: Some(30),
+            keep_last: None,
         };
         let plan = plan_prune(&all, &[], policy, 110 * DAY);
 
@@ -538,6 +556,7 @@ mod tests {
         let policy = RetentionPolicy {
             keep_full: Some(0), // 0개 보존 → 모두 삭제.
             keep_days: None,
+            keep_last: None,
         };
         let plan = plan_prune(&all, &[], policy, 100 * DAY);
         assert_eq!(plan.targets.len(), 1);
@@ -559,6 +578,7 @@ mod tests {
         let policy = RetentionPolicy {
             keep_full: Some(1),  // c3만.
             keep_days: Some(10), // now=105 → cutoff=95 → c2(95)·c3(100) 보존.
+            keep_last: None,
         };
         let plan = plan_prune(&all, &[], policy, 105 * DAY);
         // c2, c3 보존(합집합), c1만 삭제.
@@ -584,6 +604,7 @@ mod tests {
         let policy = RetentionPolicy {
             keep_full: Some(10), // base는 보존.
             keep_days: None,
+            keep_last: None,
         };
         let plan = plan_prune(&all, &["ghost".to_string()], policy, 100 * DAY);
         // base는 보존, ghost는 orphan 타깃.
@@ -604,6 +625,7 @@ mod tests {
         let policy = RetentionPolicy {
             keep_full: Some(10),
             keep_days: None,
+            keep_last: None,
         };
         let plan = plan_prune(&[m], &[], policy, 100 * DAY);
         let t = plan.targets.iter().find(|t| t.base_id == "inc").unwrap();

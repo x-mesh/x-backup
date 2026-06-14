@@ -44,9 +44,12 @@ pub async fn handle(config_path: Option<PathBuf>, args: PruneArgs) -> Result<()>
         crate::cli::output::context_mode(false),
     );
 
+    // 보존 정책 — CLI 플래그가 우선, 없으면 config의 [profiles.<name>.retention].
+    let cfg_ret = resolve_retention(&config_path, &args.profile);
     let policy = RetentionPolicy {
-        keep_full: args.keep_full,
-        keep_days: args.keep_days,
+        keep_full: args.keep_full.or(cfg_ret.keep_full),
+        keep_days: args.keep_days.or(cfg_ret.keep_days),
+        keep_last: args.keep_last.or(cfg_ret.keep_last),
     };
 
     // manifest·orphan 수집 → 순수 판정.
@@ -58,8 +61,9 @@ pub async fn handle(config_path: Option<PathBuf>, args: PruneArgs) -> Result<()>
     if policy.is_unspecified() {
         print_plan(&plan, args.dry_run);
         return Err(XBackupError::Usage(
-            "보존 기준(--keep-full N 또는 --keep-days D)이 필요합니다 — 기준 없는 prune은 \
-             아무것도 삭제하지 않습니다"
+            "보존 기준이 필요합니다 — --keep-full N / --keep-days D / --keep-last N 중 하나를 \
+             주거나 config의 [profiles.<name>.retention]에 설정하세요(기준 없는 prune은 \
+             아무것도 삭제하지 않습니다)"
                 .into(),
         ));
     }
@@ -198,6 +202,23 @@ fn print_plan(plan: &PrunePlan, dry_run: bool) {
             "  주의: orphan/incomplete 잔재는 --force일 때만 삭제됩니다(대화형 확인은 정상 체인만)."
         );
     }
+}
+
+/// config의 [profiles.<name>.retention]을 읽는다(없거나 해석 실패면 빈 정책). prune 기본값.
+fn resolve_retention(
+    config_path: &Option<PathBuf>,
+    profile: &str,
+) -> crate::config::file::RetentionConfig {
+    let config_toml = config_path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    ResolvedConfig::build(MergeInput {
+        config_toml: config_toml.as_deref(),
+        profile_name: profile,
+        overrides: &collect_overrides_from_process(),
+    })
+    .map(|r| r.profile.retention)
+    .unwrap_or_default()
 }
 
 /// config를 읽어 destination=local Storage를 연다(list/backup 핸들러와 동일 패턴).

@@ -117,7 +117,13 @@ pub async fn handle(config_path: Option<PathBuf>, args: RestoreArgs) -> Result<(
             progress_counter,
         )
     };
-    let result = run_restore(&request, storage.as_ref(), is_tty, prompt_confirm).await;
+    // 덮어쓰기 확인 프롬프트는 스피너가 도는 stderr에 그려지므로, 바를 잠시 비운 채
+    // 출력·입력을 받도록 suspend로 감싼다(안 그러면 [y/N] 줄이 스피너 프레임에 덮인다).
+    let suspend = reporter.suspend_handle();
+    let result = run_restore(&request, storage.as_ref(), is_tty, |plan| {
+        suspend.run(|| prompt_confirm(plan))
+    })
+    .await;
     reporter.finish().await;
     let outcome = result?;
 

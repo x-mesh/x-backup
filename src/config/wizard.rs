@@ -259,6 +259,7 @@ pub fn run_wizard(prompt: &mut dyn Prompt) -> Result<Config> {
                 ..IncrementalConfig::default()
             },
         },
+        retention: crate::config::file::RetentionConfig::default(),
     };
 
     let mut config = Config {

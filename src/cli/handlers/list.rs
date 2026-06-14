@@ -13,8 +13,8 @@
 
 use std::path::PathBuf;
 
-use crate::cli::args::ListArgs;
-use crate::cli::table::{paint, use_color, Align, Table, BOLD, RED, YELLOW};
+use crate::cli::args::{ListArgs, ListSort};
+use crate::cli::table::{paint, use_color, Align, Table, BOLD, DIM, RED, YELLOW};
 use crate::config::env::collect_overrides_from_process;
 use crate::config::merged::MergeInput;
 use crate::config::ResolvedConfig;
@@ -49,7 +49,7 @@ pub struct CatalogRow {
 /// `list` 핸들러 진입점.
 pub async fn handle(config_path: Option<PathBuf>, args: ListArgs) -> Result<()> {
     let storage = open_storage(&config_path, &args).await?;
-    let rows = build_catalog(storage.as_ref()).await?;
+    let all_rows = build_catalog(storage.as_ref()).await?;
 
     // 컨텍스트(프로파일) 표시 — DB는 행별 DB 칼럼으로 보인다.
     let config_toml = config_path
@@ -62,22 +62,112 @@ pub async fn handle(config_path: Option<PathBuf>, args: ListArgs) -> Result<()> 
         crate::cli::output::context_mode(args.json),
     );
 
-    if args.json {
-        print_json(&rows);
-    } else {
-        print_human(&rows);
+    // 필터 값 검증(정규화) → 필터 → 정렬(기본 최신순) → limit. 표시용 가공이며,
+    // exit 경고 판정은 *전체* 카탈로그(all_rows) 기준으로 한다(필터로 문제를 숨기지 않게).
+    let type_filter = normalize_type(args.type_filter.as_deref())?;
+    let engine_filter = normalize_engine_filter(args.engine.as_deref())?;
+    let mut rows: Vec<CatalogRow> = all_rows
+        .iter()
+        .filter(|r| type_filter.as_deref().is_none_or(|t| r.kind == t))
+        .filter(|r| engine_filter.as_deref().is_none_or(|e| r.engine == e))
+        .cloned()
+        .collect();
+    sort_rows(&mut rows, args.sort, args.asc);
+    let matched = rows.len();
+    if let Some(lim) = args.limit {
+        rows.truncate(lim);
     }
 
-    // broken/incomplete가 하나라도 있으면 경고 동반 성공(exit 4) — 운영자가 알아채도록.
-    let has_warning = rows.iter().any(|r| {
+    let store_loc = store_location(config_toml.as_deref(), &profile);
+    if args.json {
+        print_json(&rows, &store_loc);
+    } else {
+        print_human(&rows, &store_loc, all_rows.len(), matched);
+    }
+
+    // broken/incomplete/orphan이 하나라도 있으면 경고 동반 성공(exit 4) — 필터와 무관하게
+    // 전체 기준으로 알린다(운영자가 문제를 놓치지 않도록).
+    let has_warning = all_rows.iter().any(|r| {
         r.chain_status == "broken" || r.chain_status == "incomplete" || r.chain_status == "orphan"
     });
     if has_warning {
         return Err(XBackupError::VerifyWarning(
-            "broken/incomplete/orphan 항목이 있습니다 — 위 카탈로그를 확인하세요".into(),
+            "broken/incomplete/orphan 항목이 있습니다 — list로 확인하세요".into(),
         ));
     }
     Ok(())
+}
+
+/// 정렬 — created(=id, UUID v7 시간순) 또는 size. 기본은 내림차순(최신/큰 것이 위).
+fn sort_rows(rows: &mut [CatalogRow], sort: ListSort, asc: bool) {
+    match sort {
+        ListSort::Created => rows.sort_by(|a, b| a.id.cmp(&b.id)),
+        ListSort::Size => rows.sort_by(|a, b| {
+            a.stored_size_bytes
+                .cmp(&b.stored_size_bytes)
+                .then(a.id.cmp(&b.id))
+        }),
+    }
+    if !asc {
+        rows.reverse();
+    }
+}
+
+/// `--type` 필터 정규화(full|incr|orphan). 잘못된 값은 Usage 오류.
+fn normalize_type(f: Option<&str>) -> Result<Option<String>> {
+    match f {
+        None => Ok(None),
+        Some(t) => {
+            let t = t.to_ascii_lowercase();
+            match t.as_str() {
+                "full" | "incr" | "orphan" => Ok(Some(t)),
+                _ => Err(XBackupError::Usage(format!(
+                    "--type 값이 올바르지 않습니다: '{t}'(full|incr|orphan)"
+                ))),
+            }
+        }
+    }
+}
+
+/// `--engine` 필터 정규화(postgresql|mongodb, pg/mongo 약어 허용). 잘못된 값은 Usage 오류.
+fn normalize_engine_filter(f: Option<&str>) -> Result<Option<String>> {
+    match f {
+        None => Ok(None),
+        Some(e) => match e.to_ascii_lowercase().as_str() {
+            "postgresql" | "postgres" | "pg" => Ok(Some("postgresql".to_string())),
+            "mongodb" | "mongo" => Ok(Some("mongodb".to_string())),
+            other => Err(XBackupError::Usage(format!(
+                "--engine 값이 올바르지 않습니다: '{other}'(postgresql|mongodb)"
+            ))),
+        },
+    }
+}
+
+/// destination(store) 위치를 사람용 문자열로 — 표시용(local 경로 또는 s3).
+fn store_location(config_toml: Option<&str>, profile: &str) -> String {
+    ResolvedConfig::build(MergeInput {
+        config_toml,
+        profile_name: profile,
+        overrides: &collect_overrides_from_process(),
+    })
+    .ok()
+    .map(|r| {
+        let d = &r.profile.destination;
+        match d.r#type.as_deref() {
+            Some("local") => d
+                .path
+                .clone()
+                .unwrap_or_else(|| "local(경로 미설정)".to_string()),
+            Some("s3") => {
+                d.s3.as_ref()
+                    .and_then(|s| s.bucket.clone())
+                    .map(|b| format!("s3://{b}"))
+                    .unwrap_or_else(|| "s3".to_string())
+            }
+            _ => "(미설정)".to_string(),
+        }
+    })
+    .unwrap_or_else(|| "(해석 불가)".to_string())
 }
 
 /// destination의 manifest·orphan을 모아 카탈로그 행을 만든다(Storage 주입 — 테스트 가능).
@@ -232,12 +322,18 @@ fn resolve_profile_name(cli_profile: Option<&str>, config_toml: Option<&str>) ->
 }
 
 /// 사람이 읽는 카탈로그 출력(stdout).
-fn print_human(rows: &[CatalogRow]) {
+fn print_human(rows: &[CatalogRow], store_loc: &str, total: usize, matched: usize) {
+    let color = use_color();
+    // store 위치를 항상 먼저 보여준다(어디를 보고 있는지).
+    println!("{}", paint(&format!("store: {store_loc}"), &[DIM], color));
     if rows.is_empty() {
-        println!("백업이 없습니다.");
+        if total == 0 {
+            println!("백업이 없습니다.");
+        } else {
+            println!("필터에 맞는 백업이 없습니다(총 {total}개).");
+        }
         return;
     }
-    let color = use_color();
     let mut table = Table::new(
         &["ID", "TYPE", "DB", "CREATED", "SIZE", "CHAIN", "BASE"],
         // SIZE는 우측 정렬(숫자), 나머지는 좌측.
@@ -273,6 +369,23 @@ fn print_human(rows: &[CatalogRow]) {
     match rendered.split_once('\n') {
         Some((head, body)) if color => println!("{}\n{}", paint(head, &[BOLD], true), body),
         _ => println!("{rendered}"),
+    }
+    // 표시 개수 요약(필터/limit으로 일부만 보일 때).
+    let shown = rows.len();
+    if shown != total {
+        let filtered = if matched != total {
+            format!(" · 필터 매칭 {matched}")
+        } else {
+            String::new()
+        };
+        println!(
+            "{}",
+            paint(
+                &format!("총 {total}개 중 {shown}개 표시{filtered}"),
+                &[DIM],
+                color
+            )
+        );
     }
     // broken/orphan 요약 경고.
     let broken: Vec<&str> = rows
@@ -325,8 +438,8 @@ fn chain_label(status: &str) -> &str {
     }
 }
 
-/// 기계 판독 JSON 출력(stdout).
-fn print_json(rows: &[CatalogRow]) {
+/// 기계 판독 JSON 출력(stdout). store 위치도 포함한다.
+fn print_json(rows: &[CatalogRow], store_loc: &str) {
     let items: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
@@ -341,7 +454,7 @@ fn print_json(rows: &[CatalogRow]) {
             })
         })
         .collect();
-    let value = serde_json::json!({ "backups": items });
+    let value = serde_json::json!({ "store": store_loc, "backups": items });
     println!("{value}");
 }
 

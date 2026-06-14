@@ -93,6 +93,7 @@ async fn dry_run_does_not_delete_anything() {
     let policy = RetentionPolicy {
         keep_full: Some(1),
         keep_days: None,
+        keep_last: None,
     };
     let plan = plan_prune(&manifests, &orphans, policy, 200 * DAY);
 
@@ -118,6 +119,7 @@ async fn deletes_full_chain_as_unit() {
     let policy = RetentionPolicy {
         keep_full: Some(1), // 최신 1개 체인만 보존 → old 체인 삭제.
         keep_days: None,
+        keep_last: None,
     };
     let plan = plan_prune(&manifests, &orphans, policy, 200 * DAY);
     let outcome = execute_prune(&fs, &plan, false).await.unwrap();
@@ -148,6 +150,7 @@ async fn live_incremental_protects_base() {
     let policy = RetentionPolicy {
         keep_full: None,
         keep_days: Some(30), // now=100일 → cutoff=70일 → 최근 증분(95일) 보존 → base 보호.
+        keep_last: None,
     };
     let plan = plan_prune(&manifests, &orphans, policy, 100 * DAY);
     let outcome = execute_prune(&fs, &plan, true).await.unwrap();
@@ -178,6 +181,7 @@ async fn orphan_deleted_only_with_force() {
     let policy = RetentionPolicy {
         keep_full: Some(10), // keep는 보존.
         keep_days: None,
+        keep_last: None,
     };
     let plan = plan_prune(&manifests, &orphans, policy, 200 * DAY);
 
@@ -214,6 +218,7 @@ async fn empty_slice_manifest_only_pruned() {
     let policy = RetentionPolicy {
         keep_full: Some(1),
         keep_days: None,
+        keep_last: None,
     };
     let plan = plan_prune(&manifests, &orphans, policy, 200 * DAY);
     // old 체인(base + 빈 슬라이스)이 삭제 대상. data 없는 빈 슬라이스도 에러 없이 처리.
@@ -239,6 +244,7 @@ async fn full_artifact_removed_after_prune() {
     let policy = RetentionPolicy {
         keep_full: Some(1),
         keep_days: None,
+        keep_last: None,
     };
     let plan = plan_prune(&manifests, &orphans, policy, 200 * DAY);
     execute_prune(&fs, &plan, false).await.unwrap();
