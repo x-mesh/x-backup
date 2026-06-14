@@ -14,5 +14,6 @@ pub mod archive;
 pub mod backup;
 pub mod conn;
 pub mod meta;
+pub mod pgoutput;
 pub mod restore;
 pub mod status;
