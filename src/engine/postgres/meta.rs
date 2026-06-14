@@ -17,15 +17,16 @@ pub async fn connect(uri: &Secret, timeout_secs: Option<u64>) -> Result<PgClient
     PgClient::connect(uri, timeout_secs).await
 }
 
-/// 사용자 테이블 (schema.table) 목록(정렬).
+/// 사용자 테이블 (schema, table) 목록(정렬). 일반 테이블(relkind='r')만 — backup/watch와 동일 기준(리뷰 #8).
 async fn list_tables(
     client: &Client,
     schema_filter: Option<&str>,
 ) -> Result<Vec<(String, String)>> {
     let sql = format!(
-        "SELECT schemaname, tablename FROM pg_tables \
-         WHERE schemaname NOT IN ({SYSTEM_SCHEMAS}) \
-         AND ($1::text IS NULL OR schemaname = $1) ORDER BY schemaname, tablename"
+        "SELECT n.nspname, c.relname FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relkind = 'r' AND n.nspname NOT IN ({SYSTEM_SCHEMAS}) \
+         AND ($1::text IS NULL OR n.nspname = $1) ORDER BY n.nspname, c.relname"
     );
     let rows = client
         .query(sql.as_str(), &[&schema_filter])
@@ -34,6 +35,18 @@ async fn list_tables(
     Ok(rows
         .into_iter()
         .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+        .collect())
+}
+
+/// 사용자 테이블의 `schema.table` 목록 — migrate 충돌 감지용(실패는 하드 에러로 전파).
+///
+/// count 질의(`table_counts_exact`, best-effort)와 분리해, 대상 열거 실패가 --drop 가드를
+/// 조용히 무력화하지 않도록 한다(리뷰 #2).
+pub async fn list_qualified(client: &Client) -> Result<Vec<String>> {
+    Ok(list_tables(client, None)
+        .await?
+        .into_iter()
+        .map(|(s, t)| format!("{s}.{t}"))
         .collect())
 }
 

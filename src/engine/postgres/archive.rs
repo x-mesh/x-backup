@@ -9,7 +9,9 @@
 //! ```
 //! - `H`(헤더): `{ format, created_at, pg_version }` — 1회.
 //! - `Q`(시퀀스): `{ name, last_value }` — 테이블 생성 전에 만들어 nextval 기본값을 해소.
-//! - `T`(테이블): `{ ns, create_sql, constraints:[sql], indexes:[sql] }` — 테이블마다 1회.
+//! - `T`(테이블): `{ ns, quoted, schema, create_sql, constraints:[], indexes:[], copy_cols:[],
+//!   identity_cols:[] }` — 테이블마다 1회. quoted/schema로 복구가 정확히 식별, copy_cols로 COPY
+//!   컬럼을 한정(STORED generated 제외), identity_cols로 복구 후 시퀀스 리셋.
 //! - `D`(데이터): COPY 바이너리 raw 청크(길이 프리픽스 + 바이트). 테이블당 N개.
 //! - `X`(테이블끝): payload 없음 — COPY IN을 종료시키는 경계.
 //! - `E`(끝): payload 없음.
@@ -61,33 +63,52 @@ pub async fn write_header<W: AsyncWrite + Unpin>(
     write_doc_frame(w, TAG_HEADER, &doc).await
 }
 
-/// 시퀀스 메타 프레임을 쓴다(`name`, `last_value`, `is_called`).
+/// 시퀀스 메타 프레임을 쓴다(`name`, `schema`, `last_value`, `is_called`).
 ///
-/// `is_called=false`(한 번도 호출 안 된 시퀀스)면 복구가 `setval(.., last_value, false)`로
-/// 복원해 첫 `nextval`이 `last_value`가 되게 한다(미사용 시퀀스 off-by-one 방지).
+/// `schema`(quote됨)는 복구가 시퀀스 생성 전 `CREATE SCHEMA IF NOT EXISTS`로 비-기본 스키마를
+/// 먼저 만들게 한다. `is_called=false`(미호출 시퀀스)면 `setval(.., last_value, false)`로 복원해
+/// 첫 `nextval`이 `last_value`가 되게 한다(off-by-one 방지).
 pub async fn write_sequence<W: AsyncWrite + Unpin>(
     w: &mut W,
     name: &str,
+    schema: &str,
     last_value: i64,
     is_called: bool,
 ) -> Result<()> {
-    let doc = bson::doc! { "name": name, "last_value": last_value, "is_called": is_called };
+    let doc = bson::doc! {
+        "name": name, "schema": schema, "last_value": last_value, "is_called": is_called,
+    };
     write_doc_frame(w, TAG_SEQUENCE, &doc).await
 }
 
-/// 테이블 메타 프레임을 쓴다(생성 DDL + 제약 + 인덱스).
-pub async fn write_table<W: AsyncWrite + Unpin>(
-    w: &mut W,
-    ns: &str,
-    create_sql: &str,
-    constraints: &[String],
-    indexes: &[String],
-) -> Result<()> {
+/// 테이블 메타 프레임에 담을 정보(생성 DDL·제약·인덱스 + 복구가 쓸 정확한 식별자/COPY 목록).
+pub struct TableFrame<'a> {
+    /// `schema.table`(사람용·setval 인자).
+    pub ns: &'a str,
+    /// 정확히 quote된 전체 식별자(`"sch"."tbl"`) — COPY/DROP에 사용(create_sql 재파싱 불필요).
+    pub quoted: &'a str,
+    /// quote된 스키마(`"sch"`) — 복구 전 `CREATE SCHEMA IF NOT EXISTS`.
+    pub schema: &'a str,
+    pub create_sql: &'a str,
+    pub constraints: &'a [String],
+    pub indexes: &'a [String],
+    /// COPY에 쓸 컬럼 목록(quote됨) — STORED generated 컬럼은 제외한다(COPY 불가).
+    pub copy_cols: &'a [String],
+    /// IDENTITY 컬럼의 평문 이름 — 복구 후 시퀀스를 max로 리셋(setval pg_get_serial_sequence).
+    pub identity_cols: &'a [String],
+}
+
+/// 테이블 메타 프레임을 쓴다.
+pub async fn write_table<W: AsyncWrite + Unpin>(w: &mut W, t: &TableFrame<'_>) -> Result<()> {
     let doc = bson::doc! {
-        "ns": ns,
-        "create_sql": create_sql,
-        "constraints": constraints.iter().map(|s| bson::Bson::String(s.clone())).collect::<Vec<_>>(),
-        "indexes": indexes.iter().map(|s| bson::Bson::String(s.clone())).collect::<Vec<_>>(),
+        "ns": t.ns,
+        "quoted": t.quoted,
+        "schema": t.schema,
+        "create_sql": t.create_sql,
+        "constraints": t.constraints.iter().map(|s| bson::Bson::String(s.clone())).collect::<Vec<_>>(),
+        "indexes": t.indexes.iter().map(|s| bson::Bson::String(s.clone())).collect::<Vec<_>>(),
+        "copy_cols": t.copy_cols.iter().map(|s| bson::Bson::String(s.clone())).collect::<Vec<_>>(),
+        "identity_cols": t.identity_cols.iter().map(|s| bson::Bson::String(s.clone())).collect::<Vec<_>>(),
     };
     write_doc_frame(w, TAG_TABLE, &doc).await
 }
@@ -219,15 +240,23 @@ mod tests {
         write_header(&mut buf, "2026-06-14T00:00:00Z", "16.2")
             .await
             .unwrap();
-        write_sequence(&mut buf, "public.t_id_seq", 1000, true)
+        write_sequence(&mut buf, "public.t_id_seq", "\"public\"", 1000, true)
             .await
             .unwrap();
         write_table(
             &mut buf,
-            "public.t",
-            "CREATE TABLE public.t (id int, name text)",
-            &["ALTER TABLE public.t ADD CONSTRAINT t_pkey PRIMARY KEY (id)".to_string()],
-            &["CREATE INDEX t_name_idx ON public.t (name)".to_string()],
+            &TableFrame {
+                ns: "public.t",
+                quoted: "\"public\".\"t\"",
+                schema: "\"public\"",
+                create_sql: "CREATE TABLE public.t (id int, name text)",
+                constraints: &[
+                    "ALTER TABLE public.t ADD CONSTRAINT t_pkey PRIMARY KEY (id)".to_string(),
+                ],
+                indexes: &["CREATE INDEX t_name_idx ON public.t (name)".to_string()],
+                copy_cols: &["\"id\"".to_string(), "\"name\"".to_string()],
+                identity_cols: &[],
+            },
         )
         .await
         .unwrap();
@@ -254,8 +283,10 @@ mod tests {
         match read_frame(&mut r).await.unwrap() {
             Frame::Table(t) => {
                 assert_eq!(t.get_str("ns").unwrap(), "public.t");
+                assert_eq!(t.get_str("quoted").unwrap(), "\"public\".\"t\"");
                 assert_eq!(t.get_array("constraints").unwrap().len(), 1);
                 assert_eq!(t.get_array("indexes").unwrap().len(), 1);
+                assert_eq!(t.get_array("copy_cols").unwrap().len(), 2);
             }
             f => panic!("테이블 기대, {f:?}"),
         }

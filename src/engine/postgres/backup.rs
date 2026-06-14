@@ -84,13 +84,19 @@ impl PgDumper {
 
 /// 한 테이블의 메타(introspection 결과).
 struct TableDef {
-    /// 스키마.테이블(보고·로그용).
+    /// 스키마.테이블(보고·로그용·setval 인자).
     ns: String,
     /// 서버가 만든 정확히 quote된 식별자(`"sch"."tbl"`) — DDL·COPY에 사용.
     quoted: String,
+    /// quote된 스키마(`"sch"`) — 복구 전 CREATE SCHEMA.
+    schema_quoted: String,
     create_sql: String,
     constraints: Vec<String>,
     indexes: Vec<String>,
+    /// COPY 컬럼 목록(quote됨, STORED generated 제외).
+    copy_cols: Vec<String>,
+    /// IDENTITY 컬럼 평문 이름(복구 후 시퀀스 리셋용).
+    identity_cols: Vec<String>,
 }
 
 /// 대상 데이터베이스 전체를 아카이브 프레임으로 직렬화해 writer에 쓴다.
@@ -120,16 +126,23 @@ async fn write_archive(
         let def = introspect_table(client, t).await?;
         archive::write_table(
             writer,
-            &def.ns,
-            &def.create_sql,
-            &def.constraints,
-            &def.indexes,
+            &archive::TableFrame {
+                ns: &def.ns,
+                quoted: &def.quoted,
+                schema: &def.schema_quoted,
+                create_sql: &def.create_sql,
+                constraints: &def.constraints,
+                indexes: &def.indexes,
+                copy_cols: &def.copy_cols,
+                identity_cols: &def.identity_cols,
+            },
         )
         .await?;
 
-        // 데이터 — COPY text 불투명 바이트를 그대로 흘린다(해석 없음). text는 메이저 버전
-        // 간 이식성이 안전하다(바이너리는 버전 의존적 — 리뷰 #2). pg_dump 기본도 text.
-        let copy_sql = format!("COPY {} TO STDOUT (FORMAT text)", def.quoted);
+        // 데이터 — COPY text 불투명 바이트를 그대로 흘린다(해석 없음). text는 메이저 버전 간
+        // 이식성이 안전하다(리뷰 #2). STORED generated 컬럼은 COPY 불가라 copy_cols에서 제외.
+        let cols = def.copy_cols.join(", ");
+        let copy_sql = format!("COPY {} ({cols}) TO STDOUT (FORMAT text)", def.quoted);
         let stream = client
             .copy_out(copy_sql.as_str())
             .await
@@ -157,11 +170,18 @@ async fn write_sequences(
 ) -> Result<()> {
     // last_value가 NULL이면 한 번도 호출 안 된 시퀀스 → is_called=false, 값은 1로 본다(리뷰 #5).
     // 식별자 quote도 같은 쿼리에서(format('%I.%I')) 처리해 라운드트립을 줄인다.
+    // IDENTITY 컬럼의 내부 시퀀스(deptype='i')는 제외 — IDENTITY DDL이 재생성하므로 중복 방지.
     let sql = format!(
-        "SELECT format('%I.%I', schemaname, sequencename), \
-                coalesce(last_value, 1), (last_value IS NOT NULL) \
-         FROM pg_sequences WHERE schemaname NOT IN ({SYSTEM_SCHEMAS}) \
-         AND ($1::text IS NULL OR schemaname = $1) ORDER BY schemaname, sequencename"
+        "SELECT format('%I.%I', s.schemaname, s.sequencename), quote_ident(s.schemaname), \
+                coalesce(s.last_value, 1), (s.last_value IS NOT NULL) \
+         FROM pg_sequences s \
+         WHERE s.schemaname NOT IN ({SYSTEM_SCHEMAS}) \
+         AND ($1::text IS NULL OR s.schemaname = $1) \
+         AND NOT EXISTS ( \
+            SELECT 1 FROM pg_class sc JOIN pg_namespace sn ON sn.oid = sc.relnamespace \
+            JOIN pg_depend dep ON dep.objid = sc.oid AND dep.deptype = 'i' \
+            WHERE sc.relkind = 'S' AND sn.nspname = s.schemaname AND sc.relname = s.sequencename) \
+         ORDER BY s.schemaname, s.sequencename"
     );
     let rows = client
         .query(sql.as_str(), &[&schema_filter])
@@ -169,9 +189,10 @@ async fn write_sequences(
         .map_err(|e| XBackupError::Failure(format!("시퀀스 목록 조회 실패: {e}")))?;
     for row in rows {
         let quoted: String = row.get(0);
-        let last_value: i64 = row.get(1);
-        let is_called: bool = row.get(2);
-        archive::write_sequence(writer, &quoted, last_value, is_called).await?;
+        let schema: String = row.get(1);
+        let last_value: i64 = row.get(2);
+        let is_called: bool = row.get(3);
+        archive::write_sequence(writer, &quoted, &schema, last_value, is_called).await?;
     }
     Ok(())
 }
@@ -196,18 +217,22 @@ async fn warn_partitioned(client: &Client, schema_filter: Option<&str>) {
     }
 }
 
-/// 대상 사용자 테이블 (schema, table) 목록.
+/// 대상 사용자 테이블 (schema, table) 목록 — 일반 테이블(relkind='r')만.
+///
+/// 파티션 부모(relkind='p')는 제외한다(자식 파티션이 'r'로 따로 잡혀 데이터 중복을 막음 —
+/// 부모는 [`warn_partitioned`]가 경고). watch/peek의 enumeration과 동일 기준(리뷰 #8).
 async fn list_tables(
     client: &Client,
     schema_filter: Option<&str>,
     table_filter: Option<&str>,
 ) -> Result<Vec<(String, String)>> {
     let sql = format!(
-        "SELECT schemaname, tablename FROM pg_tables \
-         WHERE schemaname NOT IN ({SYSTEM_SCHEMAS}) \
-         AND ($1::text IS NULL OR schemaname = $1) \
-         AND ($2::text IS NULL OR tablename = $2) \
-         ORDER BY schemaname, tablename"
+        "SELECT n.nspname, c.relname FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relkind = 'r' AND n.nspname NOT IN ({SYSTEM_SCHEMAS}) \
+         AND ($1::text IS NULL OR n.nspname = $1) \
+         AND ($2::text IS NULL OR c.relname = $2) \
+         ORDER BY n.nspname, c.relname"
     );
     let rows = client
         .query(sql.as_str(), &[&schema_filter, &table_filter])
@@ -226,20 +251,25 @@ async fn introspect_table(client: &Client, (schema, table): &(String, String)) -
     let row = client
         .query_one(
             "SELECT format('%I.%I', $1::text, $2::text), \
-                    (quote_ident($1)||'.'||quote_ident($2))::regclass::oid",
+                    (quote_ident($1)||'.'||quote_ident($2))::regclass::oid, \
+                    quote_ident($1)",
             &[schema, table],
         )
         .await
         .map_err(|e| XBackupError::Failure(format!("{ns} 식별자/oid 조회 실패: {e}")))?;
     let quoted: String = row.get(0);
     let oid: u32 = row.get(1);
+    let schema_quoted: String = row.get(2);
 
-    // 컬럼 → CREATE TABLE. quote_ident를 같은 쿼리에서 처리(컬럼당 라운드트립 제거 — 리뷰 #4).
+    // 컬럼 → CREATE TABLE. attidentity(IDENTITY)/attgenerated(STORED generated)/타입종류(typtype)도
+    // 함께 가져온다(리뷰 #3/#4/#6). quote_ident는 같은 쿼리에서(리뷰 #4).
     let col_rows = client
         .query(
             "SELECT quote_ident(a.attname), pg_catalog.format_type(a.atttypid, a.atttypmod), \
-                    a.attnotnull, pg_get_expr(d.adbin, d.adrelid) \
+                    a.attnotnull, pg_get_expr(d.adbin, d.adrelid), \
+                    a.attidentity, a.attgenerated, t.typtype, a.attname \
              FROM pg_attribute a \
+             JOIN pg_type t ON t.oid = a.atttypid \
              LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
              WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY a.attnum",
@@ -248,14 +278,48 @@ async fn introspect_table(client: &Client, (schema, table): &(String, String)) -
         .await
         .map_err(|e| XBackupError::Failure(format!("{ns} 컬럼 조회 실패: {e}")))?;
     let mut cols = Vec::new();
+    let mut copy_cols = Vec::new();
+    let mut identity_cols = Vec::new();
     for c in &col_rows {
         let ident: String = c.get(0);
         let typ: String = c.get(1);
         let notnull: bool = c.get(2);
         let default: Option<String> = c.get(3);
+        let attidentity: i8 = c.get(4); // 'a'=always 'd'=by default 0=아님
+        let attgenerated: i8 = c.get(5); // 's'=STORED generated 0=아님
+        let typtype: i8 = c.get(6); // 'b'=base 'c'=composite 'e'=enum 'd'=domain 'r'=range ...
+        let attname: String = c.get(7);
+
+        // 복합/enum/도메인 타입은 CREATE TYPE를 1차에서 덤프하지 않는다 — 복구 시 타입 부재로
+        // 실패할 수 있어 경고한다(리뷰 #6, 로드맵).
+        if matches!(typtype as u8 as char, 'c' | 'e' | 'd') {
+            tracing::warn!(
+                ns = %ns, column = %attname, kind = %(typtype as u8 as char),
+                "PG 백업: 사용자 정의 타입(복합/enum/도메인) 컬럼 — CREATE TYPE는 1차 미덤프. \
+                 복구 대상에 동일 타입이 없으면 복구가 실패할 수 있습니다"
+            );
+        }
+
         let mut def = format!("{ident} {typ}");
-        if let Some(d) = default {
-            def.push_str(&format!(" DEFAULT {d}"));
+        if attgenerated as u8 as char == 's' {
+            // STORED generated — DEFAULT가 아니라 GENERATED ... STORED로 재현하고 COPY에서 제외.
+            let expr = default.clone().unwrap_or_else(|| "NULL".to_string());
+            def.push_str(&format!(" GENERATED ALWAYS AS ({expr}) STORED"));
+            // copy_cols에 넣지 않는다(COPY 불가).
+        } else if matches!(attidentity as u8 as char, 'a' | 'd') {
+            let kind = if attidentity as u8 as char == 'a' {
+                "ALWAYS"
+            } else {
+                "BY DEFAULT"
+            };
+            def.push_str(&format!(" GENERATED {kind} AS IDENTITY"));
+            copy_cols.push(ident.clone());
+            identity_cols.push(attname.clone());
+        } else {
+            if let Some(d) = default {
+                def.push_str(&format!(" DEFAULT {d}"));
+            }
+            copy_cols.push(ident.clone());
         }
         if notnull {
             def.push_str(" NOT NULL");
@@ -298,9 +362,12 @@ async fn introspect_table(client: &Client, (schema, table): &(String, String)) -
     Ok(TableDef {
         ns,
         quoted,
+        schema_quoted,
         create_sql,
         constraints,
         indexes,
+        copy_cols,
+        identity_cols,
     })
 }
 

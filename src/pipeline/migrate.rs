@@ -116,6 +116,21 @@ fn filter_counts(counts: Vec<(String, u64)>, ns: &Option<String>) -> Vec<(String
     }
 }
 
+/// [`filter_counts`]의 이름 전용 버전 — `db`/`db.collection` 범위로 네임스페이스 이름을 거른다.
+fn filter_names(names: Vec<String>, ns: &Option<String>) -> Vec<String> {
+    match ns {
+        None => names,
+        Some(filter) if filter.contains('.') => names.into_iter().filter(|n| n == filter).collect(),
+        Some(db) => {
+            let prefix = format!("{db}.");
+            names
+                .into_iter()
+                .filter(|n| n.starts_with(&prefix))
+                .collect()
+        }
+    }
+}
+
 /// 선택적 마이그레이션 네임스페이스 문자열을 만든다(`db` 또는 `db.collection`).
 fn ns_of(db: &Option<String>, collection: &Option<String>) -> Option<String> {
     match (db, collection) {
@@ -317,6 +332,14 @@ pub async fn plan_pg_migrate(request: &MigrateRequest) -> Result<MigratePlan> {
     let version_warning = version_compat_warning(&source_server_version, &target_server_version);
 
     let ns = ns_of(&request.db, &request.collection);
+    // 충돌 감지는 **하드 에러** 존재 질의로 — count(best-effort)와 분리해 가드 무력화를 막는다(리뷰 #2).
+    let conflicting_namespaces = {
+        let names = pg_meta::list_qualified(tgt.client())
+            .await
+            .map_err(|e| XBackupError::PrecheckFailed(format!("target 테이블 열거 실패: {e}")))?;
+        filter_names(names, &ns)
+    };
+    // 표시용 카운트는 best-effort(조회 실패해도 계획 출력은 계속).
     let source_counts = filter_counts(
         pg_meta::table_counts_exact(src.client())
             .await
@@ -329,8 +352,6 @@ pub async fn plan_pg_migrate(request: &MigrateRequest) -> Result<MigratePlan> {
             .unwrap_or_default(),
         &ns,
     );
-    // 충돌 = target에 이미 존재하는 테이블(있으면 --drop 필수). 빈 테이블도 "존재"로 본다.
-    let conflicting_namespaces = target_counts.iter().map(|(n, _)| n.clone()).collect();
 
     Ok(MigratePlan {
         source_topology: "PostgreSQL".to_string(),
@@ -394,8 +415,17 @@ where
     let restore_res = pg_restore::restore_into(&mut stream, tgt.client(), request.drop).await;
     drop(stream);
     let dump_res = handle.finish().await;
-    let inserted = restore_res?;
-    dump_res?;
+    // 둘 다 실패면 양쪽을 함께 보고한다(덤프 오류가 근본 원인일 수 있음 — 리뷰 #14).
+    let inserted = match (restore_res, dump_res) {
+        (Ok(n), Ok(())) => n,
+        (Err(re), Err(de)) => {
+            return Err(XBackupError::Failure(format!(
+                "복구 실패: {re} (덤프도 실패 — 원인일 수 있음: {de})"
+            )))
+        }
+        (Err(re), Ok(())) => return Err(re),
+        (Ok(_), Err(de)) => return Err(de),
+    };
     tracing::info!(inserted, "PG 마이그레이션 완료(파일 없음)");
 
     Ok((
