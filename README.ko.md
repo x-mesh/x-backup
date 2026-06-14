@@ -233,16 +233,20 @@ type = "local"
 path = "/var/backups/pg"
 ```
 
+DB 비의존 명령은 MongoDB와 동일하게 동작한다:
+
 ```bash
 x-backup backup  --profile pg                    # COPY 기반 풀 백업 → 압축 → 암호화 → 저장
 x-backup restore --profile pg --target postgresql://host:5432/restored --force
-x-backup status  --profile pg                    # 버전·DB 크기·테이블/행 수·마지막 백업
-x-backup list/verify ...                          # MongoDB와 동일(DB 비의존)
+x-backup status  --profile pg [--all] [--watch]  # 버전·DB 크기·테이블/행 수·마지막 백업; 라이브 Δ
+x-backup peek    --profile pg [--ns schema.table]# 데이터 육안 확인: 테이블 행 수 + 최신 행
+x-backup migrate --profile pg --target postgresql://host/other --drop --force   # 드라이버 COPY, PG → PG
+x-backup list/verify/prune ...                    # manifest 기반(DB 비의존)
 ```
 
-잡는 것(데이터 중심): **테이블 데이터**(COPY 바이너리, 타입 정확)·**테이블 구조**
+잡는 것(데이터 중심): **테이블 데이터**(text COPY, 값 정확)·**테이블 구조**
 (컬럼/타입/NOT NULL/기본값)·**제약**(PK/UNIQUE/FK/CHECK)·**인덱스**·**시퀀스**
-(`last_value` 포함 — 복구 후 다음 `INSERT`가 충돌하지 않음). 복구는 스키마를 재생성한 뒤
+(`last_value`/`is_called` — 복구 후 다음 `INSERT`가 충돌하지 않음). 복구는 스키마를 재생성한 뒤
 COPY로 적재하고, 제약·인덱스는 데이터 뒤에 적용한다.
 
 연결은 rustls TLS + `sslmode` 협상을 쓴다 — 기본 `prefer`는 TLS를 시도하고 미지원 서버엔
@@ -250,9 +254,11 @@ COPY로 적재하고, 제약·인덱스는 데이터 뒤에 적용한다.
 이식성 포맷)로 옮기므로 PostgreSQL 메이저 버전이 달라도 복구가 안전하다(메이저 불일치는 경고).
 
 아직 미지원(로드맵): 뷰·머티리얼라이즈드뷰·함수/트리거·확장·소유권/권한·파티셔닝(파티션
-부모는 경고 후 건너뜀), 그리고 증분/PITR(PostgreSQL에선 WAL 아카이빙 — oplog와 다른 메커니즘).
-데이터가 있는 DB로 복구할 땐 `--force`(백업에 든 테이블을 drop 후 재생성)를 쓰고, 빈 대상은
-플래그가 필요 없다.
+부모는 경고 후 건너뜀)·`GENERATED … AS IDENTITY` 컬럼과 시퀀스 `OWNED BY` 링크(구식 `serial`은
+동작; 데이터는 복구되나 IDENTITY 자동 증가는 재구성 안 됨), 그리고 증분/PITR(`restore --at`은
+PG에서 거부 — PITR은 WAL 아카이빙으로 oplog와 다른 메커니즘). 데이터가 있는 DB로 복구할 땐
+`--force`(백업에 든 테이블을 drop 후 재생성)를 쓰고, 빈 대상은 플래그가 필요 없다.
+`migrate`는 PG → PG만(엔진 간 불가).
 
 ### 라이브 모니터 (`status --watch`)
 

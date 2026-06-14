@@ -76,7 +76,20 @@ pub async fn handle(config_path: Option<PathBuf>, args: MigrateArgs) -> Result<(
         Some(resolved.profile.mode.output.as_str()),
     );
 
+    // DB 종류 판별 — source/target이 같은 엔진이어야 한다(엔진 간 마이그레이션 미지원).
+    use crate::engine::DbKind;
+    let source_kind = DbKind::from_uri(source_uri.expose());
+    let target_kind = DbKind::from_uri(target_uri.expose());
+    if source_kind != target_kind {
+        return Err(XBackupError::Usage(
+            "source와 target의 DB 종류가 다릅니다 — 엔진 간 마이그레이션(예: Mongo↔PG)은 \
+             지원하지 않습니다. 같은 종류끼리만 가능합니다."
+                .into(),
+        ));
+    }
+
     // 전송 엔진은 source 프로파일의 mode.engine을 따른다(기본 native — 외부 도구 불필요).
+    //   PG는 mode.engine과 무관하게 PG 엔진을 쓴다.
     let engine = crate::pipeline::backup::Engine::parse(&resolved.profile.mode.engine)?;
     let request = MigrateRequest {
         source_uri,
@@ -92,7 +105,13 @@ pub async fn handle(config_path: Option<PathBuf>, args: MigrateArgs) -> Result<(
     };
 
     let is_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-    let (plan, outcome) = run_migrate(&request, args.force, is_tty, prompt_confirm).await?;
+    let (plan, outcome) = match source_kind {
+        DbKind::Postgres => {
+            crate::pipeline::migrate::run_pg_migrate(&request, args.force, is_tty, prompt_confirm)
+                .await?
+        }
+        DbKind::Mongo => run_migrate(&request, args.force, is_tty, prompt_confirm).await?,
+    };
 
     // 3) 출력. dry-run은 계획을, 실제 실행은 완료 요약을 낸다(진행=stderr, 결과=stdout).
     if request.dry_run {

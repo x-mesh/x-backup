@@ -26,6 +26,7 @@ use crate::engine::mongo::{
 };
 use crate::engine::native::backup::NativeDumper;
 use crate::engine::native::restore::native_restore;
+use crate::engine::postgres::{backup::PgDumper, meta as pg_meta, restore as pg_restore};
 use crate::error::{Result, XBackupError};
 use crate::pipeline::backup::Engine;
 
@@ -303,6 +304,117 @@ async fn mongodump_transfer(request: &MigrateRequest, plan: &MigratePlan) -> Res
         return Err(dump_err);
     }
     restore.wait().await
+}
+
+/// PostgreSQL 마이그레이션 계획 — source/target 연결·버전·테이블 행 수(정확)·충돌. 무변경.
+pub async fn plan_pg_migrate(request: &MigrateRequest) -> Result<MigratePlan> {
+    let src = pg_meta::connect(&request.source_uri, request.timeout_secs).await?;
+    let tgt = pg_meta::connect(&request.target_uri, request.timeout_secs)
+        .await
+        .map_err(|e| XBackupError::PrecheckFailed(format!("target 연결 실패: {e}")))?;
+    let source_server_version = pg_server_version(src.client()).await;
+    let target_server_version = pg_server_version(tgt.client()).await;
+    let version_warning = version_compat_warning(&source_server_version, &target_server_version);
+
+    let ns = ns_of(&request.db, &request.collection);
+    let source_counts = filter_counts(
+        pg_meta::table_counts_exact(src.client())
+            .await
+            .unwrap_or_default(),
+        &ns,
+    );
+    let target_counts = filter_counts(
+        pg_meta::table_counts_exact(tgt.client())
+            .await
+            .unwrap_or_default(),
+        &ns,
+    );
+    // 충돌 = target에 이미 존재하는 테이블(있으면 --drop 필수). 빈 테이블도 "존재"로 본다.
+    let conflicting_namespaces = target_counts.iter().map(|(n, _)| n.clone()).collect();
+
+    Ok(MigratePlan {
+        source_topology: "PostgreSQL".to_string(),
+        source_server_version,
+        target_server_version,
+        ns,
+        conflicting_namespaces,
+        version_warning,
+        source_counts,
+        target_counts,
+    })
+}
+
+/// PostgreSQL 마이그레이션 실행 — PgDumper(source) 스트림을 restore_into(target)로 곧장 흘린다.
+///
+/// 외부 도구 없이 드라이버 COPY로 source→target 직접 복사(파일·디스크 경유 없음). 가드는
+/// Mongo 경로와 동일(데이터 있는 target은 --drop 필수, --force/대화형 확인).
+pub async fn run_pg_migrate<C>(
+    request: &MigrateRequest,
+    force: bool,
+    is_tty: bool,
+    confirm: C,
+) -> Result<(MigratePlan, Option<MigrateOutcome>)>
+where
+    C: FnOnce(&MigratePlan) -> bool,
+{
+    let plan = plan_pg_migrate(request).await?;
+    if request.dry_run {
+        return Ok((plan, None));
+    }
+
+    let target_had_data = !plan.conflicting_namespaces.is_empty();
+    match migrate_guard(target_had_data, request.drop, force) {
+        GuardOutcome::Proceed => {}
+        GuardOutcome::NeedDrop => {
+            return Err(XBackupError::Usage(format!(
+                "target에 기존 테이블이 있습니다({}개). 마이그레이션은 교체를 의미하므로 \
+                 --drop이 필요합니다(--drop 없는 복사는 어중간한 merge가 됩니다). \
+                 빈 target으로 옮기거나 --drop --force를 쓰세요.",
+                plan.conflicting_namespaces.len()
+            )));
+        }
+        GuardOutcome::NeedConfirm => {
+            if !(is_tty && confirm(&plan)) {
+                return Err(XBackupError::Failure(
+                    "target 기존 테이블을 --drop으로 교체하려면 --force 또는 대화형 확인이 \
+                     필요합니다(프로덕션 가드레일)."
+                        .into(),
+                ));
+            }
+        }
+    }
+
+    // 전송: PgDumper(source) → restore_into(target). EOF 후 양측 결과 회수.
+    let dumper = PgDumper::connect(&request.source_uri, request.timeout_secs).await?;
+    let mut stream = dumper.dump_stream(request.db.clone(), request.collection.clone());
+    let handle = stream.handle();
+    let tgt = pg_meta::connect(&request.target_uri, request.timeout_secs)
+        .await
+        .map_err(|e| XBackupError::PrecheckFailed(format!("target 연결 실패: {e}")))?;
+    let restore_res = pg_restore::restore_into(&mut stream, tgt.client(), request.drop).await;
+    drop(stream);
+    let dump_res = handle.finish().await;
+    let inserted = restore_res?;
+    dump_res?;
+    tracing::info!(inserted, "PG 마이그레이션 완료(파일 없음)");
+
+    Ok((
+        plan,
+        Some(MigrateOutcome {
+            source_topology: "PostgreSQL".to_string(),
+            target_had_data,
+        }),
+    ))
+}
+
+/// PG 서버 버전 문자열(없으면 "postgresql").
+async fn pg_server_version(client: &tokio_postgres::Client) -> String {
+    client
+        .query_one("SHOW server_version", &[])
+        .await
+        .ok()
+        .map(|r| r.get::<_, String>(0))
+        .unwrap_or_else(|| "postgresql".to_string())
 }
 
 /// 데이터 있는 target에 대한 마이그레이션 가드 판정(순수 — 테스트 용이).

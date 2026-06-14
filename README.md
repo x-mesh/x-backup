@@ -20,7 +20,7 @@ x-backup backs up a running MongoDB (standalone or replica set) or PostgreSQL in
 - ✅ **PostgreSQL** — driver-native full backup/restore via the COPY protocol (data + tables + constraints + indexes + sequences), no `pg_dump`/`pg_restore`. Same pipeline (compress → encrypt → store), same `status`/`list`/`verify`/`restore`
 - ✅ **Headless** — auto-quiet when not a TTY, `--json` output, built for cron and CI
 
-Scope: MongoDB replica sets get full and incremental backups, standalone gets full only, and sharded clusters are detected and refused. PostgreSQL gets full backup + restore + status (incremental/PITR is a roadmap item). See [PostgreSQL](#postgresql).
+Scope: MongoDB replica sets get full and incremental backups, standalone gets full only, and sharded clusters are detected and refused. PostgreSQL gets full backup, restore, migrate, status/peek/watch (incremental/PITR is a roadmap item). See [PostgreSQL](#postgresql).
 
 ## Install
 
@@ -233,17 +233,21 @@ type = "local"
 path = "/var/backups/pg"
 ```
 
+All the DB-agnostic commands work the same as MongoDB:
+
 ```bash
 x-backup backup  --profile pg                    # COPY-based full backup → compress → encrypt → store
 x-backup restore --profile pg --target postgresql://host:5432/restored --force
-x-backup status  --profile pg                    # version, db size, table/row counts, last backup
-x-backup list/verify ...                          # same as MongoDB (DB-agnostic)
+x-backup status  --profile pg [--all] [--watch]  # version, db size, table/row counts, last backup; live Δ
+x-backup peek    --profile pg [--ns schema.table]# eyeball data: per-table counts + latest rows
+x-backup migrate --profile pg --target postgresql://host/other --drop --force   # driver COPY, PG → PG
+x-backup list/verify/prune ...                    # manifest-based (DB-agnostic)
 ```
 
-What it captures (data-centric): **table data** (COPY binary, exact types), **table structure**
+What it captures (data-centric): **table data** (text COPY, exact values), **table structure**
 (columns/types/NOT NULL/defaults), **constraints** (PK/UNIQUE/FK/CHECK), **indexes**, and
-**sequences** (with `last_value`, so the next `INSERT` doesn't collide). Restore recreates the
-schema then bulk-loads via COPY, applying constraints and indexes after the data.
+**sequences** (with `last_value`/`is_called`, so the next `INSERT` doesn't collide). Restore
+recreates the schema then bulk-loads via COPY, applying constraints and indexes after the data.
 
 Connections use rustls TLS with `sslmode` negotiation — the default (`prefer`) tries TLS and
 falls back to plaintext for servers without it, while `sslmode=require`/`verify-full` enforce
@@ -251,10 +255,12 @@ TLS. Data moves as text COPY (the portable format pg_dump uses), so restoring ac
 PostgreSQL major versions is safe; a major-version mismatch is logged as a warning.
 
 Not yet covered (roadmap): views, materialized views, functions/triggers, extensions,
-ownership/grants, partitioning (partition parents are skipped with a warning); and
-incremental/PITR (which for PostgreSQL means WAL archiving — a different mechanism from
-MongoDB's oplog). Restoring into a non-empty database should use `--force` (drops and recreates
-each backed-up table); an empty target needs no flag.
+ownership/grants, partitioning (partition parents are skipped with a warning), `GENERATED … AS
+IDENTITY` columns and sequence `OWNED BY` links (old-style `serial` works; data still restores,
+but identity auto-generation isn't recreated); and incremental/PITR (`restore --at` is refused
+for PostgreSQL — PITR means WAL archiving, a different mechanism from MongoDB's oplog).
+Restoring into a non-empty database should use `--force` (drops and recreates each backed-up
+table); an empty target needs no flag. `migrate` is PG → PG only (no cross-engine).
 
 ### Live monitor (`status --watch`)
 

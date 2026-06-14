@@ -211,6 +211,16 @@ async fn handle_pitr(config_path: Option<PathBuf>, args: RestoreArgs, at: String
     // config·URI·storage·타임아웃 해석(풀 복구 경로와 동일 규칙).
     let (target_uri, storage, timeout_secs) = resolve_target_and_storage(&config_path, &args)?;
 
+    // PITR은 oplog 기반(Mongo 전용) — PostgreSQL은 WAL 아카이빙이 필요하며 미지원이다.
+    //   --at를 PG 대상에 쓰면 조용히 오작동하므로 명확히 거부한다.
+    if crate::engine::DbKind::from_uri(target_uri.expose()) == crate::engine::DbKind::Postgres {
+        return Err(XBackupError::Usage(
+            "PostgreSQL은 시점 복구(--at, PITR)를 지원하지 않습니다 — PITR은 oplog 기반(Mongo 전용)이며 \
+             PG는 WAL 아카이빙이 필요합니다(로드맵). 풀 백업 복구는 --at 없이 사용하세요."
+                .into(),
+        ));
+    }
+
     let request = PitrRequest {
         target_uri,
         mongorestore_program: "mongorestore".to_string(),

@@ -659,40 +659,76 @@ impl LiveSnapshot {
     }
 }
 
+/// 모니터가 들고 있는 라이브 연결(DB 종류별) — 끊기면 None으로 두고 다음 틱에 재연결.
+enum LiveConn {
+    Mongo(Option<MongoMeta>),
+    Postgres(Option<crate::engine::postgres::conn::PgClient>),
+}
+
 /// 프로파일별 라이브 모니터 — 드라이버 클라이언트를 재사용하고, 끊기면 다음 틱에 재연결한다.
 struct Monitor {
     profile: String,
     uri: Secret,
     timeout_secs: Option<u64>,
-    meta: Option<MongoMeta>,
+    conn: LiveConn,
 }
 
 impl Monitor {
-    /// 한 틱 폴 — 문서 수·데이터 크기를 가볍게(estimatedDocumentCount·dbStats) 조회한다.
-    /// 조회 실패면 연결을 버리고(다음 틱 재연결) disconnected 스냅샷을 돌려준다.
+    /// 한 틱 폴 — 문서/행 수·데이터 크기를 가볍게(estimated) 조회한다. 조회 실패면 연결을
+    /// 버리고(다음 틱 재연결) disconnected 스냅샷을 돌려준다. Mongo·PG 공통 인터페이스.
     async fn poll(&mut self) -> LiveSnapshot {
-        if self.meta.is_none() {
-            self.meta = MongoMeta::connect(&self.uri, self.timeout_secs).await.ok();
-        }
-        let meta = match &self.meta {
-            Some(m) => m,
-            None => return LiveSnapshot::disconnected(&self.profile),
-        };
-        let namespaces = match meta.namespace_counts().await {
-            Ok(n) => n,
-            Err(_) => {
-                self.meta = None;
-                return LiveSnapshot::disconnected(&self.profile);
+        match &mut self.conn {
+            LiveConn::Mongo(meta) => {
+                if meta.is_none() {
+                    *meta = MongoMeta::connect(&self.uri, self.timeout_secs).await.ok();
+                }
+                let m = match meta {
+                    Some(m) => m,
+                    None => return LiveSnapshot::disconnected(&self.profile),
+                };
+                let namespaces = match m.namespace_counts().await {
+                    Ok(n) => n,
+                    Err(_) => {
+                        *meta = None;
+                        return LiveSnapshot::disconnected(&self.profile);
+                    }
+                };
+                let data_size = m.data_size_bytes().await.unwrap_or(0);
+                let total_docs = namespaces.iter().map(|(_, c)| c).sum();
+                LiveSnapshot {
+                    profile: self.profile.clone(),
+                    connected: true,
+                    namespaces,
+                    total_docs,
+                    data_size,
+                }
             }
-        };
-        let data_size = meta.data_size_bytes().await.unwrap_or(0);
-        let total_docs = namespaces.iter().map(|(_, c)| c).sum();
-        LiveSnapshot {
-            profile: self.profile.clone(),
-            connected: true,
-            namespaces,
-            total_docs,
-            data_size,
+            LiveConn::Postgres(pg) => {
+                use crate::engine::postgres::{conn::PgClient, meta};
+                if pg.is_none() {
+                    *pg = PgClient::connect(&self.uri, self.timeout_secs).await.ok();
+                }
+                let c = match pg {
+                    Some(c) => c,
+                    None => return LiveSnapshot::disconnected(&self.profile),
+                };
+                let namespaces = match meta::table_counts_estimated(c.client()).await {
+                    Ok(n) => n,
+                    Err(_) => {
+                        *pg = None;
+                        return LiveSnapshot::disconnected(&self.profile);
+                    }
+                };
+                let data_size = meta::data_size_bytes(c.client()).await.unwrap_or(0);
+                let total_docs = namespaces.iter().map(|(_, c)| c).sum();
+                LiveSnapshot {
+                    profile: self.profile.clone(),
+                    connected: true,
+                    namespaces,
+                    total_docs,
+                    data_size,
+                }
+            }
         }
     }
 }
@@ -713,11 +749,15 @@ fn build_monitors(config_toml: Option<&str>, profiles: &[String]) -> Result<Vec<
                 resolved.profile_name
             ))
         })?;
+        let conn = match crate::engine::DbKind::from_uri(uri.expose()) {
+            crate::engine::DbKind::Postgres => LiveConn::Postgres(None),
+            crate::engine::DbKind::Mongo => LiveConn::Mongo(None),
+        };
         monitors.push(Monitor {
             profile: resolved.profile_name.clone(),
             uri,
             timeout_secs: resolved.profile.source.connect_timeout_secs,
-            meta: None,
+            conn,
         });
     }
     Ok(monitors)

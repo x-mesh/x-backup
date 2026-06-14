@@ -37,12 +37,78 @@ pub async fn handle(config_path: Option<PathBuf>, args: PeekArgs) -> Result<()> 
         ))
     })?;
 
-    let mongo = MongoMeta::connect(&uri, resolved.profile.source.connect_timeout_secs).await?;
+    let timeout = resolved.profile.source.connect_timeout_secs;
+
+    // DB 종류 분기 — postgres URI면 PG peek(테이블 행 수 + 최신 행), 그 외는 Mongo.
+    if crate::engine::DbKind::from_uri(uri.expose()) == crate::engine::DbKind::Postgres {
+        return peek_pg(&uri, timeout, &args).await;
+    }
+
+    let mongo = MongoMeta::connect(&uri, timeout).await?;
 
     match &args.ns {
         Some(ns) => peek_namespace(&mongo, ns, args.limit, args.json).await,
         None => peek_overview(&mongo, args.json).await,
     }
+}
+
+/// PostgreSQL peek — `--ns` 없으면 테이블별 행 수 + 최신 1행, 있으면 그 테이블 최신 N행.
+async fn peek_pg(
+    uri: &crate::config::secret::Secret,
+    timeout: Option<u64>,
+    args: &PeekArgs,
+) -> Result<()> {
+    use crate::engine::postgres::meta;
+    let pg = meta::connect(uri, timeout).await?;
+    let client = pg.client();
+
+    if let Some(ns) = &args.ns {
+        let rows = meta::latest_rows(client, ns, args.limit.max(1)).await?;
+        if args.json {
+            // 각 행은 이미 JSON 텍스트 — 배열로 합쳐 그대로 출력.
+            println!(
+                "{}",
+                serde_json::json!({ "ns": ns, "rows": rows.iter().map(|r| serde_json::from_str::<serde_json::Value>(r).unwrap_or(serde_json::Value::Null)).collect::<Vec<_>>() })
+            );
+            return Ok(());
+        }
+        println!("{ns} — 최신 {}행", rows.len());
+        if rows.is_empty() {
+            println!("  (비어 있음)");
+        }
+        for r in &rows {
+            println!("  {}", truncate(r));
+        }
+        return Ok(());
+    }
+
+    let counts = meta::table_counts_exact(client).await?;
+    if args.json {
+        let mut items = Vec::new();
+        for (ns, count) in &counts {
+            let latest = meta::latest_rows(client, ns, 1).await?.into_iter().next();
+            items.push(serde_json::json!({
+                "ns": ns,
+                "count": count,
+                "latest": latest.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+            }));
+        }
+        println!("{}", serde_json::json!({ "namespaces": items }));
+        return Ok(());
+    }
+    if counts.is_empty() {
+        println!("(사용자 데이터 없음 — 비어 있는 데이터베이스)");
+        return Ok(());
+    }
+    for (ns, count) in &counts {
+        let latest = meta::latest_rows(client, ns, 1).await?.into_iter().next();
+        let preview = match latest {
+            Some(s) => truncate(&s),
+            None => "(비어 있음)".to_string(),
+        };
+        println!("  {ns:<28} count={count:<8} latest: {preview}");
+    }
+    Ok(())
 }
 
 /// `--ns` 미지정 — 컬렉션별 문서 수 + 각 최신 1건.
