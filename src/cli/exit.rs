@@ -59,6 +59,9 @@ mod tests {
             profile: Some("prod".into()),
             all: false,
             json: false,
+            watch: false,
+            interval: 1.0,
+            count: 0,
         })))
         .await;
         // uri_env가 없는 프로파일 → Config(exit 2). 더 이상 미구현 스텁(exit 1)이 아니다.

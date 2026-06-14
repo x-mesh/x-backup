@@ -6,16 +6,21 @@
 //!
 //! 무부작용·읽기 전용이다 — 어떤 쓰기/변경도 하지 않는다(PRD §FR-8 동작 요건).
 
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::cli::args::StatusArgs;
 use crate::cli::table::{
-    display_width, pad, paint, use_color, BOLD, CYAN, RED, RESET, UNDERLINE, YELLOW,
+    display_width, pad, pad_left, paint, use_color, Align, BOLD, CYAN, DIM, GREEN, RED, RESET,
+    UNDERLINE, YELLOW,
 };
 use crate::config::env::collect_overrides_from_process;
 use crate::config::merged::MergeInput;
+use crate::config::secret::Secret;
 use crate::config::ResolvedConfig;
-use crate::engine::mongo::status::{CheckStatus, StatusChecker, StatusReport};
+use crate::engine::mongo::status::{human_bytes, CheckStatus, StatusChecker, StatusReport};
+use crate::engine::mongo::MongoMeta;
 use crate::error::{Result, XBackupError};
 
 /// backup 자동 사전 점검에서 쓰는 mongodump 실행파일 이름(backup 핸들러와 동일 기본값).
@@ -30,6 +35,11 @@ pub async fn handle(config_path: Option<PathBuf>, args: StatusArgs) -> Result<()
         })?),
         None => None,
     };
+
+    // 라이브 모드 — 주기 갱신하며 변경량(Δ)을 추적한다(단일/--all 모두 지원).
+    if args.watch {
+        return handle_watch(config_toml.as_deref(), &args).await;
+    }
 
     if args.all {
         return handle_all(config_toml.as_deref(), args.json).await;
@@ -409,6 +419,426 @@ fn overall_label(status: CheckStatus) -> &'static str {
     }
 }
 
+// ───────────────────────── status --watch (라이브 모니터) ─────────────────────────
+
+/// 한 프로파일의 라이브 스냅샷 — 틱마다 갱신되는 가벼운 메트릭(문서 수·데이터 크기).
+struct LiveSnapshot {
+    profile: String,
+    connected: bool,
+    /// 네임스페이스별 추정 문서 수(정렬).
+    namespaces: Vec<(String, u64)>,
+    /// 전체 문서 수(namespaces 합).
+    total_docs: u64,
+    /// 사용자 DB dataSize 합(바이트).
+    data_size: u64,
+}
+
+impl LiveSnapshot {
+    fn disconnected(profile: &str) -> Self {
+        Self {
+            profile: profile.to_string(),
+            connected: false,
+            namespaces: Vec::new(),
+            total_docs: 0,
+            data_size: 0,
+        }
+    }
+}
+
+/// 프로파일별 라이브 모니터 — 드라이버 클라이언트를 재사용하고, 끊기면 다음 틱에 재연결한다.
+struct Monitor {
+    profile: String,
+    uri: Secret,
+    timeout_secs: Option<u64>,
+    meta: Option<MongoMeta>,
+}
+
+impl Monitor {
+    /// 한 틱 폴 — 문서 수·데이터 크기를 가볍게(estimatedDocumentCount·dbStats) 조회한다.
+    /// 조회 실패면 연결을 버리고(다음 틱 재연결) disconnected 스냅샷을 돌려준다.
+    async fn poll(&mut self) -> LiveSnapshot {
+        if self.meta.is_none() {
+            self.meta = MongoMeta::connect(&self.uri, self.timeout_secs).await.ok();
+        }
+        let meta = match &self.meta {
+            Some(m) => m,
+            None => return LiveSnapshot::disconnected(&self.profile),
+        };
+        let namespaces = match meta.namespace_counts().await {
+            Ok(n) => n,
+            Err(_) => {
+                self.meta = None;
+                return LiveSnapshot::disconnected(&self.profile);
+            }
+        };
+        let data_size = meta.data_size_bytes().await.unwrap_or(0);
+        let total_docs = namespaces.iter().map(|(_, c)| c).sum();
+        LiveSnapshot {
+            profile: self.profile.clone(),
+            connected: true,
+            namespaces,
+            total_docs,
+            data_size,
+        }
+    }
+}
+
+/// 프로파일 목록의 모니터를 만든다(URI 해석 — config 오류는 루프 진입 전에 실패시킨다).
+fn build_monitors(config_toml: Option<&str>, profiles: &[String]) -> Result<Vec<Monitor>> {
+    let overrides = collect_overrides_from_process();
+    let mut monitors = Vec::with_capacity(profiles.len());
+    for p in profiles {
+        let resolved = ResolvedConfig::build(MergeInput {
+            config_toml,
+            profile_name: p,
+            overrides: &overrides,
+        })?;
+        let uri = resolved.resolved_uri.clone().ok_or_else(|| {
+            XBackupError::Config(format!(
+                "프로파일 '{}'에 source.uri/uri_env가 없습니다",
+                resolved.profile_name
+            ))
+        })?;
+        monitors.push(Monitor {
+            profile: resolved.profile_name.clone(),
+            uri,
+            timeout_secs: resolved.profile.source.connect_timeout_secs,
+            meta: None,
+        });
+    }
+    Ok(monitors)
+}
+
+/// 라이브 모드 진입 — 주기 갱신하며 변경량(Δ)을 추적한다. Ctrl-C 또는 `--count` 도달 시 종료(exit 0).
+async fn handle_watch(config_toml: Option<&str>, args: &StatusArgs) -> Result<()> {
+    if args.json {
+        return Err(XBackupError::Usage(
+            "--watch는 --json과 함께 쓸 수 없습니다(라이브 표시 전용)".into(),
+        ));
+    }
+    // 대상 프로파일 — --all이면 config의 모든 프로파일, 아니면 단일.
+    let profiles: Vec<String> = if args.all {
+        let raw = config_toml
+            .ok_or_else(|| XBackupError::Usage("--all에는 config 파일이 필요합니다".into()))?;
+        let config = crate::config::file::Config::from_toml_str(raw)?;
+        let mut names: Vec<String> = config.profiles.keys().cloned().collect();
+        names.sort();
+        if names.is_empty() {
+            return Err(XBackupError::Usage(
+                "config에 프로파일이 없습니다([profiles.<name>])".into(),
+            ));
+        }
+        names
+    } else {
+        let p = args
+            .profile
+            .clone()
+            .ok_or_else(|| XBackupError::Usage("--profile 또는 --all이 필요합니다".into()))?;
+        vec![p]
+    };
+
+    let interval = Duration::from_secs_f64(args.interval.max(0.2));
+    let color = use_color();
+    let tty = std::io::stdout().is_terminal();
+    let mut monitors = build_monitors(config_toml, &profiles)?;
+
+    if tty {
+        print!("\x1b[?25l"); // 커서 숨김.
+        let _ = std::io::stdout().flush();
+    }
+
+    let mut prev: std::collections::HashMap<String, LiveSnapshot> =
+        std::collections::HashMap::new();
+    let mut tick: u64 = 0;
+    loop {
+        tick += 1;
+        let mut snaps = Vec::with_capacity(monitors.len());
+        for m in &mut monitors {
+            snaps.push(m.poll().await);
+        }
+
+        let frame = render_watch_frame(&snaps, &prev, args.all, tick, args.interval, color);
+        if tty {
+            // 화면 지우고 홈으로 — watch처럼 제자리 갱신.
+            print!("\x1b[2J\x1b[H{frame}");
+        } else {
+            println!("{frame}");
+        }
+        let _ = std::io::stdout().flush();
+
+        prev = snaps.into_iter().map(|s| (s.profile.clone(), s)).collect();
+
+        if args.count != 0 && tick >= args.count {
+            break;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::signal::ctrl_c() => { break; }
+        }
+    }
+
+    if tty {
+        println!("\x1b[?25h"); // 커서 복원 + 줄바꿈.
+        let _ = std::io::stdout().flush();
+    }
+    Ok(())
+}
+
+/// 문서 수 변화량 셀 텍스트와 색 — 첫 틱(기준 없음)은 `—`(흐림).
+fn delta_docs(cur: u64, prev: Option<u64>) -> (String, &'static str) {
+    match prev {
+        None => ("—".to_string(), DIM),
+        Some(p) => {
+            let d = cur as i64 - p as i64;
+            if d > 0 {
+                (format!("+{d}"), GREEN)
+            } else if d < 0 {
+                (d.to_string(), RED)
+            } else {
+                ("0".to_string(), DIM)
+            }
+        }
+    }
+}
+
+/// 바이트 변화량 셀 텍스트와 색 — 첫 틱은 `—`(흐림).
+fn delta_bytes(cur: u64, prev: Option<u64>) -> (String, &'static str) {
+    match prev {
+        None => ("—".to_string(), DIM),
+        Some(p) => {
+            let d = cur as i64 - p as i64;
+            if d > 0 {
+                (format!("+{}", human_bytes(d)), GREEN)
+            } else if d < 0 {
+                (format!("-{}", human_bytes(-d)), RED)
+            } else {
+                ("0".to_string(), DIM)
+            }
+        }
+    }
+}
+
+/// 폭 정렬 + 색을 입힌 셀(빈 코드면 무채색).
+fn wcell(text: &str, width: usize, align: Align, code: &str, color: bool) -> String {
+    let padded = match align {
+        Align::Left => pad(text, width),
+        Align::Right => pad_left(text, width),
+    };
+    if code.is_empty() {
+        padded
+    } else {
+        paint(&padded, &[code], color)
+    }
+}
+
+/// 한 틱의 화면 프레임을 만든다(단일/--all 분기).
+fn render_watch_frame(
+    snaps: &[LiveSnapshot],
+    prev: &std::collections::HashMap<String, LiveSnapshot>,
+    all: bool,
+    tick: u64,
+    interval: f64,
+    color: bool,
+) -> String {
+    let now = chrono::Local::now().format("%H:%M:%S");
+    let scope = if all {
+        "--all".to_string()
+    } else {
+        snaps.first().map(|s| s.profile.clone()).unwrap_or_default()
+    };
+    let header =
+        format!("status --watch {scope} · 매 {interval}s · {now} · #{tick}    (Ctrl-C 종료)");
+    if all {
+        render_watch_all(snaps, prev, &header, color)
+    } else if let Some(s) = snaps.first() {
+        render_watch_single(s, prev.get(&s.profile), &header, color)
+    } else {
+        header
+    }
+}
+
+/// 단일 프로파일 라이브 — 네임스페이스별 문서 수 + Δ, 하단에 합계·데이터·연결.
+fn render_watch_single(
+    s: &LiveSnapshot,
+    prev: Option<&LiveSnapshot>,
+    header: &str,
+    color: bool,
+) -> String {
+    use std::collections::HashMap;
+    let mut out = String::new();
+    out.push_str(header);
+    out.push('\n');
+
+    if !s.connected {
+        out.push_str(&paint("  ● 연결 끊김 — 재연결 시도 중", &[RED], color));
+        return out;
+    }
+
+    let prev_ns: HashMap<&str, u64> = prev
+        .map(|p| p.namespaces.iter().map(|(n, c)| (n.as_str(), *c)).collect())
+        .unwrap_or_default();
+
+    // 행: (ns, 문서 수 문자열, Δ 문자열, Δ 색).
+    let mut rows: Vec<(String, String, String, &'static str)> = Vec::new();
+    for (ns, c) in &s.namespaces {
+        let prevc = prev.map(|_| prev_ns.get(ns.as_str()).copied().unwrap_or(0));
+        let (d, code) = delta_docs(*c, prevc);
+        rows.push((ns.clone(), c.to_string(), d, code));
+    }
+
+    let w_ns = rows
+        .iter()
+        .map(|r| display_width(&r.0))
+        .chain(std::iter::once(display_width("네임스페이스")))
+        .max()
+        .unwrap_or(12);
+    let w_cnt = rows
+        .iter()
+        .map(|r| display_width(&r.1))
+        .chain(std::iter::once(display_width("문서")))
+        .max()
+        .unwrap_or(4);
+    let w_dlt = rows
+        .iter()
+        .map(|r| display_width(&r.2))
+        .chain(std::iter::once(1))
+        .max()
+        .unwrap_or(4)
+        .max(4);
+
+    let rule = "─".repeat((2 + w_ns + 2 + w_cnt + 2 + w_dlt).min(100));
+    out.push_str(&rule);
+    out.push('\n');
+    out.push_str(&format!(
+        "  {}  {}  {}\n",
+        pad("네임스페이스", w_ns),
+        pad_left("문서", w_cnt),
+        pad_left("Δ", w_dlt)
+    ));
+    if rows.is_empty() {
+        out.push_str("  (사용자 데이터 없음)\n");
+    }
+    for (ns, cnt, dlt, code) in &rows {
+        out.push_str(&format!(
+            "  {}  {}  {}\n",
+            pad(ns, w_ns),
+            pad_left(cnt, w_cnt),
+            wcell(dlt, w_dlt, Align::Right, code, color),
+        ));
+    }
+    out.push_str(&rule);
+    out.push('\n');
+
+    // 하단 요약 — 합계 문서/데이터/연결, 각각 Δ.
+    let (td, tdc) = delta_docs(s.total_docs, prev.map(|p| p.total_docs));
+    let (sz, szc) = delta_bytes(s.data_size, prev.map(|p| p.data_size));
+    out.push_str(&format!(
+        "  합계 문서: {} ({})    데이터: {} ({})    연결: {}",
+        s.total_docs,
+        paint(&td, &[tdc], color),
+        human_bytes(s.data_size as i64),
+        paint(&sz, &[szc], color),
+        paint("OK", &[GREEN], color),
+    ));
+    out
+}
+
+/// --all 라이브 — 프로파일별 한 행(연결·문서·Δ·데이터·Δ)으로 모든 자원을 동시에 추적.
+fn render_watch_all(
+    snaps: &[LiveSnapshot],
+    prev: &std::collections::HashMap<String, LiveSnapshot>,
+    header: &str,
+    color: bool,
+) -> String {
+    let mut out = String::new();
+    out.push_str(header);
+    out.push('\n');
+
+    // 행: (profile, 연결, 연결색, 문서, Δ문서, Δ색, 데이터, Δ데이터, Δ색).
+    struct Row {
+        profile: String,
+        conn: &'static str,
+        conn_code: &'static str,
+        docs: String,
+        ddocs: String,
+        ddocs_code: &'static str,
+        size: String,
+        dsize: String,
+        dsize_code: &'static str,
+    }
+    let mut rows: Vec<Row> = Vec::with_capacity(snaps.len());
+    for s in snaps {
+        let p = prev.get(&s.profile);
+        if !s.connected {
+            rows.push(Row {
+                profile: s.profile.clone(),
+                conn: "끊김",
+                conn_code: RED,
+                docs: "—".into(),
+                ddocs: "—".into(),
+                ddocs_code: DIM,
+                size: "—".into(),
+                dsize: "—".into(),
+                dsize_code: DIM,
+            });
+            continue;
+        }
+        let (dd, ddc) = delta_docs(s.total_docs, p.map(|x| x.total_docs));
+        let (ds, dsc) = delta_bytes(s.data_size, p.map(|x| x.data_size));
+        rows.push(Row {
+            profile: s.profile.clone(),
+            conn: "OK",
+            conn_code: GREEN,
+            docs: s.total_docs.to_string(),
+            ddocs: dd,
+            ddocs_code: ddc,
+            size: human_bytes(s.data_size as i64),
+            dsize: ds,
+            dsize_code: dsc,
+        });
+    }
+
+    let w = |sel: &dyn Fn(&Row) -> &str, head: &str| -> usize {
+        rows.iter()
+            .map(|r| display_width(sel(r)))
+            .chain(std::iter::once(display_width(head)))
+            .max()
+            .unwrap_or(display_width(head))
+    };
+    let w_p = w(&|r| &r.profile, "profile").max(6);
+    let w_c = w(&|r| r.conn, "연결").max(4);
+    let w_d = w(&|r| &r.docs, "문서").max(4);
+    let w_dd = w(&|r| &r.ddocs, "Δ").max(4);
+    let w_s = w(&|r| &r.size, "데이터").max(6);
+    let w_ds = w(&|r| &r.dsize, "Δ").max(6);
+
+    let rule = "─".repeat((2 + w_p + 2 + w_c + 2 + w_d + 2 + w_dd + 2 + w_s + 2 + w_ds).min(110));
+    out.push_str(&rule);
+    out.push('\n');
+    out.push_str(&format!(
+        "  {}  {}  {}  {}  {}  {}\n",
+        pad("profile", w_p),
+        pad("연결", w_c),
+        pad_left("문서", w_d),
+        pad_left("Δ", w_dd),
+        pad_left("데이터", w_s),
+        pad_left("Δ", w_ds),
+    ));
+    for r in &rows {
+        out.push_str(&format!(
+            "  {}  {}  {}  {}  {}  {}\n",
+            pad(&r.profile, w_p),
+            wcell(r.conn, w_c, Align::Left, r.conn_code, color),
+            pad_left(&r.docs, w_d),
+            wcell(&r.ddocs, w_dd, Align::Right, r.ddocs_code, color),
+            pad_left(&r.size, w_s),
+            wcell(&r.dsize, w_ds, Align::Right, r.dsize_code, color),
+        ));
+    }
+    out.push_str(&rule);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,5 +912,25 @@ mod tests {
         let s = fmt_cell("wiredTiger", CheckStatus::Ok, false, 12, false);
         assert!(!s.contains('*'));
         assert!(!s.contains('\x1b'));
+    }
+
+    #[test]
+    fn delta_docs_signs_and_baseline() {
+        // 첫 틱(기준 없음)은 — (흐림).
+        assert_eq!(delta_docs(10, None), ("—".to_string(), DIM));
+        // 증가/감소/동일.
+        assert_eq!(delta_docs(15, Some(10)), ("+5".to_string(), GREEN));
+        assert_eq!(delta_docs(7, Some(10)), ("-3".to_string(), RED));
+        assert_eq!(delta_docs(10, Some(10)), ("0".to_string(), DIM));
+    }
+
+    #[test]
+    fn delta_bytes_signs_and_baseline() {
+        assert_eq!(delta_bytes(2048, None), ("—".to_string(), DIM));
+        let (txt, code) = delta_bytes(2048, Some(1024));
+        assert!(txt.starts_with('+') && code == GREEN);
+        let (txt, code) = delta_bytes(1024, Some(2048));
+        assert!(txt.starts_with('-') && code == RED);
+        assert_eq!(delta_bytes(1024, Some(1024)), ("0".to_string(), DIM));
     }
 }

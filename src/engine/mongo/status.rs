@@ -914,7 +914,7 @@ fn read_num(doc: &Document, key: &str) -> i64 {
 }
 
 /// 바이트 수를 사람이 읽는 단위로 근사 표기한다(표시 전용).
-fn human_bytes(bytes: i64) -> String {
+pub fn human_bytes(bytes: i64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
     let mut unit = 0;

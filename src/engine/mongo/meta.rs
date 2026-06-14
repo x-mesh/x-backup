@@ -164,6 +164,41 @@ impl MongoMeta {
         Ok(out)
     }
 
+    /// 사용자 DB의 논리 데이터 크기(`dataSize`) 합계 바이트 — 라이브 모니터(watch) 크기 추적용.
+    ///
+    /// `dbStats`(서버 캐시 통계)로 전수 스캔 없이 빠르게 합산한다. 시스템 DB는 제외하고,
+    /// 통계 조회 실패한 DB는 0으로 건너뛴다(라이브 갱신을 끊지 않도록).
+    pub async fn data_size_bytes(&self) -> Result<u64> {
+        const SYSTEM_DBS: [&str; 3] = ["admin", "config", "local"];
+        let db_names = self
+            .client
+            .list_database_names()
+            .await
+            .map_err(|e| XBackupError::Failure(format!("데이터베이스 목록 조회 실패: {e}")))?;
+        let mut total: i64 = 0;
+        for name in db_names {
+            if SYSTEM_DBS.contains(&name.as_str()) {
+                continue;
+            }
+            if let Ok(stats) = self
+                .client
+                .database(&name)
+                .run_command(doc! { "dbStats": 1 })
+                .await
+            {
+                // dataSize는 서버/스케일에 따라 double·int 어느 쪽으로도 온다.
+                let v = stats
+                    .get_f64("dataSize")
+                    .map(|f| f as i64)
+                    .or_else(|_| stats.get_i64("dataSize"))
+                    .or_else(|_| stats.get_i32("dataSize").map(|i| i as i64))
+                    .unwrap_or(0);
+                total += v;
+            }
+        }
+        Ok(total.max(0) as u64)
+    }
+
     /// 한 네임스페이스의 최신 문서 N건을 반환한다(`_id` 내림차순). 데이터 육안 확인용(peek).
     ///
     /// `_id` 역순 정렬로 "가장 최근에 들어온" 문서를 본다(ObjectId·증가 정수 _id 기준).

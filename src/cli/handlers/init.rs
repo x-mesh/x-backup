@@ -55,6 +55,9 @@ pub async fn handle(config_path: Option<PathBuf>, args: InitArgs) -> Result<()> 
                 profile: Some(profile_name),
                 all: false,
                 json: false,
+                watch: false,
+                interval: 1.0,
+                count: 0,
             };
             return crate::cli::handlers::status::handle(Some(target), status_args).await;
         }

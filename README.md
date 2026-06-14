@@ -76,6 +76,7 @@ While the repository is private, this needs `GITHUB_TOKEN` (or a prior `gh auth 
 x-backup init                                   # interactive wizard → config.toml
 x-backup status  --profile prod                 # is the server ready to back up?
 x-backup status  --all                          # side-by-side diff of every profile (source vs target)
+x-backup status  --profile prod --watch         # live monitor: per-namespace doc/size deltas (Ctrl-C)
 x-backup peek    --profile prod                 # eyeball data: per-collection counts + latest doc
 x-backup backup  --profile prod                 # full backup → compress → encrypt → store
 x-backup backup  --profile prod --type incr     # oplog increment
@@ -215,6 +216,21 @@ backup is recorded in the manifest (`tool_versions.archive_format`), and `restor
 automatically — a `native` archive is restored through the driver, a mongodump archive
 through `mongorestore`. You can restore an old mongodump backup even after switching the
 profile to `native`.
+
+### Live monitor (`status --watch`)
+
+`status --watch` turns the read-only check into a live dashboard, refreshing on an interval
+(default 1s, `--interval <secs>`) and showing the **change since the last tick** (Δ) — green
+for growth, red for shrink. It re-uses the driver connection between ticks and queries only
+cheap metadata (`estimatedDocumentCount`, `dbStats`), so it's light on the server.
+
+```bash
+x-backup status --profile prod --watch                 # per-namespace doc counts + Δ, total size + Δ
+x-backup status --all --watch --interval 2             # one row per profile, refreshed every 2s
+x-backup status --profile prod --watch --count 5       # take 5 samples then exit (scripts/CI)
+```
+
+Pair it with `scripts/xb churn` to watch increments land in real time. `Ctrl-C` exits cleanly.
 
 ### Exit codes
 

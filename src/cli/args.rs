@@ -261,6 +261,15 @@ pub struct StatusArgs {
     /// 결과를 JSON으로 출력한다.
     #[arg(long)]
     pub json: bool,
+    /// 라이브 모드 — 주기적으로 갱신하며 변경량(Δ)을 추적한다(Ctrl-C 종료).
+    #[arg(long)]
+    pub watch: bool,
+    /// watch 갱신 주기(초). 기본 1.0.
+    #[arg(long, value_name = "SECS", default_value_t = 1.0, requires = "watch")]
+    pub interval: f64,
+    /// watch를 N회 갱신 후 종료(0=무한, 기본 0). 스크립트·테스트용.
+    #[arg(long, value_name = "N", default_value_t = 0, requires = "watch")]
+    pub count: u64,
 }
 
 /// `peek` — 데이터 육안 확인(읽기 전용). 컬렉션별 문서 수 + 최신 문서.

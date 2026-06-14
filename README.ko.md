@@ -80,7 +80,8 @@ private 단계에서는 `GITHUB_TOKEN`(또는 `gh auth login`)이 필요하다.
 ```bash
 x-backup init                                   # 대화형 마법사 → config.toml
 x-backup status  --profile prod                 # 백업 가능 상태 점검(신호등)
-x-backup status  --all                          # 모든 프로파일 한 번에 점검
+x-backup status  --all                          # 모든 프로파일 비교(source vs target)
+x-backup status  --profile prod --watch         # 라이브 모니터: 네임스페이스별 문서/크기 Δ (Ctrl-C)
 x-backup peek    --profile prod                 # 데이터 육안 확인: 컬렉션별 문서 수 + 최신 문서
 x-backup backup  --profile prod                 # 풀 백업 → 압축 → 암호화 → 저장
 x-backup backup  --profile prod --type incr     # oplog 증분
@@ -215,6 +216,21 @@ engine = "native"     # native(기본) | mongodump
 기록되고, `restore`가 자동으로 분기한다 — `native` 아카이브는 드라이버로, mongodump
 아카이브는 `mongorestore`로 복구한다. 프로파일을 `native`로 바꾼 뒤에도 예전 mongodump
 백업을 복구할 수 있다.
+
+### 라이브 모니터 (`status --watch`)
+
+`status --watch`는 읽기 전용 점검을 라이브 대시보드로 바꾼다. 주기(기본 1초,
+`--interval <초>`)마다 갱신하며 **직전 틱 대비 변화량(Δ)** 을 보여준다(증가=초록, 감소=빨강).
+틱 사이에 드라이버 연결을 재사용하고 가벼운 메타데이터(`estimatedDocumentCount`·`dbStats`)만
+질의하므로 서버 부하가 작다.
+
+```bash
+x-backup status --profile prod --watch                 # 네임스페이스별 문서 수 + Δ, 총 크기 + Δ
+x-backup status --all --watch --interval 2             # 프로파일별 한 행, 2초마다 갱신
+x-backup status --profile prod --watch --count 5       # 5회 샘플 후 종료(스크립트/CI)
+```
+
+`scripts/xb churn`과 함께 쓰면 증분이 실시간으로 쌓이는 걸 볼 수 있다. `Ctrl-C`로 종료.
 
 ### Exit codes
 
