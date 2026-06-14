@@ -14,7 +14,9 @@
 use std::path::PathBuf;
 
 use crate::cli::args::ListArgs;
+use crate::cli::table::{paint, use_color, Align, Table, BOLD, RED, YELLOW};
 use crate::config::env::collect_overrides_from_process;
+use crate::engine::mongo::status::human_bytes;
 use crate::config::merged::MergeInput;
 use crate::config::ResolvedConfig;
 use crate::error::{Result, XBackupError};
@@ -220,20 +222,40 @@ fn print_human(rows: &[CatalogRow]) {
         println!("백업이 없습니다.");
         return;
     }
-    println!(
-        "{:<38} {:<7} {:<25} {:>12} {:<10} BASE",
-        "ID", "TYPE", "CREATED", "SIZE", "CHAIN"
+    let color = use_color();
+    let mut table = Table::new(
+        &["ID", "TYPE", "CREATED", "SIZE", "CHAIN", "BASE"],
+        // SIZE는 우측 정렬(숫자), 나머지는 좌측.
+        &[
+            Align::Left,
+            Align::Left,
+            Align::Left,
+            Align::Right,
+            Align::Left,
+            Align::Left,
+        ],
     );
     for r in rows {
-        println!(
-            "{:<38} {:<7} {:<25} {:>12} {:<10} {}",
-            r.id,
-            r.kind,
-            r.created_at.as_deref().unwrap_or("-"),
-            r.stored_size_bytes,
-            chain_label(&r.chain_status),
-            r.base_id.as_deref().unwrap_or("-"),
-        );
+        let cells = vec![
+            r.id.clone(),
+            r.kind.clone(),
+            short_created(r.created_at.as_deref()),
+            human_bytes(r.stored_size_bytes as i64), // raw bytes → "1.9 MiB"
+            chain_label(&r.chain_status).to_string(),
+            r.base_id.as_deref().unwrap_or("-").to_string(),
+        ];
+        // 문제 행만 색으로 강조(가시성): broken=빨강, incomplete/orphan=노랑, ok=무채색.
+        match r.chain_status.as_str() {
+            "broken" => table.row_styled(cells, vec![RED, BOLD]),
+            "incomplete" | "orphan" => table.row_styled(cells, vec![YELLOW]),
+            _ => table.row(cells),
+        }
+    }
+    // 헤더(첫 줄)는 굵게 — 나머지는 Table이 색·정렬 처리.
+    let rendered = table.render("", color);
+    match rendered.split_once('\n') {
+        Some((head, body)) if color => println!("{}\n{}", paint(head, &[BOLD], true), body),
+        _ => println!("{rendered}"),
     }
     // broken/orphan 요약 경고.
     let broken: Vec<&str> = rows
@@ -255,6 +277,16 @@ fn print_human(rows: &[CatalogRow]) {
         println!();
         println!("경고: orphan(유령 산출물) — {}", orphans.join(", "));
         println!("      manifest 없는 data 디렉터리입니다(실패한 백업 잔재 가능).");
+    }
+}
+
+/// 생성 시각을 초 단위까지로 축약한다(`2026-06-14 14:56:11`) — RFC3339의 마이크로초·TZ는
+/// 카탈로그 가독성을 떨어뜨려 생략한다(없으면 `-`).
+fn short_created(s: Option<&str>) -> String {
+    match s {
+        None => "-".to_string(),
+        // "2026-06-14T14:56:11.354264+00:00" → "2026-06-14 14:56:11"(앞 19자).
+        Some(ts) => ts.replacen('T', " ", 1).chars().take(19).collect(),
     }
 }
 
