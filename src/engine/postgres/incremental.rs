@@ -230,16 +230,30 @@ pub async fn apply<R: AsyncRead + Unpin>(
                         }
                     }
                 }
-                if let Some((sql, params)) = build_dml(&c, &cols) {
-                    let refs: Vec<&(dyn ToSql + Sync)> =
-                        params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
-                    client.execute(&sql, &refs).await.map_err(|e| {
-                        XBackupError::Failure(format!(
-                            "{}.{} 증분 적용 실패: {e}\n  SQL: {sql}",
-                            c.schema, c.table
-                        ))
-                    })?;
-                    applied += 1;
+                match build_dml(&c, &cols) {
+                    Some((sql, params)) => {
+                        let refs: Vec<&(dyn ToSql + Sync)> =
+                            params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+                        client.execute(&sql, &refs).await.map_err(|e| {
+                            XBackupError::Failure(format!(
+                                "{}.{} 증분 적용 실패: {e}\n  SQL: {sql}",
+                                c.schema, c.table
+                            ))
+                        })?;
+                        applied += 1;
+                    }
+                    // U/D인데 키가 없으면(PK/REPLICA IDENTITY 부재) 행을 식별할 수 없어 건너뛴다.
+                    // 무성 데이터 손실이 되지 않게 경고로 남긴다(테이블에 PK 또는 REPLICA
+                    // IDENTITY FULL이 필요).
+                    None if !matches!(c.op, Op::Insert) => {
+                        tracing::warn!(
+                            "{}.{} {:?} 변경을 건너뜀 — 키 없음(PK/REPLICA IDENTITY 필요)",
+                            c.schema,
+                            c.table,
+                            c.op
+                        );
+                    }
+                    None => {}
                 }
             }
             IncrFrame::End => break,
