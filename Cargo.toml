@@ -14,6 +14,10 @@ integration-tests = []
 # S3 통합 테스트 격리(환경에 docker + MinIO 필요). 기본 빌드/단위 테스트에는
 # 포함하지 않으며 `--features s3-integration`으로만 활성화한다(integration-tests 패턴 동일).
 s3-integration = []
+# PostgreSQL 통합 테스트 격리(환경에 PG wal_level=logical 필요 — make postgres-up).
+# 기본 빌드/단위 테스트에는 포함하지 않으며 `--features pg-integration`으로만 활성화한다.
+# 검증: H3(unchanged-TOAST 보존)·C2(슬롯 gap 감지)·풀→복구 라운드트립(H1 스냅샷 경로).
+pg-integration = []
 
 [[bin]]
 name = "x-backup"
