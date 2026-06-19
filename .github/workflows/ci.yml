@@ -232,6 +232,14 @@ jobs:
       - name: PostgreSQL E2E (full → incremental → PITR)
         run: make scenario-pg
 
+      # 위 시나리오가 PG 컨테이너를 띄운 상태를 재사용한다(slot·테스트 DB는 시나리오가 정리).
+      # cargo 통합 테스트로 감사 수정 회귀를 직접 검증: H3(unchanged-TOAST 보존)·C2(슬롯 gap
+      # 감지)·풀→복구 라운드트립(H1 스냅샷·H5 가드). shell 시나리오가 못 덮는 단언이다.
+      - name: PG cargo integration tests (H3 / C2 / restore round-trip)
+        run: cargo test --features pg-integration --test pg_integration -- --include-ignored --nocapture --test-threads=1
+        env:
+          XB_PG_TEST_URI: postgres://xbackup:xbackup-dev@localhost:5432/xbackup
+
       - name: Tear down PostgreSQL
         if: always()
         run: make postgres-down
