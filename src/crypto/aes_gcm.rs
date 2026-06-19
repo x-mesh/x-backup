@@ -85,14 +85,11 @@ impl AesGcmEncryptStage {
 
 impl PipelineStage for AesGcmEncryptStage {
     fn wrap(self: Box<Self>, input: BoxAsyncRead) -> BoxAsyncRead {
-        let (writer, reader) = tokio::io::duplex(DUPLEX_BUF_BYTES);
+        // 펌프 실패(encrypt_next/last 오류 등)는 PumpReader가 io::Error로 surface한다(C1).
         let key = self.key;
-        tokio::spawn(async move {
-            if let Err(e) = pump_encrypt(key, input, writer).await {
-                tracing::error!("AES-GCM 암호화 펌프 실패: {e}");
-            }
-        });
-        Box::pin(reader)
+        crate::crypto::pump_reader(DUPLEX_BUF_BYTES, move |writer| {
+            pump_encrypt(key, input, writer)
+        })
     }
 
     fn name(&self) -> &'static str {
@@ -161,14 +158,12 @@ impl AesGcmDecryptStage {
 
 impl PipelineStage for AesGcmDecryptStage {
     fn wrap(self: Box<Self>, input: BoxAsyncRead) -> BoxAsyncRead {
-        let (writer, reader) = tokio::io::duplex(DUPLEX_BUF_BYTES);
+        // 변조/자름/키 오류로 인한 펌프 실패는 PumpReader가 io::Error로 surface한다(C1) —
+        // 복구에서 잘린 평문이 다음 단계로 흘러가는 것을 막는다.
         let key = self.key;
-        tokio::spawn(async move {
-            if let Err(e) = pump_decrypt(key, input, writer).await {
-                tracing::error!("AES-GCM 복호화 펌프 실패: {e}");
-            }
-        });
-        Box::pin(reader)
+        crate::crypto::pump_reader(DUPLEX_BUF_BYTES, move |writer| {
+            pump_decrypt(key, input, writer)
+        })
     }
 
     fn name(&self) -> &'static str {
@@ -351,10 +346,9 @@ mod tests {
 
         let decrypt = Box::new(AesGcmDecryptStage::from_key(KEY));
         let result = drain_result(decrypt.wrap(reader_from(&ct))).await;
-        match result {
-            Err(_) => {}
-            Ok(out) => assert_ne!(out, payload, "변조됐는데 평문 복원됨"),
-        }
+        // C1: 변조는 GCM 태그 실패 → 펌프 Err → EOF 대신 에러로 surface돼야 한다.
+        assert!(result.is_err(), "변조 복호화 실패가 surface되지 않음(C1)");
+        let _ = payload;
     }
 
     /// 틀린 키로는 복호화에 실패한다.
@@ -369,10 +363,9 @@ mod tests {
         let wrong = [9u8; 32];
         let decrypt = Box::new(AesGcmDecryptStage::from_key(wrong));
         let result = drain_result(decrypt.wrap(reader_from(&ct))).await;
-        match result {
-            Err(_) => {}
-            Ok(out) => assert_ne!(out, payload, "틀린 키로 평문 복원됨"),
-        }
+        // C1: 틀린 키는 GCM 인증 실패 → 에러로 surface.
+        assert!(result.is_err(), "틀린 키 복호화 실패가 surface되지 않음(C1)");
+        let _ = payload;
     }
 
     /// 마지막 청크가 잘리면(truncation) 복호화가 실패해야 한다(last 플래그).
@@ -397,10 +390,9 @@ mod tests {
         let decrypt = Box::new(AesGcmDecryptStage::from_key(KEY));
         let result = drain_result(decrypt.wrap(reader_from(&truncated))).await;
         // 첫 프레임은 encrypt_next였으므로 decrypt_last로 처리되며 인증 실패.
-        match result {
-            Err(_) => {}
-            Ok(out) => assert_ne!(out, payload, "잘렸는데 평문 복원됨"),
-        }
+        // C1: 자름(truncation)은 last 플래그 불일치 → 에러로 surface돼야 한다.
+        assert!(result.is_err(), "자름 복호화 실패가 surface되지 않음(C1)");
+        let _ = payload;
     }
 
     /// 키 hex 디코드: 길이·형식 검증.

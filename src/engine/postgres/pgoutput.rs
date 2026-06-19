@@ -31,6 +31,13 @@ pub struct Change {
     pub keycols: Vec<bool>,
     /// 신규 튜플 값(Insert/Update). Delete면 빈 벡터.
     pub new_vals: Vec<Option<String>>,
+    /// `new_vals[i]`가 **unchanged-TOAST(`'u'`)** 라 써서는 안 되는 컬럼인지(H3).
+    ///
+    /// pgoutput은 UPDATE에서 변경되지 않은 out-of-line TOAST 값을 `'u'`로 보낸다 — 실제
+    /// 값을 싣지 않는다. 이를 `'n'`(SQL NULL)과 같은 `None`으로 뭉개면 UPDATE SET이 기존
+    /// 값을 NULL로 덮어써 행을 파손한다. 이 마스크가 `true`인 컬럼은 SET에서 제외해
+    /// 기존 값을 보존한다.
+    pub new_unchanged: Vec<bool>,
     /// 키/old 튜플 값(Update/Delete의 WHERE 식별). Insert면 빈 벡터.
     pub key_vals: Vec<Option<String>>,
     /// 트랜잭션 commit 시각(unix epoch 마이크로초). `--at` PITR 필터에 사용.
@@ -97,9 +104,9 @@ impl Decoder {
             b'I' => {
                 let rel_id = c.i32()?;
                 c.skip(1)?; // 'N'
-                let new_vals = c.tuple()?;
+                let (new_vals, new_unchanged) = c.tuple()?;
                 let rel = self.rel(rel_id)?;
-                Ok(Some(self.make(rel, Op::Insert, new_vals, Vec::new())))
+                Ok(Some(self.make(rel, Op::Insert, new_vals, new_unchanged, Vec::new())))
             }
             b'U' => {
                 let rel_id = c.i32()?;
@@ -107,7 +114,10 @@ impl Decoder {
                 let mut key_vals = Vec::new();
                 let tag = c.u8()?;
                 let tag = if tag == b'K' || tag == b'O' {
-                    key_vals = c.tuple()?;
+                    // old/key 튜플의 unchanged 마스크는 버린다 — WHERE 식별엔 키 컬럼(보통 PK,
+                    // 비 TOAST)만 쓰므로 영향이 없다. 신규 튜플의 'u'만 보존한다(H3).
+                    let (kv, _) = c.tuple()?;
+                    key_vals = kv;
                     c.u8()? // 'N'
                 } else {
                     tag // 이미 'N'
@@ -118,16 +128,16 @@ impl Decoder {
                         tag as char
                     )));
                 }
-                let new_vals = c.tuple()?;
+                let (new_vals, new_unchanged) = c.tuple()?;
                 let rel = self.rel(rel_id)?;
-                Ok(Some(self.make(rel, Op::Update, new_vals, key_vals)))
+                Ok(Some(self.make(rel, Op::Update, new_vals, new_unchanged, key_vals)))
             }
             b'D' => {
                 let rel_id = c.i32()?;
                 c.skip(1)?; // 'K' or 'O'
-                let key_vals = c.tuple()?;
+                let (key_vals, _) = c.tuple()?;
                 let rel = self.rel(rel_id)?;
-                Ok(Some(self.make(rel, Op::Delete, Vec::new(), key_vals)))
+                Ok(Some(self.make(rel, Op::Delete, Vec::new(), Vec::new(), key_vals)))
             }
             // 기타(Type 'Y', Origin 'O', Truncate 'T', Message 'M', stream 메시지 등)는 무시.
             _ => Ok(None),
@@ -147,6 +157,7 @@ impl Decoder {
         rel: &RelMeta,
         op: Op,
         new_vals: Vec<Option<String>>,
+        new_unchanged: Vec<bool>,
         key_vals: Vec<Option<String>>,
     ) -> Change {
         Change {
@@ -156,6 +167,7 @@ impl Decoder {
             colnames: rel.cols.iter().map(|(n, _)| n.clone()).collect(),
             keycols: rel.cols.iter().map(|(_, k)| *k).collect(),
             new_vals,
+            new_unchanged,
             key_vals,
             commit_unix_micros: self.cur_commit_micros,
         }
@@ -218,18 +230,31 @@ impl<'a> Cur<'a> {
         Ok(s)
     }
     /// TupleData: Int16 ncols, 컬럼별 'n'(null)/'u'(toast 미변경)/'t'(텍스트 len+bytes).
-    fn tuple(&mut self) -> Result<Vec<Option<String>>> {
+    ///
+    /// 반환 = (값, unchanged 마스크). `'u'`는 값이 없으므로 `None`을 넣되 마스크를 `true`로
+    /// 표시해 `'n'`(SQL NULL)과 구분한다(H3 — UPDATE SET에서 제외해 기존 값 보존).
+    fn tuple(&mut self) -> Result<(Vec<Option<String>>, Vec<bool>)> {
         let n = self.i16()?;
-        let mut out = Vec::with_capacity(n.max(0) as usize);
+        let cap = n.max(0) as usize;
+        let mut out = Vec::with_capacity(cap);
+        let mut unchanged = Vec::with_capacity(cap);
         for _ in 0..n {
             match self.u8()? {
-                b'n' | b'u' => out.push(None),
+                b'n' => {
+                    out.push(None);
+                    unchanged.push(false);
+                }
+                b'u' => {
+                    out.push(None);
+                    unchanged.push(true);
+                }
                 b't' => {
                     let len = self.i32()? as usize;
                     self.need(len)?;
                     let s = String::from_utf8_lossy(&self.b[self.i..self.i + len]).into_owned();
                     self.i += len;
                     out.push(Some(s));
+                    unchanged.push(false);
                 }
                 other => {
                     return Err(XBackupError::Failure(format!(
@@ -239,7 +264,7 @@ impl<'a> Cur<'a> {
                 }
             }
         }
-        Ok(out)
+        Ok((out, unchanged))
     }
 }
 
@@ -337,5 +362,35 @@ mod tests {
     fn truncated_message_errors() {
         let mut d = Decoder::new();
         assert!(d.feed(&[b'I', 0, 0]).is_err()); // rel_id 잘림
+    }
+
+    /// H3 — UPDATE의 unchanged-TOAST('u') 컬럼은 `new_unchanged=true`로 표시되고
+    /// `'n'`(NULL)과 구분된다. 값이 바뀐 't' 컬럼만 false.
+    #[test]
+    fn decodes_update_marks_unchanged_toast_distinct_from_null() {
+        let mut d = Decoder::new();
+        d.feed(&relation(
+            9,
+            "public",
+            "docs",
+            &[("id", true), ("body", false), ("note", false)],
+        ))
+        .unwrap();
+        // UPDATE: 'N' 신규 튜플 = [ id='7'(t), body='u'(unchanged TOAST), note='n'(NULL) ].
+        let mut upd = vec![b'U'];
+        upd.extend_from_slice(&9i32.to_be_bytes());
+        upd.push(b'N');
+        upd.extend_from_slice(&3i16.to_be_bytes()); // ncols
+        upd.push(b't'); // id
+        upd.extend_from_slice(&1i32.to_be_bytes());
+        upd.push(b'7');
+        upd.push(b'u'); // body — unchanged TOAST
+        upd.push(b'n'); // note — SQL NULL
+
+        let ch = d.feed(&upd).unwrap().unwrap();
+        assert_eq!(ch.op, Op::Update);
+        assert_eq!(ch.new_vals, vec![Some("7".into()), None, None]);
+        // body는 unchanged(true), id·note는 false — NULL과 unchanged가 구분된다.
+        assert_eq!(ch.new_unchanged, vec![false, true, false]);
     }
 }

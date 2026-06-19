@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use crate::cli::args::BackupArgs;
+use crate::cli::args::{BackupArgs, BackupType};
 use crate::cli::output::{OutputFlags, OutputMode};
 use crate::cli::progress::{new_counter, ProgressKind, ProgressReporter};
 use crate::compress::{ZstdCompressStage, ALGORITHM_ZSTD};
@@ -80,6 +80,7 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
         },
         Some(resolved.profile.mode.output.as_str()),
     );
+    let backup_type = effective_backup_type(&resolved, &args)?;
 
     // 실행 컨텍스트(프로파일·DB) 표시 — 다중 DB 툴이라 무엇을 백업하는지 항상 보인다.
     let db = crate::engine::DbKind::from_uri(uri.expose());
@@ -97,6 +98,7 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
             secondaries,
             dests.len(),
             mode,
+            backup_type,
         )
         .await;
     }
@@ -107,15 +109,18 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
     //   --skip-precheck면 우회한다(읽기 전용·무부작용).
     // 엔진 결정(native | mongodump) — 사전 점검(도구 존재 여부)과 덤프 경로 양쪽이 쓴다.
     let engine = Engine::parse(&resolved.profile.mode.engine)?;
-    if !args.skip_precheck {
+    let should_precheck = resolved.profile.mode.precheck && !args.skip_precheck;
+    if should_precheck {
         run_precheck(&uri, &resolved.profile_name, timeout_secs, engine).await?;
-    } else {
+    } else if args.skip_precheck {
         tracing::warn!("--skip-precheck 지정 — 백업 사전 점검을 건너뜁니다(FR-8 우회)");
+    } else {
+        tracing::warn!("config mode.precheck=false — 백업 사전 점검을 건너뜁니다");
     }
 
     // 증분(--type incr)은 드라이버 oplog 캡처 경로로 분기한다(t8). 선택적 백업
     //   (--db/--collection)과는 병용 불가(증분은 항상 전체 oplog 슬라이스).
-    if matches!(args.backup_type, Some(crate::cli::args::BackupType::Incr)) {
+    if matches!(backup_type, BackupType::Incr) {
         if args.db.is_some() || args.collection.is_some() {
             return Err(XBackupError::Usage(
                 "증분 백업(--type incr)은 선택적 백업(--db/--collection)과 병용할 수 없습니다 \
@@ -217,12 +222,25 @@ async fn handle_pg_backup(
     secondaries: &[DestinationConfig],
     dest_count: usize,
     mode: OutputMode,
+    backup_type: BackupType,
 ) -> Result<()> {
     let enable_incremental = resolved.profile.features.incremental.pg_logical;
 
+    // FR-8 자동 사전 점검(엔진 무관, PRD §323) — mode.precheck && !--skip-precheck면 연결+읽기
+    //   권한을 점검해 차단 결함이면 exit 3로 미시작한다(스트림 도중 실패 대신 빠른 실패). 풀·증분
+    //   양 경로보다 먼저 한 번 수행한다. Mongo 경로의 run_precheck 게이팅과 동일.
+    let should_precheck = resolved.profile.mode.precheck && !args.skip_precheck;
+    if should_precheck {
+        crate::engine::postgres::status::precheck(&uri, timeout_secs).await?;
+    } else if args.skip_precheck {
+        tracing::warn!("--skip-precheck 지정 — PG 백업 사전 점검을 건너뜁니다(FR-8 우회)");
+    } else {
+        tracing::warn!("config mode.precheck=false — PG 백업 사전 점검을 건너뜁니다");
+    }
+
     // 증분(--type incr)은 logical decoding 캡처 경로로 분기한다. pg_logical 미활성이면
     //   slot이 없어 캡처 불가하므로 명확히 안내하고 거부한다(선택적 백업과도 병용 불가).
-    if matches!(args.backup_type, Some(crate::cli::args::BackupType::Incr)) {
+    if matches!(backup_type, BackupType::Incr) {
         if !enable_incremental {
             return Err(XBackupError::Usage(
                 "PG 증분(--type incr)은 features.incremental.pg_logical=true가 필요합니다 \
@@ -328,6 +346,31 @@ async fn handle_pg_incremental(
     dest_count: usize,
     mode: OutputMode,
 ) -> Result<()> {
+    use crate::engine::postgres::{conn::PgClient, incremental};
+
+    // gap 감지(FR-2): 캡처 전 replication slot 건강도를 본다. 슬롯이 없거나(Missing)
+    //   invalidated(Lost)면 증분 체인이 끊긴 것이므로 **조용히 진행하지 않고** 풀 백업으로
+    //   승격한다(exit 4). Mongo의 oplog gap → 풀 승격과 동형이다.
+    let slot = incremental::slot_name(&resolved.profile_name);
+    let health = {
+        let admin = PgClient::connect(&uri, timeout_secs).await?;
+        incremental::slot_health(admin.client(), &slot).await?
+    };
+    if health != incremental::SlotHealth::Active {
+        return promote_pg_incremental_to_full(
+            resolved,
+            args,
+            &uri,
+            timeout_secs,
+            primary,
+            secondaries,
+            dest_count,
+            mode,
+            health,
+        )
+        .await;
+    }
+
     let (stages, meta) = build_stages(resolved, args)?;
     let progress_counter = new_counter();
     let reporter = ProgressReporter::start(
@@ -383,6 +426,89 @@ async fn handle_pg_incremental(
         return Err(XBackupError::Warning(w));
     }
     Ok(())
+}
+
+/// PG 증분 슬롯이 끊겼을 때(gap) 풀 백업으로 **승격**한다(FR-2, exit 4 — 경고 동반 성공).
+///
+/// 풀 백업이 슬롯을 재생성하므로(스타 모델 base 재정렬), 이후 증분은 이 새 풀백업에 체인된다.
+/// Mongo의 oplog gap → 풀 승격과 동일한 의미·exit code다(SC2).
+#[allow(clippy::too_many_arguments)]
+async fn promote_pg_incremental_to_full(
+    resolved: &ResolvedConfig,
+    args: &BackupArgs,
+    uri: &Secret,
+    timeout_secs: Option<u64>,
+    primary: &dyn Storage,
+    secondaries: &[DestinationConfig],
+    dest_count: usize,
+    mode: OutputMode,
+    health: crate::engine::postgres::incremental::SlotHealth,
+) -> Result<()> {
+    use crate::engine::postgres::incremental::SlotHealth;
+    let reason = match health {
+        SlotHealth::Missing => "증분 슬롯이 없음(체인 끊김 — 첫 증분이거나 슬롯 유실)",
+        SlotHealth::Lost => "증분 슬롯이 invalidated됨(WAL 제거로 체인 끊김)",
+        SlotHealth::Active => "정상", // 도달 불가(호출자가 Active면 승격하지 않음).
+    };
+    tracing::warn!("PG 증분 gap 감지({reason}) — 풀 백업으로 승격합니다");
+
+    let (stages, meta) = build_stages(resolved, args)?;
+    let progress_counter = new_counter();
+    let reporter = ProgressReporter::start(
+        mode,
+        ProgressKind::Indeterminate {
+            label: "PG 풀 백업(gap 승격)".into(),
+        },
+        std::sync::Arc::clone(&progress_counter),
+    );
+    // 승격 풀 백업은 슬롯을 재생성해 base를 재정렬한다(enable_incremental=true).
+    let result = crate::pipeline::backup::run_pg_full_backup(
+        uri,
+        timeout_secs,
+        None,
+        None,
+        primary,
+        stages,
+        meta,
+        Some(progress_counter),
+        &resolved.profile_name,
+        /* enable_incremental */ true,
+    )
+    .await;
+    reporter.finish().await;
+    let outcome = result?;
+
+    let replicate_warning = replicate_and_warn(primary, secondaries, &outcome.backup_id, true).await;
+
+    if mode.emits_json() {
+        let summary = serde_json::json!({
+            "backup_type": "full",
+            "promoted_from_gap": true,
+            "backup_id": outcome.backup_id,
+            "stored_size_bytes": outcome.stored_size_bytes,
+            "checksum_sha256": outcome.checksum_sha256,
+            "database": "postgresql",
+            "destinations": dest_count,
+            "reason": reason,
+        });
+        println!("{summary}");
+    } else if mode.shows_human_summary() {
+        println!("PG 증분 → 풀 백업 승격(gap 감지)");
+        println!("  id:       {}", outcome.backup_id);
+        println!("  크기:     {} bytes", outcome.stored_size_bytes);
+        println!("  사유:     {reason}");
+    }
+
+    // exit 4(경고 동반 성공) — main이 Warning을 exit 4로 매핑한다.
+    let mut msg = format!(
+        "PG 증분이 gap으로 풀 백업({})으로 승격되었습니다: {reason}",
+        outcome.backup_id
+    );
+    if let Some(w) = replicate_warning {
+        msg.push_str(" / ");
+        msg.push_str(&w);
+    }
+    Err(XBackupError::Warning(msg))
 }
 
 /// 보조 destination들로 백업 산출물을 순차 복제하고, 실패가 있으면 경고 메시지를 만든다.
@@ -528,6 +654,20 @@ async fn handle_incremental(
             }
             Err(XBackupError::Warning(msg))
         }
+    }
+}
+
+/// CLI `--type`이 있으면 그것을, 없으면 config `mode.backup_type`을 적용한다.
+fn effective_backup_type(resolved: &ResolvedConfig, args: &BackupArgs) -> Result<BackupType> {
+    if let Some(kind) = args.backup_type {
+        return Ok(kind);
+    }
+    match resolved.profile.mode.backup_type.as_str() {
+        "full" => Ok(BackupType::Full),
+        "incr" => Ok(BackupType::Incr),
+        other => Err(XBackupError::Config(format!(
+            "알 수 없는 mode.backup_type: '{other}'(full | incr만 지원)"
+        ))),
     }
 }
 

@@ -106,7 +106,31 @@ struct TableDef {
 }
 
 /// 대상 데이터베이스 전체를 아카이브 프레임으로 직렬화해 writer에 쓴다.
+///
+/// **스냅샷 일관성(H1):** 모든 introspection + 테이블별 COPY를 **단일 REPEATABLE READ
+/// READ ONLY 트랜잭션** 안에서 수행한다. 그렇지 않으면 각 COPY/카탈로그 질의가 제각각의
+/// 암묵 트랜잭션(read committed)으로 실행돼, 테이블 A는 t0·테이블 B는 t1 시점을 보게 되어
+/// FK/교차 테이블 불변식이 깨진 "찢어진 백업"이 된다(pg_dump가 같은 방식으로 일관성을 얻는다).
 async fn write_archive(
+    client: &Client,
+    writer: &mut DuplexStream,
+    schema_filter: Option<String>,
+    table_filter: Option<String>,
+) -> Result<()> {
+    client
+        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .await
+        .map_err(|e| XBackupError::Failure(format!("스냅샷 트랜잭션 시작 실패: {e}")))?;
+    let res = write_archive_in_snapshot(client, writer, schema_filter, table_filter).await;
+    // 읽기 전용이라 부작용은 없지만, 성공은 COMMIT·실패는 ROLLBACK으로 명시적으로 닫는다.
+    let _ = client
+        .batch_execute(if res.is_ok() { "COMMIT" } else { "ROLLBACK" })
+        .await;
+    res
+}
+
+/// [`write_archive`]의 본문 — 단일 스냅샷 트랜잭션 안에서 실행된다(H1).
+async fn write_archive_in_snapshot(
     client: &Client,
     writer: &mut DuplexStream,
     schema_filter: Option<String>,

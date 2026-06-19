@@ -71,18 +71,12 @@ impl AgeEncryptStage {
 
 impl PipelineStage for AgeEncryptStage {
     fn wrap(self: Box<Self>, input: BoxAsyncRead) -> BoxAsyncRead {
-        // duplex: writer(펌프 태스크가 암호문을 씀) ↔ reader(다음 단계가 읽음).
-        let (writer, reader) = tokio::io::duplex(DUPLEX_BUF_BYTES);
+        // 펌프 실패는 PumpReader가 EOF 대신 io::Error로 surface한다(C1) — duplex writer가
+        // 그냥 drop돼 다음 단계가 잘린 산출물을 정상 종료로 오인하는 것을 막는다.
         let recipient = self.recipient;
-
-        // 백그라운드 펌프: 입력 평문 → age 암호화 → duplex writer.
-        tokio::spawn(async move {
-            if let Err(e) = pump_encrypt(recipient, input, writer).await {
-                tracing::error!("age 암호화 펌프 실패: {e}");
-            }
-        });
-
-        Box::pin(reader)
+        crate::crypto::pump_reader(DUPLEX_BUF_BYTES, move |writer| {
+            pump_encrypt(recipient, input, writer)
+        })
     }
 
     fn name(&self) -> &'static str {
@@ -158,17 +152,12 @@ impl AgeDecryptStage {
 
 impl PipelineStage for AgeDecryptStage {
     fn wrap(self: Box<Self>, input: BoxAsyncRead) -> BoxAsyncRead {
-        let (writer, reader) = tokio::io::duplex(DUPLEX_BUF_BYTES);
+        // 개인키 없음/불일치/변조/자름은 펌프가 Err로 반환하고, PumpReader가 그 에러를
+        // EOF 대신 surface한다(C1) — 복구에서 잘린 평문이 mongorestore로 흘러가는 것을 막는다.
         let identity = self.identity;
-
-        tokio::spawn(async move {
-            if let Err(e) = pump_decrypt(identity, input, writer).await {
-                // 개인키 없음/불일치/변조 등은 여기서 실패 — duplex가 끊기며 다음 단계가 EOF/에러.
-                tracing::error!("age 복호화 펌프 실패: {e}");
-            }
-        });
-
-        Box::pin(reader)
+        crate::crypto::pump_reader(DUPLEX_BUF_BYTES, move |writer| {
+            pump_decrypt(identity, input, writer)
+        })
     }
 
     fn name(&self) -> &'static str {
@@ -291,12 +280,13 @@ mod tests {
         let wrong_identity = x25519::Identity::generate();
         let decrypt = Box::new(AgeDecryptStage::from_identity(wrong_identity));
         let result = drain_result(decrypt.wrap(reader_from(&ciphertext))).await;
-        // 펌프 실패로 duplex가 끊기면 read_to_end가 에러이거나, 빈/부분 출력이 된다.
-        // 어느 경우든 원본 평문이 복원되어선 안 된다.
-        match result {
-            Err(_) => {}
-            Ok(out) => assert_ne!(out, payload, "틀린 키로 평문이 복원됨(격리 실패)"),
-        }
+        // C1: 복호화 펌프 실패는 EOF가 아니라 에러로 surface돼야 한다 — 잘린/빈 평문이
+        // 정상 종료로 mongorestore에 전달되는 것을 막는다.
+        assert!(
+            result.is_err(),
+            "틀린 키 복호화 실패가 surface되지 않음(C1) — 평문 격리/무결성 위반"
+        );
+        let _ = payload;
     }
 
     /// recipient 파일 파싱이 주석·빈 줄을 건너뛰고 공개키를 찾는다.

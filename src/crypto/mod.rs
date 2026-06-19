@@ -18,13 +18,108 @@
 pub mod aes_gcm;
 pub mod age;
 
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use tokio::io::{AsyncRead, DuplexStream, ReadBuf};
+use tokio::task::JoinHandle;
+
 use crate::config::file::EncryptionConfig;
 use crate::error::{Result, XBackupError};
 use crate::manifest::schema::EncryptionMeta;
 use crate::pipeline::stage::PipelineStage;
+use crate::storage::BoxAsyncRead;
 
 pub use self::aes_gcm::{AesGcmDecryptStage, AesGcmEncryptStage, ALGORITHM_AES_GCM};
 pub use self::age::{AgeDecryptStage, AgeEncryptStage, ALGORITHM_AGE};
+
+/// 암복호 펌프 reader 어댑터 — 펌프 태스크의 [`JoinHandle`]을 붙잡아, duplex가
+/// EOF를 줄 때 **펌프 결과를 확인한다**.
+///
+/// ## 배경(C1 — 펌프 에러 삼킴 방지)
+/// 암호화/복호화는 `tokio::io::duplex` 파이프 + 백그라운드 펌프 태스크로 스트리밍한다.
+/// 펌프가 중간에 실패하면 writer가 drop되는데, duplex의 읽기 끝은 이를 **에러가 아니라
+/// 깨끗한 EOF(Ok(0))** 로 본다. 과거 구현은 JoinHandle을 버려서, 잘린 산출물이
+/// 정상 종료처럼 흘러갔다 — 백업에서는 `status: Complete`로 기록되고(exit 0),
+/// 복구에서는 **잘린 평문이 mongorestore/pg_restore에 전달**됐다.
+///
+/// 이 어댑터는 duplex가 EOF를 줄 때 펌프 태스크의 결과를 폴링해:
+/// - 펌프가 `Ok` → 정상 EOF,
+/// - 펌프가 `Err(e)` → EOF 대신 그 `io::Error`를 surface(다운스트림이 실패로 인지),
+/// - 태스크 패닉(JoinError) → `io::Error`로 변환.
+///
+/// 펌프가 일부 바이트를 쓴 뒤 실패한 경우, 그 바이트는 먼저 정상 전달되고 **마지막에
+/// 에러가 surface**되므로 다운스트림(체크섬·put_stream·복구 소비자)이 부분 산출물을
+/// 끝까지 정상으로 오인하지 않는다.
+struct PumpReader {
+    reader: DuplexStream,
+    handle: Option<JoinHandle<std::io::Result<()>>>,
+}
+
+impl AsyncRead for PumpReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // PumpReader의 필드는 모두 Unpin이므로 안전하게 가변 참조를 얻는다.
+        let me = self.get_mut();
+        let before = buf.filled().len();
+        match Pin::new(&mut me.reader).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                if buf.filled().len() != before {
+                    // 데이터를 읽음 — 그대로 전달.
+                    return Poll::Ready(Ok(()));
+                }
+                // duplex가 EOF — 펌프 태스크 결과로 정상 종료인지 실패인지 판별한다.
+                let Some(handle) = me.handle.as_mut() else {
+                    // 이미 검증한 뒤의 반복 EOF — 진짜 종료.
+                    return Poll::Ready(Ok(()));
+                };
+                match Pin::new(handle).poll(cx) {
+                    Poll::Ready(Ok(Ok(()))) => {
+                        me.handle = None;
+                        Poll::Ready(Ok(())) // 펌프 정상 완료 → 정상 EOF
+                    }
+                    Poll::Ready(Ok(Err(e))) => {
+                        me.handle = None;
+                        Poll::Ready(Err(e)) // 펌프 실패 → EOF 대신 에러 surface
+                    }
+                    Poll::Ready(Err(join_err)) => {
+                        me.handle = None;
+                        Poll::Ready(Err(std::io::Error::other(format!(
+                            "암복호 펌프 태스크 비정상 종료: {join_err}"
+                        ))))
+                    }
+                    // 펌프가 아직 종료 직전(드물게) — 태스크 완료 시 waker로 재폴링된다.
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+/// 펌프 패턴 공통 헬퍼 — duplex를 만들고 펌프 future를 spawn한 뒤, 펌프 실패를
+/// 에러로 surface하는 [`PumpReader`]를 반환한다(age/aes_gcm 공용, C1).
+///
+/// `make_pump`는 duplex의 writer를 받아 펌프 future를 만든다(입력 reader·키 등은
+/// 호출 측 클로저가 캡처). 펌프 future는 `Send + 'static`이어야 한다(태스크로 spawn).
+pub(crate) fn pump_reader<Fut>(
+    buf_bytes: usize,
+    make_pump: impl FnOnce(DuplexStream) -> Fut,
+) -> BoxAsyncRead
+where
+    Fut: Future<Output = std::io::Result<()>> + Send + 'static,
+{
+    let (writer, reader) = tokio::io::duplex(buf_bytes);
+    let handle = tokio::spawn(make_pump(writer));
+    Box::pin(PumpReader {
+        reader,
+        handle: Some(handle),
+    })
+}
 
 /// 복호화 키 소스 — 복구(t5)·verify --deep에서 개인키/대칭키를 어디서 읽을지.
 ///
@@ -224,5 +319,57 @@ mod tests {
     /// 부분 슬라이스 포함 여부.
     fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// `n`바이트를 흘린 뒤 io::Error를 반환하는 테스트용 reader(펌프 중간 실패 모사).
+    struct FailingReader {
+        remaining: usize,
+    }
+
+    impl AsyncRead for FailingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.remaining == 0 {
+                return Poll::Ready(Err(std::io::Error::other("주입된 입력 실패")));
+            }
+            let n = self.remaining.min(buf.remaining()).min(4096);
+            buf.initialize_unfilled_to(n).iter_mut().for_each(|b| *b = 0xAB);
+            buf.advance(n);
+            self.remaining -= n;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// C1 — 암호화 펌프가 입력 도중 실패하면, 감싼 reader는 **EOF가 아니라 io::Error**를
+    /// surface해야 한다(백업이 잘린 산출물을 정상 종료로 오인 → Complete 오기록하는 것 방지).
+    #[tokio::test]
+    async fn encrypt_pump_failure_surfaces_as_error_age() {
+        use tokio::io::AsyncReadExt;
+        let id = ::age::x25519::Identity::generate();
+        let stage = Box::new(AgeEncryptStage::from_recipient(id.to_public()));
+        let input: BoxAsyncRead = Box::pin(FailingReader { remaining: 100_000 });
+        let mut out = Vec::new();
+        let result = stage.wrap(input).read_to_end(&mut out).await;
+        assert!(
+            result.is_err(),
+            "펌프 실패가 EOF로 삼켜짐 — 잘린 산출물이 정상 종료로 오인됨(C1)"
+        );
+    }
+
+    /// C1 — AES-GCM 암호화 펌프도 동일하게 실패를 surface해야 한다.
+    #[tokio::test]
+    async fn encrypt_pump_failure_surfaces_as_error_aes() {
+        use tokio::io::AsyncReadExt;
+        let stage = Box::new(AesGcmEncryptStage::from_key([3u8; 32]));
+        let input: BoxAsyncRead = Box::pin(FailingReader { remaining: 100_000 });
+        let mut out = Vec::new();
+        let result = stage.wrap(input).read_to_end(&mut out).await;
+        assert!(
+            result.is_err(),
+            "AES 펌프 실패가 EOF로 삼켜짐(C1) — 잘린 산출물이 정상 종료로 오인됨"
+        );
     }
 }

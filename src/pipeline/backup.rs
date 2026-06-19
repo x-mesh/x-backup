@@ -503,17 +503,18 @@ pub async fn run_pg_full_backup(
     let selective = db.is_some() || collection.is_some();
 
     // 증분 활성(features.incremental.pg_logical)이면 **덤프 전에** replication slot+publication을
-    // 만들어 base LSN을 잡는다 — 슬롯이 이 시점부터 WAL을 보존해야 이후 변경을 빠짐없이
-    // 캡처한다(슬롯을 덤프 뒤에 만들면 그 사이 변경이 유실됨; 덤프와의 겹침은 적용이
-    // idempotent라 안전). 선택적 백업은 증분 base 부적격이라 건너뛴다.
+    // **새로** 만들어(있으면 재생성) base에 정렬한다 — 슬롯이 이 시점부터 WAL을 보존해야
+    // 이후 변경을 빠짐없이 캡처한다. 매 풀백업마다 재생성하므로 살아있는 슬롯이 항상 최신
+    // 풀백업(=증분 base)에 묶인다(C2 — 슬롯 재사용으로 인한 조용한 체인 붕괴 방지). 선택적
+    // 백업은 증분 base 부적격이라 건너뛴다.
     if enable_incremental && !selective {
         let admin = PgClient::connect(uri, timeout_secs).await?;
         ensure_wal_level_logical(admin.client()).await?;
         let slot = incremental::slot_name(profile_name);
         let publication = incremental::publication_name(profile_name);
         let base_lsn =
-            incremental::ensure_slot_and_publication(admin.client(), &slot, &publication).await?;
-        tracing::info!(%slot, %publication, %base_lsn, "PG 증분 slot 준비 완료(풀 백업 base)");
+            incremental::recreate_slot_and_publication(admin.client(), &slot, &publication).await?;
+        tracing::info!(%slot, %publication, %base_lsn, "PG 증분 slot 재생성 완료(풀 백업 base에 정렬)");
     } else if enable_incremental && selective {
         tracing::warn!(
             "선택적 PG 백업(--db/--collection)은 증분 base 부적격이라 slot을 만들지 않습니다"

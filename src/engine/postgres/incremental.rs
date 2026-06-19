@@ -1,7 +1,8 @@
 //! PG 증분 — logical decoding(pgoutput) slot에서 변경을 캡처해 아카이브하고, 복구 시 DML로 적용.
 //!
 //! Mongo oplog 증분과 동형이되 PG WAL을 logical decoding으로 읽는다:
-//! - 풀 백업 시 [`ensure_slot_and_publication`]으로 슬롯·publication을 만들고 base LSN을 기록.
+//! - 풀 백업 시 [`recreate_slot_and_publication`]으로 슬롯을 (재)생성해 base에 정렬하고,
+//!   증분 시 [`slot_health`]로 gap(슬롯 유실/invalidated)을 감지해 풀 승격(FR-2).
 //! - [`capture`]가 `pg_logical_slot_peek_binary_changes`로 pgoutput을 읽어 디코드 →
 //!   `xb-pg-incr-v1` 아카이브(변경 레코드 나열). 저장 성공 후 [`advance_slot`]로 슬롯 전진.
 //! - [`apply`]가 복구 대상에 변경을 DML(I=upsert / U·D=키 기반)로 적용. `--at`은 commit ts 필터.
@@ -51,15 +52,8 @@ pub fn publication_name(profile: &str) -> String {
     format!("xb_{}_pub", sanitize(profile))
 }
 
-/// publication(FOR ALL TABLES) + pgoutput slot을 보장하고 현재(또는 기존) LSN을 돌려준다.
-///
-/// 풀 백업 직전에 호출 — 슬롯이 이 시점부터 WAL을 잡아 증분의 시작점이 된다. 이름은 sanitize된
-/// 식별자라 인젝션 안전(파라미터화 불가한 DDL이므로 직접 보간).
-pub async fn ensure_slot_and_publication(
-    client: &Client,
-    slot: &str,
-    publication: &str,
-) -> Result<String> {
+/// publication(FOR ALL TABLES)을 보장한다(없으면 생성). slot은 다루지 않는다.
+async fn ensure_publication(client: &Client, publication: &str) -> Result<()> {
     let pub_exists: bool = client
         .query_one(
             "SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname=$1)",
@@ -74,43 +68,114 @@ pub async fn ensure_slot_and_publication(
             .await
             .map_err(|e| XBackupError::Failure(format!("publication 생성 실패: {e}")))?;
     }
+    Ok(())
+}
 
-    let slot_lsn: Option<String> = client
-        .query_opt(
-            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name=$1",
+/// 풀 백업용으로 슬롯을 **새로 만든다**(있으면 drop 후 재생성). publication은 재사용(FOR ALL
+/// TABLES). 반환 = 새 슬롯의 consistent LSN.
+///
+/// ## 왜 매 풀 백업마다 재생성하나(C2 — 스타 모델 base 바인딩)
+/// PG 증분은 모두 "가장 최신 풀백업"에 체인된다(스타 모델, [`select_pg_full_base`]). 슬롯을
+/// **재사용**하면, 2번째 풀백업 이후에도 슬롯은 옛 base 위치에서 계속 전진하므로 새 증분이
+/// **시작된 적 없는 base에 묶이는** 조용한 체인 붕괴가 생긴다(FR-2 위반). 매 풀백업마다 슬롯을
+/// 재생성하면 살아있는 슬롯이 항상 최신 풀백업(=선택되는 base)에 정렬된다.
+///
+/// 옛 슬롯을 drop하면 이전 base의 미캡처 증분 WAL은 버려지지만, 새 풀백업이 그 base를
+/// 대체하므로(이후 증분은 새 base에 체인) 안전하다.
+///
+/// 이름은 sanitize된 식별자라 인젝션 안전(파라미터화 불가한 DDL이므로 직접 보간하지 않고
+/// 함수 인자로 넘긴다).
+///
+/// > **잔여(정확한 H2 정렬):** 슬롯 consistent point(이 LSN)와 덤프 스냅샷 사이의 좁은
+/// > 구간에 커밋된 변경은 base와 첫 증분에 **둘 다** 들어갈 수 있다(double-apply). 복구
+/// > 적용이 idempotent(I=upsert, U/D=키 기반)라 일반적으로 무해하다. 구간을 0으로 만드는
+/// > 정확한 정렬은 replication 프로토콜의 exported snapshot이 필요하며 후속 과제다.
+pub async fn recreate_slot_and_publication(
+    client: &Client,
+    slot: &str,
+    publication: &str,
+) -> Result<String> {
+    ensure_publication(client, publication).await?;
+
+    if slot_exists(client, slot).await? {
+        client
+            .execute("SELECT pg_drop_replication_slot($1)", &[&slot])
+            .await
+            .map_err(|e| XBackupError::Failure(format!("기존 slot drop 실패: {e}")))?;
+    }
+    let lsn: String = client
+        .query_one(
+            "SELECT lsn::text FROM pg_create_logical_replication_slot($1,'pgoutput')",
             &[&slot],
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("slot 확인 실패: {e}")))?
-        .map(|r| r.get(0));
+        .map(|r| r.get(0))
+        .map_err(|e| XBackupError::Failure(format!("slot 생성 실패: {e}")))?;
+    Ok(lsn)
+}
 
-    match slot_lsn {
-        Some(lsn) => Ok(lsn),
-        None => {
-            let lsn: String = client
-                .query_one(
-                    "SELECT lsn::text FROM pg_create_logical_replication_slot($1,'pgoutput')",
-                    &[&slot],
-                )
-                .await
-                .map(|r| r.get(0))
-                .map_err(|e| XBackupError::Failure(format!("slot 생성 실패: {e}")))?;
-            Ok(lsn)
+/// 증분 슬롯 건강도 — gap 판정(FR-2)에 쓴다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotHealth {
+    /// 정상 — 캡처 가능.
+    Active,
+    /// 슬롯이 invalidated(WAL이 max_slot_wal_keep_size 초과로 제거됨, wal_status='lost')거나
+    /// restart_lsn이 NULL — 체인이 끊겼다. 풀 백업으로 승격해야 한다.
+    Lost,
+    /// 슬롯이 아예 없음 — base/슬롯 설정이 사라졌다. 풀 백업으로 (재)생성해야 한다.
+    Missing,
+}
+
+/// 증분 슬롯의 건강도를 판정한다(gap 감지, FR-2). 캡처 전에 호출해 Lost/Missing이면
+/// 호출자가 풀 백업으로 승격한다(exit 4).
+pub async fn slot_health(client: &Client, slot: &str) -> Result<SlotHealth> {
+    let row = client
+        .query_opt(
+            "SELECT wal_status, (restart_lsn IS NULL) AS restart_null \
+             FROM pg_replication_slots WHERE slot_name=$1",
+            &[&slot],
+        )
+        .await
+        .map_err(|e| XBackupError::Failure(format!("slot 건강도 조회 실패: {e}")))?;
+    match row {
+        None => Ok(SlotHealth::Missing),
+        Some(r) => {
+            // wal_status: 'reserved'|'extended'|'unreserved'|'lost'(PG13+). NULL일 수도 있다.
+            let wal_status: Option<String> = r.get("wal_status");
+            let restart_null: bool = r.get("restart_null");
+            if restart_null || wal_status.as_deref() == Some("lost") {
+                Ok(SlotHealth::Lost)
+            } else {
+                Ok(SlotHealth::Active)
+            }
         }
     }
 }
 
-/// 캡처 결과 — 아카이브 바이트, 마지막 LSN(없으면 변경 0), 변경 수.
+/// 한 번의 capture가 peek할 최대 변경 수(`upto_nchanges`). 메모리 상한을 위해 둔다(H4).
+///
+/// pgoutput은 트랜잭션 경계에서만 멈추므로 실제 반환은 이 값을 약간 넘길 수 있고, 트랜잭션이
+/// 쪼개지지 않는다. 한도를 넘는 backlog는 다음 증분 실행이 이어서 캡처한다(슬롯은 캡처한
+/// 만큼만 전진). 정상 주기 증분은 이 한도에 한참 못 미친다.
+const MAX_CHANGES_PER_CAPTURE: i32 = 50_000;
+
+/// 캡처 결과 — 아카이브 바이트, 마지막 LSN(없으면 변경 0), 변경 수, backlog 잔여 여부.
 pub struct CaptureOutcome {
     pub archive: Vec<u8>,
     pub last_lsn: Option<String>,
     pub count: u64,
+    /// `upto_nchanges` 한도에 걸려 더 남은 backlog가 있을 수 있는지(H4 — 다음 실행이 이어감).
+    pub more_pending: bool,
 }
 
 /// 슬롯에서 변경을 peek(비소비)해 디코드 → `xb-pg-incr-v1` 아카이브 바이트로 만든다.
 ///
 /// peek라 슬롯을 전진시키지 않는다 — 호출자가 **저장 성공 후** [`advance_slot`]로 전진한다
 /// (저장 실패 시 다음에 재캡처 — 적용이 idempotent라 안전).
+///
+/// **메모리(H4):** `upto_nchanges`([`MAX_CHANGES_PER_CAPTURE`])로 한 번에 가져오는 변경
+/// 수를 제한해 backlog가 커도 상주 메모리를 상수 상한으로 묶는다. 한도 초과분은 다음 실행이
+/// 이어서 캡처한다.
 pub async fn capture(client: &Client, slot: &str, publication: &str) -> Result<CaptureOutcome> {
     if !slot_exists(client, slot).await? {
         return Err(XBackupError::PrecheckFailed(format!(
@@ -120,11 +185,15 @@ pub async fn capture(client: &Client, slot: &str, publication: &str) -> Result<C
     let rows = client
         .query(
             "SELECT lsn::text, data FROM pg_logical_slot_peek_binary_changes(\
-                $1, NULL, NULL, 'proto_version','1','publication_names',$2)",
-            &[&slot, &publication],
+                $1, NULL, $3::int, 'proto_version','1','publication_names',$2)",
+            &[&slot, &publication, &MAX_CHANGES_PER_CAPTURE],
         )
         .await
         .map_err(|e| XBackupError::Failure(format!("logical 변경 peek 실패: {e}")))?;
+
+    // upto_nchanges는 B/C/R 등 모든 디코드 메시지를 세므로, 반환 행 수가 한도에 근접하면
+    // backlog가 더 남았을 수 있다(다음 실행이 이어감).
+    let more_pending = rows.len() as i32 >= MAX_CHANGES_PER_CAPTURE;
 
     let mut archive = Vec::new();
     write_header(&mut archive, &chrono::Utc::now().to_rfc3339()).await?;
@@ -140,10 +209,17 @@ pub async fn capture(client: &Client, slot: &str, publication: &str) -> Result<C
         }
     }
     write_end(&mut archive).await?;
+    if more_pending {
+        tracing::warn!(
+            "PG 증분 capture가 {MAX_CHANGES_PER_CAPTURE} 변경 한도에 도달 — 남은 backlog는 \
+             다음 증분 실행이 이어서 캡처합니다(메모리 보호)"
+        );
+    }
     Ok(CaptureOutcome {
         archive,
         last_lsn,
         count,
+        more_pending,
     })
 }
 
@@ -437,9 +513,11 @@ fn build_dml(c: &Change, cols: &[ColMeta]) -> Option<(String, Vec<Option<String>
             };
             let mut params: Vec<Option<String>> = Vec::new();
             let mut idx = 1;
-            // SET: GENERATED ALWAYS identity 제외(명시값 SET 불가). 나머지 전부.
+            // SET: GENERATED ALWAYS identity 제외(명시값 SET 불가) + unchanged-TOAST('u') 제외
+            // (H3: 값이 실리지 않은 컬럼을 NULL로 덮어쓰면 기존 값이 파손됨). 나머지 전부.
             let set = (0..c.colnames.len())
                 .filter(|i| !cols[*i].generated_always)
+                .filter(|i| !c.new_unchanged.get(*i).copied().unwrap_or(false))
                 .map(|i| {
                     params.push(c.new_vals.get(i).cloned().flatten());
                     let s = format!(
@@ -607,6 +685,8 @@ fn change_to_doc(c: &Change) -> Document {
         "cols": c.colnames.iter().map(|s| Bson::String(s.clone())).collect::<Vec<_>>(),
         "keys": c.keycols.iter().map(|b| Bson::Boolean(*b)).collect::<Vec<_>>(),
         "new": vals(&c.new_vals),
+        // unchanged-TOAST 마스크(H3) — new[i]가 'u'(미변경)라 적용 시 SET에서 제외해야 함.
+        "unchanged": c.new_unchanged.iter().map(|b| Bson::Boolean(*b)).collect::<Vec<_>>(),
         "key": vals(&c.key_vals),
         "ts": c.commit_unix_micros,
     }
@@ -633,6 +713,12 @@ fn doc_to_change(d: &Document) -> Result<Change> {
         "D" => Op::Delete,
         other => return Err(XBackupError::Failure(format!("증분 op 손상: '{other}'"))),
     };
+    let new_vals = opt_vals("new");
+    // unchanged 마스크(H3) — 구 아카이브엔 없을 수 있으므로 없으면 모두 false(기존 동작).
+    let new_unchanged = match d.get_array("unchanged") {
+        Ok(a) => a.iter().map(|b| b.as_bool().unwrap_or(false)).collect(),
+        Err(_) => vec![false; new_vals.len()],
+    };
     Ok(Change {
         op,
         schema: d.get_str("schema").unwrap_or("").to_string(),
@@ -642,7 +728,8 @@ fn doc_to_change(d: &Document) -> Result<Change> {
             .get_array("keys")
             .map(|a| a.iter().map(|b| b.as_bool().unwrap_or(false)).collect())
             .unwrap_or_default(),
-        new_vals: opt_vals("new"),
+        new_vals,
+        new_unchanged,
         key_vals: opt_vals("key"),
         commit_unix_micros: d.get_i64("ts").unwrap_or(0),
     })
@@ -660,6 +747,7 @@ mod tests {
             colnames: vec!["id".into(), "name".into()],
             keycols: vec![true, false],
             new_vals: vec![Some("7".into()), Some("a".into())],
+            new_unchanged: vec![false, false],
             key_vals: vec![Some("7".into()), None],
             commit_unix_micros: 123,
         }
@@ -770,5 +858,43 @@ mod tests {
         let mut c = ch(Op::Update);
         c.keycols = vec![false, false];
         assert!(build_dml(&c, &[cm("integer", false), cm("text", false)]).is_none());
+    }
+
+    /// H3 — UPDATE의 unchanged-TOAST 컬럼은 SET에서 제외되고 NULL로 덮어쓰지 않는다.
+    #[test]
+    fn dml_update_excludes_unchanged_toast_from_set() {
+        // id(키), body(unchanged TOAST 'u'), note(변경됨). body는 SET에서 빠져야 한다.
+        let mut c = ch(Op::Update);
+        c.colnames = vec!["id".into(), "body".into(), "note".into()];
+        c.keycols = vec![true, false, false];
+        c.new_vals = vec![Some("7".into()), None, Some("hello".into())];
+        c.new_unchanged = vec![false, true, false]; // body만 unchanged
+        c.key_vals = vec![Some("7".into()), None, None];
+        let cols = vec![cm("integer", false), cm("text", false), cm("text", false)];
+        let (sql, params) = build_dml(&c, &cols).unwrap();
+        // 핵심(H3): body(unchanged TOAST)는 SET·params에 절대 없어야 한다(기존 값 보존).
+        assert!(!sql.contains("\"body\""), "unchanged body가 SET에 포함됨: {sql}");
+        // id·note는 SET에 그대로(기존 동작 — 키 컬럼도 SET에 포함). body만 빠진다.
+        assert!(sql.contains("SET \"id\" = $1::text::integer, \"note\" = $2::text::text"), "sql={sql}");
+        assert!(sql.contains("WHERE \"id\" = $3::text::integer"), "sql={sql}");
+        // params: SET id(1), note(2) + WHERE id(3) — body는 바인드되지 않음.
+        assert_eq!(
+            params,
+            vec![Some("7".into()), Some("hello".into()), Some("7".into())]
+        );
+    }
+
+    /// H3 — unchanged 마스크가 증분 아카이브(BSON)를 round-trip한다.
+    #[tokio::test]
+    async fn unchanged_mask_round_trips_through_archive() {
+        let mut c = ch(Op::Update);
+        c.new_unchanged = vec![false, true];
+        let mut buf = Vec::new();
+        write_change(&mut buf, &c).await.unwrap();
+        let mut r = std::io::Cursor::new(buf);
+        match read_frame(&mut r).await.unwrap() {
+            IncrFrame::Change(back) => assert_eq!(back.new_unchanged, vec![false, true]),
+            f => panic!("change 기대, {f:?}"),
+        }
     }
 }

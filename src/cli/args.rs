@@ -86,8 +86,9 @@ pub struct MigrateArgs {
     /// 선택적 마이그레이션 — 특정 DB만.
     #[arg(long, value_name = "DB")]
     pub db: Option<String>,
-    /// 선택적 마이그레이션 — 특정 컬렉션만.
-    #[arg(long, value_name = "COLL")]
+    /// 선택적 마이그레이션 — 특정 컬렉션만. `--db`를 함께 지정해야 한다(H9 — 컬렉션은 한 DB에
+    /// 속하므로, `--db` 없이 주면 모든 DB의 동명 컬렉션이 대상이 된다).
+    #[arg(long, value_name = "COLL", requires = "db")]
     pub collection: Option<String>,
     /// target의 기존 컬렉션을 복원 전 drop한다(기본 비활성).
     #[arg(long)]
@@ -138,8 +139,9 @@ pub struct BackupArgs {
     /// 특정 데이터베이스만 백업(선택적 백업 — --oplog와 병용 불가, FR-1).
     #[arg(long, value_name = "DB")]
     pub db: Option<String>,
-    /// 특정 컬렉션만 백업(선택적 백업).
-    #[arg(long, value_name = "COLL")]
+    /// 특정 컬렉션만 백업(선택적 백업). `--db`를 함께 지정해야 한다(H9 — 컬렉션은 한 DB에
+    /// 속하므로, `--db` 없이 주면 native 엔진이 모든 DB의 동명 컬렉션을 과다 수집한다).
+    #[arg(long, value_name = "COLL", requires = "db")]
     pub collection: Option<String>,
     /// 암호화를 끄고 평문으로 백업(명시적 opt-out, FR-5).
     #[arg(long)]
@@ -397,5 +399,51 @@ mod tests {
             "--progress",
         ]);
         assert!(result.is_err(), "quiet+progress는 충돌해야 함");
+    }
+
+    /// H9 — backup `--collection`은 `--db` 없이 쓸 수 없다(컬렉션은 한 DB에 속하므로
+    /// `--db` 없으면 native 엔진이 모든 DB의 동명 컬렉션을 과다 수집함).
+    #[test]
+    fn backup_collection_requires_db() {
+        // --collection만 → 거부(usage 오류, exit 2).
+        assert!(
+            Cli::try_parse_from(["x-backup", "backup", "--profile", "p", "--collection", "users"])
+                .is_err(),
+            "--collection은 --db 없이 거부되어야 함"
+        );
+        // --db + --collection → 통과.
+        assert!(
+            Cli::try_parse_from([
+                "x-backup", "backup", "--profile", "p", "--db", "app", "--collection", "users",
+            ])
+            .is_ok(),
+            "--db와 함께면 통과해야 함"
+        );
+        // --db 단독 → 통과(DB만 선택적 백업은 정상).
+        assert!(
+            Cli::try_parse_from(["x-backup", "backup", "--profile", "p", "--db", "app"]).is_ok(),
+            "--db 단독은 통과해야 함"
+        );
+    }
+
+    /// H9 — migrate `--collection`도 동일하게 `--db`를 요구한다.
+    #[test]
+    fn migrate_collection_requires_db() {
+        assert!(
+            Cli::try_parse_from([
+                "x-backup", "migrate", "--profile", "p", "--target", "mongodb://t/db",
+                "--collection", "users",
+            ])
+            .is_err(),
+            "migrate --collection은 --db 없이 거부되어야 함"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "x-backup", "migrate", "--profile", "p", "--target", "mongodb://t/db", "--db",
+                "app", "--collection", "users",
+            ])
+            .is_ok(),
+            "migrate --db와 함께면 통과해야 함"
+        );
     }
 }

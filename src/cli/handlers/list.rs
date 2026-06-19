@@ -27,7 +27,7 @@ use crate::manifest::schema::{BackupStatus, BackupType};
 use crate::manifest::store::{ManifestStore, DATA_FILE, MANIFEST_FILE};
 use crate::manifest::ChainNode;
 use crate::pipeline::verify::collect_manifest_ids;
-use crate::storage::{LocalFs, Storage};
+use crate::storage::{LocalFs, Storage, StorageEntry};
 
 /// 카탈로그 한 행(백업 또는 orphan).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,14 +87,18 @@ pub async fn handle(config_path: Option<PathBuf>, args: ListArgs) -> Result<()> 
         print_human(&rows, &store_loc, all_rows.len(), matched);
     }
 
-    // broken/incomplete/orphan이 하나라도 있으면 경고 동반 성공(exit 4) — 필터와 무관하게
-    // 전체 기준으로 알린다(운영자가 문제를 놓치지 않도록).
+    // broken/incomplete/orphan/corrupt가 하나라도 있으면 경고 동반 성공(exit 4) — 필터와
+    // 무관하게 전체 기준으로 알린다(운영자가 문제를 놓치지 않도록). 특히 corrupt(손상 manifest)는
+    // 가장 위험하므로 절대 숨기지 않는다(H10).
     let has_warning = all_rows.iter().any(|r| {
-        r.chain_status == "broken" || r.chain_status == "incomplete" || r.chain_status == "orphan"
+        matches!(
+            r.chain_status.as_str(),
+            "broken" | "incomplete" | "orphan" | "corrupt"
+        )
     });
     if has_warning {
         return Err(XBackupError::VerifyWarning(
-            "broken/incomplete/orphan 항목이 있습니다 — list로 확인하세요".into(),
+            "broken/incomplete/orphan/corrupt 항목이 있습니다 — list로 확인하세요".into(),
         ));
     }
     Ok(())
@@ -176,14 +180,21 @@ fn store_location(config_toml: Option<&str>, profile: &str) -> String {
 pub async fn build_catalog(storage: &dyn Storage) -> Result<Vec<CatalogRow>> {
     let store = ManifestStore::new(storage);
 
-    // 1) manifest를 가진 백업 ID 수집 + 노드 구성(체인 판정용).
+    // destination 객체 목록을 한 번만 나열해 orphan·corrupt 크기 조회에 공유한다.
+    let entries = storage.list("").await?;
+
+    // 1) manifest를 가진 백업 ID 수집 + 노드 구성(체인 판정용). manifest.json은 존재하나
+    //    읽기/파싱에 실패한 것은 **숨기지 않고**(H10) corrupt 행으로 표면화한다 — list는
+    //    카탈로그/상태 surface라 가장 위험한 항목을 운영자에게 보여야 한다.
     let ids = collect_manifest_ids(storage).await?;
     let mut manifests = Vec::with_capacity(ids.len());
+    let mut corrupt_ids: Vec<String> = Vec::new();
     for id in &ids {
         match store.read(id).await {
             Ok(m) => manifests.push(m),
             Err(e) => {
-                tracing::debug!(id = %id, "manifest 읽기 실패(카탈로그에서 제외): {e}");
+                tracing::warn!(id = %id, "manifest 읽기/파싱 실패 — 손상(corrupt) 항목으로 표시: {e}");
+                corrupt_ids.push(id.clone());
             }
         }
     }
@@ -218,26 +229,45 @@ pub async fn build_catalog(storage: &dyn Storage) -> Result<Vec<CatalogRow>> {
         });
     }
 
-    // 3) orphan 감지 — manifest 없이 data.bin만 있는 디렉터리(pitfall 7-1).
-    let orphans = detect_orphans(storage, &ids).await?;
+    // 3) corrupt 행 — manifest.json은 있으나 읽기/파싱 실패한 백업(H10). data.bin 크기는
+    //    객체 목록에서 찾고(없으면 0), chain_status=corrupt로 exit-4 경고에 포함시킨다.
+    let data_suffix = format!("/{DATA_FILE}");
+    for id in &corrupt_ids {
+        let size = entries
+            .iter()
+            .find(|e| e.path == format!("{id}{data_suffix}"))
+            .map(|e| e.size)
+            .unwrap_or(0);
+        rows.push(CatalogRow {
+            id: id.clone(),
+            kind: "corrupt".to_string(),
+            engine: "-".to_string(), // manifest 파싱 불가 → 엔진 불명.
+            created_at: None,
+            stored_size_bytes: size,
+            chain_status: "corrupt".to_string(),
+            base_id: None,
+        });
+    }
+
+    // 4) orphan 감지 — manifest 없이 data.bin만 있는 디렉터리(pitfall 7-1).
+    let orphans = detect_orphans(&entries, &ids);
     rows.extend(orphans);
 
-    // 4) id(=UUID v7, 시간 정렬 가능)로 정렬해 안정적 출력.
+    // 5) id(=UUID v7, 시간 정렬 가능)로 정렬해 안정적 출력.
     rows.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(rows)
 }
 
-/// manifest가 없는 data.bin 디렉터리를 orphan 행으로 만든다.
+/// manifest가 없는 data.bin 디렉터리를 orphan 행으로 만든다(미리 나열한 `entries` 위에서 순수 판정).
 ///
 /// `known_ids`는 manifest를 가진 백업 ID 집합이다. data.bin은 있으나 manifest가 없는
 /// 디렉터리를 유령 산출물로 본다(실패한 백업의 잔재 또는 수동 삭제로 깨진 체인).
-async fn detect_orphans(storage: &dyn Storage, known_ids: &[String]) -> Result<Vec<CatalogRow>> {
-    let entries = storage.list("").await?;
+fn detect_orphans(entries: &[StorageEntry], known_ids: &[String]) -> Vec<CatalogRow> {
     let data_suffix = format!("/{DATA_FILE}");
     let manifest_suffix = format!("/{MANIFEST_FILE}");
 
     let mut rows = Vec::new();
-    for e in &entries {
+    for e in entries {
         // data.bin 경로에서 디렉터리(id)를 추출한다.
         let Some(id) = e
             .path
@@ -268,7 +298,7 @@ async fn detect_orphans(storage: &dyn Storage, known_ids: &[String]) -> Result<V
             base_id: None,
         });
     }
-    Ok(rows)
+    rows
 }
 
 /// config를 읽어 destination=local Storage를 연다.
@@ -359,9 +389,9 @@ fn print_human(rows: &[CatalogRow], store_loc: &str, total: usize, matched: usiz
             chain_label(&r.chain_status).to_string(),
             r.base_id.as_deref().unwrap_or("-").to_string(),
         ];
-        // 문제 행만 색으로 강조(가시성): broken=빨강, incomplete/orphan=노랑, ok=무채색.
+        // 문제 행만 색으로 강조(가시성): broken/corrupt=빨강, incomplete/orphan=노랑, ok=무채색.
         match r.chain_status.as_str() {
-            "broken" => table.row_styled(cells, vec![RED, BOLD]),
+            "broken" | "corrupt" => table.row_styled(cells, vec![RED, BOLD]),
             "incomplete" | "orphan" => table.row_styled(cells, vec![YELLOW]),
             _ => table.row(cells),
         }
@@ -436,6 +466,7 @@ fn chain_label(status: &str) -> &str {
         "broken" => "BROKEN",
         "incomplete" => "INCOMPLETE",
         "orphan" => "ORPHAN",
+        "corrupt" => "CORRUPT",
         other => other,
     }
 }
@@ -573,6 +604,37 @@ mod tests {
         assert_eq!(orphan.kind, "orphan");
         assert_eq!(orphan.chain_status, "orphan");
         assert_eq!(orphan.stored_size_bytes, "orphan data".len() as u64);
+    }
+
+    /// H10 — manifest.json은 있으나 파싱 불가한 백업은 **숨기지 않고** corrupt 행으로
+    /// 표면화한다(orphan으로 오분류하지 않으며, 정상 백업은 그대로 보인다).
+    #[tokio::test]
+    async fn catalog_surfaces_corrupt_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = LocalFs::new(dir.path()).unwrap();
+        // 정상 백업 하나.
+        write_manifest(&fs, &manifest("good", BackupType::Full, None)).await;
+        // 손상된 manifest.json(파싱 불가) + data.bin.
+        let garbage: BoxAsyncRead =
+            Box::pin(std::io::Cursor::new(b"{ not valid json at all".to_vec()));
+        fs.put_stream(&format!("bad/{MANIFEST_FILE}"), garbage, None)
+            .await
+            .unwrap();
+        let data: BoxAsyncRead = Box::pin(std::io::Cursor::new(b"some data".to_vec()));
+        fs.put_stream(&data_path("bad"), data, None).await.unwrap();
+
+        let rows = build_catalog(&fs).await.unwrap();
+        let bad = rows
+            .iter()
+            .find(|r| r.id == "bad")
+            .expect("corrupt 행이 카탈로그에 있어야 함(절대 숨기지 않음)");
+        assert_eq!(bad.kind, "corrupt");
+        assert_eq!(bad.chain_status, "corrupt");
+        assert_eq!(bad.stored_size_bytes, "some data".len() as u64);
+        // manifest 파일이 존재하므로 orphan으로 잘못 분류되지 않는다.
+        assert_eq!(rows.iter().filter(|r| r.id == "bad").count(), 1);
+        // 정상 백업은 그대로 보인다.
+        assert!(rows.iter().any(|r| r.id == "good" && r.chain_status == "ok"));
     }
 
     /// 빈 카탈로그도 에러 없이 빈 벡터를 만든다.

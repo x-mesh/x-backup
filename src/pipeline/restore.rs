@@ -188,13 +188,23 @@ pub async fn run_restore<C>(
 where
     C: FnOnce(&RestorePlan) -> bool,
 {
-    // PostgreSQL 대상은 Mongo 메타 점검을 건너뛴다(드라이버가 다름). 충돌 점검은 PG 복구가
-    //   create-if-not-exists로 처리하며, 비운 대상으로 복구하거나 --force(drop)를 권장한다.
     let is_pg = crate::engine::DbKind::from_uri(request.target_uri.expose())
         == crate::engine::DbKind::Postgres;
 
-    // 사전 점검 메타: skip-precheck가 아니면 대상에 연결해 점검에 활용한다.
-    // dry-run도 충돌 목록을 보여주려면 점검이 필요하므로 동일하게 연결한다.
+    // H6: PG 복구는 `--only`(선택적 복구)를 지원하지 않는다 — pg_restore에 ns 필터가 없어
+    //   전체를 복구하면서 계획만 좁게 보여주면 데이터 범위가 거짓 보고된다. 명확히 거부한다
+    //   (exit 2). PG 시점 복구(--at) 경로도 동일하게 --only를 거부한다.
+    if is_pg && request.only.is_some() {
+        return Err(XBackupError::Usage(
+            "PG 복구는 --only(선택적 복구)를 지원하지 않습니다 — 전체 복구만 가능합니다. \
+             특정 테이블만 필요하면 복구 후 정리하거나 별도 도구를 사용하세요."
+                .into(),
+        ));
+    }
+
+    // 사전 점검 메타(Mongo): skip-precheck가 아니면 대상에 연결해 점검에 활용한다.
+    // dry-run도 충돌 목록을 보여주려면 점검이 필요하므로 동일하게 연결한다. PG는 드라이버가
+    // 달라 Mongo 메타 경로를 타지 않고, 아래에서 별도로 충돌을 채운다(H5).
     let meta = if request.skip_precheck || is_pg {
         None
     } else {
@@ -205,7 +215,26 @@ where
         )
     };
 
-    let plan = build_plan(request, storage, meta.as_ref()).await?;
+    let mut plan = build_plan(request, storage, meta.as_ref()).await?;
+
+    // H5: PG 풀 복구도 프로덕션 덮어쓰기 가드레일을 적용한다 — 대상에 기존 사용자 테이블이
+    //   있으면 충돌로 보고 `decide_guard`가 --force/대화형 확인/비-TTY 거부를 강제한다(FR-3).
+    //   Mongo 메타 경로를 타지 않는 PG에서도 동일 가드가 걸리도록 충돌 목록을 채운다(PG 시점
+    //   복구 경로와 같은 방식). --skip-precheck면 건너뛴다.
+    if is_pg && !request.skip_precheck {
+        let pg = crate::engine::postgres::conn::PgClient::connect(
+            &request.target_uri,
+            request.timeout_secs,
+        )
+        .await
+        .map_err(|e| XBackupError::PrecheckFailed(format!("복구 대상(PG) 연결 실패: {e}")))?;
+        let existing = crate::engine::postgres::meta::list_qualified(pg.client())
+            .await
+            .map_err(|e| {
+                XBackupError::PrecheckFailed(format!("기존 테이블 조회 실패: {e}"))
+            })?;
+        plan.conflicting_namespaces = existing;
+    }
 
     // 버전 호환 경고는 진행 전 항상 알린다(차단하지 않음 — PRD: 경고).
     if let Some(warning) = &plan.version_warning {
@@ -604,6 +633,29 @@ mod tests {
         // data.bin 바이트 수가 아니다(실측 다운로드 없이 계획만 산출).
         assert_eq!(outcome.stored_size_bytes, 100);
         assert!(!outcome.plan.has_conflicts());
+    }
+
+    /// H6 — PG 대상 복구에서 `--only`(선택적 복구)는 Usage(exit 2)로 거부된다. 거부는 백업
+    /// 선택·대상 연결보다 먼저 일어나므로 DB 없이 검증된다.
+    #[tokio::test]
+    async fn pg_restore_rejects_only_selective() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = LocalFs::new(dir.path()).unwrap();
+        let request = RestoreRequest {
+            target_uri: crate::config::secret::Secret::new("postgres://unused/db"),
+            mongorestore_program: "/nonexistent/should-never-run".to_string(),
+            backup_id: Some("bk".to_string()),
+            only: Some("public.orders".to_string()),
+            force: false,
+            dry_run: true,
+            skip_precheck: true,
+            timeout_secs: None,
+            progress_counter: None,
+        };
+        let err = run_restore(&request, &fs, false, |_| panic!("거부 전이라 confirm 미호출"))
+            .await
+            .expect_err("PG --only는 거부되어야 함");
+        assert_eq!(err.exit_code(), 2, "PG --only는 Usage(exit 2)여야 함: {err}");
     }
 
     fn plan_with_conflicts(conflicts: Vec<String>) -> RestorePlan {
