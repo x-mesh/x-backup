@@ -18,7 +18,7 @@ TOOLS_PATH    := $(abspath $(TOOLS_DIR))/bin
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build build-debug lint fmt test test-integration test-s3 test-pg \
+.PHONY: help build build-debug lint fmt test test-integration test-s3 test-pg test-pg-integration \
         mongodb-up mongodb-down postgres-up postgres-down tools scenario scenario-pg \
         clean devenv devenv-down xbenv-mongo xbenv-pg xbenv-clean
 
@@ -56,6 +56,10 @@ test-s3: ## S3(MinIO) 통합 테스트 — 테스트가 MinIO 컨테이너를 �
 
 test-pg: ## PostgreSQL 엔진 단위 테스트(engine::postgres 모듈) — DB·Docker 불필요
 	cargo test --lib engine::postgres
+
+test-pg-integration: postgres-up ## PG cargo 통합 테스트(H3 TOAST·C2 슬롯 gap·풀→복구) — compose PG(wal_level=logical) 자체 기동·정리
+	cargo test --features pg-integration --test pg_integration -- --include-ignored --test-threads=1; \
+	  status=$$?; $(COMPOSE_PG) down -v; exit $$status
 
 # ── 테스트용 DB 컨테이너 ──────────────────────────────────────────────
 
