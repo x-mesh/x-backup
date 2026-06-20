@@ -1,6 +1,9 @@
 # Rust 빌드 산출물
 /target
 
+# 릴리스 산출물(scripts/release.sh — tar.gz + checksums.txt)
+/dist
+
 # 백업 산출물·임시 파일 (로컬 destination 테스트 시)
 *.bin
 *.tmp
