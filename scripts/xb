@@ -94,39 +94,38 @@ ensure_devenv() {
     log "config.toml 생성 → $CFG"
     local enc_enabled="true"
     [ "${XB_NO_ENCRYPT:-0}" = "1" ] && enc_enabled="false"
+    # v2 표면 문법: 프로파일당 [profile.<name>] + flat 키. 압축·암호화는 [defaults]에
+    # 한 번만 둔다(target은 endpoint 전용이라 encrypt=false로 덮어 백업 정책 무시).
+    local enc_line="encrypt  = \"age:$AGE_PUB\""
+    [ "$enc_enabled" = "false" ] && enc_line="encrypt  = false"
     cat > "$CFG" <<EOF
-# scripts/xb가 자동 생성한 개발용 config.
+# scripts/xb가 자동 생성한 개발용 config(v2).
 #
 # 세 가지는 서로 다른 축이다:
-#   - source      = 백업 대상(prod) MongoDB. 여기선 :$( echo "$SRC_URI" | sed 's#.*localhost:##; s#/.*##' ) 컨테이너.
-#   - destination = 백업 *파일*을 둘 곳(MongoDB 아님). 여기선 로컬 폴더.
-#   - 복구 대상   = 복구를 부을 MongoDB. config가 아니라 'restore --target <uri>'로 지정
-#                   (래퍼의 restore-target은 :$( echo "$TGT_URI" | sed 's#.*localhost:##; s#/.*##' ) 컨테이너로 보냄).
+#   - source(uri)     = 백업 대상(prod) MongoDB. 여기선 :$( echo "$SRC_URI" | sed 's#.*localhost:##; s#/.*##' ) 컨테이너.
+#   - dest            = 백업 *파일*을 둘 곳(MongoDB 아님). 여기선 로컬 폴더.
+#   - 복구 대상       = 복구를 부을 MongoDB. config가 아니라 'restore --target <uri>'로 지정
+#                       (래퍼의 restore-target은 :$( echo "$TGT_URI" | sed 's#.*localhost:##; s#/.*##' ) 컨테이너로 보냄).
 #
-# 개발이라 source.uri를 직접 적었다(자격증명 없는 로컬 연결이라 안전). 비밀번호가
+# 개발이라 uri를 직접 적었다(자격증명 없는 로컬 연결이라 안전). 비밀번호가
 # 있는 prod는 평문 대신 uri_env = "MONGO_URI"로 env 참조를 쓴다(FR-10·§11).
 default_profile = "$PROFILE"
 
-[profiles.$PROFILE.source]
-uri = "$SRC_URI"            # 백업 대상(prod) = 소스 컨테이너
+# 공통 정책(전체 프로파일 적용).
+[defaults]
+compress = "zstd:6"
+$enc_line
 
-[profiles.$PROFILE.destination]
-type = "local"             # 백업 파일 저장소(local | s3) — MongoDB가 아님
-path = "$STORE"
-
-[profiles.$PROFILE.features.compression]
-algorithm = "zstd"
-level     = 6
-
-[profiles.$PROFILE.features.encryption]
-enabled        = $enc_enabled
-algorithm      = "age"
-recipient_file = "$AGE_PUB"
+[profile.$PROFILE]
+uri  = "$SRC_URI"            # 백업 대상(prod) = 소스 컨테이너
+dest = "local:$STORE"        # 백업 파일 저장소(local | s3) — MongoDB가 아님
 
 # 마이그레이션 대상용 프로파일 — 타깃 컨테이너(:$( echo "$TGT_URI" | sed 's#.*localhost:##; s#/.*##' )).
-# 'xb migrate --target-profile target'으로 source($PROFILE) → 이 프로파일로 직접 복사.
-[profiles.target.source]
-uri = "$TGT_URI"
+# endpoint 전용(dest 없음·암호화 끔). 'xb migrate --target-profile target'으로
+# source($PROFILE) → 이 프로파일로 직접 복사.
+[profile.target]
+uri     = "$TGT_URI"
+encrypt = false
 EOF
   fi
 }

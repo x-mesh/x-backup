@@ -18,7 +18,9 @@
 #   scripts/xbenv destroy ./ws             # 워크스페이스+격리 DB 제거
 #
 # 명령:
-#   new <dir> [--engine mongo|pg] [--name NAME] [--force]
+#   new <dir> [--engine mongo|pg|both] [--name NAME] [--force]
+#     --engine both : mongo+pg를 한 워크스페이스에(프로파일 mongo/mongo-target/pg/pg-target).
+#                     'make mongodb-up && make postgres-up' 둘 다 필요.
 #   adopt <dir> [--name PROFILE]   # 기존 config 디렉터리(.devenv 등)를 복사 없이 activate로 감싸기
 #   destroy <dir> [--yes]
 #   help
@@ -30,15 +32,17 @@
 # `status --all`은 XB_PROFILE과 충돌하므로 `env -u XB_PROFILE x-backup status --all`로 쓴다
 # (워크스페이스는 단일 프로파일이라 보통 그냥 `x-backup status`로 충분하다).
 #
-# 오버라이드(대상 컨테이너 접속): XB_PG_USER/XB_PG_PASSWORD/XB_PG_PORT/XB_PG_DB,
+# 오버라이드(대상 컨테이너 접속): XB_PG_USER/XB_PG_PASSWORD/XB_PG_PORT/XB_PG_TARGET_PORT/XB_PG_DB,
 #   XB_MONGO_PORT/XB_MONGO_TARGET_PORT. 빌드 생략: XB_NO_BUILD=1.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-PG_CTR="x-backup-postgres"
+PG_CTR="x-backup-postgres"            # 소스 PG 컨테이너
+PG_TGT_CTR="x-backup-postgres-target" # 복구/이관 타깃 PG 컨테이너(별도 서버)
 PGUSER="${XB_PG_USER:-xbackup}"
 PGPASS="${XB_PG_PASSWORD:-xbackup-dev}"
 PGPORT="${XB_PG_PORT:-5432}"
+PG_TGT_PORT="${XB_PG_TARGET_PORT:-5433}"
 MONGO_PORT="${XB_MONGO_PORT:-27017}"
 MONGO_TGT_PORT="${XB_MONGO_TARGET_PORT:-27117}"
 
@@ -60,82 +64,125 @@ ensure_bin() {
 }
 
 # ── PG 격리 DB 프로비저닝 ───────────────────────────────────────────────────
-pg_healthy() { docker inspect -f '{{.State.Health.Status}}' "$PG_CTR" 2>/dev/null | grep -qx healthy; }
-pg_admin()   { docker exec -i "$PG_CTR" psql -v ON_ERROR_STOP=1 -U "$PGUSER" -d postgres -tAc "$1"; }
+# 소스·타깃이 별도 컨테이너라 모든 헬퍼는 첫 인자로 컨테이너 이름을 받는다.
+pg_healthy() { docker inspect -f '{{.State.Health.Status}}' "${1:-$PG_CTR}" 2>/dev/null | grep -qx healthy; }
+pg_admin()   { docker exec -i "$1" psql -v ON_ERROR_STOP=1 -U "$PGUSER" -d postgres -tAc "$2"; }
 
 pg_create_db() {
-  local db="$1"
-  if pg_admin "SELECT 1 FROM pg_database WHERE datname='$db'" | grep -qx 1; then
-    log "PG DB 이미 존재: $db"
+  local ctr="$1" db="$2"
+  if pg_admin "$ctr" "SELECT 1 FROM pg_database WHERE datname='$db'" | grep -qx 1; then
+    log "PG DB 이미 존재: $db ($ctr)"
   else
-    docker exec -i "$PG_CTR" psql -v ON_ERROR_STOP=1 -U "$PGUSER" -d postgres \
-      -c "CREATE DATABASE \"$db\"" >/dev/null && log "PG DB 생성: $db"
+    docker exec -i "$ctr" psql -v ON_ERROR_STOP=1 -U "$PGUSER" -d postgres \
+      -c "CREATE DATABASE \"$db\"" >/dev/null && log "PG DB 생성: $db ($ctr)"
   fi
 }
 
 pg_drop_db() {
-  local db="$1"
-  docker exec -i "$PG_CTR" psql -U "$PGUSER" -d postgres \
-    -c "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE)" >/dev/null 2>&1 && log "PG DB 제거: $db" || true
+  local ctr="$1" db="$2"
+  docker exec -i "$ctr" psql -U "$PGUSER" -d postgres \
+    -c "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE)" >/dev/null 2>&1 && log "PG DB 제거: $db ($ctr)" || true
 }
 
 # ── 워크스페이스 메타(.xbenv) ───────────────────────────────────────────────
+# pg_profile: PG replication slot(xb_<profile>) 정리에 쓸 PG 프로파일 이름. 단일 pg면
+#   워크스페이스 이름, 결합(both)이면 "pg", mongo면 빈 값.
 write_meta() { cat > "$1/.xbenv" <<EOF
 engine=$2
 name=$3
 src_db=${4:-}
 tgt_db=${5:-}
+pg_profile=${6:-}
 EOF
 }
 
 # ── config.toml ─────────────────────────────────────────────────────────────
-# 시크릿(URI)은 파일에 담지 않고 uri_env로 참조한다(activate가 export). FR-10 원칙.
+# 로컬 격리 테스트 워크스페이스라 source URI를 직접 적는다(uri_env 간접 참조 대신 — 어디로
+# 붙는지 한눈에). 워크스페이스 디렉터리는 통째로 gitignore되고 자격증명은 로컬 테스트 전용이다.
+# (운영 config는 시크릿 평문 저장 금지 — uri_env를 쓴다. FR-10.)
 write_config() {
-  local dir="$1" name="$2" engine="$3"
+  local dir="$1" name="$2" engine="$3" src="$4"
   {
-    echo "# xbenv가 생성한 격리 워크스페이스 config — source URI는 env(XBENV_SOURCE_URI) 참조."
+    echo "# xbenv가 생성한 격리 워크스페이스 config(v2) — source URI 직접 지정(로컬 테스트 전용)."
     echo "default_profile = \"$name\""
     echo
-    echo "[profiles.$name.source]"
-    echo "uri_env = \"XBENV_SOURCE_URI\""
+    echo "# 공통 정책(전체 프로파일 적용) — 압축·암호화는 여기 한 번만 둔다."
+    echo "[defaults]"
+    echo "compress = \"zstd:6\""
+    echo "encrypt  = \"age:$dir/keys/age.pub\""
     echo
-    echo "[profiles.$name.destination]"
-    echo "type = \"local\""
-    echo "path = \"$dir/store\""
-    echo
-    echo "[profiles.$name.features.compression]"
-    echo "algorithm = \"zstd\""
-    echo "level     = 6"
-    echo
-    echo "[profiles.$name.features.encryption]"
-    echo "enabled        = true"
-    echo "algorithm      = \"age\""
-    echo "recipient_file = \"$dir/keys/age.pub\""
+    echo "[profile.$name]"
+    echo "uri  = \"$src\"            # 백업 대상 = 소스 컨테이너"
+    echo "dest = \"local:$dir/store\""
     if [ "$engine" = "pg" ]; then
-      echo
-      echo "[profiles.$name.features.incremental]"
-      echo "pg_logical = true   # PG 증분(logical decoding) 활성"
+      echo "pg_logical = true        # PG 증분(logical decoding) 활성"
     fi
   } > "$dir/config.toml"
 }
 
+# 한 프로파일 블록(v2 flat)을 config.toml에 덧붙인다(결합 워크스페이스 조립용).
+#   out, profile, engine(mongo|pg), uri(source URI 직접),
+#   store(""=dest 없는 endpoint 전용 프로파일), backup(1=백업 잡, 0=endpoint 전용)
+# 압축·암호화는 [defaults]에 공통으로 두므로 여기선 반복하지 않는다. endpoint 전용
+# 프로파일은 dest를 내지 않고 encrypt=false로 [defaults]의 암호화만 끈다.
+emit_profile() {
+  local out="$1" p="$2" engine="$3" uri="$4" store="$5" backup="$6"
+  {
+    echo
+    echo "[profile.$p]"
+    echo "uri  = \"$uri\""
+    if [ "$backup" = 1 ]; then
+      echo "dest = \"local:$store\""
+      if [ "$engine" = "pg" ]; then echo "pg_logical = true        # PG 증분(logical decoding) 활성"; fi
+    else
+      echo "encrypt = false          # endpoint 전용(복구/이관 대상) — 백업 안 만듦"
+    fi
+  } >> "$out"
+}
+
+# 결합(mongo+pg) config(v2) — 백업 잡 2개(mongo, pg) + endpoint 전용 대상 2개(mongo-target,
+# pg-target). 압축·암호화는 [defaults]에 공통으로 둔다. source URI는 직접 적어 어디로
+# 붙는지 한눈에 보인다(로컬 테스트 전용). 복구는 `restore --profile mongo --target-profile mongo-target`.
+#   인자: dir, m_src, m_tgt, p_src, p_tgt (각 엔진 소스/타깃 URI)
+write_config_both() {
+  local dir="$1" m_src="$2" m_tgt="$3" p_src="$4" p_tgt="$5"
+  local out="$dir/config.toml"
+  {
+    echo "# xbenv가 생성한 결합(mongo+pg) 워크스페이스 config(v2) — source URI 직접 지정(로컬 테스트 전용)."
+    echo "# 백업 잡: mongo, pg   |   복구/이관 대상(endpoint 전용): mongo-target, pg-target"
+    echo "default_profile = \"mongo\""
+    echo
+    echo "# 공통 정책(전체 프로파일 적용). endpoint 전용 프로파일은 encrypt=false로 덮는다."
+    echo "[defaults]"
+    echo "compress = \"zstd:6\""
+    echo "encrypt  = \"age:$dir/keys/age.pub\""
+  } > "$out"
+  emit_profile "$out" "mongo"        "mongo" "$m_src" "$dir/store/mongo" 1
+  emit_profile "$out" "mongo-target" "mongo" "$m_tgt" ""                 0
+  emit_profile "$out" "pg"           "pg"    "$p_src" "$dir/store/pg"    1
+  emit_profile "$out" "pg-target"    "pg"    "$p_tgt" ""                 0
+}
+
 # ── activate(생성물) ────────────────────────────────────────────────────────
-# 1부: 절대경로/URI를 셸 변수로 baking(unquoted heredoc — xbenv가 확장).
+# 1부: 절대경로/프로파일/엔진별 env(URI)를 baking(unquoted heredoc — xbenv가 확장).
 # 2부: 활성/비활성 로직(quoted heredoc — 전부 리터럴, 1부 변수만 참조).
+#
+# 인자: dir, label(프롬프트 표시명), profile(""=XB_PROFILE 미고정 — 다중 프로파일 WS),
+#       engine, agekey, env_pairs(줄당 "NAME=VALUE" — 워크스페이스 전용 export 대상; 비면 없음).
 write_activate() {
-  local dir="$1" name="$2" engine="$3" src="$4" tgt="$5"
-  local agekey="${6:-$dir/keys/age.key}"
-  cat > "$dir/activate" <<EOF
-# x-backup 워크스페이스 '$name'($engine) — \`source\`로 활성화. 비활성화: deactivate
-_XBENV_DIR="$dir"
-_XBENV_NAME="$name"
-_XBENV_ENGINE="$engine"
-_XBENV_SRC="$src"
-_XBENV_TGT="$tgt"
-_XBENV_AGEKEY="$agekey"
-_XBENV_RELBIN="$REPO/target/release"
-_XBENV_TOOLSBIN="$REPO/.tools/bin"
-EOF
+  local dir="$1" label="$2" profile="$3" engine="$4" agekey="$5" env_pairs="${6:-}"
+  {
+    echo "# x-backup 워크스페이스 '$label'($engine) — \`source\`로 활성화. 비활성화: deactivate"
+    echo "_XBENV_DIR=\"$dir\""
+    echo "_XBENV_NAME=\"$label\""
+    echo "_XBENV_PROFILE=\"$profile\""
+    echo "_XBENV_ENGINE=\"$engine\""
+    echo "_XBENV_AGEKEY=\"$agekey\""
+    echo "_XBENV_RELBIN=\"$REPO/target/release\""
+    echo "_XBENV_TOOLSBIN=\"$REPO/.tools/bin\""
+    # 워크스페이스 전용 env(URI) — 줄당 NAME=VALUE. 2부가 export하고 deactivate가 unset한다.
+    echo "_XBENV_ENV=\"$(printf '%s' "$env_pairs" | sed 's/\\/\\\\/g; s/"/\\"/g')\""
+  } > "$dir/activate"
   cat >> "$dir/activate" <<'EOF'
 
 deactivate() {
@@ -143,10 +190,14 @@ deactivate() {
   [ -n "${_XBENV_OLD_PATH+x}" ] && { PATH="$_XBENV_OLD_PATH"; export PATH; unset _XBENV_OLD_PATH; }
   if [ "${_XBENV_HAD_CONFIG:-0}" = 1 ]; then export XB_CONFIG="$_XBENV_OLD_CONFIG"; else unset XB_CONFIG 2>/dev/null || true; fi
   if [ "${_XBENV_HAD_AGE:-0}" = 1 ]; then export XB_AGE_IDENTITY_FILE="$_XBENV_OLD_AGE"; else unset XB_AGE_IDENTITY_FILE 2>/dev/null || true; fi
-  if [ "${_XBENV_HAD_PROFILE:-0}" = 1 ]; then export XB_PROFILE="$_XBENV_OLD_PROFILE"; else unset XB_PROFILE 2>/dev/null || true; fi
-  unset XB_WORKSPACE XBENV_ENGINE XBENV_SOURCE_URI XBENV_TARGET_URI
-  unset _XBENV_OLD_CONFIG _XBENV_OLD_AGE _XBENV_OLD_PROFILE _XBENV_HAD_CONFIG _XBENV_HAD_AGE _XBENV_HAD_PROFILE
-  unset _XBENV_DIR _XBENV_NAME _XBENV_ENGINE _XBENV_SRC _XBENV_TGT _XBENV_AGEKEY _XBENV_RELBIN _XBENV_TOOLSBIN
+  if [ "${_XBENV_SET_PROFILE:-0}" = 1 ]; then
+    if [ "${_XBENV_HAD_PROFILE:-0}" = 1 ]; then export XB_PROFILE="$_XBENV_OLD_PROFILE"; else unset XB_PROFILE 2>/dev/null || true; fi
+  fi
+  unset XB_WORKSPACE XBENV_ENGINE
+  # 워크스페이스가 export한 URI들 전부 원복.
+  if [ -n "${_XBENV_EXPORTED:-}" ]; then for _v in $_XBENV_EXPORTED; do unset "$_v" 2>/dev/null || true; done; fi
+  unset _XBENV_OLD_CONFIG _XBENV_OLD_AGE _XBENV_OLD_PROFILE _XBENV_HAD_CONFIG _XBENV_HAD_AGE _XBENV_HAD_PROFILE _XBENV_SET_PROFILE _XBENV_EXPORTED _v 2>/dev/null || true
+  unset _XBENV_DIR _XBENV_NAME _XBENV_PROFILE _XBENV_ENGINE _XBENV_AGEKEY _XBENV_RELBIN _XBENV_TOOLSBIN _XBENV_ENV
   unset -f deactivate 2>/dev/null || true
 }
 
@@ -158,15 +209,29 @@ _XBENV_OLD_PS1="${PS1:-}"
 _XBENV_OLD_PATH="$PATH"
 if [ -n "${XB_CONFIG+x}" ]; then _XBENV_OLD_CONFIG="$XB_CONFIG"; _XBENV_HAD_CONFIG=1; else _XBENV_HAD_CONFIG=0; fi
 if [ -n "${XB_AGE_IDENTITY_FILE+x}" ]; then _XBENV_OLD_AGE="$XB_AGE_IDENTITY_FILE"; _XBENV_HAD_AGE=1; else _XBENV_HAD_AGE=0; fi
-if [ -n "${XB_PROFILE+x}" ]; then _XBENV_OLD_PROFILE="$XB_PROFILE"; _XBENV_HAD_PROFILE=1; else _XBENV_HAD_PROFILE=0; fi
 
 export XB_WORKSPACE="$_XBENV_DIR"
 export XBENV_ENGINE="$_XBENV_ENGINE"
 export XB_CONFIG="$_XBENV_DIR/config.toml"
-export XB_PROFILE="$_XBENV_NAME"
+# 단일 프로파일 WS만 XB_PROFILE을 고정한다(다중이면 비워 둬 default_profile/--profile·status --all 사용).
+if [ -n "$_XBENV_PROFILE" ]; then
+  if [ -n "${XB_PROFILE+x}" ]; then _XBENV_OLD_PROFILE="$XB_PROFILE"; _XBENV_HAD_PROFILE=1; else _XBENV_HAD_PROFILE=0; fi
+  export XB_PROFILE="$_XBENV_PROFILE"; _XBENV_SET_PROFILE=1
+fi
 [ -n "$_XBENV_AGEKEY" ] && [ -f "$_XBENV_AGEKEY" ] && export XB_AGE_IDENTITY_FILE="$_XBENV_AGEKEY"
-[ -n "$_XBENV_SRC" ] && export XBENV_SOURCE_URI="$_XBENV_SRC"
-[ -n "$_XBENV_TGT" ] && export XBENV_TARGET_URI="$_XBENV_TGT"
+# 워크스페이스 전용 env(URI) export + deactivate용 이름 목록 축적(글로빙·재확장 없이 안전 파싱).
+_XBENV_EXPORTED=""
+if [ -n "${_XBENV_ENV:-}" ]; then
+  while IFS= read -r _line; do
+    [ -z "$_line" ] && continue
+    _name="${_line%%=*}"; _val="${_line#*=}"
+    export "$_name=$_val"
+    _XBENV_EXPORTED="$_XBENV_EXPORTED $_name"
+  done <<INNER
+$_XBENV_ENV
+INNER
+fi
+unset _line _name _val 2>/dev/null || true
 [ -d "$_XBENV_RELBIN" ]  && PATH="$_XBENV_RELBIN:$PATH"
 [ -d "$_XBENV_TOOLSBIN" ] && PATH="$_XBENV_TOOLSBIN:$PATH"
 export PATH
@@ -188,8 +253,9 @@ cmd_new() {
       *) [ -z "$dir" ] && dir="$1" || err "디렉터리 인자가 둘 이상"; shift ;;
     esac
   done
-  [ -n "$dir" ] || err "사용법: xbenv new <dir> [--engine mongo|pg] [--name NAME]"
-  case "$engine" in mongo|pg) ;; *) err "--engine은 mongo|pg" ;; esac
+  [ -n "$dir" ] || err "사용법: xbenv new <dir> [--engine mongo|pg|both] [--name NAME]"
+  case "$engine" in mongo|pg|both|all) ;; *) err "--engine은 mongo|pg|both" ;; esac
+  [ "$engine" = "all" ] && engine="both"
 
   if [ -e "$dir" ] && [ "$force" != 1 ]; then
     err "$dir 이미 존재 — 다른 경로를 쓰거나 --force"
@@ -208,25 +274,31 @@ cmd_new() {
     ( cd "$REPO" && cargo run --quiet --release --example gen_age_key -- "$dir/keys" >&2 )
   fi
 
-  # 엔진별 source/target URI + (PG) 격리 DB.
-  local src tgt src_db="" tgt_db=""
+  # 결합(mongo+pg)은 전용 경로로.
+  if [ "$engine" = "both" ]; then
+    cmd_new_both "$dir" "$name"
+    return
+  fi
+
+  # 엔진별 source/target URI + (PG) 격리 DB. PG는 소스(:PGPORT)·타깃(:PG_TGT_PORT) 별도 서버.
+  local src tgt src_db="" tgt_db="" pg_profile=""
   if [ "$engine" = "pg" ]; then
-    src_db="xbenv_$name"; tgt_db="xbenv_${name}_restore"
+    src_db="xbenv_$name"; tgt_db="xbenv_${name}_restore"; pg_profile="$name"
     src="postgres://$PGUSER:$PGPASS@localhost:$PGPORT/$src_db"
-    tgt="postgres://$PGUSER:$PGPASS@localhost:$PGPORT/$tgt_db"
-    if pg_healthy; then
-      pg_create_db "$src_db"; pg_create_db "$tgt_db"
-    else
-      warn "$PG_CTR healthy 아님 — 격리 DB 미생성. 'make postgres-up' 후 직접 createdb 하세요($src_db, $tgt_db)."
-    fi
+    tgt="postgres://$PGUSER:$PGPASS@localhost:$PG_TGT_PORT/$tgt_db"
+    if pg_healthy "$PG_CTR"; then pg_create_db "$PG_CTR" "$src_db"
+    else warn "$PG_CTR healthy 아님 — 소스 DB 미생성. 'make postgres-up' 후 createdb 하세요($src_db)."; fi
+    if pg_healthy "$PG_TGT_CTR"; then pg_create_db "$PG_TGT_CTR" "$tgt_db"
+    else warn "$PG_TGT_CTR healthy 아님 — 타깃 DB 미생성. 'make postgres-up' 후 createdb 하세요($tgt_db)."; fi
   else
     src="mongodb://localhost:$MONGO_PORT/?replicaSet=rs0&directConnection=true"
     tgt="mongodb://localhost:$MONGO_TGT_PORT/?replicaSet=rs0&directConnection=true"
   fi
 
-  write_config "$dir" "$name" "$engine"
-  write_activate "$dir" "$name" "$engine" "$src" "$tgt"
-  write_meta "$dir" "$engine" "$name" "$src_db" "$tgt_db"
+  write_config "$dir" "$name" "$engine" "$src"
+  write_activate "$dir" "$name" "$name" "$engine" "$dir/keys/age.key" \
+    "$(printf 'XBENV_SOURCE_URI=%s\nXBENV_TARGET_URI=%s' "$src" "$tgt")"
+  write_meta "$dir" "$engine" "$name" "$src_db" "$tgt_db" "$pg_profile"
   printf '*\n' > "$dir/.gitignore"               # 워크스페이스 통째로 ignore
 
   log "워크스페이스 생성: $dir (engine=$engine, profile=$name)"
@@ -237,6 +309,53 @@ cmd_new() {
   복구대상: \$XBENV_TARGET_URI
   비활성화: deactivate
   제거:     scripts/xbenv destroy "$dir"
+EOF
+}
+
+# ── new --engine both ────────────────────────────────────────────────────────
+# 한 워크스페이스에 mongo+pg를 모두 둔다 — 백업 잡 mongo/pg + endpoint 전용 대상
+# mongo-target/pg-target. mongo는 컨테이너 :27017/:27117, pg는 격리 DB를 쓴다.
+# (age 키·디렉터리·ensure_bin은 호출부 cmd_new에서 이미 준비됨.)
+cmd_new_both() {
+  local dir="$1" name="$2"
+  mkdir -p "$dir/store/mongo" "$dir/store/pg"
+
+  # Mongo URI(컨테이너) — 소스 :27017, 복구/이관 대상 :27117.
+  local m_src m_tgt
+  m_src="mongodb://localhost:$MONGO_PORT/?replicaSet=rs0&directConnection=true"
+  m_tgt="mongodb://localhost:$MONGO_TGT_PORT/?replicaSet=rs0&directConnection=true"
+
+  # PG 격리 DB — 소스(:PGPORT)·복구 대상(:PG_TGT_PORT)이 별도 서버. healthy면 각자 생성.
+  local pg_src_db="xbenv_${name}_pg" pg_tgt_db="xbenv_${name}_pg_restore"
+  local p_src p_tgt
+  p_src="postgres://$PGUSER:$PGPASS@localhost:$PGPORT/$pg_src_db"
+  p_tgt="postgres://$PGUSER:$PGPASS@localhost:$PG_TGT_PORT/$pg_tgt_db"
+  if pg_healthy "$PG_CTR"; then pg_create_db "$PG_CTR" "$pg_src_db"
+  else warn "$PG_CTR healthy 아님 — PG 소스 DB 미생성. 'make postgres-up' 후 createdb 하세요($pg_src_db)."; fi
+  if pg_healthy "$PG_TGT_CTR"; then pg_create_db "$PG_TGT_CTR" "$pg_tgt_db"
+  else warn "$PG_TGT_CTR healthy 아님 — PG 타깃 DB 미생성. 'make postgres-up' 후 createdb 하세요($pg_tgt_db)."; fi
+
+  write_config_both "$dir" "$m_src" "$m_tgt" "$p_src" "$p_tgt"
+  # XB_PROFILE은 default_profile(mongo)로 고정한다 — plain `x-backup status/backup`이 바로
+  # 동작하도록(다중 프로파일이라도 기본은 mongo). `--profile pg`로 전환, `status --all`은
+  # --all이 XB_PROFILE보다 우선하므로 그대로 전체를 본다. 편의용 XBENV_*_URI도 함께 export.
+  write_activate "$dir" "$name" "mongo" "both" "$dir/keys/age.key" \
+    "$(printf 'XBENV_MONGO_SOURCE_URI=%s\nXBENV_MONGO_TARGET_URI=%s\nXBENV_PG_SOURCE_URI=%s\nXBENV_PG_TARGET_URI=%s' \
+        "$m_src" "$m_tgt" "$p_src" "$p_tgt")"
+  # 슬롯 정리는 PG 프로파일 "pg" 기준. src_db/tgt_db엔 PG 것을 기록(mongo는 드롭 대상 없음).
+  write_meta "$dir" "both" "$name" "$pg_src_db" "$pg_tgt_db" "pg"
+  printf '*\n' > "$dir/.gitignore"
+
+  log "결합 워크스페이스 생성: $dir (engine=both, profiles=mongo, mongo-target, pg, pg-target)"
+  cat >&2 <<EOF
+
+  활성화:   source "$dir/activate"   (기본 프로파일 mongo — plain 명령은 mongo 대상)
+  상태:     x-backup status --all    (전체)   |   x-backup status (mongo)
+  Mongo:    x-backup backup --profile mongo  &&  x-backup restore --profile mongo --target-profile mongo-target
+  PG:       x-backup backup --profile pg     &&  x-backup restore --profile pg    --target-profile pg-target
+  이관:     x-backup migrate --profile mongo --target-profile mongo-target
+  대상 URI: \$XBENV_MONGO_TARGET_URI / \$XBENV_PG_TARGET_URI
+  비활성화: deactivate   |   제거: scripts/xbenv destroy "$dir"
 EOF
 }
 
@@ -270,8 +389,8 @@ cmd_adopt() {
   for c in "$dir/keys/age.key" "$dir/age.key"; do [ -f "$c" ] && { agekey="$c"; break; }; done
 
   ensure_bin
-  # config가 직접 uri를 갖는 경우가 많으므로 src/tgt는 비워 둔다(activate가 XBENV_* 강제 안 함).
-  write_activate "$dir" "$name" "adopted" "" "" "$agekey"
+  # config가 직접 uri를 갖는 경우가 많으므로 env(URI)는 비워 둔다(activate가 XBENV_* 강제 안 함).
+  write_activate "$dir" "$name" "$name" "adopted" "$agekey" ""
 
   log "adopt 완료: $dir (profile=$name${agekey:+, age=$agekey})"
   cat >&2 <<EOF
@@ -299,29 +418,37 @@ cmd_destroy() {
   [ -f "$dir/.xbenv" ] || err "$dir 는 xbenv 워크스페이스가 아님(.xbenv 없음)"
 
   # shellcheck disable=SC1091
-  local engine name src_db tgt_db
+  local engine name src_db tgt_db pg_profile
   engine="$(grep -E '^engine=' "$dir/.xbenv" | cut -d= -f2-)"
   name="$(grep -E '^name=' "$dir/.xbenv" | cut -d= -f2-)"
   src_db="$(grep -E '^src_db=' "$dir/.xbenv" | cut -d= -f2-)"
   tgt_db="$(grep -E '^tgt_db=' "$dir/.xbenv" | cut -d= -f2-)"
+  pg_profile="$(grep -E '^pg_profile=' "$dir/.xbenv" | cut -d= -f2-)"
+  # 하위호환: 옛 메타엔 pg_profile이 없다 — 단일 pg면 워크스페이스 이름이 곧 슬롯 프로파일.
+  [ -z "$pg_profile" ] && pg_profile="$name"
+
+  # PG 정리가 필요한 엔진(pg 단일 또는 결합 both).
+  local has_pg=0
+  case "$engine" in pg|both) has_pg=1 ;; esac
 
   if [ "$yes" != 1 ]; then
     printf '[xbenv] %s (engine=%s) 를 제거합니다' "$dir" "$engine" >&2
-    [ "$engine" = "pg" ] && printf ' — PG DB %s, %s 및 slot xb_%s 포함' "$src_db" "$tgt_db" "$name" >&2
+    [ "$has_pg" = 1 ] && printf ' — PG DB %s, %s 및 slot xb_%s 포함' "$src_db" "$tgt_db" "$pg_profile" >&2
     printf '. 계속? [y/N] ' >&2
     local ans; read -r ans
     case "$ans" in y|yes|Y|YES) ;; *) log "취소"; return ;; esac
   fi
 
-  if [ "$engine" = "pg" ] && pg_healthy; then
-    # slot은 src_db에 묶여 있으므로 DB 드롭 전에 먼저 제거.
-    if [ -n "$src_db" ]; then
+  if [ "$has_pg" = 1 ]; then
+    # 소스 서버: slot은 src_db에 묶여 있으므로 DB 드롭 전에 먼저 제거(슬롯 이름은 PG 프로파일 기준).
+    if [ -n "$src_db" ] && pg_healthy "$PG_CTR"; then
       docker exec -i "$PG_CTR" psql -U "$PGUSER" -d "$src_db" \
-        -c "SELECT pg_drop_replication_slot('xb_$name') WHERE EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name='xb_$name')" \
+        -c "SELECT pg_drop_replication_slot('xb_$pg_profile') WHERE EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name='xb_$pg_profile')" \
         >/dev/null 2>&1 || true
-      pg_drop_db "$src_db"
+      pg_drop_db "$PG_CTR" "$src_db"
     fi
-    [ -n "$tgt_db" ] && pg_drop_db "$tgt_db"
+    # 타깃 서버: 복구 대상 DB 제거.
+    [ -n "$tgt_db" ] && pg_healthy "$PG_TGT_CTR" && pg_drop_db "$PG_TGT_CTR" "$tgt_db"
   fi
 
   rm -rf "$dir"

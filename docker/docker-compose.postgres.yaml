@@ -1,9 +1,13 @@
 # 테스트용 PostgreSQL — PG 엔진(드라이버 COPY 백업/복구/status) 검증 환경.
 #
-# 기본 자격증명은 로컬 테스트 전용 — 외부 노출 금지. 운영 값은 환경변수로 주입:
-#   XB_PG_PORT / XB_PG_USER / XB_PG_PASSWORD / XB_PG_DB
+# MongoDB와 동일하게 소스 + 복구/이관 타깃 2식으로 띄운다(server→server 복구·migrate 검증).
+#   소스:  postgres://…@localhost:${XB_PG_PORT:-5432}/<db>
+#   타깃:  postgres://…@localhost:${XB_PG_TARGET_PORT:-5433}/<db>
 #
-# 사용: make postgres-up / make postgres-down
+# 기본 자격증명은 로컬 테스트 전용 — 외부 노출 금지. 운영 값은 환경변수로 주입:
+#   XB_PG_PORT / XB_PG_TARGET_PORT / XB_PG_USER / XB_PG_PASSWORD / XB_PG_DB
+#
+# 사용: make postgres-up / make postgres-down (둘 다 한 번에 기동·정리)
 
 services:
   postgres:
@@ -27,6 +31,29 @@ services:
       # listen_addresses=''(유닉스 소켓 전용)라 TCP가 없다. -h 없이 소켓으로 검사하면 그
       # 임시 서버에 매칭돼 `--wait`가 진짜(wal_level=logical) 서버 기동 전에 반환될 수 있다.
       # TCP 게이팅으로 본서버까지 확실히 대기한다.
+      test:
+        - CMD-SHELL
+        - pg_isready -h 127.0.0.1 -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 3s
+
+  # 타깃 분리 복구·migrate(server→server) 검증용 별도 인스턴스(:5433). 데이터는 비영속.
+  postgres-target:
+    image: ${XB_PG_IMAGE:-postgres:16}
+    container_name: x-backup-postgres-target
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+    environment:
+      POSTGRES_USER: ${XB_PG_USER:-xbackup}
+      POSTGRES_PASSWORD: ${XB_PG_PASSWORD:-xbackup-dev} # 로컬 전용 기본값
+      POSTGRES_DB: ${XB_PG_DB:-xbackup}
+    ports:
+      - "${XB_PG_TARGET_PORT:-5433}:5432"
+    healthcheck:
       test:
         - CMD-SHELL
         - pg_isready -h 127.0.0.1 -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
