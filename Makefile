@@ -16,11 +16,25 @@ TOOLS_URL     ?= https://fastdl.mongodb.org/tools/db/mongodb-database-tools-maco
 TOOLS_SHA     ?= 5bef906f3d9b593e70155b01b8eff8de37f9717cfc1c77568853a9b122e6adbf
 TOOLS_PATH    := $(abspath $(TOOLS_DIR))/bin
 
+# 현재 패키지 버전(Cargo.toml [package].version) — bump/tag/release가 공유.
+# release.sh와 동일한 추출식(행 시작 version만 매칭 — 의존성의 들여쓴 version은 제외).
+VERSION  := $(shell grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+# 디버그 실행 기본값 — `make run ARGS="backup --config ..."`, `make run RUST_LOG=trace`로 오버라이드.
+RUST_LOG ?= debug
+ARGS     ?=
+
+# 로컬 설치 위치 — install.sh 기본과 동일($HOME/.local/bin, sudo 불필요).
+# 시스템 전역은 `make install PREFIX=/usr/local`(쓰기 권한 필요할 수 있음).
+PREFIX ?= $(HOME)/.local
+BINDIR := $(PREFIX)/bin
+
 .DEFAULT_GOAL := help
 
-.PHONY: help build build-debug lint fmt test test-integration test-s3 test-pg test-pg-integration \
+.PHONY: help build build-debug run debug lint fmt install uninstall \
+        bump-patch bump-minor bump-major tag release release-dry release-skip-tap \
+        test test-integration test-s3 test-pg test-pg-integration \
         mongodb-up mongodb-down postgres-up postgres-down tools scenario scenario-pg \
-        clean devenv devenv-down xbenv-mongo xbenv-pg xbenv-clean
+        clean devenv devenv-down xbenv-mongo xbenv-pg xbenv-both xbenv-clean
 
 help: ## 타깃 목록 출력
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -33,12 +47,79 @@ build: ## release 빌드 → target/release/x-backup
 build-debug: ## 디버그 빌드(심볼 포함, 디버거 연결용) → target/debug/x-backup
 	cargo build
 
+run: build-debug ## 디버그 빌드 실행(RUST_LOG=debug 기본, 백트레이스 ON). 인자: ARGS="backup ..."
+	RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=1 target/debug/x-backup $(ARGS)
+
+debug: build-debug ## rust-lldb로 디버거 기동(브레이크포인트·스텝). 인자: ARGS="..."
+	@command -v rust-lldb >/dev/null 2>&1 || { echo "rust-lldb 없음 — rustup component add llvm-tools / Xcode CLT 확인"; exit 1; }
+	RUST_BACKTRACE=1 rust-lldb -- target/debug/x-backup $(ARGS)
+
 lint: ## cargo fmt --check + clippy -D warnings (CI lint job과 동일)
 	cargo fmt --all -- --check
 	cargo clippy --all-targets --all-features -- -D warnings
 
 fmt: ## cargo fmt --all 적용
 	cargo fmt --all
+
+# ── 설치(로컬) ────────────────────────────────────────────────────────
+# release 바이너리를 $(BINDIR)에 복사한다. brew 설치본($(brew --prefix)/bin/x-backup)과는
+# 다른 디렉터리라 파일 충돌 없이 공존하며, 실제 실행 바이너리는 PATH 우선순위가 정한다
+# (보통 ~/.local/bin이 앞 → 로컬 빌드가 brew 것을 가린다. 확인: which -a x-backup).
+
+install: build ## release 바이너리를 로컬 설치 → $(BINDIR)/x-backup. 위치 변경: PREFIX=/usr/local
+	@mkdir -p "$(BINDIR)"
+	install -m 0755 target/release/x-backup "$(BINDIR)/x-backup"
+	@printf '\033[1;32m✓\033[0m 설치: %s (%s)\n' "$(BINDIR)/x-backup" "$$("$(BINDIR)/x-backup" --version 2>/dev/null)"
+	@case ":$$PATH:" in *":$(BINDIR):"*) ;; \
+	  *) printf '\033[1;33m주의\033[0m %s 가 PATH에 없습니다 — 셸 rc에 추가: export PATH="%s:$$PATH"\n' "$(BINDIR)" "$(BINDIR)" ;; esac
+	@if command -v brew >/dev/null 2>&1 && [ -x "$$(brew --prefix)/bin/x-backup" ]; then \
+	  printf 'brew 설치본과 공존: %s/bin/x-backup — 실제 실행은 PATH 우선순위 기준(확인: which -a x-backup)\n' "$$(brew --prefix)"; \
+	fi
+
+uninstall: ## 로컬 설치 제거($(BINDIR)/x-backup) — brew 설치본은 건드리지 않음
+	@rm -f "$(BINDIR)/x-backup" && printf '\033[1;32m✓\033[0m 제거: %s\n' "$(BINDIR)/x-backup"
+
+# ── 릴리스 · 버전 · 배포 ──────────────────────────────────────────────
+# 표준 흐름: make bump-patch → (CHANGELOG 갱신·커밋) → make tag → make release
+# bump은 cargo set-version(cargo-edit) 우선, 없으면 sed+cargo update로 폴백한다.
+
+bump-patch: ## 패치 버전 +1 (Cargo.toml + Cargo.lock)
+	$(bump-version)
+bump-minor: ## 마이너 버전 +1, 패치 리셋 (Cargo.toml + Cargo.lock)
+	$(bump-version)
+bump-major: ## 메이저 버전 +1, 마이너·패치 리셋 (Cargo.toml + Cargo.lock)
+	$(bump-version)
+
+# $(@:bump-%=%) → patch|minor|major. cargo set-version이 있으면 Cargo.lock까지 갱신,
+# 없으면 awk로 semver 증가 후 [package].version만 치환(BSD/GNU sed 공통 -i.bak) + lock 동기화.
+define bump-version
+	@part='$(@:bump-%=%)'; cur='$(VERSION)'; \
+	if command -v cargo-set-version >/dev/null 2>&1; then \
+	  cargo set-version --bump "$$part"; \
+	else \
+	  new=$$(printf '%s' "$$cur" | awk -F. -v p="$$part" -v OFS=. \
+	    '{ if(p=="major"){$$1++;$$2=0;$$3=0} else if(p=="minor"){$$2++;$$3=0} else {$$3++} } 1'); \
+	  sed -i.bak -E "s/^version = \"[^\"]+\"/version = \"$$new\"/" Cargo.toml && rm -f Cargo.toml.bak; \
+	  cargo update -p x-backup --precise "$$new" >/dev/null 2>&1 || cargo update -p x-backup >/dev/null 2>&1 || true; \
+	fi; \
+	printf '\033[1;32m✓\033[0m 버전: %s → %s  (다음: CHANGELOG 갱신·커밋 → make tag → make release)\n' \
+	  "$$cur" "$$(grep -m1 '^version' Cargo.toml | sed -E 's/.*\"([^\"]+)\".*/\1/')"
+endef
+
+tag: ## 현재 버전으로 git 태그 v$(VERSION) 생성 + origin push (release 전제조건)
+	@v='v$(VERSION)'; \
+	git rev-parse "$$v" >/dev/null 2>&1 && { echo "태그 $$v 이미 존재 — 중복 생성 안 함"; exit 1; }; \
+	git diff --quiet && git diff --cached --quiet || { echo "워킹트리가 clean이 아님 — 커밋 후 태그하세요"; exit 1; }; \
+	git tag "$$v" && git push origin "$$v" && printf '\033[1;32m✓\033[0m 태그 push: %s\n' "$$v"
+
+release: ## 정식 릴리스 게시 — 4플랫폼 빌드·패키징 → GitHub 릴리스 → Homebrew tap 갱신
+	scripts/release.sh
+
+release-dry: ## 릴리스 빌드·패키징만 검증(게시/tap 갱신 안 함) → dist/
+	scripts/release.sh --dry-run
+
+release-skip-tap: ## 릴리스 게시하되 Homebrew tap 갱신은 생략
+	scripts/release.sh --skip-tap
 
 # ── 테스트 ────────────────────────────────────────────────────────────
 
@@ -69,10 +150,10 @@ mongodb-up: ## MongoDB replica set 기동(소스 :27017 + 복구 타깃 :27117, 
 mongodb-down: ## MongoDB 컨테이너·볼륨 정리
 	$(COMPOSE_MONGO) down -v
 
-postgres-up: ## PostgreSQL :5432 기동(PG 엔진 백업/복구/status 테스트용)
+postgres-up: ## PostgreSQL 소스 :5432 + 타깃 :5433 기동(PG 엔진 백업/복구/migrate 테스트용)
 	$(COMPOSE_PG) up -d --wait
 
-postgres-down: ## PostgreSQL 정리
+postgres-down: ## PostgreSQL 정리(소스+타깃)
 	$(COMPOSE_PG) down -v
 
 # ── 도구·시나리오 ─────────────────────────────────────────────────────
@@ -116,8 +197,12 @@ xbenv-pg: build postgres-up ## PG 격리 워크스페이스 준비 + activate �
 	@d='$(or $(DIR),.xbenv-pg)'; [ -f "$$d/activate" ] || scripts/xbenv new "$$d" --engine pg --name pg; \
 	  printf '\n  활성화: \033[36msource %s/activate\033[0m   (해제: deactivate · 제거: make xbenv-clean)\n' "$$d"
 
-xbenv-clean: ## 격리 워크스페이스 제거(.xbenv-mongo/.xbenv-pg, 또는 DIR=)
-	@for d in $(or $(DIR),.xbenv-mongo .xbenv-pg); do \
+xbenv-both: build mongodb-up postgres-up ## mongo+pg 결합 워크스페이스(프로파일 mongo/pg + *-target) + 안내
+	@d='$(or $(DIR),.xbenv-both)'; [ -f "$$d/activate" ] || scripts/xbenv new "$$d" --engine both --name both; \
+	  printf '\n  활성화: \033[36msource %s/activate\033[0m   (해제: deactivate · 제거: make xbenv-clean)\n' "$$d"
+
+xbenv-clean: ## 격리 워크스페이스 제거(.xbenv-mongo/.xbenv-pg/.xbenv-both, 또는 DIR=)
+	@for d in $(or $(DIR),.xbenv-mongo .xbenv-pg .xbenv-both); do \
 	  if [ -e "$$d" ]; then scripts/xbenv destroy "$$d" --yes; fi; \
 	done
 
