@@ -16,10 +16,12 @@
 use std::path::PathBuf;
 
 use crate::cli::args::VerifyArgs;
+use crate::cli::output::{field_line, field_line_toned, status_token, style, Tone};
 use crate::config::env::collect_overrides_from_process;
 use crate::config::merged::MergeInput;
 use crate::config::ResolvedConfig;
 use crate::error::{Result, XBackupError};
+use crate::i18n::Lang;
 use crate::manifest::chain::ChainReport;
 use crate::pipeline::verify::{verify_backup, verify_chain_for, VerifyReport};
 use crate::storage::{LocalFs, Storage};
@@ -28,13 +30,24 @@ use crate::storage::{LocalFs, Storage};
 ///
 /// `--profile`이 없을 때 destination을 알아내기 위해 config가 필요하다. verify는 프로파일
 /// 선택 인자가 없으므로(현 args 표면) default_profile 또는 단일 프로파일을 사용한다.
-pub async fn handle(config_path: Option<PathBuf>, args: VerifyArgs) -> Result<()> {
+pub async fn handle(
+    config_path: Option<PathBuf>,
+    lang_flag: Option<crate::i18n::Lang>,
+    args: VerifyArgs,
+) -> Result<()> {
+    let config_toml = match &config_path {
+        Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
+            XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
+        })?),
+        None => None,
+    };
+    let lang = crate::i18n::resolve_from_toml(lang_flag, config_toml.as_deref());
     let storage = open_storage(&config_path).await?;
-    run(storage.as_ref(), &args).await
+    run(storage.as_ref(), &args, lang).await
 }
 
 /// 검증을 수행하고 종료 코드를 결정한다(Storage 주입 — 테스트 가능).
-async fn run(storage: &dyn Storage, args: &VerifyArgs) -> Result<()> {
+async fn run(storage: &dyn Storage, args: &VerifyArgs, lang: Lang) -> Result<()> {
     // 1) 구조(+심층) 검증. 키 부재(Config)는 §8.5에 따라 검증 실패(exit 1)로 보정한다.
     let report = match verify_backup(storage, &args.id, args.deep).await {
         Ok(r) => r,
@@ -59,7 +72,7 @@ async fn run(storage: &dyn Storage, args: &VerifyArgs) -> Result<()> {
     if args.json {
         print_json(&report, chain.as_ref());
     } else {
-        print_human(&report, chain.as_ref());
+        print_human(&report, chain.as_ref(), lang);
     }
 
     // 4) 종료 코드 판정.
@@ -126,45 +139,106 @@ async fn open_storage(config_path: &Option<PathBuf>) -> Result<Box<dyn Storage>>
 /// config.toml에서 default_profile을 읽는다(없으면 "default").
 fn default_profile_name(config_toml: Option<&str>) -> String {
     config_toml
-        .and_then(|raw| toml::from_str::<crate::config::file::Config>(raw).ok())
+        .and_then(|raw| crate::config::file::Config::from_toml_str(raw).ok())
         .and_then(|c| c.default_profile)
         .unwrap_or_else(|| "default".to_string())
 }
 
 /// 사람이 읽는 검증 결과 출력(stdout).
-fn print_human(report: &VerifyReport, chain: Option<&ChainReport>) {
-    println!("검증 결과 — {}", report.backup_id);
-    println!("  manifest 정합: {}", ok_mark(report.manifest_sidecar_ok));
-    println!("  data 체크섬:   {}", ok_mark(report.data_checksum_ok));
+fn print_human(report: &VerifyReport, chain: Option<&ChainReport>, lang: Lang) {
+    const W: usize = 21;
+    println!(
+        "{} — {}",
+        style(lang.sel("verify result", "검증 결과"), Tone::Plan),
+        style(&report.backup_id, Tone::Value)
+    );
+    println!(
+        "{}",
+        field_line("manifest integrity", ok_mark(report.manifest_sidecar_ok), W,)
+    );
+    println!(
+        "{}",
+        field_line("data checksum", ok_mark(report.data_checksum_ok), W,)
+    );
     if report.empty_slice {
-        println!("  (빈 증분 슬라이스 — data.bin 없음, 정상)");
+        println!(
+            "  {}",
+            style(
+                lang.sel(
+                    "(empty incremental slice — no data.bin, normal)",
+                    "(빈 증분 슬라이스 — data.bin 없음, 정상)"
+                ),
+                Tone::Muted,
+            )
+        );
     }
     match report.deep_decode_ok {
-        Some(true) => println!("  심층 디코드:   OK"),
-        Some(false) => println!("  심층 디코드:   실패"),
+        Some(true) => println!("{}", field_line("deep decode", ok_mark(true), W)),
+        Some(false) => println!("{}", field_line("deep decode", ok_mark(false), W)),
         None => {}
     }
     for w in &report.warnings {
-        println!("  경고:          {w}");
+        println!(
+            "{}",
+            field_line_toned(lang.sel("warning", "경고"), w, W, Tone::Warning)
+        );
     }
 
     if let Some(c) = chain {
-        println!("체인 — base: {}", c.base_id);
         println!(
-            "  증분 {}개: {}",
-            c.incremental_ids.len(),
-            c.incremental_ids.join(", ")
+            "{} — base: {}",
+            style(lang.sel("chain", "체인"), Tone::Plan),
+            style(&c.base_id, Tone::Value)
+        );
+        println!(
+            "{}",
+            field_line(
+                lang.sel("incremental", "증분"),
+                format!(
+                    "{}: {}",
+                    style(&c.incremental_ids.len().to_string(), Tone::Value),
+                    c.incremental_ids.join(", ")
+                ),
+                W,
+            )
         );
         if c.is_continuous() {
-            println!("  체인 상태:     연속(PITR 가능)");
+            println!(
+                "{}",
+                field_line_toned(
+                    lang.sel("chain status", "체인 상태"),
+                    lang.sel("continuous (PITR available)", "연속(PITR 가능)"),
+                    W,
+                    Tone::Success,
+                )
+            );
         } else {
-            println!("  체인 상태:     끊김({}건) — PITR 불가", c.breaks.len());
+            println!(
+                "{}",
+                field_line_toned(
+                    lang.sel("chain status", "체인 상태"),
+                    lang.sel(
+                        &format!("broken ({} breaks) — PITR unavailable", c.breaks.len()),
+                        &format!("끊김({}건) — PITR 불가", c.breaks.len())
+                    ),
+                    W,
+                    Tone::Danger,
+                )
+            );
             for b in &c.breaks {
-                println!("    - {b}");
+                println!("    - {}", style(&b.to_string(), Tone::Danger));
             }
         }
         for w in &c.warnings {
-            println!("  체인 경고:     {w}");
+            println!(
+                "{}",
+                field_line_toned(
+                    lang.sel("chain warning", "체인 경고"),
+                    w.to_string(),
+                    W,
+                    Tone::Warning,
+                )
+            );
         }
     }
 }
@@ -193,12 +267,12 @@ fn print_json(report: &VerifyReport, chain: Option<&ChainReport>) {
     println!("{value}");
 }
 
-/// 불리언을 OK/실패 마크로.
-fn ok_mark(ok: bool) -> &'static str {
+/// 불리언을 색 입힌 OK/FAIL 마크로(상태 토큰 — 항상 영문).
+fn ok_mark(ok: bool) -> String {
     if ok {
-        "OK"
+        status_token("OK", Tone::Success)
     } else {
-        "실패"
+        status_token("FAIL", Tone::Danger)
     }
 }
 
@@ -268,7 +342,9 @@ mod tests {
         let payload = b"archive";
         seed(&fs, &full("bk", &sha256_hex(payload)), payload).await;
 
-        run(&fs, &args("bk", false, false, false)).await.unwrap();
+        run(&fs, &args("bk", false, false, false), crate::i18n::Lang::En)
+            .await
+            .unwrap();
     }
 
     /// 변조 산출물은 exit 1로 실패한다.
@@ -279,7 +355,7 @@ mod tests {
         let m = full("bk", &sha256_hex(b"original"));
         seed(&fs, &m, b"TAMPERED").await;
 
-        let err = run(&fs, &args("bk", false, false, false))
+        let err = run(&fs, &args("bk", false, false, false), crate::i18n::Lang::En)
             .await
             .unwrap_err();
         assert_eq!(err.exit_code(), 1);
@@ -302,7 +378,9 @@ mod tests {
         unsafe {
             std::env::remove_var(crate::pipeline::stage::ENV_AGE_IDENTITY_FILE);
         }
-        let err = run(&fs, &args("bk", true, false, false)).await.unwrap_err();
+        let err = run(&fs, &args("bk", true, false, false), crate::i18n::Lang::En)
+            .await
+            .unwrap_err();
         // §8.5: 키 부재 deep은 검증 실패(exit 1)로 보정.
         assert_eq!(err.exit_code(), 1, "키 부재 deep은 exit 1: {err}");
         assert!(err.to_string().contains("개인키"), "격리 안내 누락: {err}");
@@ -318,7 +396,7 @@ mod tests {
         m.status = BackupStatus::Incomplete;
         seed(&fs, &m, payload).await;
 
-        let err = run(&fs, &args("bk", false, false, false))
+        let err = run(&fs, &args("bk", false, false, false), crate::i18n::Lang::En)
             .await
             .unwrap_err();
         assert_eq!(err.exit_code(), 4);
@@ -347,7 +425,9 @@ mod tests {
             .await
             .unwrap();
 
-        let err = run(&fs, &args("i1", false, true, false)).await.unwrap_err();
+        let err = run(&fs, &args("i1", false, true, false), crate::i18n::Lang::En)
+            .await
+            .unwrap_err();
         assert_eq!(err.exit_code(), 4, "broken chain은 exit 4: {err}");
     }
 

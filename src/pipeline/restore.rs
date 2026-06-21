@@ -230,9 +230,7 @@ where
         .map_err(|e| XBackupError::PrecheckFailed(format!("복구 대상(PG) 연결 실패: {e}")))?;
         let existing = crate::engine::postgres::meta::list_qualified(pg.client())
             .await
-            .map_err(|e| {
-                XBackupError::PrecheckFailed(format!("기존 테이블 조회 실패: {e}"))
-            })?;
+            .map_err(|e| XBackupError::PrecheckFailed(format!("기존 테이블 조회 실패: {e}")))?;
         plan.conflicting_namespaces = existing;
     }
 
@@ -652,10 +650,16 @@ mod tests {
             timeout_secs: None,
             progress_counter: None,
         };
-        let err = run_restore(&request, &fs, false, |_| panic!("거부 전이라 confirm 미호출"))
-            .await
-            .expect_err("PG --only는 거부되어야 함");
-        assert_eq!(err.exit_code(), 2, "PG --only는 Usage(exit 2)여야 함: {err}");
+        let err = run_restore(&request, &fs, false, |_| {
+            panic!("거부 전이라 confirm 미호출")
+        })
+        .await
+        .expect_err("PG --only는 거부되어야 함");
+        assert_eq!(
+            err.exit_code(),
+            2,
+            "PG --only는 Usage(exit 2)여야 함: {err}"
+        );
     }
 
     fn plan_with_conflicts(conflicts: Vec<String>) -> RestorePlan {

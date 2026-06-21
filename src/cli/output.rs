@@ -12,6 +12,10 @@
 
 use std::io::IsTerminal;
 
+use crate::cli::table::{
+    pad, paint, use_color, use_color_stderr, BOLD, CYAN, DIM, GREEN, RED, YELLOW,
+};
+
 /// 사용자에게 보여줄 출력 모드.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMode {
@@ -21,6 +25,68 @@ pub enum OutputMode {
     Quiet,
     /// 기계 판독 JSON.
     Json,
+}
+
+/// 사람용 출력의 의미 색상.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    /// 성공적으로 끝난 작업 제목.
+    Success,
+    /// dry-run/계획/정보성 제목.
+    Plan,
+    /// 경고·주의.
+    Warning,
+    /// 위험하거나 실패한 상태.
+    Danger,
+    /// 필드 라벨·강조 기호.
+    Label,
+    /// 중요한 값.
+    Value,
+    /// 보조 설명·컨텍스트.
+    Muted,
+}
+
+fn tone_codes(tone: Tone) -> &'static [&'static str] {
+    match tone {
+        Tone::Success => &[BOLD, GREEN],
+        Tone::Plan => &[BOLD, CYAN],
+        Tone::Warning => &[BOLD, YELLOW],
+        Tone::Danger => &[BOLD, RED],
+        Tone::Label => &[BOLD, CYAN],
+        Tone::Value => &[BOLD],
+        Tone::Muted => &[DIM],
+    }
+}
+
+/// stdout 사람용 텍스트에 의미 색상을 적용한다. 비-TTY/NO_COLOR에서는 원문 그대로.
+pub fn style(s: &str, tone: Tone) -> String {
+    paint(s, tone_codes(tone), use_color())
+}
+
+/// stderr 사람용 텍스트에 의미 색상을 적용한다. 비-TTY/NO_COLOR에서는 원문 그대로.
+pub fn style_stderr(s: &str, tone: Tone) -> String {
+    paint(s, tone_codes(tone), use_color_stderr())
+}
+
+/// 정렬된 `label: value` 한 줄을 만든다. `width`는 `label:` 포함 표시 폭이다.
+pub fn field_line(label: &str, value: impl AsRef<str>, width: usize) -> String {
+    let key = pad(&format!("{label}:"), width);
+    format!("  {}{}", style(&key, Tone::Label), value.as_ref())
+}
+
+/// 값의 상태에 따라 색을 다르게 입힌 `label: value` 한 줄.
+pub fn field_line_toned(label: &str, value: impl AsRef<str>, width: usize, tone: Tone) -> String {
+    let key = pad(&format!("{label}:"), width);
+    format!(
+        "  {}{}",
+        style(&key, Tone::Label),
+        style(value.as_ref(), tone)
+    )
+}
+
+/// OK/WARN/FAIL 같은 짧은 상태 토큰.
+pub fn status_token(text: &str, tone: Tone) -> String {
+    style(text, tone)
 }
 
 /// 출력 모드 결정에 쓰는 CLI 플래그 묶음.
@@ -128,12 +194,149 @@ pub fn print_run_context(profile: &str, db: Option<crate::engine::DbKind>, mode:
     if mode.emits_json() {
         return;
     }
-    use crate::cli::table::{paint, use_color, DIM};
     let line = match db {
-        Some(d) => format!("▸ 프로파일 {profile} · DB {}", d.label()),
-        None => format!("▸ 프로파일 {profile}"),
+        Some(d) => format!("▸ profile {profile} · DB {}", d.label()),
+        None => format!("▸ profile {profile}"),
     };
-    eprintln!("{}", paint(&line, &[DIM], use_color()));
+    eprintln!("{}", style_stderr(&line, Tone::Muted));
+}
+
+/// 접속 URI에서 자격증명(userinfo)·민감 쿼리 값을 가린 표시용 문자열을 만든다.
+///
+/// "어디로 연결/복구되는지"(scheme·host:port·DB)는 사람이 확인할 수 있어야 하지만, 비밀번호·
+/// 토큰은 절대 노출하지 않는다(PRD §11). `user:pass@`는 `***@`로, 민감 쿼리 파라미터의 값은
+/// `***`로 치환하고 나머지(replicaSet 등)는 그대로 둔다. [`Secret`](crate::config::secret::Secret)이
+/// 통째로 `[REDACTED]`만 내는 것과 달리, 이 함수는 host를 보존해 대상 식별을 돕는다.
+pub fn redact_uri(uri: &str) -> String {
+    // scheme://rest 분리(스킴이 없으면 통째로 authority/rest로 취급).
+    let (scheme, rest) = match uri.split_once("://") {
+        Some((s, r)) => (Some(s), r),
+        None => (None, uri),
+    };
+    // authority(host[:port])와 path/query 분리 — authority는 첫 '/' 또는 '?' 전까지.
+    let auth_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(auth_end);
+    // userinfo(user:pass@)가 있으면 흔적(***@)만 남기고 호스트는 보존한다.
+    let host = match authority.rsplit_once('@') {
+        Some((_, h)) => format!("***@{h}"),
+        None => authority.to_string(),
+    };
+    let tail = redact_query(tail);
+    match scheme {
+        Some(s) => format!("{s}://{host}{tail}"),
+        None => format!("{host}{tail}"),
+    }
+}
+
+/// path?query에서 민감 키의 값을 `***`로 가린다(키·나머지 파라미터는 보존). query가 없으면 그대로.
+fn redact_query(tail: &str) -> String {
+    let Some((path, query)) = tail.split_once('?') else {
+        return tail.to_string();
+    };
+    let redacted = query
+        .split('&')
+        .map(|pair| {
+            let key = pair.split('=').next().unwrap_or(pair);
+            if is_sensitive_param(key) {
+                format!("{key}=***")
+            } else {
+                pair.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{path}?{redacted}")
+}
+
+/// 값에 시크릿이 담길 수 있는 쿼리 파라미터 키인지 판별한다(대소문자 무시).
+fn is_sensitive_param(key: &str) -> bool {
+    const SENSITIVE: &[&str] = &[
+        "password",
+        "pwd",
+        "sslpassword",
+        "tlscertificatekeyfilepassword",
+        "authmechanismproperties",
+        "secret",
+        "token",
+        "accesskey",
+        "secretkey",
+        "awssessiontoken",
+    ];
+    let k = key.to_ascii_lowercase();
+    SENSITIVE.contains(&k.as_str())
+}
+
+/// 복구 대상 URI가 어디서 왔는지 — 표시·감사용.
+///
+/// restore의 대상 결정 우선순위(`--target` > `--target-profile` > 프로파일 자신 source)를
+/// 그대로 반영한다. 이름(`Profile`)은 소유한다 — 짧은 문자열이라 복제 비용이 무시할 만하고,
+/// `args` 수명에 묶이지 않아 핸들러 간 이동이 자유롭다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreTargetOrigin {
+    /// `--target <uri>`로 직접 지정.
+    Flag,
+    /// `--target-profile <name>` — 다른 프로파일의 source 접속.
+    Profile(String),
+    /// 미지정 — 프로파일 자신의 source로 되돌리는 in-place 복구(기본).
+    InPlace,
+}
+
+impl RestoreTargetOrigin {
+    /// 사람용 출처 라벨(괄호 안 표시).
+    fn label(&self, lang: crate::i18n::Lang) -> String {
+        match self {
+            RestoreTargetOrigin::Flag => "--target".to_string(),
+            RestoreTargetOrigin::Profile(name) => format!("--target-profile: {name}"),
+            RestoreTargetOrigin::InPlace => {
+                lang.sel("profile source", "프로파일 source").to_string()
+            }
+        }
+    }
+}
+
+/// 복구 대상(어느 host로 복원하는지)을 **stderr**에 한 줄로 명확히 표시한다.
+///
+/// restore는 기본적으로 백업을 떠온 프로파일 `source`로 되돌린다(in-place). `--target`(URI)이나
+/// `--target-profile`(다른 프로파일의 source)을 주면 다른 곳으로 보낸다 — 어느 쪽이든 자격증명을
+/// 가린 대상 URI와 그 출처([`RestoreTargetOrigin`])를 보여줘, 운영 DB를 실수로 덮어쓰는 일을 막는다
+/// ([`redact_uri`]로 시크릿 차단). json은 생략(기계 출력 오염 방지)하고 사람 모드(progress/quiet)에서만
+/// 표시하며, 같은 정보는 json 출력에 `destination` 필드로 들어간다.
+pub fn print_restore_target(
+    target_uri: &crate::config::secret::Secret,
+    origin: &RestoreTargetOrigin,
+    mode: OutputMode,
+    lang: crate::i18n::Lang,
+) {
+    if mode.emits_json() {
+        return;
+    }
+    let line = format!(
+        "→ {} {} ({})",
+        lang.sel("restore target", "복구 대상"),
+        redact_uri(target_uri.expose()),
+        origin.label(lang),
+    );
+    eprintln!("{}", style_stderr(&line, Tone::Warning));
+}
+
+/// 참조 중인 config 파일 위치를 사람이 읽는 한 줄로 만든다(절대경로 우선).
+///
+/// config 경로는 `--config <PATH>` 또는 `XB_CONFIG`로만 결정된다(자동 탐색 없음). 그래서
+/// `None`이면 "어디서도 읽지 않는다"를 명시해, 사용자가 어떤 파일을 보는지(특히 `xbenv`
+/// 활성화로 `XB_CONFIG`가 자동 주입된 경우) 헷갈리지 않게 한다. 존재하는 경로는
+/// canonicalize로 절대경로화하고, 실패하면 입력 경로를 그대로 보여준다.
+pub fn config_source_label(path: Option<&std::path::Path>, lang: crate::i18n::Lang) -> String {
+    match path {
+        Some(p) => std::fs::canonicalize(p)
+            .map(|abs| abs.display().to_string())
+            .unwrap_or_else(|_| p.display().to_string()),
+        None => lang
+            .sel(
+                "(unset — no XB_CONFIG/--config; env override only)",
+                "(미지정 — XB_CONFIG/--config 없음, env override만)",
+            )
+            .to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -240,5 +443,40 @@ mod tests {
 
         assert!(OutputMode::Json.emits_json());
         assert!(!OutputMode::Progress.emits_json());
+    }
+
+    #[test]
+    fn redact_uri_strips_userinfo_keeps_host() {
+        // 자격증명은 ***@로 가리고 host:port·DB·일반 쿼리는 보존한다.
+        assert_eq!(
+            redact_uri("mongodb://alice:s3cr3t@db.prod:27017/app?replicaSet=rs0"),
+            "mongodb://***@db.prod:27017/app?replicaSet=rs0"
+        );
+        // userinfo가 없으면 그대로 둔다(로컬/개발 URI).
+        assert_eq!(
+            redact_uri("mongodb://localhost:27017/?replicaSet=rs0&directConnection=true"),
+            "mongodb://localhost:27017/?replicaSet=rs0&directConnection=true"
+        );
+        assert_eq!(
+            redact_uri("postgres://u:p@10.0.0.5:5432/maindb"),
+            "postgres://***@10.0.0.5:5432/maindb"
+        );
+    }
+
+    #[test]
+    fn redact_uri_masks_sensitive_query_values() {
+        // 쿼리에 담긴 시크릿(password 등)도 값만 가리고 키·나머지는 남긴다.
+        assert_eq!(
+            redact_uri("postgres://host:5432/db?sslmode=require&password=hunter2"),
+            "postgres://host:5432/db?sslmode=require&password=***"
+        );
+    }
+
+    #[test]
+    fn redact_uri_never_leaks_secrets() {
+        // 어떤 형태든 평문 시크릿이 남지 않아야 한다.
+        let rendered = redact_uri("mongodb://admin:topsecret@h:27017/db?token=abc123");
+        assert!(!rendered.contains("topsecret"), "userinfo 노출: {rendered}");
+        assert!(!rendered.contains("abc123"), "쿼리 시크릿 노출: {rendered}");
     }
 }

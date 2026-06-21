@@ -41,7 +41,11 @@ fn rank(s: CheckStatus) -> u8 {
 }
 
 /// `doctor` 핸들러.
-pub async fn handle(config_path: Option<PathBuf>, args: DoctorArgs) -> Result<()> {
+pub async fn handle(
+    config_path: Option<PathBuf>,
+    lang_flag: Option<crate::i18n::Lang>,
+    args: DoctorArgs,
+) -> Result<()> {
     let config_toml = match &config_path {
         Some(p) => std::fs::read_to_string(p)
             .map_err(|e| XBackupError::Config(format!("config 읽기 실패({}): {e}", p.display())))?,
@@ -51,8 +55,9 @@ pub async fn handle(config_path: Option<PathBuf>, args: DoctorArgs) -> Result<()
             ))
         }
     };
-    let cfg: Config = toml::from_str(&config_toml)
-        .map_err(|e| XBackupError::Config(format!("config 파싱 실패: {e}")))?;
+    // from_toml_str로 통일 — v2 표면도 여기서 정규화된다(inline toml::from_str 금지).
+    let cfg: Config = Config::from_toml_str(&config_toml)?;
+    let lang = crate::i18n::resolve_from_toml(lang_flag, Some(config_toml.as_str()));
 
     // 점검할 프로파일 — --profile 지정 시 그것만, 아니면 전체(이름순).
     let names: Vec<String> = match &args.profile {
@@ -78,7 +83,7 @@ pub async fn handle(config_path: Option<PathBuf>, args: DoctorArgs) -> Result<()
 
     let reports: Vec<ProfileReport> = names
         .iter()
-        .map(|n| check_profile(&config_toml, &cfg, n))
+        .map(|n| check_profile(&config_toml, &cfg, n, lang))
         .collect();
     let overall = reports
         .iter()
@@ -94,7 +99,9 @@ pub async fn handle(config_path: Option<PathBuf>, args: DoctorArgs) -> Result<()
     if args.json {
         render_json(&reports, overall);
     } else {
-        render_human(&reports, overall, &engines);
+        // doctor는 config가 필수라 위에서 None을 이미 걸렀다 — 항상 참조 경로가 존재한다.
+        let config_src = crate::cli::output::config_source_label(config_path.as_deref(), lang);
+        render_human(&reports, overall, &engines, &config_src, lang);
     }
 
     match overall {
@@ -109,7 +116,12 @@ pub async fn handle(config_path: Option<PathBuf>, args: DoctorArgs) -> Result<()
 }
 
 /// 한 프로파일을 정적 점검한다(연결 없음).
-fn check_profile(config_toml: &str, cfg: &Config, name: &str) -> ProfileReport {
+fn check_profile(
+    config_toml: &str,
+    cfg: &Config,
+    name: &str,
+    lang: crate::i18n::Lang,
+) -> ProfileReport {
     let mut items = Vec::new();
     let mut db = None;
 
@@ -127,13 +139,18 @@ fn check_profile(config_toml: &str, cfg: &Config, name: &str) -> ProfileReport {
                 items.push(Item {
                     status: CheckStatus::Ok,
                     label: "source",
-                    message: format!("해석됨 → {}", kind.label()),
+                    message: format!("{} → {}", lang.sel("resolved", "해석됨"), kind.label()),
                 });
             }
             None => items.push(Item {
                 status: CheckStatus::Fail,
                 label: "source",
-                message: "source.uri/uri_env가 없습니다".into(),
+                message: lang
+                    .sel(
+                        "source.uri/uri_env is missing",
+                        "source.uri/uri_env가 없습니다",
+                    )
+                    .into(),
             }),
         },
         // uri_env 미설정·프로파일 오류 등 — 런타임에 막힌다(경고).
@@ -146,13 +163,36 @@ fn check_profile(config_toml: &str, cfg: &Config, name: &str) -> ProfileReport {
 
     let prof = &cfg.profiles[name];
 
+    // endpoint 전용(복구/이관 대상) 프로파일은 destination/encryption이 없는 게 정상이다 —
+    // backup 잡이 아니므로 해당 점검들을 건너뛰고 역할만 표기한다(오탐 FAIL/WARN 방지).
+    // source(1) 점검은 위에서 이미 했다(대상 endpoint URI가 해석되는지 확인).
+    if prof.is_endpoint_only() {
+        items.push(Item {
+            status: CheckStatus::Ok,
+            label: "role",
+            message: lang
+                .sel(
+                    "endpoint-only profile (restore/migrate target) — no backup storage",
+                    "endpoint 전용 프로파일(복구/이관 대상) — 백업 저장소 없음",
+                )
+                .into(),
+        });
+        return ProfileReport {
+            name: name.to_string(),
+            db,
+            items,
+        };
+    }
+
     // 2) destination — type(local/s3)과 필수 필드.
     let dests = prof.effective_destinations();
     if dests.is_empty() {
         items.push(Item {
             status: CheckStatus::Fail,
             label: "destination",
-            message: "destination이 없습니다".into(),
+            message: lang
+                .sel("no destination configured", "destination이 없습니다")
+                .into(),
         });
     }
     for (i, d) in dests.iter().enumerate() {
@@ -171,7 +211,10 @@ fn check_profile(config_toml: &str, cfg: &Config, name: &str) -> ProfileReport {
                 None => items.push(Item {
                     status: CheckStatus::Fail,
                     label: "destination",
-                    message: format!("{tag}local인데 path가 없습니다"),
+                    message: format!(
+                        "{tag}{}",
+                        lang.sel("local but path is missing", "local인데 path가 없습니다")
+                    ),
                 }),
             },
             Some("s3") => match &d.s3 {
@@ -183,18 +226,36 @@ fn check_profile(config_toml: &str, cfg: &Config, name: &str) -> ProfileReport {
                 None => items.push(Item {
                     status: CheckStatus::Fail,
                     label: "destination",
-                    message: format!("{tag}s3인데 [.s3] 설정이 없습니다"),
+                    message: format!(
+                        "{tag}{}",
+                        lang.sel(
+                            "s3 but [.s3] config is missing",
+                            "s3인데 [.s3] 설정이 없습니다"
+                        )
+                    ),
                 }),
             },
             Some(other) => items.push(Item {
                 status: CheckStatus::Fail,
                 label: "destination",
-                message: format!("{tag}알 수 없는 type '{other}'(local|s3)"),
+                message: format!(
+                    "{tag}{}",
+                    lang.sel(
+                        &format!("unknown type '{other}' (local|s3)"),
+                        &format!("알 수 없는 type '{other}'(local|s3)")
+                    )
+                ),
             }),
             None => items.push(Item {
                 status: CheckStatus::Fail,
                 label: "destination",
-                message: format!("{tag}destination.type이 없습니다(local|s3)"),
+                message: format!(
+                    "{tag}{}",
+                    lang.sel(
+                        "destination.type is missing (local|s3)",
+                        "destination.type이 없습니다(local|s3)"
+                    )
+                ),
             }),
         }
     }
@@ -205,7 +266,12 @@ fn check_profile(config_toml: &str, cfg: &Config, name: &str) -> ProfileReport {
         items.push(Item {
             status: CheckStatus::Warn,
             label: "encryption",
-            message: "비활성 — 평문으로 백업됩니다".into(),
+            message: lang
+                .sel(
+                    "disabled — backups are stored in plaintext",
+                    "비활성 — 평문으로 백업됩니다",
+                )
+                .into(),
         });
     } else if enc.algorithm == "age" {
         match &enc.recipient_file {
@@ -217,19 +283,34 @@ fn check_profile(config_toml: &str, cfg: &Config, name: &str) -> ProfileReport {
             Some(f) => items.push(Item {
                 status: CheckStatus::Fail,
                 label: "encryption",
-                message: format!("age인데 recipient_file이 없습니다: {f}"),
+                message: format!(
+                    "{}: {f}",
+                    lang.sel(
+                        "age but recipient_file does not exist",
+                        "age인데 recipient_file이 없습니다"
+                    )
+                ),
             }),
             None => items.push(Item {
                 status: CheckStatus::Fail,
                 label: "encryption",
-                message: "age인데 recipient_file 미지정".into(),
+                message: lang
+                    .sel(
+                        "age but recipient_file is not set",
+                        "age인데 recipient_file 미지정",
+                    )
+                    .into(),
             }),
         }
     } else {
         items.push(Item {
             status: CheckStatus::Ok,
             label: "encryption",
-            message: format!("{} (키는 런타임 env)", enc.algorithm),
+            message: format!(
+                "{} {}",
+                enc.algorithm,
+                lang.sel("(key from runtime env)", "(키는 런타임 env)")
+            ),
         });
     }
 
@@ -239,8 +320,13 @@ fn check_profile(config_toml: &str, cfg: &Config, name: &str) -> ProfileReport {
             if prof.features.incremental.pg_logical {
                 items.push(Item {
                     status: CheckStatus::Ok,
-                    label: "증분",
-                    message: "pg_logical=true(서버 wal_level=logical 필요)".into(),
+                    label: "incremental",
+                    message: lang
+                        .sel(
+                            "pg_logical=true (server requires wal_level=logical)",
+                            "pg_logical=true(서버 wal_level=logical 필요)",
+                        )
+                        .into(),
                 });
             }
         }
@@ -249,8 +335,13 @@ fn check_profile(config_toml: &str, cfg: &Config, name: &str) -> ProfileReport {
             if eng == "mongodump" {
                 items.push(Item {
                     status: CheckStatus::Ok,
-                    label: "엔진",
-                    message: "mongodump(외부 도구 필요 — native 권장)".into(),
+                    label: "engine",
+                    message: lang
+                        .sel(
+                            "mongodump (external tool required — native recommended)",
+                            "mongodump(외부 도구 필요 — native 권장)",
+                        )
+                        .into(),
                 });
             }
         }
@@ -273,16 +364,27 @@ fn signal(status: CheckStatus, color: bool) -> String {
     paint(t, &[BOLD, c], color)
 }
 
-fn render_human(reports: &[ProfileReport], overall: CheckStatus, engines: &BTreeSet<&str>) {
+fn render_human(
+    reports: &[ProfileReport],
+    overall: CheckStatus,
+    engines: &BTreeSet<&str>,
+    config_src: &str,
+    lang: crate::i18n::Lang,
+) {
     let color = use_color();
     println!(
         "{}",
         paint(
-            &format!("doctor — config 점검 ({}개 프로파일)", reports.len()),
+            &format!(
+                "doctor — config check ({} {})",
+                reports.len(),
+                lang.sel("profiles", "프로파일")
+            ),
             &[BOLD],
             color
         )
     );
+    println!("{}", paint(&format!("config: {config_src}"), &[DIM], color));
     for r in reports {
         let db = r.db.map(|d| d.label()).unwrap_or("?");
         println!();
@@ -311,8 +413,12 @@ fn render_human(reports: &[ProfileReport], overall: CheckStatus, engines: &BTree
         println!(
             "{}",
             paint(
-                "참고: 한 config에 여러 DB가 있습니다. 마이그레이션은 같은 엔진끼리만 \
-                 가능합니다(PG↔Mongo 변환 불가).",
+                lang.sel(
+                    "note: this config contains multiple DBs. Migration is only possible \
+                     between the same engine (PG↔Mongo conversion is not supported).",
+                    "참고: 한 config에 여러 DB가 있습니다. 마이그레이션은 같은 엔진끼리만 \
+                     가능합니다(PG↔Mongo 변환 불가).",
+                ),
                 &[DIM],
                 color
             )
@@ -320,11 +426,11 @@ fn render_human(reports: &[ProfileReport], overall: CheckStatus, engines: &BTree
     }
     println!();
     let label = match overall {
-        CheckStatus::Ok => "정상 (exit 0)",
-        CheckStatus::Warn => "경고 동반 (exit 4)",
-        CheckStatus::Fail => "차단성 문제 (exit 3)",
+        CheckStatus::Ok => lang.sel("ok (exit 0)", "정상 (exit 0)"),
+        CheckStatus::Warn => lang.sel("with warnings (exit 4)", "경고 동반 (exit 4)"),
+        CheckStatus::Fail => lang.sel("blocking problem (exit 3)", "차단성 문제 (exit 3)"),
     };
-    println!("전체: {} {}", signal(overall, color), label);
+    println!("overall: {} {}", signal(overall, color), label);
 }
 
 fn render_json(reports: &[ProfileReport], overall: CheckStatus) {

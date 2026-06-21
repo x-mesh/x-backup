@@ -65,6 +65,11 @@ pub fn use_color() -> bool {
     std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
 }
 
+/// stderr로 나가는 사람용 메시지에 ANSI 색을 쓸지.
+pub fn use_color_stderr() -> bool {
+    std::env::var_os("NO_COLOR").is_none() && std::io::stderr().is_terminal()
+}
+
 /// 코드(들)로 텍스트를 감싼다(`color=false`면 원문 그대로). `codes`는 이어붙여 적용한다.
 pub fn paint(s: &str, codes: &[&str], color: bool) -> String {
     if !color || codes.is_empty() {

@@ -45,25 +45,46 @@ impl ResolvedConfig {
     where
         F: Fn(&str) -> Option<String>,
     {
-        // 1) file 레이어를 toml::Value로 로드(없으면 빈 테이블).
+        // 1) file 레이어를 toml::Value로 로드(없으면 빈 테이블). v2 표면이면 v1 nested로 정규화한다
+        //    — ENV 오버라이드(아래 3단계)가 정규화된 nested 트리에 정확히 적용되도록 이 시점에서 한다.
         let mut root: toml::Value = match input.config_toml {
-            Some(raw) => toml::from_str(raw)
-                .map_err(|e| XBackupError::Config(format!("config.toml 파싱 실패: {e}")))?,
+            Some(raw) => {
+                let value: toml::Value = toml::from_str(raw)
+                    .map_err(|e| XBackupError::Config(format!("config.toml 파싱 실패: {e}")))?;
+                crate::config::v2::normalize_v2(value)?
+            }
             None => toml::Value::Table(toml::value::Table::new()),
         };
 
+        // 1.5) 프로파일 이름 확정 — 빈 이름(예: XB_PROFILE="" 잔재)이면 config의
+        //      default_profile로 폴백한다. 그래야 다중 프로파일 워크스페이스에서 plain 명령이
+        //      기본 프로파일로 동작하고, "프로파일 ''" 같은 혼란스러운 에러를 막는다
+        //      (list/verify의 default_profile 폴백과 일관). 둘 다 없으면 명확히 거부한다.
+        let effective_name: String = if input.profile_name.is_empty() {
+            root.get("default_profile")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    XBackupError::Config(
+                        "사용할 프로파일이 없습니다 — --profile/XB_PROFILE 또는 config의 \
+                         default_profile을 지정하세요"
+                            .to_string(),
+                    )
+                })?
+        } else {
+            input.profile_name.to_string()
+        };
+
         // 2) 선택된 프로파일 하위 테이블을 확보한다(없으면 생성 — ENV만 구성 허용).
-        let profile_value = profile_subtree(&mut root, input.profile_name)?;
+        let profile_value = profile_subtree(&mut root, &effective_name)?;
 
         // 3) ENV 오버라이드를 프로파일 테이블에 적용(file 위에 덮어씀).
         apply_overrides(profile_value, input.overrides)?;
 
         // 4) serde로 역직렬화 — 미지정 필드는 default가 채운다(우선순위 최하단).
         let profile: Profile = profile_value.clone().try_into().map_err(|e| {
-            XBackupError::Config(format!(
-                "프로파일 '{}' 역직렬화 실패: {e}",
-                input.profile_name
-            ))
+            XBackupError::Config(format!("프로파일 '{effective_name}' 역직렬화 실패: {e}"))
         })?;
 
         // 5) source URI 해석 — 우선순위: uri_env(env 값) > uri(직접 리터럴).
@@ -72,7 +93,7 @@ impl ResolvedConfig {
         let resolved_uri = resolve_source_uri(&profile.source, &secret_lookup)?;
 
         Ok(Self {
-            profile_name: input.profile_name.to_string(),
+            profile_name: effective_name,
             profile,
             resolved_uri,
         })
@@ -250,6 +271,46 @@ bucket = "db-backups"
         assert_eq!(
             cfg.resolved_uri.unwrap().expose(),
             "mongodb://localhost:27017/?replicaSet=rs0"
+        );
+    }
+
+    /// 빈 프로파일 이름(예: XB_PROFILE="" 잔재)은 config의 default_profile로 폴백한다.
+    #[test]
+    fn empty_profile_falls_back_to_default_profile() {
+        let toml = "default_profile = \"mongo\"\n\
+                    [profiles.mongo.source]\nuri = \"mongodb://localhost:27017/db\"\n";
+        let cfg = ResolvedConfig::build_with(
+            MergeInput {
+                config_toml: Some(toml),
+                profile_name: "",
+                overrides: &[],
+            },
+            lookup(&[]),
+        )
+        .unwrap();
+        assert_eq!(cfg.profile_name, "mongo");
+        assert_eq!(
+            cfg.resolved_uri.unwrap().expose(),
+            "mongodb://localhost:27017/db"
+        );
+    }
+
+    /// 빈 프로파일 + default_profile도 없으면 명확한 설정 오류(빈 테이블 생성으로 폴백하지 않음).
+    #[test]
+    fn empty_profile_without_default_is_error() {
+        let toml = "[profiles.mongo.source]\nuri = \"mongodb://localhost/db\"\n";
+        let err = ResolvedConfig::build_with(
+            MergeInput {
+                config_toml: Some(toml),
+                profile_name: "",
+                overrides: &[],
+            },
+            lookup(&[]),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("프로파일이 없습니다"),
+            "기대한 폴백 에러가 아님: {err}"
         );
     }
 

@@ -14,6 +14,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use crate::cli::args::{InitArgs, StatusArgs};
+use crate::cli::output::{style_stderr, Tone};
 use crate::config::wizard::{config_to_toml, run_wizard, Prompt, StdinPrompt};
 use crate::config::Config;
 use crate::error::{Result, XBackupError};
@@ -22,7 +23,14 @@ use crate::error::{Result, XBackupError};
 const DEFAULT_CONFIG_FILENAME: &str = "config.toml";
 
 /// `init` 핸들러 진입점.
-pub async fn handle(config_path: Option<PathBuf>, args: InitArgs) -> Result<()> {
+pub async fn handle(
+    config_path: Option<PathBuf>,
+    lang_flag: Option<crate::i18n::Lang>,
+    args: InitArgs,
+) -> Result<()> {
+    // init은 config.toml을 새로 만드는 흐름이라 읽어들일 기존 config_toml이 없다 → flag/기본만 본다.
+    let lang = crate::i18n::resolve(lang_flag, None);
+
     // 1) 비-TTY 가드 — 마법사는 대화형 전용. 표준입력이 터미널이 아니면 거부한다.
     if !std::io::stdin().is_terminal() {
         return Err(XBackupError::Usage(
@@ -43,12 +51,22 @@ pub async fn handle(config_path: Option<PathBuf>, args: InitArgs) -> Result<()> 
     // 4) config.toml 기록.
     write_config(&target, &config)?;
     // 안내는 stderr로(결과 채널 분리). 경로를 stdout으로 한 줄 알린다(스크립트 활용).
-    eprintln!("config.toml을 생성했습니다: {}", target.display());
+    eprintln!(
+        "{}",
+        style_stderr(
+            &format!(
+                "{}: {}",
+                lang.sel("Created config.toml", "config.toml을 생성했습니다"),
+                target.display()
+            ),
+            Tone::Success,
+        )
+    );
     println!("{}", target.display());
 
     // 5) (선택) status 즉시 검증 — 동의 시 status 핸들러를 호출한다(FR-10 "생성 후 status").
     if let Some(profile_name) = config.default_profile.clone() {
-        if ask_run_status(&mut prompt)? {
+        if ask_run_status(&mut prompt, lang)? {
             // status 핸들러는 같은 config 경로를 읽어 연결·권한을 점검한다.
             // 경고/실패도 정상 종료 코드로 표현되므로 여기서 에러를 흡수하지 않고 전파한다.
             let status_args = StatusArgs {
@@ -59,7 +77,8 @@ pub async fn handle(config_path: Option<PathBuf>, args: InitArgs) -> Result<()> 
                 interval: 1.0,
                 count: 0,
             };
-            return crate::cli::handlers::status::handle(Some(target), status_args).await;
+            return crate::cli::handlers::status::handle(Some(target), lang_flag, status_args)
+                .await;
         }
     }
 
@@ -67,8 +86,14 @@ pub async fn handle(config_path: Option<PathBuf>, args: InitArgs) -> Result<()> 
 }
 
 /// 마지막 질문 — 지금 status로 연결·권한을 검증할지.
-fn ask_run_status(prompt: &mut dyn Prompt) -> Result<bool> {
-    let answer = prompt.read_line("지금 status로 연결·권한을 검증하시겠습니까? [y/N]: ")?;
+fn ask_run_status(prompt: &mut dyn Prompt, lang: crate::i18n::Lang) -> Result<bool> {
+    let answer = prompt.read_line(&style_stderr(
+        lang.sel(
+            "Run status now to verify connection and permissions? [y/N]: ",
+            "지금 status로 연결·권한을 검증하시겠습니까? [y/N]: ",
+        ),
+        Tone::Plan,
+    ))?;
     Ok(matches!(
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
@@ -160,7 +185,20 @@ mod tests {
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains("MONGO_URI"));
         assert!(!written.contains("mongodb://"));
-        // 다시 파싱되어야 한다(왕복 안전).
+        // init은 v2 표면을 쓴다: [profile.<name>](단수) + flat 키.
+        assert!(
+            written.contains("[profile.prod]"),
+            "v2 형식이어야 함([profile.prod]):\n{written}"
+        );
+        assert!(
+            !written.contains("[profiles."),
+            "v1 형식(profiles 복수)이면 안 됨:\n{written}"
+        );
+        assert!(
+            written.contains("dest = \"local:/data/backups\""),
+            "v2 compact dest여야 함:\n{written}"
+        );
+        // 다시 파싱되어야 한다(v2 → v1 nested 정규화 왕복 안전).
         let reparsed = Config::from_toml_str(&written).unwrap();
         assert_eq!(reparsed.default_profile.as_deref(), Some("prod"));
         assert_eq!(

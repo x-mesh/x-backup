@@ -240,10 +240,16 @@ pub struct BackupOutcome {
     pub backup_id: String,
     /// 저장 바이트 수(data.bin).
     pub stored_size_bytes: u64,
+    /// 압축 전 원본 바이트(압축 단계가 없으면 stored와 동일). 압축률 표시용.
+    pub original_size_bytes: u64,
     /// 저장 바이트의 sha256 hex.
     pub checksum_sha256: String,
     /// 토폴로지.
     pub topology: Topology,
+    /// 적용된 압축 메타(평문 경로면 None).
+    pub compression: Option<crate::manifest::schema::CompressionMeta>,
+    /// 적용된 암호화 메타(평문 경로면 None).
+    pub encryption: Option<crate::manifest::schema::EncryptionMeta>,
     /// oplog 구간(replica set일 때만).
     pub oplog_range: Option<OplogRange>,
 }
@@ -413,8 +419,11 @@ pub async fn run_full_backup_with_meta(
     Ok(BackupOutcome {
         backup_id,
         stored_size_bytes: stored_size,
+        original_size_bytes: original_size,
         checksum_sha256: checksum,
         topology,
+        compression: meta.compression.clone(),
+        encryption: meta.encryption.clone(),
         oplog_range,
     })
 }
@@ -596,8 +605,11 @@ pub async fn run_pg_full_backup(
     Ok(BackupOutcome {
         backup_id,
         stored_size_bytes: stored_size,
+        original_size_bytes: original_size,
         checksum_sha256: checksum,
         topology: Topology::Standalone,
+        compression: meta.compression.clone(),
+        encryption: meta.encryption.clone(),
         oplog_range: None,
     })
 }

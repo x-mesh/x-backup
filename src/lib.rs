@@ -16,6 +16,7 @@ pub mod config;
 pub mod crypto;
 pub mod engine;
 pub mod error;
+pub mod i18n;
 pub mod lock;
 pub mod manifest;
 pub mod pipeline;
@@ -32,6 +33,7 @@ pub use error::{Result, XBackupError};
 /// `RUST_LOG` 환경변수가 있으면 그 필터가 우선한다(12-factor).
 /// 이미 전역 구독자가 설치된 경우(테스트 등)에는 조용히 무시한다.
 pub fn init_tracing(verbosity: u8, json: bool) {
+    use std::io::IsTerminal;
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
     // verbosity → 필터. -vv부터는 MongoDB 드라이버 로그도 끌어올려(연결·토폴로지 진단)
@@ -50,6 +52,7 @@ pub fn init_tracing(verbosity: u8, json: bool) {
     // -vvv(trace)에서는 스레드 ID까지(동시 파이프라인 추적용).
     let show_loc = verbosity >= 2;
     let show_thread = verbosity >= 3;
+    let ansi = std::env::var_os("NO_COLOR").is_none() && std::io::stderr().is_terminal();
 
     // 로그는 stderr로 보낸다 — stdout은 결과·progress·--json 출력 전용(PRD §9-9.1).
     let registry = tracing_subscriber::registry().with(filter);
@@ -62,6 +65,7 @@ pub fn init_tracing(verbosity: u8, json: bool) {
             .with(
                 fmt::layer()
                     .with_writer(std::io::stderr)
+                    .with_ansi(ansi)
                     .with_target(show_loc)
                     .with_line_number(show_loc)
                     .with_thread_ids(show_thread),

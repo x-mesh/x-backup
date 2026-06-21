@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use crate::cli::args::{BackupArgs, BackupType};
-use crate::cli::output::{OutputFlags, OutputMode};
+use crate::cli::output::{field_line, field_line_toned, style, OutputFlags, OutputMode, Tone};
 use crate::cli::progress::{new_counter, ProgressKind, ProgressReporter};
 use crate::compress::{ZstdCompressStage, ALGORITHM_ZSTD};
 use crate::config::env::collect_overrides_from_process;
@@ -17,9 +17,10 @@ use crate::config::merged::MergeInput;
 use crate::config::secret::Secret;
 use crate::config::ResolvedConfig;
 use crate::crypto::build_encrypt_stage;
-use crate::engine::mongo::status::{CheckStatus, StatusChecker};
+use crate::engine::mongo::status::{human_bytes, CheckStatus, StatusChecker};
 use crate::error::{Result, XBackupError};
-use crate::manifest::schema::CompressionMeta;
+use crate::i18n::Lang;
+use crate::manifest::schema::{CompressionMeta, EncryptionMeta, OplogRange, Topology};
 use crate::pipeline::backup::{run_full_backup_with_meta, BackupMeta, BackupRequest, Engine};
 use crate::pipeline::incremental::{
     run_incremental_backup, IncrementalOutcome, IncrementalRequest,
@@ -28,7 +29,11 @@ use crate::pipeline::stage::{StageStack, ENV_AES_KEY_HEX};
 use crate::storage::{from_config, replicate_artifact, Storage};
 
 /// `backup` 핸들러 진입점.
-pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()> {
+pub async fn handle(
+    config_path: Option<PathBuf>,
+    lang_flag: Option<crate::i18n::Lang>,
+    args: BackupArgs,
+) -> Result<()> {
     // 동시 실행 잠금(FR-12) — 같은 프로파일의 backup/restore/prune과 직렬화한다.
     // 가드(_lock)를 함수 끝까지 유지해 작업 동안 lock을 잡는다(충돌 시 exit 5).
     let _lock = crate::lock::acquire(&args.profile)?;
@@ -40,6 +45,7 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
         })?),
         None => None,
     };
+    let lang = crate::i18n::resolve_from_toml(lang_flag, config_toml.as_deref());
     let overrides = collect_overrides_from_process();
     let resolved = ResolvedConfig::build(MergeInput {
         config_toml: config_toml.as_deref(),
@@ -95,10 +101,12 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
             uri,
             timeout_secs,
             primary.as_ref(),
+            &dests[0],
             secondaries,
             dests.len(),
             mode,
             backup_type,
+            lang,
         )
         .await;
     }
@@ -128,8 +136,17 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
                     .into(),
             ));
         }
-        return handle_incremental(&resolved, &args, &uri, primary.as_ref(), secondaries, mode)
-            .await;
+        return handle_incremental(
+            &resolved,
+            &args,
+            &uri,
+            primary.as_ref(),
+            &dests[0],
+            secondaries,
+            mode,
+            lang,
+        )
+        .await;
     }
 
     // 4) 파이프라인 단계 구성(t6): compress → encrypt 고정 순서(PRD §8.4). 단계와
@@ -151,7 +168,7 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
     let reporter = ProgressReporter::start(
         mode,
         ProgressKind::Indeterminate {
-            label: "백업".into(),
+            label: lang.sel("backup", "백업").into(),
         },
         progress_counter,
     );
@@ -180,23 +197,29 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
         });
         println!("{summary}");
     } else if mode.shows_human_summary() {
-        println!("백업 완료");
-        println!("  id:       {}", outcome.backup_id);
-        println!("  크기:     {} bytes", outcome.stored_size_bytes);
-        println!("  체크섬:   sha256:{}", outcome.checksum_sha256);
-        if dests.len() > 1 {
-            println!(
-                "  destination: {}곳(primary + 보조 {})",
-                dests.len(),
-                dests.len() - 1
-            );
-        }
-        if let Some(range) = &outcome.oplog_range {
-            println!(
-                "  oplog:    {{t:{},i:{}}} → {{t:{},i:{}}}",
-                range.start_ts.t, range.start_ts.i, range.end_ts.t, range.end_ts.i
-            );
-        }
+        let topo = match outcome.topology {
+            Topology::ReplicaSet => "replica_set",
+            Topology::Standalone => "standalone",
+        };
+        print_backup_summary(
+            &BackupSummary {
+                kind: "full",
+                detail: topo,
+                backup_id: &outcome.backup_id,
+                primary_dest: &dests[0],
+                stored_size: outcome.stored_size_bytes,
+                original_size: Some(outcome.original_size_bytes),
+                compression: outcome.compression.as_ref(),
+                encryption: outcome.encryption.as_ref(),
+                checksum: Some(&outcome.checksum_sha256),
+                dest_count: dests.len(),
+                base_id: None,
+                change: None,
+                oplog_range: outcome.oplog_range.as_ref(),
+                note: None,
+            },
+            lang,
+        );
     }
 
     // 보조 복제 실패가 있으면 경고로 마감(exit 4) — primary 백업은 이미 성공.
@@ -204,6 +227,170 @@ pub async fn handle(config_path: Option<PathBuf>, args: BackupArgs) -> Result<()
         return Err(XBackupError::Warning(w));
     }
     Ok(())
+}
+
+/// 백업이 저장된 위치를 사람이 읽는 한 줄로 만든다(완료 요약 표시용).
+///
+/// 로컬 destination은 `경로/<id>/`(실제 디렉터리), 그 외(S3 등 path 없는 백엔드)는
+/// `라벨:<id>`로 식별만 보여준다. 절대 경로/식별만 노출하며 시크릿은 담지 않는다.
+fn backup_location(dest: &DestinationConfig, backup_id: &str) -> String {
+    match dest.path.as_deref() {
+        Some(p) => format!("{}/{}/", p.trim_end_matches('/'), backup_id),
+        None => format!("{}:{}", dest.label(0), backup_id),
+    }
+}
+
+/// 백업 완료 요약(사람용)의 통일된 뷰 — 4개 경로(mongo·pg × full·incr)가 공유한다.
+///
+/// 각 경로가 자기 outcome/메타에서 이 뷰를 채워 [`print_backup_summary`]에 넘긴다. 경로
+/// 특유의 필드(base/변경/oplog/note)는 `Option`이라 해당 없으면 줄이 생략된다.
+struct BackupSummary<'a> {
+    /// 분류 — "full" | "incr" | "full(gap 승격)".
+    kind: &'a str,
+    /// 부가 분류 — Mongo는 토폴로지("replica_set"/"standalone"), PG는 "PostgreSQL".
+    detail: &'a str,
+    backup_id: &'a str,
+    /// primary destination(저장 위치 표시용).
+    primary_dest: &'a DestinationConfig,
+    /// 저장 바이트(data.bin). 빈 증분 슬라이스면 0.
+    stored_size: u64,
+    /// 압축 전 원본 바이트 — 풀 백업만 Some(절감률 표시). 증분은 미보유라 None.
+    original_size: Option<u64>,
+    compression: Option<&'a CompressionMeta>,
+    encryption: Option<&'a EncryptionMeta>,
+    /// data.bin sha256 — 풀 백업만 Some(증분 outcome은 미노출).
+    checksum: Option<&'a str>,
+    /// 전체 destination 수(primary + 보조). 2 이상이면 fan-out 줄 표시.
+    dest_count: usize,
+    /// 증분: 연결된 base 백업 ID.
+    base_id: Option<&'a str>,
+    /// 증분: (라벨, 건수) — Mongo "entries"(oplog), PG "changes"(레코드). 라벨은 항상 영문.
+    change: Option<(&'a str, u64)>,
+    /// Mongo: oplog 구간.
+    oplog_range: Option<&'a OplogRange>,
+    /// 꼬리 주석 — "변경 없음 …", gap 승격 사유 등.
+    note: Option<&'a str>,
+}
+
+/// 통일된 백업 완료 요약을 stdout(결과 전용)에 출력한다.
+fn print_backup_summary(s: &BackupSummary, lang: Lang) {
+    const W: usize = 11;
+    println!(
+        "{}",
+        style(
+            &format!(
+                "{} ({} · {})",
+                lang.sel("Backup complete", "백업 완료"),
+                s.kind,
+                s.detail
+            ),
+            Tone::Success
+        )
+    );
+    println!("{}", field_line_toned("id", s.backup_id, W, Tone::Value));
+    if let Some(b) = s.base_id {
+        println!("{}", field_line_toned("base", b, W, Tone::Value));
+    }
+    if let Some((label, n)) = s.change {
+        // 값 컬럼을 다른 라벨 줄과 맞춘다 — 라벨 표시폭(ASCII 1폭) 기준 패딩.
+        println!("{}", field_line_toned(label, n.to_string(), W, Tone::Value));
+    }
+    let location = backup_location(s.primary_dest, s.backup_id);
+    let dest_type = s.primary_dest.r#type.as_deref().unwrap_or("local");
+    println!(
+        "{}",
+        field_line(
+            "location",
+            format!(
+                "{}  ({})",
+                style(&location, Tone::Value),
+                style(dest_type, Tone::Muted)
+            ),
+            W,
+        )
+    );
+    // 크기: 사람이 읽는 단위 + 정확한 bytes. 풀 백업은 원본 대비 절감률도 한 줄 덧붙인다.
+    print!(
+        "{}",
+        field_line(
+            "size",
+            format!(
+                "{} ({} bytes)",
+                style(&human_bytes(s.stored_size as i64), Tone::Value),
+                s.stored_size
+            ),
+            W,
+        )
+    );
+    if let (Some(orig), Some(c)) = (s.original_size, s.compression) {
+        if orig > s.stored_size {
+            let saved = ((1.0 - s.stored_size as f64 / orig as f64) * 100.0).round() as i64;
+            print!(
+                "\n             {} {} · {} {saved}% {}",
+                style(lang.sel("from", "← 원본"), Tone::Muted),
+                style(&human_bytes(orig as i64), Tone::Value),
+                style(&c.algorithm, Tone::Value),
+                style(lang.sel("saved", "절감"), Tone::Success),
+            );
+        }
+    }
+    println!();
+    if let Some(c) = s.compression {
+        println!(
+            "{}",
+            field_line(
+                "compression",
+                format!("{} level {}", style(&c.algorithm, Tone::Value), c.level),
+                W,
+            )
+        );
+    }
+    if let Some(e) = s.encryption {
+        println!(
+            "{}",
+            field_line_toned("encryption", &e.algorithm, W, Tone::Value)
+        );
+    }
+    if let Some(cs) = s.checksum {
+        println!(
+            "{}",
+            field_line("checksum", format!("sha256:{}", style(cs, Tone::Value)), W,)
+        );
+    }
+    if s.dest_count > 1 {
+        println!(
+            "{}",
+            field_line(
+                "destination",
+                format!(
+                    "{} ({})",
+                    style(&s.dest_count.to_string(), Tone::Value),
+                    lang.sel(
+                        &format!("primary + {} secondary", s.dest_count - 1),
+                        &format!("primary + 보조 {}", s.dest_count - 1),
+                    )
+                ),
+                W,
+            ),
+        );
+    }
+    if let Some(r) = s.oplog_range {
+        println!(
+            "{}",
+            field_line_toned(
+                "oplog",
+                format!(
+                    "{{t:{},i:{}}} → {{t:{},i:{}}}",
+                    r.start_ts.t, r.start_ts.i, r.end_ts.t, r.end_ts.i,
+                ),
+                W,
+                Tone::Value,
+            )
+        );
+    }
+    if let Some(n) = s.note {
+        println!("  {}", style(n, Tone::Warning));
+    }
 }
 
 /// PostgreSQL 풀 백업 경로 — 드라이버 COPY 아카이브를 압축·암호화·저장하고 보조 복제까지.
@@ -219,10 +406,12 @@ async fn handle_pg_backup(
     uri: Secret,
     timeout_secs: Option<u64>,
     primary: &dyn Storage,
+    primary_dest: &DestinationConfig,
     secondaries: &[DestinationConfig],
     dest_count: usize,
     mode: OutputMode,
     backup_type: BackupType,
+    lang: Lang,
 ) -> Result<()> {
     let enable_incremental = resolved.profile.features.incremental.pg_logical;
 
@@ -262,9 +451,11 @@ async fn handle_pg_backup(
             uri,
             timeout_secs,
             primary,
+            primary_dest,
             secondaries,
             dest_count,
             mode,
+            lang,
         )
         .await;
     }
@@ -274,7 +465,7 @@ async fn handle_pg_backup(
     let reporter = ProgressReporter::start(
         mode,
         ProgressKind::Indeterminate {
-            label: "PG 백업".into(),
+            label: lang.sel("PG backup", "PG 백업").into(),
         },
         std::sync::Arc::clone(&progress_counter),
     );
@@ -312,16 +503,25 @@ async fn handle_pg_backup(
         });
         println!("{summary}");
     } else if mode.shows_human_summary() {
-        println!("백업 완료(PostgreSQL)");
-        println!("  id:       {}", outcome.backup_id);
-        println!("  크기:     {} bytes", outcome.stored_size_bytes);
-        println!("  체크섬:   sha256:{}", outcome.checksum_sha256);
-        if dest_count > 1 {
-            println!(
-                "  destination: {dest_count}곳(primary + 보조 {})",
-                dest_count - 1
-            );
-        }
+        print_backup_summary(
+            &BackupSummary {
+                kind: "full",
+                detail: "PostgreSQL",
+                backup_id: &outcome.backup_id,
+                primary_dest,
+                stored_size: outcome.stored_size_bytes,
+                original_size: Some(outcome.original_size_bytes),
+                compression: outcome.compression.as_ref(),
+                encryption: outcome.encryption.as_ref(),
+                checksum: Some(&outcome.checksum_sha256),
+                dest_count,
+                base_id: None,
+                change: None,
+                oplog_range: None,
+                note: None,
+            },
+            lang,
+        );
     }
 
     if let Some(w) = replicate_warning {
@@ -342,9 +542,11 @@ async fn handle_pg_incremental(
     uri: Secret,
     timeout_secs: Option<u64>,
     primary: &dyn Storage,
+    primary_dest: &DestinationConfig,
     secondaries: &[DestinationConfig],
     dest_count: usize,
     mode: OutputMode,
+    lang: Lang,
 ) -> Result<()> {
     use crate::engine::postgres::{conn::PgClient, incremental};
 
@@ -363,20 +565,24 @@ async fn handle_pg_incremental(
             &uri,
             timeout_secs,
             primary,
+            primary_dest,
             secondaries,
             dest_count,
             mode,
             health,
+            lang,
         )
         .await;
     }
 
     let (stages, meta) = build_stages(resolved, args)?;
+    // meta는 run으로 move되므로, 완료 요약(압축·암호화 표시)용 사본을 미리 둔다.
+    let summary_meta = meta.clone();
     let progress_counter = new_counter();
     let reporter = ProgressReporter::start(
         mode,
         ProgressKind::Indeterminate {
-            label: "PG 증분".into(),
+            label: lang.sel("PG incremental", "PG 증분").into(),
         },
         std::sync::Arc::clone(&progress_counter),
     );
@@ -412,14 +618,28 @@ async fn handle_pg_incremental(
         });
         println!("{summary}");
     } else if mode.shows_human_summary() {
-        println!("증분 백업 완료(PostgreSQL)");
-        println!("  id:       {}", outcome.backup_id);
-        println!("  base:     {}", outcome.base_id);
-        println!("  변경:     {}건", outcome.change_count);
-        println!("  크기:     {} bytes", outcome.stored_size_bytes);
-        if outcome.change_count == 0 {
-            println!("  (변경 없음 — 빈 슬라이스: manifest만 기록)");
-        }
+        print_backup_summary(
+            &BackupSummary {
+                kind: "incr",
+                detail: "PostgreSQL",
+                backup_id: &outcome.backup_id,
+                primary_dest,
+                stored_size: outcome.stored_size_bytes,
+                original_size: None,
+                compression: summary_meta.compression.as_ref(),
+                encryption: summary_meta.encryption.as_ref(),
+                checksum: None,
+                dest_count,
+                base_id: Some(&outcome.base_id),
+                change: Some(("changes", outcome.change_count)),
+                oplog_range: None,
+                note: (outcome.change_count == 0).then_some(lang.sel(
+                    "(no changes — empty slice: manifest only)",
+                    "(변경 없음 — 빈 슬라이스: manifest만 기록)",
+                )),
+            },
+            lang,
+        );
     }
 
     if let Some(w) = replicate_warning {
@@ -439,16 +659,31 @@ async fn promote_pg_incremental_to_full(
     uri: &Secret,
     timeout_secs: Option<u64>,
     primary: &dyn Storage,
+    primary_dest: &DestinationConfig,
     secondaries: &[DestinationConfig],
     dest_count: usize,
     mode: OutputMode,
     health: crate::engine::postgres::incremental::SlotHealth,
+    lang: Lang,
 ) -> Result<()> {
     use crate::engine::postgres::incremental::SlotHealth;
+    // reason은 JSON/에러/로그에 그대로 쓰이므로(기계 판독·범위 밖) 영문화하지 않는다.
     let reason = match health {
         SlotHealth::Missing => "증분 슬롯이 없음(체인 끊김 — 첫 증분이거나 슬롯 유실)",
         SlotHealth::Lost => "증분 슬롯이 invalidated됨(WAL 제거로 체인 끊김)",
         SlotHealth::Active => "정상", // 도달 불가(호출자가 Active면 승격하지 않음).
+    };
+    // 사람용 요약(note)에 보일 설명 — 언어 토글.
+    let reason_human = match health {
+        SlotHealth::Missing => lang.sel(
+            "incremental slot missing (chain broken — first incr or slot lost)",
+            "증분 슬롯이 없음(체인 끊김 — 첫 증분이거나 슬롯 유실)",
+        ),
+        SlotHealth::Lost => lang.sel(
+            "incremental slot invalidated (chain broken by WAL removal)",
+            "증분 슬롯이 invalidated됨(WAL 제거로 체인 끊김)",
+        ),
+        SlotHealth::Active => lang.sel("ok", "정상"),
     };
     tracing::warn!("PG 증분 gap 감지({reason}) — 풀 백업으로 승격합니다");
 
@@ -457,7 +692,9 @@ async fn promote_pg_incremental_to_full(
     let reporter = ProgressReporter::start(
         mode,
         ProgressKind::Indeterminate {
-            label: "PG 풀 백업(gap 승격)".into(),
+            label: lang
+                .sel("PG full backup (gap promotion)", "PG 풀 백업(gap 승격)")
+                .into(),
         },
         std::sync::Arc::clone(&progress_counter),
     );
@@ -478,7 +715,8 @@ async fn promote_pg_incremental_to_full(
     reporter.finish().await;
     let outcome = result?;
 
-    let replicate_warning = replicate_and_warn(primary, secondaries, &outcome.backup_id, true).await;
+    let replicate_warning =
+        replicate_and_warn(primary, secondaries, &outcome.backup_id, true).await;
 
     if mode.emits_json() {
         let summary = serde_json::json!({
@@ -493,10 +731,25 @@ async fn promote_pg_incremental_to_full(
         });
         println!("{summary}");
     } else if mode.shows_human_summary() {
-        println!("PG 증분 → 풀 백업 승격(gap 감지)");
-        println!("  id:       {}", outcome.backup_id);
-        println!("  크기:     {} bytes", outcome.stored_size_bytes);
-        println!("  사유:     {reason}");
+        print_backup_summary(
+            &BackupSummary {
+                kind: lang.sel("full (gap promotion)", "full(gap 승격)"),
+                detail: "PostgreSQL",
+                backup_id: &outcome.backup_id,
+                primary_dest,
+                stored_size: outcome.stored_size_bytes,
+                original_size: Some(outcome.original_size_bytes),
+                compression: outcome.compression.as_ref(),
+                encryption: outcome.encryption.as_ref(),
+                checksum: Some(&outcome.checksum_sha256),
+                dest_count,
+                base_id: None,
+                change: None,
+                oplog_range: None,
+                note: Some(reason_human),
+            },
+            lang,
+        );
     }
 
     // exit 4(경고 동반 성공) — main이 Warning을 exit 4로 매핑한다.
@@ -559,13 +812,16 @@ async fn replicate_and_warn(
 ///
 /// gap·late gap·oplog-empty로 풀 백업으로 승격되면 **exit 4**(경고 동반 성공,
 /// [`XBackupError::Warning`])로 보고한다(SC2). 정상 증분(빈 슬라이스 포함)은 exit 0.
+#[allow(clippy::too_many_arguments)]
 async fn handle_incremental(
     resolved: &ResolvedConfig,
     args: &BackupArgs,
     uri: &Secret,
     primary: &dyn Storage,
+    primary_dest: &DestinationConfig,
     secondaries: &[DestinationConfig],
     mode: OutputMode,
+    lang: Lang,
 ) -> Result<()> {
     let request = IncrementalRequest {
         uri: uri.clone(),
@@ -575,6 +831,8 @@ async fn handle_incremental(
     };
     // 캡처/승격 양쪽에서 동일 구성의 새 StageStack을 만들 수 있도록 팩토리로 넘긴다.
     let stage_factory = || build_stages(resolved, args);
+    // 완료 요약(압축·암호화 표시)용 메타 — 동일 구성을 한 번 더 만들어 메타만 취한다.
+    let summary_meta = build_stages(resolved, args)?.1;
 
     let outcome = run_incremental_backup(&request, primary, stage_factory).await?;
 
@@ -599,21 +857,28 @@ async fn handle_incremental(
                 });
                 println!("{summary}");
             } else if mode.shows_human_summary() {
-                println!("증분 백업 완료");
-                println!("  id:       {backup_id}");
-                println!("  base:     {base_id}");
-                println!("  엔트리:   {oplog_count}건");
-                println!("  크기:     {stored_size_bytes} bytes");
-                println!(
-                    "  oplog:    {{t:{},i:{}}} → {{t:{},i:{}}}",
-                    oplog_range.start_ts.t,
-                    oplog_range.start_ts.i,
-                    oplog_range.end_ts.t,
-                    oplog_range.end_ts.i
+                print_backup_summary(
+                    &BackupSummary {
+                        kind: "incr",
+                        detail: "replica_set",
+                        backup_id: &backup_id,
+                        primary_dest,
+                        stored_size: stored_size_bytes,
+                        original_size: None,
+                        compression: summary_meta.compression.as_ref(),
+                        encryption: summary_meta.encryption.as_ref(),
+                        checksum: None,
+                        dest_count: secondaries.len() + 1,
+                        base_id: Some(&base_id),
+                        change: Some(("entries", oplog_count)),
+                        oplog_range: Some(&oplog_range),
+                        note: (oplog_count == 0).then_some(lang.sel(
+                            "(no changes — empty slice: manifest only)",
+                            "(변경 없음 — 빈 슬라이스: manifest만 기록)",
+                        )),
+                    },
+                    lang,
                 );
-                if oplog_count == 0 {
-                    println!("  (변경 없음 — 빈 슬라이스: manifest만 기록)");
-                }
             }
             // 보조 복제 실패는 경고(exit 4) — 증분 캡처 자체는 성공.
             if let Some(w) = replicate_warning {
@@ -637,10 +902,29 @@ async fn handle_incremental(
                 });
                 println!("{summary}");
             } else if mode.shows_human_summary() {
-                println!("증분 → 풀 백업 승격(gap 감지)");
-                println!("  id:       {}", outcome.backup_id);
-                println!("  크기:     {} bytes", outcome.stored_size_bytes);
-                println!("  사유:     {reason}");
+                let topo = match outcome.topology {
+                    Topology::ReplicaSet => "replica_set",
+                    Topology::Standalone => "standalone",
+                };
+                print_backup_summary(
+                    &BackupSummary {
+                        kind: lang.sel("full (gap promotion)", "full(gap 승격)"),
+                        detail: topo,
+                        backup_id: &outcome.backup_id,
+                        primary_dest,
+                        stored_size: outcome.stored_size_bytes,
+                        original_size: Some(outcome.original_size_bytes),
+                        compression: outcome.compression.as_ref(),
+                        encryption: outcome.encryption.as_ref(),
+                        checksum: Some(&outcome.checksum_sha256),
+                        dest_count: secondaries.len() + 1,
+                        base_id: None,
+                        change: None,
+                        oplog_range: outcome.oplog_range.as_ref(),
+                        note: Some(&reason),
+                    },
+                    lang,
+                );
             }
             // exit 4(경고 동반 성공) — main이 Warning을 exit 4로 매핑한다.
             // 승격 경고에 보조 복제 실패가 있으면 함께 알린다(둘 다 exit 4).

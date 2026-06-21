@@ -106,7 +106,13 @@ impl Decoder {
                 c.skip(1)?; // 'N'
                 let (new_vals, new_unchanged) = c.tuple()?;
                 let rel = self.rel(rel_id)?;
-                Ok(Some(self.make(rel, Op::Insert, new_vals, new_unchanged, Vec::new())))
+                Ok(Some(self.make(
+                    rel,
+                    Op::Insert,
+                    new_vals,
+                    new_unchanged,
+                    Vec::new(),
+                )))
             }
             b'U' => {
                 let rel_id = c.i32()?;
@@ -130,14 +136,26 @@ impl Decoder {
                 }
                 let (new_vals, new_unchanged) = c.tuple()?;
                 let rel = self.rel(rel_id)?;
-                Ok(Some(self.make(rel, Op::Update, new_vals, new_unchanged, key_vals)))
+                Ok(Some(self.make(
+                    rel,
+                    Op::Update,
+                    new_vals,
+                    new_unchanged,
+                    key_vals,
+                )))
             }
             b'D' => {
                 let rel_id = c.i32()?;
                 c.skip(1)?; // 'K' or 'O'
                 let (key_vals, _) = c.tuple()?;
                 let rel = self.rel(rel_id)?;
-                Ok(Some(self.make(rel, Op::Delete, Vec::new(), Vec::new(), key_vals)))
+                Ok(Some(self.make(
+                    rel,
+                    Op::Delete,
+                    Vec::new(),
+                    Vec::new(),
+                    key_vals,
+                )))
             }
             // 기타(Type 'Y', Origin 'O', Truncate 'T', Message 'M', stream 메시지 등)는 무시.
             _ => Ok(None),

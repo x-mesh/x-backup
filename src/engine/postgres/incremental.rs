@@ -873,10 +873,19 @@ mod tests {
         let cols = vec![cm("integer", false), cm("text", false), cm("text", false)];
         let (sql, params) = build_dml(&c, &cols).unwrap();
         // 핵심(H3): body(unchanged TOAST)는 SET·params에 절대 없어야 한다(기존 값 보존).
-        assert!(!sql.contains("\"body\""), "unchanged body가 SET에 포함됨: {sql}");
+        assert!(
+            !sql.contains("\"body\""),
+            "unchanged body가 SET에 포함됨: {sql}"
+        );
         // id·note는 SET에 그대로(기존 동작 — 키 컬럼도 SET에 포함). body만 빠진다.
-        assert!(sql.contains("SET \"id\" = $1::text::integer, \"note\" = $2::text::text"), "sql={sql}");
-        assert!(sql.contains("WHERE \"id\" = $3::text::integer"), "sql={sql}");
+        assert!(
+            sql.contains("SET \"id\" = $1::text::integer, \"note\" = $2::text::text"),
+            "sql={sql}"
+        );
+        assert!(
+            sql.contains("WHERE \"id\" = $3::text::integer"),
+            "sql={sql}"
+        );
         // params: SET id(1), note(2) + WHERE id(3) — body는 바인드되지 않음.
         assert_eq!(
             params,

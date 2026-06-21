@@ -397,11 +397,11 @@ impl StatusChecker {
                     .mechanism
                     .as_ref()
                     .map(|m| m.as_str().to_string())
-                    .unwrap_or_else(|| "SCRAM(자동 협상)".to_string()),
+                    .unwrap_or_else(|| "SCRAM (auto-negotiated)".to_string()),
                 username: cred.username.clone(),
             },
             None => ConnectionInfo {
-                mechanism: "none(인증 없음)".to_string(),
+                mechanism: "none".to_string(),
                 username: None,
             },
         };
@@ -425,8 +425,10 @@ impl StatusChecker {
         profile: &str,
         mongodump_program: Option<&str>,
     ) -> StatusReport {
+        // precheck 항목은 Fail 판정에만 쓰이고 사람 표시 메시지는 출력되지 않으므로 En 고정.
+        let lang = crate::i18n::Lang::En;
         let mut items = Vec::new();
-        items.push(self.check_connection().await);
+        items.push(self.check_connection(lang).await);
 
         // 연결 실패면 이후 점검은 의미 없음 — 조기 종료.
         if items[0].status == CheckStatus::Fail {
@@ -434,8 +436,8 @@ impl StatusChecker {
         }
 
         let hello = self.run_admin(doc! { "hello": 1 }).await;
-        items.push(self.check_topology_core(&hello));
-        items.push(self.check_privileges().await);
+        items.push(self.check_topology_core(&hello, lang));
+        items.push(self.check_privileges(lang).await);
         // 네이티브 엔진은 외부 도구 불필요 — mongodump 점검을 건너뛴다.
         if let Some(program) = mongodump_program {
             items.push(check_tool_presence(program));
@@ -451,11 +453,12 @@ impl StatusChecker {
         mongodump_program: &str,
         interval: &str,
         prefer_secondary: bool,
+        lang: crate::i18n::Lang,
     ) -> StatusReport {
         let mut items = Vec::new();
 
         // 1) 연결·인증.
-        items.push(self.check_connection().await);
+        items.push(self.check_connection(lang).await);
         if items[0].status == CheckStatus::Fail {
             // 연결이 안 되면 나머지는 모두 의미 없음 — 연결 실패만 보고.
             return StatusReport::new(profile, items);
@@ -463,38 +466,41 @@ impl StatusChecker {
 
         // 4) 토폴로지(샤딩 거부 포함) — 먼저 hello로 샤딩을 잡는다.
         let hello = self.run_admin(doc! { "hello": 1 }).await;
-        let topology_item = self.check_topology_full(&hello).await;
+        let topology_item = self.check_topology_full(&hello, lang).await;
         let is_sharded_target = topology_item.status == CheckStatus::Fail
             && hello.as_ref().map(is_sharded).unwrap_or(false);
         items.push(topology_item);
 
         // 2) 권한.
-        items.push(self.check_privileges().await);
+        items.push(self.check_privileges(lang).await);
         // 3) 버전 정합.
-        items.push(self.check_version(mongodump_program).await);
+        items.push(self.check_version(mongodump_program, lang).await);
         // 3.5) FCV(호환성 경계).
-        items.push(self.check_fcv().await);
+        items.push(self.check_fcv(lang).await);
         // 6) 저장 엔진.
-        items.push(self.check_storage_engine().await);
+        items.push(self.check_storage_engine(lang).await);
         // 3.6) 서버 시계(clock skew).
-        items.push(self.check_clock().await);
+        items.push(self.check_clock(lang).await);
 
         // 샤딩이면 oplog/크기/secondary 점검은 스코프 외이므로 생략(거부가 우선).
         if !is_sharded_target {
             // 5) oplog 윈도우.
-            items.push(self.check_oplog_window(&hello, interval).await);
+            items.push(self.check_oplog_window(&hello, interval, lang).await);
             // 7) 데이터 형상 + 예상 크기 — dbStats 한 번 합산으로 함께 만든다.
             match self.db_stats_totals().await {
                 Ok(totals) => {
-                    items.extend(Self::shape_items(&totals));
+                    items.extend(Self::shape_items(&totals, lang));
                     items.push(Self::estimated_size_item(&totals));
                 }
                 Err(e) => {
                     items.push(
                         CheckItem::warn(
                             "estimated_size",
-                            "예상 크기",
-                            format!("dbStats 합산 실패(권한 부족 가능): {e}"),
+                            "est. size",
+                            lang.sel(
+                                &format!("dbStats aggregation failed (privileges may be insufficient): {e}"),
+                                &format!("dbStats 합산 실패(권한 부족 가능): {e}"),
+                            ),
                         )
                         .with_value("조회 실패"),
                     );
@@ -502,7 +508,7 @@ impl StatusChecker {
             }
             // 8) (선택) secondary 가용성.
             if prefer_secondary {
-                items.push(self.check_secondary_availability(&hello));
+                items.push(self.check_secondary_availability(&hello, lang));
             }
         }
 
@@ -519,35 +525,54 @@ impl StatusChecker {
     }
 
     /// 1) 연결·인증 — admin.ping + 인증 메커니즘 표시(읽기 전용).
-    async fn check_connection(&self) -> CheckItem {
+    async fn check_connection(&self, lang: crate::i18n::Lang) -> CheckItem {
         match self.run_admin(doc! { "ping": 1 }).await {
             Ok(_) => {
                 let who = match &self.connection.username {
-                    Some(u) => format!("사용자={u}, "),
+                    Some(u) => lang
+                        .sel(&format!("user={u}, "), &format!("사용자={u}, "))
+                        .to_string(),
                     None => String::new(),
                 };
                 CheckItem::ok(
                     "connection",
-                    "연결·인증",
-                    format!("연결 성공({who}메커니즘={})", self.connection.mechanism),
+                    "connection",
+                    lang.sel(
+                        &format!("connected ({who}mechanism={})", self.connection.mechanism),
+                        &format!("연결 성공({who}메커니즘={})", self.connection.mechanism),
+                    ),
                 )
                 .with_value(self.connection.mechanism.to_string())
             }
-            Err(e) => CheckItem::fail("connection", "연결·인증", format!("연결 실패: {e}"))
-                .with_value("연결 실패"),
+            Err(e) => CheckItem::fail(
+                "connection",
+                "connection",
+                lang.sel(
+                    &format!("connection failed: {e}"),
+                    &format!("연결 실패: {e}"),
+                ),
+            )
+            .with_value("연결 실패"),
         }
     }
 
     /// 2) 권한 — connectionStatus {showPrivileges:true}로 부여 액션을 모아 필요 집합과 대조.
-    async fn check_privileges(&self) -> CheckItem {
+    async fn check_privileges(&self, lang: crate::i18n::Lang) -> CheckItem {
         let resp = self
             .run_admin(doc! { "connectionStatus": 1, "showPrivileges": true })
             .await;
         let doc = match resp {
             Ok(d) => d,
             Err(e) => {
-                return CheckItem::fail("privileges", "권한", format!("권한 조회 실패: {e}"))
-                    .with_value("조회 실패")
+                return CheckItem::fail(
+                    "privileges",
+                    "privileges",
+                    lang.sel(
+                        &format!("privilege lookup failed: {e}"),
+                        &format!("권한 조회 실패: {e}"),
+                    ),
+                )
+                .with_value("조회 실패")
             }
         };
         // 인증 비활성 서버(인증된 사용자 없음)는 사실상 전권 — 권한 누락으로 보지 않는다.
@@ -555,10 +580,14 @@ impl StatusChecker {
         if auth_is_disabled(&doc) {
             return CheckItem::warn(
                 "privileges",
-                "권한",
-                "인증이 비활성화된 서버입니다(인증된 사용자 없음) — 접속 주체가 전권을 가지므로 \
-                 권한은 충분하나, 운영 환경에서는 인증 활성화를 권장합니다"
-                    .to_string(),
+                "privileges",
+                lang.sel(
+                    "authentication is disabled on this server (no authenticated user) — the \
+                     connecting principal has full privileges, so privileges are sufficient, but \
+                     enabling authentication is recommended in production",
+                    "인증이 비활성화된 서버입니다(인증된 사용자 없음) — 접속 주체가 전권을 가지므로 \
+                     권한은 충분하나, 운영 환경에서는 인증 활성화를 권장합니다",
+                ),
             )
             .with_value("인증 비활성");
         }
@@ -567,17 +596,26 @@ impl StatusChecker {
         if missing.is_empty() {
             CheckItem::ok(
                 "privileges",
-                "권한",
-                "백업에 필요한 권한(전 DB read + oplog 읽기 상당)을 보유".to_string(),
+                "privileges",
+                lang.sel(
+                    "has the privileges required for backup (all-DB read + oplog read equivalent)",
+                    "백업에 필요한 권한(전 DB read + oplog 읽기 상당)을 보유",
+                ),
             )
-            .with_value("충분")
+            .with_value(lang.sel("sufficient", "충분"))
         } else {
             CheckItem::fail(
                 "privileges",
-                "권한",
-                format!(
-                    "필요 권한 누락: [{}] — 백업/읽기 역할(backup, read/readAnyDatabase) 부여 필요",
-                    missing.join(", ")
+                "privileges",
+                lang.sel(
+                    &format!(
+                        "missing required privileges: [{}] — grant backup/read roles (backup, read/readAnyDatabase)",
+                        missing.join(", ")
+                    ),
+                    &format!(
+                        "필요 권한 누락: [{}] — 백업/읽기 역할(backup, read/readAnyDatabase) 부여 필요",
+                        missing.join(", ")
+                    ),
                 ),
             )
             .with_value(format!("누락 {}", missing.len()))
@@ -585,13 +623,15 @@ impl StatusChecker {
     }
 
     /// 4) 토폴로지(핵심 서브셋) — 샤딩 거부 + standalone/replica set 판별만.
-    fn check_topology_core(&self, hello: &Result<Document>) -> CheckItem {
+    fn check_topology_core(&self, hello: &Result<Document>, lang: crate::i18n::Lang) -> CheckItem {
         match hello {
             Ok(doc) if is_sharded(doc) => CheckItem::fail(
                 "topology",
-                "토폴로지",
-                "샤딩 클러스터(mongos) 감지 — 1차 스코프 외입니다. 백업을 거부합니다(PRD §4/§6.5)"
-                    .to_string(),
+                "topology",
+                lang.sel(
+                    "sharded cluster (mongos) detected — out of initial scope. Refusing backup (PRD §4/§6.5)",
+                    "샤딩 클러스터(mongos) 감지 — 1차 스코프 외입니다. 백업을 거부합니다(PRD §4/§6.5)",
+                ),
             )
             .with_value("sharded"),
             Ok(doc) => {
@@ -599,23 +639,34 @@ impl StatusChecker {
                     let set = doc.get_str("setName").unwrap_or("?");
                     CheckItem::ok(
                         "topology",
-                        "토폴로지",
+                        "topology",
                         format!("replica set(setName={set})"),
                     )
                     .with_value(format!("rs:{set}"))
                 } else {
-                    CheckItem::ok("topology", "토폴로지", "standalone".to_string())
+                    CheckItem::ok("topology", "topology", "standalone".to_string())
                         .with_value("standalone")
                 }
             }
-            Err(e) => CheckItem::fail("topology", "토폴로지", format!("hello 조회 실패: {e}"))
-                .with_value("조회 실패"),
+            Err(e) => CheckItem::fail(
+                "topology",
+                "topology",
+                lang.sel(
+                    &format!("hello lookup failed: {e}"),
+                    &format!("hello 조회 실패: {e}"),
+                ),
+            )
+            .with_value("조회 실패"),
         }
     }
 
     /// 4) 토폴로지(전체) — 핵심 판별 + replica set 멤버 상태(PRIMARY/lag) 요약.
-    async fn check_topology_full(&self, hello: &Result<Document>) -> CheckItem {
-        let core = self.check_topology_core(hello);
+    async fn check_topology_full(
+        &self,
+        hello: &Result<Document>,
+        lang: crate::i18n::Lang,
+    ) -> CheckItem {
+        let core = self.check_topology_core(hello, lang);
         // 핵심에서 fail/standalone이면 그대로. replica set일 때만 멤버 상태를 덧붙인다.
         if core.status != CheckStatus::Ok {
             return core;
@@ -641,18 +692,25 @@ impl StatusChecker {
                     .ok()
                     .and_then(|d| d.get_str("setName").ok())
                     .unwrap_or("?");
-                let msg = format!(
-                    "replica set(setName={set}, PRIMARY={}, SECONDARY={}, 최대 lag={lag})",
-                    if summary.has_primary {
-                        "있음"
-                    } else {
-                        "없음"
-                    },
-                    summary.secondary_count,
-                );
+                let primary_disp = if summary.has_primary {
+                    lang.sel("yes", "있음")
+                } else {
+                    lang.sel("no", "없음")
+                };
+                let msg = lang.sel(
+                    &format!(
+                        "replica set(setName={set}, PRIMARY={primary_disp}, SECONDARY={}, max lag={lag})",
+                        summary.secondary_count,
+                    ),
+                    &format!(
+                        "replica set(setName={set}, PRIMARY={primary_disp}, SECONDARY={}, 최대 lag={lag})",
+                        summary.secondary_count,
+                    ),
+                )
+                .to_string();
                 CheckItem {
                     key: "topology",
-                    label: "토폴로지",
+                    label: "topology",
                     status,
                     message: msg,
                     value: Some(format!("rs:{set}")),
@@ -661,42 +719,66 @@ impl StatusChecker {
             // replSetGetStatus 실패(권한 등)는 토폴로지 판별 자체는 됐으므로 경고로 강등.
             Err(e) => CheckItem::warn(
                 "topology",
-                "토폴로지",
-                format!("{} (멤버 상태 조회 실패: {e})", core.message),
+                "topology",
+                lang.sel(
+                    &format!("{} (member status lookup failed: {e})", core.message),
+                    &format!("{} (멤버 상태 조회 실패: {e})", core.message),
+                ),
             )
             .with_value(core.value.clone().unwrap_or_default()),
         }
     }
 
     /// 3) 버전 정합 — buildInfo(서버) + mongodump --version(도구).
-    async fn check_version(&self, mongodump_program: &str) -> CheckItem {
+    async fn check_version(&self, mongodump_program: &str, lang: crate::i18n::Lang) -> CheckItem {
         let server_version = match self.run_admin(doc! { "buildInfo": 1 }).await {
             Ok(doc) => doc.get_str("version").unwrap_or("unknown").to_string(),
             Err(e) => {
-                return CheckItem::fail("version", "버전 정합", format!("buildInfo 조회 실패: {e}"))
-                    .with_value("조회 실패")
+                return CheckItem::fail(
+                    "version",
+                    "version",
+                    lang.sel(
+                        &format!("buildInfo lookup failed: {e}"),
+                        &format!("buildInfo 조회 실패: {e}"),
+                    ),
+                )
+                .with_value("조회 실패")
             }
         };
         let tool_version = detect_mongodump_version(mongodump_program);
         let status = version_compat_status(&server_version, tool_version.as_deref());
-        let tool_disp = tool_version
-            .clone()
-            .unwrap_or_else(|| "미설치/탐색 실패".to_string());
+        let tool_disp = tool_version.clone().unwrap_or_else(|| {
+            lang.sel("not installed/not found", "미설치/탐색 실패")
+                .to_string()
+        });
         let msg = match status {
-            CheckStatus::Fail => format!(
-                "mongodump를 찾을 수 없습니다('{mongodump_program}'). 서버 버전={server_version} \
-                 — Database Tools 설치/PATH 확인(예: mongodb-database-tools)"
-            ),
-            CheckStatus::Warn => format!(
-                "서버={server_version}, mongodump={tool_disp} — 메이저 차이로 비호환 가능, 검증 권장"
-            ),
+            CheckStatus::Fail => lang.sel(
+                &format!(
+                    "mongodump not found ('{mongodump_program}'). server version={server_version} \
+                     — install Database Tools / check PATH (e.g. mongodb-database-tools)"
+                ),
+                &format!(
+                    "mongodump를 찾을 수 없습니다('{mongodump_program}'). 서버 버전={server_version} \
+                     — Database Tools 설치/PATH 확인(예: mongodb-database-tools)"
+                ),
+            )
+            .to_string(),
+            CheckStatus::Warn => lang.sel(
+                &format!(
+                    "server={server_version}, mongodump={tool_disp} — major-version gap may be incompatible, verification recommended"
+                ),
+                &format!(
+                    "서버={server_version}, mongodump={tool_disp} — 메이저 차이로 비호환 가능, 검증 권장"
+                ),
+            )
+            .to_string(),
             CheckStatus::Ok => {
-                format!("서버={server_version}, mongodump={tool_disp}")
+                format!("server={server_version}, mongodump={tool_disp}")
             }
         };
         CheckItem {
             key: "version",
-            label: "버전 정합",
+            label: "version",
             status,
             message: msg,
             // 비교는 서버 버전 기준(mongodump는 로컬 도구라 서버 간 diff 의미 없음).
@@ -705,7 +787,7 @@ impl StatusChecker {
     }
 
     /// 6) 저장 엔진 — serverStatus.storageEngine.name.
-    async fn check_storage_engine(&self) -> CheckItem {
+    async fn check_storage_engine(&self, lang: crate::i18n::Lang) -> CheckItem {
         match self.run_admin(doc! { "serverStatus": 1 }).await {
             Ok(doc) => {
                 let engine = doc
@@ -715,7 +797,7 @@ impl StatusChecker {
                     .unwrap_or("unknown");
                 CheckItem::ok(
                     "storage_engine",
-                    "저장 엔진",
+                    "storage engine",
                     format!("storageEngine={engine}"),
                 )
                 .with_value(engine.to_string())
@@ -723,15 +805,23 @@ impl StatusChecker {
             // serverStatus는 clusterMonitor 권한이 필요할 수 있어 실패는 경고로 강등.
             Err(e) => CheckItem::warn(
                 "storage_engine",
-                "저장 엔진",
-                format!("serverStatus 조회 실패(권한 부족 가능): {e}"),
+                "storage engine",
+                lang.sel(
+                    &format!("serverStatus lookup failed (privileges may be insufficient): {e}"),
+                    &format!("serverStatus 조회 실패(권한 부족 가능): {e}"),
+                ),
             )
             .with_value("조회 실패"),
         }
     }
 
     /// 5) oplog 윈도우 — 최소~최신 ts 시간 폭, config interval 대비 여유.
-    async fn check_oplog_window(&self, hello: &Result<Document>, interval: &str) -> CheckItem {
+    async fn check_oplog_window(
+        &self,
+        hello: &Result<Document>,
+        interval: &str,
+        lang: crate::i18n::Lang,
+    ) -> CheckItem {
         let is_rs = hello
             .as_ref()
             .map(|d| d.get_str("setName").is_ok())
@@ -739,8 +829,11 @@ impl StatusChecker {
         if !is_rs {
             return CheckItem::warn(
                 "oplog_window",
-                "oplog 윈도우",
-                "standalone — oplog 없음(증분 백업 불가, 풀 백업만 가능)".to_string(),
+                "oplog window",
+                lang.sel(
+                    "standalone — no oplog (incremental backup unavailable, full backup only)",
+                    "standalone — oplog 없음(증분 백업 불가, 풀 백업만 가능)",
+                ),
             )
             .with_value("없음(standalone)");
         }
@@ -761,19 +854,32 @@ impl StatusChecker {
                     Some(iv) => oplog_window_status(window_secs, iv),
                     None => CheckStatus::Ok,
                 };
-                let iv_disp = interval_secs
-                    .map(|s| format!("{s}s"))
-                    .unwrap_or_else(|| format!("'{interval}'(파싱 불가)"));
+                let iv_disp = interval_secs.map(|s| format!("{s}s")).unwrap_or_else(|| {
+                    lang.sel(
+                        &format!("'{interval}'(unparseable)"),
+                        &format!("'{interval}'(파싱 불가)"),
+                    )
+                    .to_string()
+                });
                 let msg = match status {
-                    CheckStatus::Warn => format!(
-                        "윈도우={}s 가 증분 주기({iv_disp})의 2배 미만 — gap 위험(주기 단축/oplog 증대 권고, §6.2)",
-                        window_secs
-                    ),
-                    _ => format!("윈도우={window_secs}s, 증분 주기={iv_disp}"),
+                    CheckStatus::Warn => lang.sel(
+                        &format!(
+                            "window={window_secs}s is less than 2x the incremental interval ({iv_disp}) — gap risk (shorten interval / increase oplog, §6.2)"
+                        ),
+                        &format!(
+                            "윈도우={window_secs}s 가 증분 주기({iv_disp})의 2배 미만 — gap 위험(주기 단축/oplog 증대 권고, §6.2)"
+                        ),
+                    )
+                    .to_string(),
+                    _ => lang.sel(
+                        &format!("window={window_secs}s, incremental interval={iv_disp}"),
+                        &format!("윈도우={window_secs}s, 증분 주기={iv_disp}"),
+                    )
+                    .to_string(),
                 };
                 CheckItem {
                     key: "oplog_window",
-                    label: "oplog 윈도우",
+                    label: "oplog window",
                     status,
                     message: msg,
                     value: Some(format!("{window_secs}s")),
@@ -781,8 +887,11 @@ impl StatusChecker {
             }
             _ => CheckItem::warn(
                 "oplog_window",
-                "oplog 윈도우",
-                "oplog 엔트리를 읽지 못함(권한/빈 oplog 가능)".to_string(),
+                "oplog window",
+                lang.sel(
+                    "could not read oplog entries (privileges / empty oplog possible)",
+                    "oplog 엔트리를 읽지 못함(권한/빈 oplog 가능)",
+                ),
             )
             .with_value("읽기 실패"),
         }
@@ -823,7 +932,7 @@ impl StatusChecker {
     fn estimated_size_item(totals: &DbTotals) -> CheckItem {
         CheckItem::ok(
             "estimated_size",
-            "예상 크기",
+            "est. size",
             format!(
                 "dataSize={} ({}), storageSize={} ({}), indexSize={}",
                 totals.data_size,
@@ -838,27 +947,43 @@ impl StatusChecker {
     }
 
     /// 데이터 형상 항목 — 문서 수·컬렉션 수·인덱스 수(+ 인덱스 크기). 비교 뷰의 drift 확인용.
-    fn shape_items(totals: &DbTotals) -> Vec<CheckItem> {
+    fn shape_items(totals: &DbTotals, lang: crate::i18n::Lang) -> Vec<CheckItem> {
         vec![
             CheckItem::ok(
                 "doc_count",
-                "문서 수",
-                format!("추정 문서 {}건(estimatedDocumentCount 합)", totals.objects),
+                "documents",
+                lang.sel(
+                    &format!(
+                        "~{} documents (sum of estimatedDocumentCount)",
+                        totals.objects
+                    ),
+                    &format!("추정 문서 {}건(estimatedDocumentCount 합)", totals.objects),
+                ),
             )
             .with_value(totals.objects.to_string()),
             CheckItem::ok(
                 "collection_count",
-                "컬렉션 수",
-                format!("사용자 컬렉션 {}개", totals.collections),
+                "collections",
+                lang.sel(
+                    &format!("{} user collections", totals.collections),
+                    &format!("사용자 컬렉션 {}개", totals.collections),
+                ),
             )
             .with_value(totals.collections.to_string()),
             CheckItem::ok(
                 "index_count",
-                "인덱스 수",
-                format!(
-                    "인덱스 {}개, 인덱스 크기 {}",
-                    totals.indexes,
-                    human_bytes(totals.index_size)
+                "indexes",
+                lang.sel(
+                    &format!(
+                        "{} indexes, index size {}",
+                        totals.indexes,
+                        human_bytes(totals.index_size)
+                    ),
+                    &format!(
+                        "인덱스 {}개, 인덱스 크기 {}",
+                        totals.indexes,
+                        human_bytes(totals.index_size)
+                    ),
                 ),
             )
             .with_value(totals.indexes.to_string()),
@@ -866,7 +991,7 @@ impl StatusChecker {
     }
 
     /// 3.5) FCV(featureCompatibilityVersion) — 서버 버전과 별개의 호환성 경계.
-    async fn check_fcv(&self) -> CheckItem {
+    async fn check_fcv(&self, lang: crate::i18n::Lang) -> CheckItem {
         let resp = self
             .run_admin(doc! { "getParameter": 1, "featureCompatibilityVersion": 1 })
             .await;
@@ -882,15 +1007,22 @@ impl StatusChecker {
                     .with_value(fcv)
             }
             // FCV 조회는 권한이 필요할 수 있어 실패는 경고로 강등(백업을 막지 않음).
-            Err(e) => CheckItem::warn("fcv", "FCV", format!("FCV 조회 실패(권한 부족 가능): {e}"))
-                .with_value("조회 실패"),
+            Err(e) => CheckItem::warn(
+                "fcv",
+                "FCV",
+                lang.sel(
+                    &format!("FCV lookup failed (privileges may be insufficient): {e}"),
+                    &format!("FCV 조회 실패(권한 부족 가능): {e}"),
+                ),
+            )
+            .with_value("조회 실패"),
         }
     }
 
     /// 3.6) 서버 시계 — `hello.localTime`과 로컬 시각의 차(clock skew). PITR/oplog 안전성 신호.
     ///
     /// 왕복 지연만큼 오차가 있으므로 근사값이다. |skew| ≥ 5초면 경고(시계 동기 권장).
-    async fn check_clock(&self) -> CheckItem {
+    async fn check_clock(&self, lang: crate::i18n::Lang) -> CheckItem {
         let before = Utc::now().timestamp_millis();
         let hello = self.run_admin(doc! { "hello": 1 }).await;
         let after = Utc::now().timestamp_millis();
@@ -903,8 +1035,12 @@ impl StatusChecker {
         let server_ms = match server_ms {
             Some(s) => s,
             None => {
-                return CheckItem::warn("clock", "서버 시계", "서버 시각을 읽지 못함".to_string())
-                    .with_value("불명")
+                return CheckItem::warn(
+                    "clock",
+                    "server clock",
+                    lang.sel("could not read server time", "서버 시각을 읽지 못함"),
+                )
+                .with_value("불명")
             }
         };
         // 클라이언트 시각의 중간값(왕복 보정)과 서버 시각의 차.
@@ -913,21 +1049,35 @@ impl StatusChecker {
         let skew_s = skew_ms as f64 / 1000.0;
         let sign = if skew_ms >= 0 { "+" } else { "-" };
         let disp = format!("{sign}{:.1}s", skew_s.abs());
-        let msg = format!("서버가 로컬 대비 {disp} (왕복 보정 근사)");
+        let msg = lang
+            .sel(
+                &format!("server is {disp} relative to local (round-trip-corrected approximation)"),
+                &format!("서버가 로컬 대비 {disp} (왕복 보정 근사)"),
+            )
+            .to_string();
         if skew_ms.abs() >= 5_000 {
             CheckItem::warn(
                 "clock",
-                "서버 시계",
-                format!("{msg} — 5초 이상 차이, NTP 동기 권장(oplog/PITR 정확도)"),
+                "server clock",
+                lang.sel(
+                    &format!(
+                        "{msg} — over 5s difference, NTP sync recommended (oplog/PITR accuracy)"
+                    ),
+                    &format!("{msg} — 5초 이상 차이, NTP 동기 권장(oplog/PITR 정확도)"),
+                ),
             )
             .with_value(disp)
         } else {
-            CheckItem::ok("clock", "서버 시계", msg).with_value(disp)
+            CheckItem::ok("clock", "server clock", msg).with_value(disp)
         }
     }
 
     /// 8) (선택) secondary 가용성 — prefer_secondary 구성 시 읽기 가능한 secondary 존재 여부.
-    fn check_secondary_availability(&self, hello: &Result<Document>) -> CheckItem {
+    fn check_secondary_availability(
+        &self,
+        hello: &Result<Document>,
+        lang: crate::i18n::Lang,
+    ) -> CheckItem {
         let hosts = hello
             .as_ref()
             .ok()
@@ -943,22 +1093,31 @@ impl StatusChecker {
         if hosts >= 2 {
             CheckItem::ok(
                 "secondary",
-                "secondary 가용성",
-                format!("멤버 {hosts}개 — prefer_secondary 백업 가능(secondary 후보 존재)"),
+                "secondary availability",
+                lang.sel(
+                    &format!("{hosts} members — prefer_secondary backup possible (secondary candidate exists)"),
+                    &format!("멤버 {hosts}개 — prefer_secondary 백업 가능(secondary 후보 존재)"),
+                ),
             )
             .with_value(format!("멤버 {hosts}"))
         } else if is_primary {
             CheckItem::warn(
                 "secondary",
-                "secondary 가용성",
-                "prefer_secondary 구성이나 읽을 secondary가 없음 — PRIMARY에서 백업됨".to_string(),
+                "secondary availability",
+                lang.sel(
+                    "prefer_secondary is configured but no readable secondary — backing up from PRIMARY",
+                    "prefer_secondary 구성이나 읽을 secondary가 없음 — PRIMARY에서 백업됨",
+                ),
             )
             .with_value("없음")
         } else {
             CheckItem::warn(
                 "secondary",
-                "secondary 가용성",
-                "secondary 가용성을 판정할 멤버 정보가 부족".to_string(),
+                "secondary availability",
+                lang.sel(
+                    "insufficient member info to determine secondary availability",
+                    "secondary 가용성을 판정할 멤버 정보가 부족",
+                ),
             )
             .with_value("불명")
         }
@@ -1095,11 +1254,11 @@ pub fn parse_mongodump_version(output: &str) -> Option<String> {
 /// 버전 파싱까지 가지 않고 실행 가능 여부만 본다 — 부재는 백업을 막는 실패다.
 pub fn check_tool_presence(program: &str) -> CheckItem {
     match detect_mongodump_version(program) {
-        Some(v) => CheckItem::ok("tool", "백업 도구", format!("mongodump={v}")),
+        Some(v) => CheckItem::ok("tool", "backup tool", format!("mongodump={v}")),
         None => CheckItem::fail(
             "tool",
-            "백업 도구",
-            format!("mongodump를 찾을 수 없습니다('{program}') — 설치/PATH 확인"),
+            "backup tool",
+            format!("mongodump not found ('{program}') — check install/PATH"),
         ),
     }
 }

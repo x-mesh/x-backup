@@ -270,10 +270,11 @@ pub fn run_wizard(prompt: &mut dyn Prompt) -> Result<Config> {
     Ok(config)
 }
 
-/// [`Config`]를 TOML 문자열로 직렬화한다(파일 기록용). 시크릿이 없으므로 그대로 안전하다.
+/// [`Config`]를 **v2 표면 TOML 문자열**로 직렬화한다(파일 기록용; init이 v2를 쓴다).
+/// 시크릿이 없으므로 그대로 안전하다. v2 직렬화는
+/// [`crate::config::v2::to_v2_string`](normalize_v2의 역연산)에 위임한다.
 pub fn config_to_toml(config: &Config) -> Result<String> {
-    toml::to_string_pretty(config)
-        .map_err(|e| XBackupError::Failure(format!("config.toml 직렬화 실패: {e}")))
+    crate::config::v2::to_v2_string(config)
 }
 
 #[cfg(test)]

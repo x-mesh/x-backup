@@ -231,7 +231,8 @@ pub fn plan_prune(
             kind: PruneKind::Incomplete,
             base_id: m.id.clone(),
             member_ids: vec![m.id.clone()],
-            reason: "incomplete 백업(체인 부적격 잔재) — --force에서만 삭제".to_string(),
+            reason: "incomplete backup (chain-ineligible remnant) — deleted only with --force"
+                .to_string(),
         });
     }
 
@@ -241,7 +242,8 @@ pub fn plan_prune(
             kind: PruneKind::Orphan,
             base_id: id.clone(),
             member_ids: vec![id.clone()],
-            reason: "orphan(manifest 없는 data 산출물) — --force에서만 삭제".to_string(),
+            reason: "orphan (data artifact without manifest) — deleted only with --force"
+                .to_string(),
         });
     }
 
@@ -265,18 +267,18 @@ struct ChainGroup {
 fn prune_reason(policy: RetentionPolicy, idx: usize) -> String {
     let mut parts = Vec::new();
     if let Some(n) = policy.keep_full {
-        parts.push(format!("keep-full {n}(정렬 {}번째)", idx + 1));
+        parts.push(format!("keep-full {n} (rank {})", idx + 1));
     }
     if let Some(d) = policy.keep_days {
-        parts.push(format!("keep-days {d}일"));
+        parts.push(format!("keep-days {d}d"));
     }
     if let Some(l) = policy.keep_last {
-        parts.push(format!("keep-last {l}벌"));
+        parts.push(format!("keep-last {l}"));
     }
     if parts.is_empty() {
-        "보존 기준 미지정".to_string() // 도달하지 않음(is_unspecified 가드).
+        "no retention rule".to_string() // 도달하지 않음(is_unspecified 가드).
     } else {
-        format!("보존 기준 초과({})", parts.join(" · "))
+        format!("exceeds retention ({})", parts.join(" · "))
     }
 }
 

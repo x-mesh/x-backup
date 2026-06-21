@@ -16,11 +16,17 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     propagate_version = true
 )]
 pub struct Cli {
-    /// config.toml 경로(미지정 시 기본 탐색 경로 사용).
+    /// config.toml 경로(미지정 시 `XB_CONFIG` 환경변수 — 자동 탐색은 없다).
     ///
+    /// 어떤 config를 참조 중인지는 `status`/`doctor` 출력의 `config:` 줄에서 확인할 수 있다.
     /// 시크릿은 config에 평문 저장하지 않고 ENV 참조(uri_env 등)로 주입한다(FR-10).
     #[arg(long, global = true, value_name = "PATH", env = "XB_CONFIG")]
     pub config: Option<PathBuf>,
+
+    /// 출력 설명 언어(en|ko). 라벨·기술용어는 항상 영문이며, 이 옵션은 설명·안내 문구에만
+    /// 적용된다. 미지정 시 config `[output].language` → 기본 en.
+    #[arg(long, global = true, value_enum, env = "XB_LANG")]
+    pub lang: Option<crate::i18n::Lang>,
 
     /// 로그 상세도를 한 단계씩 올린다(-v, -vv).
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
@@ -172,9 +178,13 @@ pub struct RestoreArgs {
     /// 복구할 백업 ID. 미지정 시 최신 풀 백업을 자동 선택한다(FR-3).
     #[arg(long, value_name = "BACKUP_ID")]
     pub id: Option<String>,
-    /// 복구 대상 MongoDB URI(미지정 시 프로파일 source). 타깃 분리 복구용.
-    #[arg(long, value_name = "MONGO_URI")]
+    /// 복구 대상 DB URI(미지정 시 프로파일 source). 타깃 분리 복구용. `--target-profile`과 택일.
+    #[arg(long, value_name = "DB_URI", conflicts_with = "target_profile")]
     pub target: Option<String>,
+    /// 복구 대상을 다른 프로파일의 source 접속으로 지정한다(URI 직접 입력 대신).
+    /// 같은 config.toml 안의 프로파일 이름. `--target`과 택일. 예: `--profile mongo --target-profile dr`.
+    #[arg(long, value_name = "NAME")]
+    pub target_profile: Option<String>,
     /// 어느 destination에서 읽을지(멀티 destination일 때). 이름 또는 `type#idx`.
     /// 미지정 시 primary(첫 destination).
     #[arg(long, value_name = "NAME")]
@@ -407,14 +417,28 @@ mod tests {
     fn backup_collection_requires_db() {
         // --collection만 → 거부(usage 오류, exit 2).
         assert!(
-            Cli::try_parse_from(["x-backup", "backup", "--profile", "p", "--collection", "users"])
-                .is_err(),
+            Cli::try_parse_from([
+                "x-backup",
+                "backup",
+                "--profile",
+                "p",
+                "--collection",
+                "users"
+            ])
+            .is_err(),
             "--collection은 --db 없이 거부되어야 함"
         );
         // --db + --collection → 통과.
         assert!(
             Cli::try_parse_from([
-                "x-backup", "backup", "--profile", "p", "--db", "app", "--collection", "users",
+                "x-backup",
+                "backup",
+                "--profile",
+                "p",
+                "--db",
+                "app",
+                "--collection",
+                "users",
             ])
             .is_ok(),
             "--db와 함께면 통과해야 함"
@@ -431,19 +455,66 @@ mod tests {
     fn migrate_collection_requires_db() {
         assert!(
             Cli::try_parse_from([
-                "x-backup", "migrate", "--profile", "p", "--target", "mongodb://t/db",
-                "--collection", "users",
+                "x-backup",
+                "migrate",
+                "--profile",
+                "p",
+                "--target",
+                "mongodb://t/db",
+                "--collection",
+                "users",
             ])
             .is_err(),
             "migrate --collection은 --db 없이 거부되어야 함"
         );
         assert!(
             Cli::try_parse_from([
-                "x-backup", "migrate", "--profile", "p", "--target", "mongodb://t/db", "--db",
-                "app", "--collection", "users",
+                "x-backup",
+                "migrate",
+                "--profile",
+                "p",
+                "--target",
+                "mongodb://t/db",
+                "--db",
+                "app",
+                "--collection",
+                "users",
             ])
             .is_ok(),
             "migrate --db와 함께면 통과해야 함"
+        );
+    }
+
+    /// restore는 `--target`(URI)와 `--target-profile`(프로파일 이름)을 동시에 줄 수 없다(택일).
+    #[test]
+    fn restore_target_and_target_profile_conflict() {
+        // 둘 다 → 거부.
+        assert!(
+            Cli::try_parse_from([
+                "x-backup",
+                "restore",
+                "--profile",
+                "mongo",
+                "--target",
+                "mongodb://t/db",
+                "--target-profile",
+                "dr",
+            ])
+            .is_err(),
+            "--target과 --target-profile 동시 지정은 거부되어야 함"
+        );
+        // --target-profile 단독 → 통과.
+        assert!(
+            Cli::try_parse_from([
+                "x-backup",
+                "restore",
+                "--profile",
+                "mongo",
+                "--target-profile",
+                "dr",
+            ])
+            .is_ok(),
+            "--target-profile 단독은 통과해야 함"
         );
     }
 }

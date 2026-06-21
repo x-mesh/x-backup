@@ -23,6 +23,7 @@ use crate::config::ResolvedConfig;
 use crate::engine::mongo::status::{human_bytes, CheckStatus, StatusChecker, StatusReport};
 use crate::engine::mongo::MongoMeta;
 use crate::error::{Result, XBackupError};
+use crate::i18n::Lang;
 use crate::manifest::schema::{BackupManifest, BackupType};
 use crate::manifest::ManifestStore;
 use crate::storage::{from_config, BoxAsyncRead, Storage};
@@ -31,7 +32,11 @@ use crate::storage::{from_config, BoxAsyncRead, Storage};
 pub const DEFAULT_MONGODUMP: &str = "mongodump";
 
 /// `status` 핸들러 진입점.
-pub async fn handle(config_path: Option<PathBuf>, args: StatusArgs) -> Result<()> {
+pub async fn handle(
+    config_path: Option<PathBuf>,
+    lang_flag: Option<crate::i18n::Lang>,
+    args: StatusArgs,
+) -> Result<()> {
     // config 파일은 한 번만 읽는다(--all은 여러 프로파일에 재사용).
     let config_toml = match &config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
@@ -39,14 +44,25 @@ pub async fn handle(config_path: Option<PathBuf>, args: StatusArgs) -> Result<()
         })?),
         None => None,
     };
+    let lang = crate::i18n::resolve_from_toml(lang_flag, config_toml.as_deref());
+
+    // 참조 중인 config 위치를 stderr에 한 줄 알린다(다중 DB 툴 + xbenv 자동 XB_CONFIG 환경에서
+    // "지금 어느 config를 보는지"를 분명히). json은 기계 판독 오염 방지로 생략.
+    if !args.json {
+        let src = crate::cli::output::config_source_label(config_path.as_deref(), lang);
+        eprintln!(
+            "{}",
+            paint(&format!("▸ config: {src}"), &[DIM], use_color())
+        );
+    }
 
     // 라이브 모드 — 주기 갱신하며 변경량(Δ)을 추적한다(단일/--all 모두 지원).
     if args.watch {
-        return handle_watch(config_toml.as_deref(), &args).await;
+        return handle_watch(config_toml.as_deref(), &args, lang).await;
     }
 
     if args.all {
-        return handle_all(config_toml.as_deref(), args.json).await;
+        return handle_all(config_toml.as_deref(), args.json, lang).await;
     }
 
     // 단일 프로파일(--all 아니면 --profile 필수 — clap이 강제).
@@ -54,24 +70,42 @@ pub async fn handle(config_path: Option<PathBuf>, args: StatusArgs) -> Result<()
         .profile
         .as_deref()
         .ok_or_else(|| XBackupError::Usage("--profile 또는 --all이 필요합니다".into()))?;
-    let report = build_report(config_toml.as_deref(), profile).await?;
+    // --json은 기계 판독 안정성을 위해 언어를 En으로 고정한다(사람 출력만 resolve된 lang 사용).
+    let report_lang = if args.json {
+        crate::i18n::Lang::En
+    } else {
+        lang
+    };
+    let report = build_report(config_toml.as_deref(), profile, report_lang).await?;
 
     // 실행 컨텍스트(프로파일·DB) — 표시용으로 source URI 엔진을 가볍게 재해석(연결 없음).
-    let db = ResolvedConfig::build(MergeInput {
+    // profile이 빈 문자열(XB_PROFILE="" 잔재)이면 build가 default_profile로 폴백하므로,
+    // 표시도 원시 빈 값이 아닌 실효 프로파일 이름(resolved.profile_name)을 쓴다.
+    let resolved_ctx = ResolvedConfig::build(MergeInput {
         config_toml: config_toml.as_deref(),
         profile_name: profile,
         overrides: &collect_overrides_from_process(),
     })
-    .ok()
-    .and_then(|r| r.resolved_uri)
-    .map(|u| crate::engine::DbKind::from_uri(u.expose()));
-    crate::cli::output::print_run_context(profile, db, crate::cli::output::context_mode(args.json));
+    .ok();
+    let display_profile: String = resolved_ctx
+        .as_ref()
+        .map(|r| r.profile_name.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| profile.to_string());
+    let db = resolved_ctx
+        .and_then(|r| r.resolved_uri)
+        .map(|u| crate::engine::DbKind::from_uri(u.expose()));
+    crate::cli::output::print_run_context(
+        &display_profile,
+        db,
+        crate::cli::output::context_mode(args.json),
+    );
 
     // 출력 — --json 구조화 또는 사람용 표.
     if args.json {
         render_json(&report)?;
     } else {
-        render_human(&report);
+        render_human(&report, lang);
     }
 
     // 신호등 → 종료 코드. fail이면 PrecheckFailed(exit 3), warn이면 Warning(exit 4), ok면 0.
@@ -81,7 +115,7 @@ pub async fn handle(config_path: Option<PathBuf>, args: StatusArgs) -> Result<()
 /// `--all` — config의 모든 프로파일을 점검한다. 사람용 출력은 **프로파일별 전체 상세**
 /// (단일 `status`와 동일한 신호등 표)를 차례로 찍은 뒤, 마지막에 한 줄씩 종합 표를 붙인다.
 /// 종료 코드는 최악 신호등을 따른다. `-v`는 로그 레벨일 뿐 이 보고서 상세도와 무관하다.
-async fn handle_all(config_toml: Option<&str>, json: bool) -> Result<()> {
+async fn handle_all(config_toml: Option<&str>, json: bool, lang: Lang) -> Result<()> {
     let raw = config_toml.ok_or_else(|| {
         XBackupError::Usage("--all에는 config 파일이 필요합니다(프로파일 목록)".into())
     })?;
@@ -94,9 +128,11 @@ async fn handle_all(config_toml: Option<&str>, json: bool) -> Result<()> {
         ));
     }
 
+    // --json은 기계 판독 안정성을 위해 언어를 En으로 고정한다.
+    let report_lang = if json { crate::i18n::Lang::En } else { lang };
     let mut reports = Vec::with_capacity(names.len());
     for name in &names {
-        reports.push(build_report(config_toml, name).await?);
+        reports.push(build_report(config_toml, name, report_lang).await?);
     }
 
     // 출력.
@@ -120,10 +156,10 @@ async fn handle_all(config_toml: Option<&str>, json: bool) -> Result<()> {
         println!("{}", serde_json::json!({ "profiles": items }));
     } else if reports.len() == 1 {
         // 프로파일이 하나면 비교 의미가 없다 — 단일 status 상세 표 그대로.
-        render_human(&reports[0]);
+        render_human(&reports[0], lang);
     } else {
         // 둘 이상이면 source(왼쪽=첫 열) 기준 비교 표.
-        render_comparison(&reports);
+        render_comparison(&reports, lang);
     }
 
     // 최악 신호등으로 종료 코드 결정.
@@ -140,7 +176,11 @@ async fn handle_all(config_toml: Option<&str>, json: bool) -> Result<()> {
 }
 
 /// 한 프로파일의 점검 보고서를 만든다(connect 실패도 보고서로 표현 — Err로 끊지 않음).
-async fn build_report(config_toml: Option<&str>, profile: &str) -> Result<StatusReport> {
+async fn build_report(
+    config_toml: Option<&str>,
+    profile: &str,
+    lang: crate::i18n::Lang,
+) -> Result<StatusReport> {
     let overrides = collect_overrides_from_process();
     let resolved = ResolvedConfig::build(MergeInput {
         config_toml,
@@ -160,7 +200,8 @@ async fn build_report(config_toml: Option<&str>, profile: &str) -> Result<Status
     // DB 종류 분기 — postgres URI면 PG status, 그 외는 Mongo status.
     let report = if crate::engine::DbKind::from_uri(uri.expose()) == crate::engine::DbKind::Postgres
     {
-        crate::engine::postgres::status::full_report(&resolved.profile_name, &uri, timeout).await
+        crate::engine::postgres::status::full_report(&resolved.profile_name, &uri, timeout, lang)
+            .await
     } else {
         match StatusChecker::connect(&uri, timeout).await {
             Ok(checker) => {
@@ -170,6 +211,7 @@ async fn build_report(config_toml: Option<&str>, profile: &str) -> Result<Status
                         DEFAULT_MONGODUMP,
                         &interval,
                         prefer_secondary,
+                        lang,
                     )
                     .await
             }
@@ -177,8 +219,11 @@ async fn build_report(config_toml: Option<&str>, profile: &str) -> Result<Status
                 &resolved.profile_name,
                 vec![crate::engine::mongo::status::CheckItem::fail(
                     "connection",
-                    "연결·인증",
-                    format!("연결 준비 실패: {e}"),
+                    "connection / auth",
+                    lang.sel(
+                        format!("connection setup failed: {e}").as_str(),
+                        format!("연결 준비 실패: {e}").as_str(),
+                    ),
                 )],
             ),
         }
@@ -191,13 +236,44 @@ async fn build_report(config_toml: Option<&str>, profile: &str) -> Result<Status
         mut items,
         ..
     } = report;
-    items.push(last_backup_item(&resolved.profile).await);
-    items.push(destination_item(&resolved.profile).await);
+    if resolved.profile.is_endpoint_only() {
+        // endpoint 전용(복구/이관 대상) — 백업 저장소가 없는 게 정상이므로 destination/
+        // last-backup 점검은 "해당 없음"으로 표기한다(오탐 WARN 방지).
+        use crate::engine::mongo::status::CheckItem;
+        items.push(
+            CheckItem::ok(
+                "last_backup",
+                "last backup",
+                lang.sel(
+                    "n/a — endpoint-only profile",
+                    "해당 없음 — endpoint 전용 프로파일",
+                ),
+            )
+            .with_value(lang.sel("n/a", "해당없음")),
+        );
+        items.push(
+            CheckItem::ok(
+                "destination",
+                "destination",
+                lang.sel(
+                    "endpoint only — restore/migrate target (no backup storage)",
+                    "endpoint 전용 — 복구/이관 대상(백업 저장소 없음)",
+                ),
+            )
+            .with_value(lang.sel("endpoint only", "endpoint 전용")),
+        );
+    } else {
+        items.push(last_backup_item(&resolved.profile, lang).await);
+        items.push(destination_item(&resolved.profile, lang).await);
+    }
     Ok(StatusReport::new(name, items))
 }
 
 /// destination의 최신 manifest를 읽어 "마지막 백업" 항목을 만든다(나이·타입·크기). 무변경.
-async fn last_backup_item(profile: &Profile) -> crate::engine::mongo::status::CheckItem {
+async fn last_backup_item(
+    profile: &Profile,
+    lang: crate::i18n::Lang,
+) -> crate::engine::mongo::status::CheckItem {
     use crate::engine::mongo::status::CheckItem;
     let dests = profile.effective_destinations();
     let dest = match dests.first() {
@@ -205,10 +281,10 @@ async fn last_backup_item(profile: &Profile) -> crate::engine::mongo::status::Ch
         None => {
             return CheckItem::warn(
                 "last_backup",
-                "마지막 백업",
-                "destination 미설정".to_string(),
+                "last backup",
+                lang.sel("destination not configured", "destination 미설정"),
             )
-            .with_value("미설정")
+            .with_value(lang.sel("not configured", "미설정"))
         }
     };
     let storage = match from_config(dest) {
@@ -216,36 +292,48 @@ async fn last_backup_item(profile: &Profile) -> crate::engine::mongo::status::Ch
         Err(e) => {
             return CheckItem::warn(
                 "last_backup",
-                "마지막 백업",
-                format!("destination 접근 실패: {e}"),
+                "last backup",
+                lang.sel(
+                    format!("destination access failed: {e}").as_str(),
+                    format!("destination 접근 실패: {e}").as_str(),
+                ),
             )
-            .with_value("접근 실패")
+            .with_value(lang.sel("access failed", "접근 실패"))
         }
     };
     match latest_manifest_any(storage.as_ref()).await {
         Some(m) => {
-            let age = format_age_rfc3339(&m.created_at);
+            let age = format_age_rfc3339(&m.created_at, lang);
             let typ = match m.backup_type {
                 BackupType::Full => "full",
                 BackupType::Incremental => "incr",
             };
             CheckItem::ok(
                 "last_backup",
-                "마지막 백업",
-                format!(
-                    "{typ}, {}, {age} 전 (id {})",
-                    human_bytes(m.stored_size_bytes as i64),
-                    short_id(&m.id)
+                "last backup",
+                lang.sel(
+                    format!(
+                        "{typ}, {}, {age} ago (id {})",
+                        human_bytes(m.stored_size_bytes as i64),
+                        short_id(&m.id)
+                    )
+                    .as_str(),
+                    format!(
+                        "{typ}, {}, {age} 전 (id {})",
+                        human_bytes(m.stored_size_bytes as i64),
+                        short_id(&m.id)
+                    )
+                    .as_str(),
                 ),
             )
-            .with_value(format!("{age} 전"))
+            .with_value(lang.sel(format!("{age} ago").as_str(), format!("{age} 전").as_str()))
         }
         None => CheckItem::warn(
             "last_backup",
-            "마지막 백업",
-            "백업 이력이 없습니다".to_string(),
+            "last backup",
+            lang.sel("no backup history", "백업 이력이 없습니다"),
         )
-        .with_value("없음"),
+        .with_value(lang.sel("none", "없음")),
     }
 }
 
@@ -253,7 +341,10 @@ async fn last_backup_item(profile: &Profile) -> crate::engine::mongo::status::Ch
 ///
 /// 지금은 source만 점검하던 한계를 보완 — 대상이 안 닿거나 권한이 없으면 백업이 실패한다.
 /// 상태는 경고(Warn)로 보고한다(env별 일시 문제로 status 전체를 exit 3으로 끊지 않도록).
-async fn destination_item(profile: &Profile) -> crate::engine::mongo::status::CheckItem {
+async fn destination_item(
+    profile: &Profile,
+    lang: crate::i18n::Lang,
+) -> crate::engine::mongo::status::CheckItem {
     use crate::engine::mongo::status::CheckItem;
     let dests = profile.effective_destinations();
     let dest = match dests.first() {
@@ -262,9 +353,9 @@ async fn destination_item(profile: &Profile) -> crate::engine::mongo::status::Ch
             return CheckItem::warn(
                 "destination",
                 "destination",
-                "destination 미설정".to_string(),
+                lang.sel("destination not configured", "destination 미설정"),
             )
-            .with_value("미설정")
+            .with_value(lang.sel("not configured", "미설정"))
         }
     };
     let storage = match from_config(dest) {
@@ -273,9 +364,12 @@ async fn destination_item(profile: &Profile) -> crate::engine::mongo::status::Ch
             return CheckItem::warn(
                 "destination",
                 "destination",
-                format!("destination 생성 실패: {e}"),
+                lang.sel(
+                    format!("destination creation failed: {e}").as_str(),
+                    format!("destination 생성 실패: {e}").as_str(),
+                ),
             )
-            .with_value("생성 실패")
+            .with_value(lang.sel("creation failed", "생성 실패"))
         }
     };
 
@@ -288,29 +382,39 @@ async fn destination_item(profile: &Profile) -> crate::engine::mongo::status::Ch
 
     match write_ok {
         Ok(_) => {
-            let extra = if kind == "local" {
-                dest.path
-                    .as_deref()
-                    .and_then(free_space_bytes)
-                    .map(|b| format!(", 여유 {}", human_bytes(b as i64)))
-                    .unwrap_or_default()
+            let free = if kind == "local" {
+                dest.path.as_deref().and_then(free_space_bytes)
             } else {
-                String::new()
+                None
             };
             let loc = dest.path.as_deref().unwrap_or(kind);
-            CheckItem::ok(
-                "destination",
-                "destination",
-                format!("쓰기 가능({kind}: {loc}){extra}"),
-            )
-            .with_value("OK")
+            let msg: String = match free {
+                Some(b) => lang
+                    .sel(
+                        format!("writable ({kind}: {loc}), free {}", human_bytes(b as i64))
+                            .as_str(),
+                        format!("쓰기 가능({kind}: {loc}), 여유 {}", human_bytes(b as i64))
+                            .as_str(),
+                    )
+                    .to_string(),
+                None => lang
+                    .sel(
+                        format!("writable ({kind}: {loc})").as_str(),
+                        format!("쓰기 가능({kind}: {loc})").as_str(),
+                    )
+                    .to_string(),
+            };
+            CheckItem::ok("destination", "destination", msg).with_value("OK")
         }
         Err(e) => CheckItem::warn(
             "destination",
             "destination",
-            format!("쓰기 실패({kind}): {e}"),
+            lang.sel(
+                format!("write failed ({kind}): {e}").as_str(),
+                format!("쓰기 실패({kind}): {e}").as_str(),
+            ),
         )
-        .with_value("쓰기 실패"),
+        .with_value(lang.sel("write failed", "쓰기 실패")),
     }
 }
 
@@ -347,29 +451,29 @@ async fn latest_manifest_any(storage: &dyn Storage) -> Option<BackupManifest> {
     best
 }
 
-/// RFC3339 시각 문자열을 현재와 비교해 사람이 읽는 경과 시간으로 만든다("2시간" 등).
-fn format_age_rfc3339(created_at: &str) -> String {
+/// RFC3339 시각 문자열을 현재와 비교해 사람이 읽는 경과 시간으로 만든다("2h"/"2시간" 등).
+fn format_age_rfc3339(created_at: &str, lang: crate::i18n::Lang) -> String {
     match chrono::DateTime::parse_from_rfc3339(created_at) {
         Ok(dt) => {
             let secs = (chrono::Utc::now() - dt.with_timezone(&chrono::Utc))
                 .num_seconds()
                 .max(0) as u64;
-            format_age_secs(secs)
+            format_age_secs(secs, lang)
         }
         Err(_) => "?".to_string(),
     }
 }
 
-/// 경과 초를 가장 큰 단위로 근사 표기한다.
-fn format_age_secs(s: u64) -> String {
+/// 경과 초를 가장 큰 단위로 근사 표기한다. 시간 단위는 짧은 표기라 언어별로 둔다(en s/m/h/d).
+fn format_age_secs(s: u64, lang: crate::i18n::Lang) -> String {
     if s < 60 {
-        format!("{s}초")
+        format!("{s}{}", lang.sel("s", "초"))
     } else if s < 3600 {
-        format!("{}분", s / 60)
+        format!("{}{}", s / 60, lang.sel("m", "분"))
     } else if s < 86_400 {
-        format!("{}시간", s / 3600)
+        format!("{}{}", s / 3600, lang.sel("h", "시간"))
     } else {
-        format!("{}일", s / 86_400)
+        format!("{}{}", s / 86_400, lang.sel("d", "일"))
     }
 }
 
@@ -418,7 +522,7 @@ fn overall_short(status: CheckStatus) -> &'static str {
 /// 각 점검 차원을 행으로, 프로파일을 열로 둔다. 셀은 비교용 짧은 값(없으면 상태 단어)이며,
 /// 기준 열과 **다른 값**은 색(또는 비-TTY면 `*`)으로 강조하고 행 앞에 `Δ`를 단다. WARN/FAIL의
 /// 구체 메시지는 표 아래 노트로 보존한다(요약이 detail을 가리지 않게).
-fn render_comparison(reports: &[StatusReport]) {
+fn render_comparison(reports: &[StatusReport], lang: Lang) {
     use std::collections::HashMap;
 
     let color = use_color();
@@ -452,7 +556,7 @@ fn render_comparison(reports: &[StatusReport]) {
     let label_w = keys
         .iter()
         .map(|k| display_width(labels.get(k).copied().unwrap_or(k)))
-        .chain(std::iter::once(display_width("점검")))
+        .chain(std::iter::once(display_width("check")))
         .max()
         .unwrap_or(8)
         .max(8);
@@ -472,11 +576,12 @@ fn render_comparison(reports: &[StatusReport]) {
 
     // 4) 헤더.
     println!(
-        "status --all 비교 — 기준(왼쪽): {}",
+        "status --all {} {}",
+        lang.sel("comparison — baseline (left):", "비교 — 기준(왼쪽):"),
         paint(&baseline.profile, &[BOLD], color)
     );
     println!("{rule}");
-    print!("  {}  ", pad("점검", label_w));
+    print!("  {}  ", pad("check", label_w));
     for (r, w) in reports.iter().zip(&col_w) {
         print!("{}  ", pad(&r.profile, *w));
     }
@@ -539,7 +644,10 @@ fn render_comparison(reports: &[StatusReport]) {
         }
     }
     if !notes.is_empty() {
-        println!("노트(경고·실패 상세):");
+        println!(
+            "{}",
+            lang.sel("notes (warning/failure detail):", "노트(경고·실패 상세):")
+        );
         for n in notes {
             println!("{n}");
         }
@@ -607,9 +715,9 @@ fn render_json(report: &StatusReport) -> Result<()> {
 }
 
 /// 점검 결과를 사람이 읽는 신호등 표로 stdout에 출력한다.
-fn render_human(report: &StatusReport) {
+fn render_human(report: &StatusReport, lang: Lang) {
     let color = use_color();
-    let title = format!("status 점검 — 프로파일: {}", report.profile);
+    let title = format!("status check — profile: {}", report.profile);
     println!("{}", paint(&title, &[BOLD], color));
 
     // 라벨 칼럼은 **표시 폭**(한글 2배폭) 기준으로 패딩한다 — 문자 수(`{:<14}`)로 맞추면
@@ -645,9 +753,9 @@ fn render_human(report: &StatusReport) {
     println!("{rule}");
     println!(
         "  {} {} {}",
-        paint("전체:", &[BOLD], color),
+        paint("overall:", &[BOLD], color),
         signal_colored(report.overall, color),
-        overall_label(report.overall),
+        overall_label(report.overall, lang),
     );
 }
 
@@ -672,11 +780,14 @@ fn signal(status: CheckStatus) -> &'static str {
 }
 
 /// 전체 신호등 라벨(종료 코드 안내 포함).
-fn overall_label(status: CheckStatus) -> &'static str {
+fn overall_label(status: CheckStatus, lang: Lang) -> &'static str {
     match status {
-        CheckStatus::Ok => "정상 (exit 0)",
-        CheckStatus::Warn => "경고 동반 (exit 4)",
-        CheckStatus::Fail => "실패 — 백업 불가 (exit 3)",
+        CheckStatus::Ok => lang.sel("healthy (exit 0)", "정상 (exit 0)"),
+        CheckStatus::Warn => lang.sel("with warnings (exit 4)", "경고 동반 (exit 4)"),
+        CheckStatus::Fail => lang.sel(
+            "failed — backup blocked (exit 3)",
+            "실패 — 백업 불가 (exit 3)",
+        ),
     }
 }
 
@@ -811,7 +922,7 @@ fn build_monitors(config_toml: Option<&str>, profiles: &[String]) -> Result<Vec<
 }
 
 /// 라이브 모드 진입 — 주기 갱신하며 변경량(Δ)을 추적한다. Ctrl-C 또는 `--count` 도달 시 종료(exit 0).
-async fn handle_watch(config_toml: Option<&str>, args: &StatusArgs) -> Result<()> {
+async fn handle_watch(config_toml: Option<&str>, args: &StatusArgs, lang: Lang) -> Result<()> {
     if args.json {
         return Err(XBackupError::Usage(
             "--watch는 --json과 함께 쓸 수 없습니다(라이브 표시 전용)".into(),
@@ -858,7 +969,7 @@ async fn handle_watch(config_toml: Option<&str>, args: &StatusArgs) -> Result<()
             snaps.push(m.poll().await);
         }
 
-        let frame = render_watch_frame(&snaps, &prev, args.all, tick, args.interval, color);
+        let frame = render_watch_frame(&snaps, &prev, args.all, tick, args.interval, color, lang);
         if tty {
             // 화면 지우고 홈으로 — watch처럼 제자리 갱신.
             print!("\x1b[2J\x1b[H{frame}");
@@ -940,6 +1051,7 @@ fn render_watch_frame(
     tick: u64,
     interval: f64,
     color: bool,
+    lang: Lang,
 ) -> String {
     let now = chrono::Local::now().format("%H:%M:%S");
     let scope = if all {
@@ -947,12 +1059,15 @@ fn render_watch_frame(
     } else {
         snaps.first().map(|s| s.profile.clone()).unwrap_or_default()
     };
-    let header =
-        format!("status --watch {scope} · 매 {interval}s · {now} · #{tick}    (Ctrl-C 종료)");
+    let header = format!(
+        "status --watch {scope} · {} · {now} · #{tick}    {}",
+        lang.sel(&format!("every {interval}s"), &format!("매 {interval}s")),
+        lang.sel("(Ctrl-C to quit)", "(Ctrl-C 종료)")
+    );
     if all {
-        render_watch_all(snaps, prev, &header, color)
+        render_watch_all(snaps, prev, &header, color, lang)
     } else if let Some(s) = snaps.first() {
-        render_watch_single(s, prev.get(&s.profile), &header, color)
+        render_watch_single(s, prev.get(&s.profile), &header, color, lang)
     } else {
         header
     }
@@ -964,6 +1079,7 @@ fn render_watch_single(
     prev: Option<&LiveSnapshot>,
     header: &str,
     color: bool,
+    lang: Lang,
 ) -> String {
     use std::collections::HashMap;
     let mut out = String::new();
@@ -971,7 +1087,14 @@ fn render_watch_single(
     out.push('\n');
 
     if !s.connected {
-        out.push_str(&paint("  ● 연결 끊김 — 재연결 시도 중", &[RED], color));
+        out.push_str(&paint(
+            lang.sel(
+                "  ● disconnected — reconnecting",
+                "  ● 연결 끊김 — 재연결 시도 중",
+            ),
+            &[RED],
+            color,
+        ));
         return out;
     }
 
@@ -990,13 +1113,13 @@ fn render_watch_single(
     let w_ns = rows
         .iter()
         .map(|r| display_width(&r.0))
-        .chain(std::iter::once(display_width("네임스페이스")))
+        .chain(std::iter::once(display_width("namespace")))
         .max()
         .unwrap_or(12);
     let w_cnt = rows
         .iter()
         .map(|r| display_width(&r.1))
-        .chain(std::iter::once(display_width("문서")))
+        .chain(std::iter::once(display_width("documents")))
         .max()
         .unwrap_or(4);
     let w_dlt = rows
@@ -1012,12 +1135,12 @@ fn render_watch_single(
     out.push('\n');
     out.push_str(&format!(
         "  {}  {}  {}\n",
-        pad("네임스페이스", w_ns),
-        pad_left("문서", w_cnt),
+        pad("namespace", w_ns),
+        pad_left("documents", w_cnt),
         pad_left("Δ", w_dlt)
     ));
     if rows.is_empty() {
-        out.push_str("  (사용자 데이터 없음)\n");
+        out.push_str(lang.sel("  (no user data)\n", "  (사용자 데이터 없음)\n"));
     }
     for (ns, cnt, dlt, code) in &rows {
         out.push_str(&format!(
@@ -1034,7 +1157,7 @@ fn render_watch_single(
     let (td, tdc) = delta_docs(s.total_docs, prev.map(|p| p.total_docs));
     let (sz, szc) = delta_bytes(s.data_size, prev.map(|p| p.data_size));
     out.push_str(&format!(
-        "  합계 문서: {} ({})    데이터: {} ({})    연결: {}",
+        "  total documents: {} ({})    data: {} ({})    connection: {}",
         s.total_docs,
         paint(&td, &[tdc], color),
         human_bytes(s.data_size as i64),
@@ -1050,6 +1173,7 @@ fn render_watch_all(
     prev: &std::collections::HashMap<String, LiveSnapshot>,
     header: &str,
     color: bool,
+    _lang: Lang,
 ) -> String {
     let mut out = String::new();
     out.push_str(header);
@@ -1073,7 +1197,7 @@ fn render_watch_all(
         if !s.connected {
             rows.push(Row {
                 profile: s.profile.clone(),
-                conn: "끊김",
+                conn: "down",
                 conn_code: RED,
                 docs: "—".into(),
                 ddocs: "—".into(),
@@ -1107,10 +1231,10 @@ fn render_watch_all(
             .unwrap_or(display_width(head))
     };
     let w_p = w(&|r| &r.profile, "profile").max(6);
-    let w_c = w(&|r| r.conn, "연결").max(4);
-    let w_d = w(&|r| &r.docs, "문서").max(4);
+    let w_c = w(&|r| r.conn, "connection").max(4);
+    let w_d = w(&|r| &r.docs, "documents").max(4);
     let w_dd = w(&|r| &r.ddocs, "Δ").max(4);
-    let w_s = w(&|r| &r.size, "데이터").max(6);
+    let w_s = w(&|r| &r.size, "data").max(6);
     let w_ds = w(&|r| &r.dsize, "Δ").max(6);
 
     let rule = "─".repeat((2 + w_p + 2 + w_c + 2 + w_d + 2 + w_dd + 2 + w_s + 2 + w_ds).min(110));
@@ -1119,10 +1243,10 @@ fn render_watch_all(
     out.push_str(&format!(
         "  {}  {}  {}  {}  {}  {}\n",
         pad("profile", w_p),
-        pad("연결", w_c),
-        pad_left("문서", w_d),
+        pad("connection", w_c),
+        pad_left("documents", w_d),
         pad_left("Δ", w_dd),
-        pad_left("데이터", w_s),
+        pad_left("data", w_s),
         pad_left("Δ", w_ds),
     ));
     for r in &rows {
@@ -1237,10 +1361,14 @@ mod tests {
 
     #[test]
     fn age_scales_units() {
-        assert_eq!(format_age_secs(30), "30초");
-        assert_eq!(format_age_secs(150), "2분");
-        assert_eq!(format_age_secs(7200), "2시간");
-        assert_eq!(format_age_secs(172800), "2일");
+        use crate::i18n::Lang;
+        // en은 짧은 단위(s/m/h/d), ko는 한글 단위.
+        assert_eq!(format_age_secs(30, Lang::En), "30s");
+        assert_eq!(format_age_secs(150, Lang::En), "2m");
+        assert_eq!(format_age_secs(7200, Lang::En), "2h");
+        assert_eq!(format_age_secs(172800, Lang::En), "2d");
+        assert_eq!(format_age_secs(30, Lang::Ko), "30초");
+        assert_eq!(format_age_secs(7200, Lang::Ko), "2시간");
     }
 
     #[test]

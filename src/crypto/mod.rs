@@ -336,7 +336,9 @@ mod tests {
                 return Poll::Ready(Err(std::io::Error::other("주입된 입력 실패")));
             }
             let n = self.remaining.min(buf.remaining()).min(4096);
-            buf.initialize_unfilled_to(n).iter_mut().for_each(|b| *b = 0xAB);
+            buf.initialize_unfilled_to(n)
+                .iter_mut()
+                .for_each(|b| *b = 0xAB);
             buf.advance(n);
             self.remaining -= n;
             Poll::Ready(Ok(()))

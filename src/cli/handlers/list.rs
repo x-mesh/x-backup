@@ -49,7 +49,11 @@ pub struct CatalogRow {
 }
 
 /// `list` 핸들러 진입점.
-pub async fn handle(config_path: Option<PathBuf>, args: ListArgs) -> Result<()> {
+pub async fn handle(
+    config_path: Option<PathBuf>,
+    lang_flag: Option<crate::i18n::Lang>,
+    args: ListArgs,
+) -> Result<()> {
     let storage = open_storage(&config_path, &args).await?;
     let all_rows = build_catalog(storage.as_ref()).await?;
 
@@ -57,6 +61,7 @@ pub async fn handle(config_path: Option<PathBuf>, args: ListArgs) -> Result<()> 
     let config_toml = config_path
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok());
+    let lang = crate::i18n::resolve_from_toml(lang_flag, config_toml.as_deref());
     let profile = resolve_profile_name(args.profile.as_deref(), config_toml.as_deref());
     crate::cli::output::print_run_context(
         &profile,
@@ -84,7 +89,7 @@ pub async fn handle(config_path: Option<PathBuf>, args: ListArgs) -> Result<()> 
     if args.json {
         print_json(&rows, &store_loc);
     } else {
-        print_human(&rows, &store_loc, all_rows.len(), matched);
+        print_human(&rows, &store_loc, all_rows.len(), matched, lang);
     }
 
     // broken/incomplete/orphan/corrupt가 하나라도 있으면 경고 동반 성공(exit 4) — 필터와
@@ -348,21 +353,33 @@ fn resolve_profile_name(cli_profile: Option<&str>, config_toml: Option<&str>) ->
         return p.to_string();
     }
     config_toml
-        .and_then(|raw| toml::from_str::<crate::config::file::Config>(raw).ok())
+        .and_then(|raw| crate::config::file::Config::from_toml_str(raw).ok())
         .and_then(|c| c.default_profile)
         .unwrap_or_else(|| "default".to_string())
 }
 
 /// 사람이 읽는 카탈로그 출력(stdout).
-fn print_human(rows: &[CatalogRow], store_loc: &str, total: usize, matched: usize) {
+fn print_human(
+    rows: &[CatalogRow],
+    store_loc: &str,
+    total: usize,
+    matched: usize,
+    lang: crate::i18n::Lang,
+) {
     let color = use_color();
     // store 위치를 항상 먼저 보여준다(어디를 보고 있는지).
     println!("{}", paint(&format!("store: {store_loc}"), &[DIM], color));
     if rows.is_empty() {
         if total == 0 {
-            println!("백업이 없습니다.");
+            println!("{}", lang.sel("No backups found.", "백업이 없습니다."));
         } else {
-            println!("필터에 맞는 백업이 없습니다(총 {total}개).");
+            println!(
+                "{}",
+                lang.sel(
+                    &format!("No backups match the filter (total {total})."),
+                    &format!("필터에 맞는 백업이 없습니다(총 {total}개)."),
+                )
+            );
         }
         return;
     }
@@ -406,14 +423,21 @@ fn print_human(rows: &[CatalogRow], store_loc: &str, total: usize, matched: usiz
     let shown = rows.len();
     if shown != total {
         let filtered = if matched != total {
-            format!(" · 필터 매칭 {matched}")
+            lang.sel(
+                &format!(" · {matched} matched filter"),
+                &format!(" · 필터 매칭 {matched}"),
+            )
+            .to_string()
         } else {
             String::new()
         };
         println!(
             "{}",
             paint(
-                &format!("총 {total}개 중 {shown}개 표시{filtered}"),
+                lang.sel(
+                    &format!("showing {shown} of {total}{filtered}"),
+                    &format!("총 {total}개 중 {shown}개 표시{filtered}"),
+                ),
                 &[DIM],
                 color
             )
@@ -427,8 +451,18 @@ fn print_human(rows: &[CatalogRow], store_loc: &str, total: usize, matched: usiz
         .collect();
     if !broken.is_empty() {
         println!();
-        println!("경고: 끊어진 체인 — {}", broken.join(", "));
-        println!("      수동 삭제로 체인이 깨졌을 수 있습니다. verify --chain --id <id>로 상세 확인하세요.");
+        println!(
+            "{} {}",
+            lang.sel("warning: broken chain —", "경고: 끊어진 체인 —"),
+            broken.join(", ")
+        );
+        println!(
+            "      {}",
+            lang.sel(
+                "The chain may be broken by a manual deletion. Run verify --chain --id <id> for details.",
+                "수동 삭제로 체인이 깨졌을 수 있습니다. verify --chain --id <id>로 상세 확인하세요.",
+            )
+        );
     }
     let orphans: Vec<&str> = rows
         .iter()
@@ -437,8 +471,18 @@ fn print_human(rows: &[CatalogRow], store_loc: &str, total: usize, matched: usiz
         .collect();
     if !orphans.is_empty() {
         println!();
-        println!("경고: orphan(유령 산출물) — {}", orphans.join(", "));
-        println!("      manifest 없는 data 디렉터리입니다(실패한 백업 잔재 가능).");
+        println!(
+            "{} {}",
+            lang.sel("warning: orphan —", "경고: orphan(유령 산출물) —"),
+            orphans.join(", ")
+        );
+        println!(
+            "      {}",
+            lang.sel(
+                "A data directory without a manifest (possibly leftover from a failed backup).",
+                "manifest 없는 data 디렉터리입니다(실패한 백업 잔재 가능).",
+            )
+        );
     }
 }
 
@@ -634,7 +678,9 @@ mod tests {
         // manifest 파일이 존재하므로 orphan으로 잘못 분류되지 않는다.
         assert_eq!(rows.iter().filter(|r| r.id == "bad").count(), 1);
         // 정상 백업은 그대로 보인다.
-        assert!(rows.iter().any(|r| r.id == "good" && r.chain_status == "ok"));
+        assert!(rows
+            .iter()
+            .any(|r| r.id == "good" && r.chain_status == "ok"));
     }
 
     /// 빈 카탈로그도 에러 없이 빈 벡터를 만든다.

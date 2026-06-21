@@ -364,7 +364,10 @@ mod tests {
         let decrypt = Box::new(AesGcmDecryptStage::from_key(wrong));
         let result = drain_result(decrypt.wrap(reader_from(&ct))).await;
         // C1: 틀린 키는 GCM 인증 실패 → 에러로 surface.
-        assert!(result.is_err(), "틀린 키 복호화 실패가 surface되지 않음(C1)");
+        assert!(
+            result.is_err(),
+            "틀린 키 복호화 실패가 surface되지 않음(C1)"
+        );
         let _ = payload;
     }
 

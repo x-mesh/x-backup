@@ -7,6 +7,8 @@
 use std::path::PathBuf;
 
 use crate::cli::args::PeekArgs;
+use crate::cli::output::{style, Tone};
+use crate::cli::table::pad;
 use crate::config::env::collect_overrides_from_process;
 use crate::config::merged::MergeInput;
 use crate::config::ResolvedConfig;
@@ -17,13 +19,18 @@ use crate::error::{Result, XBackupError};
 const MAX_DOC_CHARS: usize = 200;
 
 /// `peek` 핸들러 진입점.
-pub async fn handle(config_path: Option<PathBuf>, args: PeekArgs) -> Result<()> {
+pub async fn handle(
+    config_path: Option<PathBuf>,
+    lang_flag: Option<crate::i18n::Lang>,
+    args: PeekArgs,
+) -> Result<()> {
     let config_toml = match &config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
             XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
         })?),
         None => None,
     };
+    let lang = crate::i18n::resolve_from_toml(lang_flag, config_toml.as_deref());
     let overrides = collect_overrides_from_process();
     let resolved = ResolvedConfig::build(MergeInput {
         config_toml: config_toml.as_deref(),
@@ -49,14 +56,14 @@ pub async fn handle(config_path: Option<PathBuf>, args: PeekArgs) -> Result<()> 
 
     // DB 종류 분기 — postgres URI면 PG peek(테이블 행 수 + 최신 행), 그 외는 Mongo.
     if db == crate::engine::DbKind::Postgres {
-        return peek_pg(&uri, timeout, &args).await;
+        return peek_pg(&uri, timeout, &args, lang).await;
     }
 
     let mongo = MongoMeta::connect(&uri, timeout).await?;
 
     match &args.ns {
-        Some(ns) => peek_namespace(&mongo, ns, args.limit, args.json).await,
-        None => peek_overview(&mongo, args.json).await,
+        Some(ns) => peek_namespace(&mongo, ns, args.limit, args.json, lang).await,
+        None => peek_overview(&mongo, args.json, lang).await,
     }
 }
 
@@ -65,6 +72,7 @@ async fn peek_pg(
     uri: &crate::config::secret::Secret,
     timeout: Option<u64>,
     args: &PeekArgs,
+    lang: crate::i18n::Lang,
 ) -> Result<()> {
     use crate::engine::postgres::meta;
     let pg = meta::connect(uri, timeout).await?;
@@ -80,12 +88,25 @@ async fn peek_pg(
             );
             return Ok(());
         }
-        println!("{ns} — 최신 {}행", rows.len());
+        println!(
+            "{ns} — {} {}",
+            style(lang.sel("latest", "최신"), Tone::Label),
+            style(
+                &lang.sel(
+                    &format!("{} rows", rows.len()),
+                    &format!("{}행", rows.len())
+                ),
+                Tone::Value,
+            )
+        );
         if rows.is_empty() {
-            println!("  (비어 있음)");
+            println!(
+                "  {}",
+                style(lang.sel("(empty)", "(비어 있음)"), Tone::Muted)
+            );
         }
         for r in &rows {
-            println!("  {}", truncate(r));
+            println!("  {}", truncate(r, lang));
         }
         return Ok(());
     }
@@ -105,22 +126,39 @@ async fn peek_pg(
         return Ok(());
     }
     if counts.is_empty() {
-        println!("(사용자 데이터 없음 — 비어 있는 데이터베이스)");
+        println!(
+            "{}",
+            style(
+                lang.sel(
+                    "(no user data — empty database)",
+                    "(사용자 데이터 없음 — 비어 있는 데이터베이스)"
+                ),
+                Tone::Muted,
+            )
+        );
         return Ok(());
     }
     for (ns, count) in &counts {
         let latest = meta::latest_rows(client, ns, 1).await?.into_iter().next();
         let preview = match latest {
-            Some(s) => truncate(&s),
-            None => "(비어 있음)".to_string(),
+            Some(s) => truncate(&s, lang),
+            None => lang.sel("(empty)", "(비어 있음)").to_string(),
         };
-        println!("  {ns:<28} count={count:<8} latest: {preview}");
+        let ns_cell = pad(ns, 28);
+        println!(
+            "  {} {}={}  {} {}",
+            style(&ns_cell, Tone::Value),
+            style("count", Tone::Label),
+            style(&count.to_string(), Tone::Value),
+            style("latest:", Tone::Label),
+            preview
+        );
     }
     Ok(())
 }
 
 /// `--ns` 미지정 — 컬렉션별 문서 수 + 각 최신 1건.
-async fn peek_overview(mongo: &MongoMeta, json: bool) -> Result<()> {
+async fn peek_overview(mongo: &MongoMeta, json: bool, lang: crate::i18n::Lang) -> Result<()> {
     let counts = mongo.namespace_counts().await?;
 
     if json {
@@ -138,22 +176,45 @@ async fn peek_overview(mongo: &MongoMeta, json: bool) -> Result<()> {
     }
 
     if counts.is_empty() {
-        println!("(사용자 데이터 없음 — 비어 있는 서버)");
+        println!(
+            "{}",
+            style(
+                lang.sel(
+                    "(no user data — empty server)",
+                    "(사용자 데이터 없음 — 비어 있는 서버)"
+                ),
+                Tone::Muted,
+            )
+        );
         return Ok(());
     }
     for (ns, count) in &counts {
         let latest = latest_one(mongo, ns).await?;
         let preview = match latest {
-            Some(d) => truncate(&doc_to_line(&d)),
-            None => "(비어 있음)".to_string(),
+            Some(d) => truncate(&doc_to_line(&d), lang),
+            None => lang.sel("(empty)", "(비어 있음)").to_string(),
         };
-        println!("  {ns:<28} count={count:<8} latest: {preview}");
+        let ns_cell = pad(ns, 28);
+        println!(
+            "  {} {}={}  {} {}",
+            style(&ns_cell, Tone::Value),
+            style("count", Tone::Label),
+            style(&count.to_string(), Tone::Value),
+            style("latest:", Tone::Label),
+            preview
+        );
     }
     Ok(())
 }
 
 /// `--ns db.coll` — 그 컬렉션의 최신 N건.
-async fn peek_namespace(mongo: &MongoMeta, ns: &str, limit: i64, json: bool) -> Result<()> {
+async fn peek_namespace(
+    mongo: &MongoMeta,
+    ns: &str,
+    limit: i64,
+    json: bool,
+    lang: crate::i18n::Lang,
+) -> Result<()> {
     let (db, coll) = ns.split_once('.').ok_or_else(|| {
         XBackupError::Usage(format!("--ns는 db.collection 형식이어야 합니다: '{ns}'"))
     })?;
@@ -165,9 +226,22 @@ async fn peek_namespace(mongo: &MongoMeta, ns: &str, limit: i64, json: bool) -> 
         return Ok(());
     }
 
-    println!("{ns} — 최신 {}건", docs.len());
+    println!(
+        "{ns} — {} {}",
+        style(lang.sel("latest", "최신"), Tone::Label),
+        style(
+            &lang.sel(
+                &format!("{} documents", docs.len()),
+                &format!("{}건", docs.len())
+            ),
+            Tone::Value,
+        )
+    );
     if docs.is_empty() {
-        println!("  (비어 있음)");
+        println!(
+            "  {}",
+            style(lang.sel("(empty)", "(비어 있음)"), Tone::Muted)
+        );
     }
     for d in &docs {
         println!("  {}", doc_to_line(d));
@@ -201,12 +275,12 @@ fn doc_to_json(doc: bson::Document) -> serde_json::Value {
 }
 
 /// 사람용 미리보기를 MAX_DOC_CHARS로 자른다(긴 문서 줄바꿈 방지).
-fn truncate(s: &str) -> String {
+fn truncate(s: &str, lang: crate::i18n::Lang) -> String {
     if s.chars().count() <= MAX_DOC_CHARS {
         s.to_string()
     } else {
         let cut: String = s.chars().take(MAX_DOC_CHARS).collect();
-        format!("{cut}… (잘림)")
+        format!("{cut}… {}", lang.sel("(truncated)", "(잘림)"))
     }
 }
 
@@ -216,9 +290,10 @@ mod tests {
 
     #[test]
     fn truncate_keeps_short_and_cuts_long() {
-        assert_eq!(truncate("short"), "short");
+        let lang = crate::i18n::Lang::Ko;
+        assert_eq!(truncate("short", lang), "short");
         let long = "x".repeat(MAX_DOC_CHARS + 50);
-        let out = truncate(&long);
+        let out = truncate(&long, lang);
         assert!(out.ends_with("… (잘림)"));
         assert!(out.chars().count() < long.chars().count());
     }

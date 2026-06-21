@@ -22,6 +22,20 @@ pub struct Config {
     /// 이름별 프로파일 맵(`[profiles.<name>]`).
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
+    /// 출력 표시 설정 — `[output]`. 현재는 설명 텍스트 언어(language)만 둔다.
+    #[serde(default)]
+    pub output: Option<OutputSection>,
+}
+
+/// `[output]` 섹션 — 출력 표시 설정.
+///
+/// 라벨·기술용어(checksum/id/size/…)는 언어와 무관하게 항상 영문이며, 여기서 고르는
+/// `language`는 **설명·안내 문구**의 ko/en 선택에만 영향을 준다.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OutputSection {
+    /// 설명/안내 텍스트 언어("en" | "ko"). 미지정 시 기본 en.
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 /// 단일 프로파일 — mode/source/destination/features (PRD §FR-10).
@@ -71,6 +85,15 @@ impl Profile {
         } else {
             self.destinations.iter().collect()
         }
+    }
+
+    /// 백업 저장소(destination)가 설정되지 않은 **endpoint 전용** 프로파일인지.
+    ///
+    /// `restore`/`migrate`의 `--target-profile` 대상으로만 쓰는 프로파일은 destination을 두지
+    /// 않는 게 정상이다(백업 잡이 아님). `status`·`doctor`가 이런 프로파일에 destination/
+    /// last-backup/encryption 점검을 적용해 오탐 경고를 내지 않도록 판별에 쓴다.
+    pub fn is_endpoint_only(&self) -> bool {
+        self.destinations.is_empty() && self.destination.r#type.is_none()
     }
 }
 
@@ -292,8 +315,17 @@ fn default_on_gap() -> String {
 
 impl Config {
     /// TOML 문자열에서 설정을 파싱한다.
+    ///
+    /// v2(flat/상속) 표면이면 [`normalize_v2`](crate::config::v2::normalize_v2)로 v1 nested
+    /// 트리로 정규화한 뒤 역직렬화한다 — 모든 raw-TOML→Config 진입점이 이 함수를 거치도록
+    /// 통일해 v2가 일부 명령에서만 동작하는 split-brain을 방지한다.
     pub fn from_toml_str(s: &str) -> Result<Self> {
-        toml::from_str(s).map_err(|e| XBackupError::Config(format!("config.toml 파싱 실패: {e}")))
+        let value: toml::Value = toml::from_str(s)
+            .map_err(|e| XBackupError::Config(format!("config.toml 파싱 실패: {e}")))?;
+        let value = crate::config::v2::normalize_v2(value)?;
+        value
+            .try_into()
+            .map_err(|e| XBackupError::Config(format!("config.toml 파싱 실패: {e}")))
     }
 
     /// 파일 경로에서 설정을 읽어 파싱한다.
@@ -426,5 +458,31 @@ path = \"/var/b2\"
             s3: None,
         };
         assert_eq!(unnamed.label(1), "s3#1");
+    }
+
+    /// is_endpoint_only: destination이 없으면(source만) endpoint 전용으로 판별한다.
+    #[test]
+    fn is_endpoint_only_detects_source_only_profile() {
+        // source만 있는 프로파일 → endpoint 전용.
+        let cfg = Config::from_toml_str(
+            "[profiles.dr.source]\nuri = \"mongodb://localhost:27117/db\"\n",
+        )
+        .unwrap();
+        assert!(cfg.profile("dr").unwrap().is_endpoint_only());
+
+        // destination이 있으면 endpoint 전용이 아니다(backup 잡).
+        let cfg2 = Config::from_toml_str(
+            "[profiles.p.source]\nuri = \"mongodb://h/db\"\n\
+             [profiles.p.destination]\ntype = \"local\"\npath = \"/var/b\"\n",
+        )
+        .unwrap();
+        assert!(!cfg2.profile("p").unwrap().is_endpoint_only());
+
+        // destinations(복수)가 있어도 backup 잡이다.
+        let cfg3 = Config::from_toml_str(
+            "[[profiles.p.destinations]]\ntype = \"local\"\npath = \"/var/b\"\n",
+        )
+        .unwrap();
+        assert!(!cfg3.profile("p").unwrap().is_endpoint_only());
     }
 }

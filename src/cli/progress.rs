@@ -29,6 +29,7 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use tokio::task::JoinHandle;
 
 use crate::cli::output::OutputMode;
+use crate::cli::table::use_color_stderr;
 
 /// 파이프라인이 누산하는 공유 진행 카운터(통과 바이트 수).
 pub type ProgressCounter = Arc<AtomicU64>;
@@ -118,6 +119,7 @@ impl ProgressReporter {
     /// indicatif 바/스피너를 stderr에 그리는 표시기.
     fn start_bar(kind: ProgressKind, counter: ProgressCounter) -> Self {
         // 모든 ProgressBar는 명시적으로 stderr 타깃에 그린다(pitfall 9-1).
+        let color = use_color_stderr();
         let bar = match &kind {
             ProgressKind::Exact { total_bytes, label }
             | ProgressKind::Estimated {
@@ -132,12 +134,19 @@ impl ProgressReporter {
                 } else {
                     ""
                 };
-                bar.set_style(
-                    ProgressStyle::with_template(&format!(
+                let template = if color {
+                    format!(
+                        "{{msg:.bold.cyan}} [{{bar:30.cyan/blue}}] {{bytes:.bold}}/{{total_bytes:.bold}} ({{percent}}%{suffix}) {{bytes_per_sec:.dim}} {{elapsed:.dim}}"
+                    )
+                } else {
+                    format!(
                         "{{msg}} [{{bar:30}}] {{bytes}}/{{total_bytes}} ({{percent}}%{suffix}) {{bytes_per_sec}} {{elapsed}}"
-                    ))
-                    .unwrap_or_else(|_| ProgressStyle::default_bar())
-                    .progress_chars("=> "),
+                    )
+                };
+                bar.set_style(
+                    ProgressStyle::with_template(&template)
+                        .unwrap_or_else(|_| ProgressStyle::default_bar())
+                        .progress_chars("=> "),
                 );
                 bar.set_message(label.clone());
                 bar
@@ -145,11 +154,14 @@ impl ProgressReporter {
             ProgressKind::Indeterminate { label } => {
                 // 총량 미지 → 스피너(부정형). 처리 바이트·속도·경과시간만 표시.
                 let bar = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr());
+                let template = if color {
+                    "{spinner:.green} {msg:.bold.cyan} {bytes:.bold} {bytes_per_sec:.dim} {elapsed:.dim}"
+                } else {
+                    "{spinner} {msg} {bytes} {bytes_per_sec} {elapsed}"
+                };
                 bar.set_style(
-                    ProgressStyle::with_template(
-                        "{spinner} {msg} {bytes} {bytes_per_sec} {elapsed}",
-                    )
-                    .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+                    ProgressStyle::with_template(template)
+                        .unwrap_or_else(|_| ProgressStyle::default_spinner()),
                 );
                 bar.set_message(label.clone());
                 bar

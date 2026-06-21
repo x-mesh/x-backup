@@ -48,7 +48,11 @@ pub async fn full_backup_choices(storage: &dyn Storage) -> Result<Vec<BackupChoi
     }
 
     // 최신순: created_at desc, 동률이면 id desc.
-    manifests.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+    manifests.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
 
     Ok(manifests
         .into_iter()
@@ -83,10 +87,13 @@ fn short_created(ts: &str) -> String {
 ///
 /// 후보가 비어 있으면 호출하지 않는다(호출 측에서 폴백 처리). dialoguer는 stderr 기준
 /// 터미널에 그리므로 stdout(결과·--json)을 오염시키지 않는다.
-pub fn pick_backup(choices: &[BackupChoice]) -> Result<Option<String>> {
+pub fn pick_backup(choices: &[BackupChoice], lang: crate::i18n::Lang) -> Result<Option<String>> {
     let labels: Vec<&str> = choices.iter().map(|c| c.label.as_str()).collect();
     let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("복구할 백업 선택 (타이핑=필터, ↑↓=이동, Enter=선택, Esc=취소)")
+        .with_prompt(lang.sel(
+            "Select backup to restore (type=filter, ↑↓=move, Enter=select, Esc=cancel)",
+            "복구할 백업 선택 (타이핑=필터, ↑↓=이동, Enter=선택, Esc=취소)",
+        ))
         .items(&labels)
         .default(0)
         .interact_opt()
@@ -100,7 +107,12 @@ mod tests {
     use crate::manifest::schema::{ToolVersions, Topology, FORMAT_VERSION};
     use crate::storage::LocalFs;
 
-    fn manifest(id: &str, created_at: &str, ty: BackupType, status: BackupStatus) -> BackupManifest {
+    fn manifest(
+        id: &str,
+        created_at: &str,
+        ty: BackupType,
+        status: BackupStatus,
+    ) -> BackupManifest {
         BackupManifest {
             format_version: FORMAT_VERSION,
             id: id.to_string(),
@@ -133,10 +145,46 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fs = LocalFs::new(dir.path()).unwrap();
         // 오래된 풀, 최신 풀, 증분(제외), 미완료 풀(제외).
-        write(&fs, &manifest("a-old", "2026-06-10T00:00:00Z", BackupType::Full, BackupStatus::Complete)).await;
-        write(&fs, &manifest("b-new", "2026-06-14T00:00:00Z", BackupType::Full, BackupStatus::Complete)).await;
-        write(&fs, &manifest("c-incr", "2026-06-15T00:00:00Z", BackupType::Incremental, BackupStatus::Complete)).await;
-        write(&fs, &manifest("d-partial", "2026-06-16T00:00:00Z", BackupType::Full, BackupStatus::Incomplete)).await;
+        write(
+            &fs,
+            &manifest(
+                "a-old",
+                "2026-06-10T00:00:00Z",
+                BackupType::Full,
+                BackupStatus::Complete,
+            ),
+        )
+        .await;
+        write(
+            &fs,
+            &manifest(
+                "b-new",
+                "2026-06-14T00:00:00Z",
+                BackupType::Full,
+                BackupStatus::Complete,
+            ),
+        )
+        .await;
+        write(
+            &fs,
+            &manifest(
+                "c-incr",
+                "2026-06-15T00:00:00Z",
+                BackupType::Incremental,
+                BackupStatus::Complete,
+            ),
+        )
+        .await;
+        write(
+            &fs,
+            &manifest(
+                "d-partial",
+                "2026-06-16T00:00:00Z",
+                BackupType::Full,
+                BackupStatus::Incomplete,
+            ),
+        )
+        .await;
 
         let choices = full_backup_choices(&fs).await.unwrap();
 
@@ -150,7 +198,16 @@ mod tests {
     async fn empty_when_no_full_complete() {
         let dir = tempfile::tempdir().unwrap();
         let fs = LocalFs::new(dir.path()).unwrap();
-        write(&fs, &manifest("c-incr", "2026-06-15T00:00:00Z", BackupType::Incremental, BackupStatus::Complete)).await;
+        write(
+            &fs,
+            &manifest(
+                "c-incr",
+                "2026-06-15T00:00:00Z",
+                BackupType::Incremental,
+                BackupStatus::Complete,
+            ),
+        )
+        .await;
         let choices = full_backup_choices(&fs).await.unwrap();
         assert!(choices.is_empty());
     }
@@ -158,7 +215,12 @@ mod tests {
     /// 라벨 포맷: id·full·db·축약시각·사람단위 크기를 담는다.
     #[test]
     fn label_format_is_human_readable() {
-        let m = manifest("bk-1", "2026-06-14T14:56:11.354264+00:00", BackupType::Full, BackupStatus::Complete);
+        let m = manifest(
+            "bk-1",
+            "2026-06-14T14:56:11.354264+00:00",
+            BackupType::Full,
+            BackupStatus::Complete,
+        );
         let label = format_choice(&m);
         assert!(label.contains("bk-1"), "id 포함: {label}");
         assert!(label.contains("full"), "유형 포함: {label}");

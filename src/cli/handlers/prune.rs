@@ -19,10 +19,12 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use crate::cli::args::PruneArgs;
+use crate::cli::output::{field_line, field_line_toned, style, style_stderr, Tone};
 use crate::config::env::collect_overrides_from_process;
 use crate::config::merged::MergeInput;
 use crate::config::ResolvedConfig;
 use crate::error::{Result, XBackupError};
+use crate::i18n::Lang;
 use crate::lock::LockGuard;
 use crate::pipeline::prune::{
     execute_prune, load_backups, plan_prune, PruneKind, PrunePlan, RetentionPolicy,
@@ -30,10 +32,20 @@ use crate::pipeline::prune::{
 use crate::storage::{LocalFs, Storage};
 
 /// `prune` 핸들러 진입점.
-pub async fn handle(config_path: Option<PathBuf>, args: PruneArgs) -> Result<()> {
+pub async fn handle(
+    config_path: Option<PathBuf>,
+    lang_flag: Option<crate::i18n::Lang>,
+    args: PruneArgs,
+) -> Result<()> {
     // 동시 실행 잠금(FR-12) — 같은 프로파일의 backup/restore/prune과 직렬화한다.
     // 가드를 함수 스코프 끝까지 유지(_lock)해 작업 동안 lock을 잡는다.
     let _lock: LockGuard = crate::lock::acquire(&args.profile)?;
+
+    // 출력 설명 언어 결정(라벨은 항상 영문, 설명만 ko/en 토글).
+    let config_toml = config_path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    let lang = crate::i18n::resolve_from_toml(lang_flag, config_toml.as_deref());
 
     let storage = open_storage(&config_path, &args).await?;
 
@@ -59,7 +71,7 @@ pub async fn handle(config_path: Option<PathBuf>, args: PruneArgs) -> Result<()>
 
     // 보존 기준 미지정 가드: 명시적 기준 없는 prune은 거부(실수로 전부 보존만 하고 끝).
     if policy.is_unspecified() {
-        print_plan(&plan, args.dry_run);
+        print_plan(&plan, args.dry_run, lang);
         return Err(XBackupError::Usage(
             "보존 기준이 필요합니다 — --keep-full N / --keep-days D / --keep-last N 중 하나를 \
              주거나 config의 [profiles.<name>.retention]에 설정하세요(기준 없는 prune은 \
@@ -70,33 +82,63 @@ pub async fn handle(config_path: Option<PathBuf>, args: PruneArgs) -> Result<()>
 
     // dry-run: 목록만 출력하고 종료(무변경).
     if args.dry_run {
-        print_plan(&plan, true);
+        print_plan(&plan, true, lang);
         return Ok(());
     }
 
     // 삭제할 게 없으면 조기 종료.
     if plan.is_empty() {
-        println!("삭제할 백업이 없습니다(모든 체인이 보존 기준 이내).");
+        println!(
+            "{}",
+            style(
+                lang.sel(
+                    "No backups to delete (all chains within retention).",
+                    "삭제할 백업이 없습니다(모든 체인이 보존 기준 이내)."
+                ),
+                Tone::Success,
+            )
+        );
         return Ok(());
     }
 
     // 계획을 먼저 보여준다(삭제 전 운영자가 확인할 수 있도록).
-    print_plan(&plan, false);
+    print_plan(&plan, false, lang);
 
     // 실삭제 승인 — orphan/incomplete까지 지울지(include_force_only) 결정한다.
     let is_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-    let approval = decide_approval(&plan, args.force, is_tty, prompt_confirm)?;
+    let approval = decide_approval(&plan, args.force, is_tty, |p| prompt_confirm(p, lang))?;
 
     if !approval.proceed {
-        println!("취소되었습니다 — 삭제하지 않았습니다.");
+        println!(
+            "{}",
+            style(
+                lang.sel(
+                    "Cancelled — nothing was deleted.",
+                    "취소되었습니다 — 삭제하지 않았습니다."
+                ),
+                Tone::Muted,
+            )
+        );
         return Ok(());
     }
 
     let outcome = execute_prune(storage.as_ref(), &plan, approval.include_force_only).await?;
 
     println!(
-        "prune 완료 — 체인 {}개, 백업 {}개 삭제",
-        outcome.deleted_chains, outcome.deleted_backups
+        "{}",
+        style(
+            &lang.sel(
+                &format!(
+                    "prune done — deleted {} chains, {} backups",
+                    outcome.deleted_chains, outcome.deleted_backups
+                ),
+                &format!(
+                    "prune 완료 — 체인 {}개, 백업 {}개 삭제",
+                    outcome.deleted_chains, outcome.deleted_backups
+                )
+            ),
+            Tone::Success,
+        )
     );
     Ok(())
 }
@@ -142,14 +184,23 @@ fn decide_approval(
 }
 
 /// 대화형 확인 프롬프트(TTY). 삭제 전 명시적 동의를 받는다(stderr — stdout은 결과 전용).
-fn prompt_confirm(plan: &PrunePlan) -> bool {
+fn prompt_confirm(plan: &PrunePlan, lang: Lang) -> bool {
     use std::io::Write;
     let chain_count = plan
         .targets
         .iter()
         .filter(|t| t.kind == PruneKind::Chain)
         .count();
-    eprint!("위 {chain_count}개 체인을 삭제하시겠습니까? [y/N] ");
+    eprint!(
+        "{}",
+        style_stderr(
+            &lang.sel(
+                &format!("Delete the {chain_count} chains above? [y/N] "),
+                &format!("위 {chain_count}개 체인을 삭제하시겠습니까? [y/N] ")
+            ),
+            Tone::Warning,
+        )
+    );
     let _ = std::io::stderr().flush();
 
     let mut input = String::new();
@@ -160,46 +211,94 @@ fn prompt_confirm(plan: &PrunePlan) -> bool {
 }
 
 /// 삭제 계획을 출력한다(체인 단위·사유). dry-run이면 헤더를 그에 맞게 표기한다.
-fn print_plan(plan: &PrunePlan, dry_run: bool) {
+fn print_plan(plan: &PrunePlan, dry_run: bool, lang: Lang) {
     if dry_run {
-        println!("prune 계획(dry-run) — 실제 삭제 없음");
+        println!(
+            "{}",
+            style(
+                lang.sel(
+                    "prune plan (dry-run) — no actual deletion",
+                    "prune 계획(dry-run) — 실제 삭제 없음"
+                ),
+                Tone::Plan,
+            )
+        );
     } else {
-        println!("prune 삭제 대상");
+        println!(
+            "{}",
+            style(
+                lang.sel("prune deletion targets", "prune 삭제 대상"),
+                Tone::Warning
+            )
+        );
     }
 
     if plan.targets.is_empty() {
-        println!("  삭제 대상 없음(모든 체인이 보존 기준 이내).");
+        println!(
+            "  {}",
+            style(
+                lang.sel(
+                    "no deletion targets (all chains within retention).",
+                    "삭제 대상 없음(모든 체인이 보존 기준 이내)."
+                ),
+                Tone::Success,
+            )
+        );
     }
 
     for t in &plan.targets {
         let label = match t.kind {
-            PruneKind::Chain => "체인",
+            PruneKind::Chain => "chain",
             PruneKind::Orphan => "orphan",
             PruneKind::Incomplete => "incomplete",
         };
+        let tone = match t.kind {
+            PruneKind::Chain => Tone::Warning,
+            PruneKind::Orphan | PruneKind::Incomplete => Tone::Danger,
+        };
         println!(
-            "  [{label}] base={} (구성원 {}개): {}",
-            t.base_id,
-            t.member_ids.len(),
-            t.reason
+            "  {} {}",
+            style(&format!("[{label}]"), tone),
+            field_line(
+                "base",
+                format!(
+                    "{} ({} {}): {}",
+                    style(&t.base_id, Tone::Value),
+                    style(&t.member_ids.len().to_string(), tone),
+                    lang.sel("members", "구성원"),
+                    t.reason
+                ),
+                6,
+            )
+            .trim_start()
         );
         // 체인은 구성원 ID를 들여쓰기로 나열(투명성).
         if t.kind == PruneKind::Chain {
             for id in &t.member_ids {
                 let role = if id == &t.base_id { "base" } else { "incr" };
-                println!("        - {id} ({role})");
+                println!("        - {} ({})", style(id, Tone::Muted), role);
             }
         }
     }
 
     if !plan.kept_base_ids.is_empty() {
-        println!("  보존: {}", plan.kept_base_ids.join(", "));
+        println!(
+            "{}",
+            field_line_toned("retained", plan.kept_base_ids.join(", "), 11, Tone::Muted)
+        );
     }
 
     if plan.has_force_only_targets() {
         println!();
         println!(
-            "  주의: orphan/incomplete 잔재는 --force일 때만 삭제됩니다(대화형 확인은 정상 체인만)."
+            "  {}",
+            style(
+                lang.sel(
+                    "note: orphan/incomplete residue is deleted only with --force (interactive confirm covers normal chains only).",
+                    "주의: orphan/incomplete 잔재는 --force일 때만 삭제됩니다(대화형 확인은 정상 체인만)."
+                ),
+                Tone::Warning,
+            )
         );
     }
 }

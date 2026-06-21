@@ -12,20 +12,23 @@ use crate::error::Result;
 /// [`Result`]를 반환하고 `main`이 에러의 exit code로 프로세스를 종료한다.
 pub async fn dispatch(cli: Cli) -> Result<()> {
     let Cli {
-        config, command, ..
+        config,
+        lang,
+        command,
+        ..
     } = cli;
     match command {
-        Command::Init(args) => handlers::init::handle(config, args).await,
-        Command::Backup(args) => handlers::backup::handle(config, args).await,
-        Command::Restore(args) => handlers::restore::handle(config, args).await,
-        Command::List(args) => handlers::list::handle(config, args).await,
-        Command::Verify(args) => handlers::verify::handle(config, args).await,
-        Command::Prune(args) => handlers::prune::handle(config, args).await,
-        Command::Status(args) => handlers::status::handle(config, args).await,
-        Command::Doctor(args) => handlers::doctor::handle(config, args).await,
-        Command::Peek(args) => handlers::peek::handle(config, args).await,
-        Command::Migrate(args) => handlers::migrate::handle(config, args).await,
-        Command::Update(args) => handlers::update::handle(args).await,
+        Command::Init(args) => handlers::init::handle(config, lang, args).await,
+        Command::Backup(args) => handlers::backup::handle(config, lang, args).await,
+        Command::Restore(args) => handlers::restore::handle(config, lang, args).await,
+        Command::List(args) => handlers::list::handle(config, lang, args).await,
+        Command::Verify(args) => handlers::verify::handle(config, lang, args).await,
+        Command::Prune(args) => handlers::prune::handle(config, lang, args).await,
+        Command::Status(args) => handlers::status::handle(config, lang, args).await,
+        Command::Doctor(args) => handlers::doctor::handle(config, lang, args).await,
+        Command::Peek(args) => handlers::peek::handle(config, lang, args).await,
+        Command::Migrate(args) => handlers::migrate::handle(config, lang, args).await,
+        Command::Update(args) => handlers::update::handle(lang, args).await,
     }
 }
 
@@ -38,6 +41,7 @@ mod tests {
     fn cli_with(command: Command) -> Cli {
         Cli {
             config: None,
+            lang: None,
             verbose: 0,
             command,
         }

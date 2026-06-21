@@ -10,22 +10,36 @@ use crate::engine::mongo::status::{human_bytes, CheckItem, StatusReport};
 const SYSTEM_SCHEMAS: &str = "'pg_catalog','information_schema','pg_toast'";
 
 /// PostgreSQL 프로파일의 status 보고서를 만든다(연결 실패도 보고서로 표현).
-pub async fn full_report(profile: &str, uri: &Secret, timeout_secs: Option<u64>) -> StatusReport {
+pub async fn full_report(
+    profile: &str,
+    uri: &Secret,
+    timeout_secs: Option<u64>,
+    lang: crate::i18n::Lang,
+) -> StatusReport {
     let pg = match PgClient::connect(uri, timeout_secs).await {
         Ok(p) => p,
         Err(e) => {
             return StatusReport::new(
                 profile,
-                vec![
-                    CheckItem::fail("connection", "연결·인증", format!("연결 실패: {e}"))
-                        .with_value("연결 실패"),
-                ],
+                vec![CheckItem::fail(
+                    "connection",
+                    "connection",
+                    lang.sel(
+                        &format!("connection failed: {e}"),
+                        &format!("연결 실패: {e}"),
+                    ),
+                )
+                .with_value(lang.sel("connection failed", "연결 실패"))],
             )
         }
     };
     let c = pg.client();
-    let mut items =
-        vec![CheckItem::ok("connection", "연결·인증", "연결 성공(PostgreSQL)").with_value("OK")];
+    let mut items = vec![CheckItem::ok(
+        "connection",
+        "connection",
+        lang.sel("connected (PostgreSQL)", "연결 성공(PostgreSQL)"),
+    )
+    .with_value("OK")];
 
     // 현재 데이터베이스. 질의 실패는 **숨기지 않고 warn**으로 표면화한다(권한 부족이 거짓
     // 초록으로 보이지 않게 — FR-8 신호등).
@@ -33,13 +47,21 @@ pub async fn full_report(profile: &str, uri: &Secret, timeout_secs: Option<u64>)
         Ok(row) => {
             let db: String = row.get(0);
             items.push(
-                CheckItem::ok("database", "데이터베이스", format!("현재 DB: {db}")).with_value(db),
+                CheckItem::ok(
+                    "database",
+                    "database",
+                    lang.sel(&format!("current DB: {db}"), &format!("현재 DB: {db}")),
+                )
+                .with_value(db),
             );
         }
         Err(e) => items.push(CheckItem::warn(
             "database",
-            "데이터베이스",
-            format!("current_database 조회 실패(권한 가능): {e}"),
+            "database",
+            lang.sel(
+                &format!("current_database query failed (privilege?): {e}"),
+                &format!("current_database 조회 실패(권한 가능): {e}"),
+            ),
         )),
     }
 
@@ -50,18 +72,31 @@ pub async fn full_report(profile: &str, uri: &Secret, timeout_secs: Option<u64>)
             let item = match parse_major(&v) {
                 Some(m) if m < 12 => CheckItem::warn(
                     "version",
-                    "버전",
-                    format!("PostgreSQL {v} — 구버전(<12), 복구 호환에 주의"),
+                    "version",
+                    lang.sel(
+                        &format!(
+                            "PostgreSQL {v} — old version (<12), recovery compatibility caution"
+                        ),
+                        &format!("PostgreSQL {v} — 구버전(<12), 복구 호환에 주의"),
+                    ),
                 )
                 .with_value(v),
-                _ => CheckItem::ok("version", "버전", format!("PostgreSQL {v}")).with_value(v),
+                _ => CheckItem::ok(
+                    "version",
+                    "version",
+                    lang.sel(&format!("PostgreSQL {v}"), &format!("PostgreSQL {v}")),
+                )
+                .with_value(v),
             };
             items.push(item);
         }
         Err(e) => items.push(CheckItem::warn(
             "version",
-            "버전",
-            format!("server_version 조회 실패: {e}"),
+            "version",
+            lang.sel(
+                &format!("server_version query failed: {e}"),
+                &format!("server_version 조회 실패: {e}"),
+            ),
         )),
     }
 
@@ -80,28 +115,39 @@ pub async fn full_report(profile: &str, uri: &Secret, timeout_secs: Option<u64>)
                 items.push(
                     CheckItem::warn(
                         "permission",
-                        "권한",
-                        format!(
-                            "사용자 테이블 {missing}/{total}개에 SELECT 권한 없음 — 백업이 일부 실패할 수 있음"
+                        "privileges",
+                        lang.sel(
+                            &format!(
+                                "no SELECT on {missing}/{total} user tables — backup may partially fail"
+                            ),
+                            &format!(
+                                "사용자 테이블 {missing}/{total}개에 SELECT 권한 없음 — 백업이 일부 실패할 수 있음"
+                            ),
                         ),
                     )
-                    .with_value(format!("{missing}/{total} 부족")),
+                    .with_value(format!("{missing}/{total} missing")),
                 );
             } else {
                 items.push(
                     CheckItem::ok(
                         "permission",
-                        "권한",
-                        format!("전 사용자 테이블 SELECT 가능({total}개)"),
+                        "privileges",
+                        lang.sel(
+                            &format!("SELECT on all user tables ({total})"),
+                            &format!("전 사용자 테이블 SELECT 가능({total}개)"),
+                        ),
                     )
-                    .with_value("충분"),
+                    .with_value(lang.sel("sufficient", "충분")),
                 );
             }
         }
         Err(e) => items.push(CheckItem::warn(
             "permission",
-            "권한",
-            format!("권한 점검 실패: {e}"),
+            "privileges",
+            lang.sel(
+                &format!("privilege check failed: {e}"),
+                &format!("권한 점검 실패: {e}"),
+            ),
         )),
     }
 
@@ -121,8 +167,11 @@ pub async fn full_report(profile: &str, uri: &Secret, timeout_secs: Option<u64>)
                 items.push(
                     CheckItem::ok(
                         "topology",
-                        "토폴로지",
-                        "standby(복제본) — 읽기 전용. 백업 소스로 적합",
+                        "topology",
+                        lang.sel(
+                            "standby (replica) — read-only. suitable as backup source",
+                            "standby(복제본) — 읽기 전용. 백업 소스로 적합",
+                        ),
                     )
                     .with_value("standby"),
                 );
@@ -136,8 +185,15 @@ pub async fn full_report(profile: &str, uri: &Secret, timeout_secs: Option<u64>)
                 {
                     let lag: i64 = r.get(0);
                     items.push(
-                        CheckItem::ok("replication_lag", "복제 지연", format!("재생 지연 약 {lag}s"))
-                            .with_value(format!("{lag}s")),
+                        CheckItem::ok(
+                            "replication_lag",
+                            "replication lag",
+                            lang.sel(
+                                &format!("replay lag approx {lag}s"),
+                                &format!("재생 지연 약 {lag}s"),
+                            ),
+                        )
+                        .with_value(format!("{lag}s")),
                     );
                 }
             } else {
@@ -146,7 +202,7 @@ pub async fn full_report(profile: &str, uri: &Secret, timeout_secs: Option<u64>)
                 } else {
                     "primary"
                 };
-                items.push(CheckItem::ok("topology", "토폴로지", note).with_value("primary"));
+                items.push(CheckItem::ok("topology", "topology", note).with_value("primary"));
                 // 연결된 standby 수(권한 따라 0일 수 있음 — 정보성).
                 if let Ok(r) = c
                     .query_one("SELECT count(*)::bigint FROM pg_stat_replication", &[])
@@ -154,16 +210,26 @@ pub async fn full_report(profile: &str, uri: &Secret, timeout_secs: Option<u64>)
                 {
                     let n: i64 = r.get(0);
                     items.push(
-                        CheckItem::ok("replication", "복제", format!("연결된 standby {n}개"))
-                            .with_value(n.to_string()),
+                        CheckItem::ok(
+                            "replication",
+                            "replication",
+                            lang.sel(
+                                &format!("{n} connected standby(s)"),
+                                &format!("연결된 standby {n}개"),
+                            ),
+                        )
+                        .with_value(n.to_string()),
                     );
                 }
             }
         }
         Err(e) => items.push(CheckItem::warn(
             "topology",
-            "토폴로지",
-            format!("토폴로지/복제 점검 실패: {e}"),
+            "topology",
+            lang.sel(
+                &format!("topology/replication check failed: {e}"),
+                &format!("토폴로지/복제 점검 실패: {e}"),
+            ),
         )),
     }
 
@@ -177,16 +243,22 @@ pub async fn full_report(profile: &str, uri: &Secret, timeout_secs: Option<u64>)
             items.push(
                 CheckItem::ok(
                     "estimated_size",
-                    "예상 크기",
-                    format!("DB 크기 {}", human_bytes(sz)),
+                    "est. size",
+                    lang.sel(
+                        &format!("DB size {}", human_bytes(sz)),
+                        &format!("DB 크기 {}", human_bytes(sz)),
+                    ),
                 )
                 .with_value(human_bytes(sz)),
             );
         }
         Err(e) => items.push(CheckItem::warn(
             "estimated_size",
-            "예상 크기",
-            format!("DB 크기 조회 실패(권한 가능): {e}"),
+            "est. size",
+            lang.sel(
+                &format!("DB size query failed (privilege?): {e}"),
+                &format!("DB 크기 조회 실패(권한 가능): {e}"),
+            ),
         )),
     }
 
@@ -200,16 +272,19 @@ pub async fn full_report(profile: &str, uri: &Secret, timeout_secs: Option<u64>)
             items.push(
                 CheckItem::ok(
                     "collection_count",
-                    "테이블 수",
-                    format!("사용자 테이블 {n}개"),
+                    "tables",
+                    lang.sel(&format!("{n} user tables"), &format!("사용자 테이블 {n}개")),
                 )
                 .with_value(n.to_string()),
             );
         }
         Err(e) => items.push(CheckItem::warn(
             "collection_count",
-            "테이블 수",
-            format!("테이블 수 조회 실패(권한 가능): {e}"),
+            "tables",
+            lang.sel(
+                &format!("table count query failed (privilege?): {e}"),
+                &format!("테이블 수 조회 실패(권한 가능): {e}"),
+            ),
         )),
     }
 
@@ -223,14 +298,24 @@ pub async fn full_report(profile: &str, uri: &Secret, timeout_secs: Option<u64>)
         Ok(row) => {
             let n: i64 = row.get(0);
             items.push(
-                CheckItem::ok("doc_count", "행 수", format!("추정 {n}행(reltuples)"))
-                    .with_value(n.to_string()),
+                CheckItem::ok(
+                    "doc_count",
+                    "rows",
+                    lang.sel(
+                        &format!("est. {n} rows (reltuples)"),
+                        &format!("추정 {n}행(reltuples)"),
+                    ),
+                )
+                .with_value(n.to_string()),
             );
         }
         Err(e) => items.push(CheckItem::warn(
             "doc_count",
-            "행 수",
-            format!("행 수 조회 실패(권한 가능): {e}"),
+            "rows",
+            lang.sel(
+                &format!("row count query failed (privilege?): {e}"),
+                &format!("행 수 조회 실패(권한 가능): {e}"),
+            ),
         )),
     }
 
@@ -239,7 +324,11 @@ pub async fn full_report(profile: &str, uri: &Secret, timeout_secs: Option<u64>)
 
 /// `server_version` 문자열에서 메이저 버전을 파싱한다(예: "16.2" → 16, "15beta1" → 15).
 fn parse_major(v: &str) -> Option<u32> {
-    let head: String = v.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+    let head: String = v
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     head.parse().ok()
 }
 
