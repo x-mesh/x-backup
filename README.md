@@ -137,11 +137,167 @@ use the file path instead (`backup` → `restore --target`, which supports `--op
 
 A config has three distinct axes, easy to conflate:
 
-- **source** — the MongoDB you back up (your prod). `uri_env` (an env var name) for anything
+- **source** — the database you back up (your prod). `uri_env` (an env var name) for anything
   with credentials; `uri` (a literal) is fine for local/no-secret connections.
-- **destination** — where backup *files* go. This is storage (`local` / `s3`), **not** a MongoDB.
-- **restore target** — the MongoDB you restore *into*. Not in config; passed at restore time
+- **destination** — where backup *files* go. This is storage (`local` / `s3`), **not** a database.
+- **restore target** — the database you restore *into*. Not in config; passed at restore time
   with `restore --target <uri>`.
+
+x-backup reads **two config formats** and auto-detects which one a file uses:
+
+- **v2 (recommended)** — one flat `[profile.<name>]` table per profile, with shared policy
+  factored out into `[defaults]` (applied to every profile) and `[base.<name>]` + `extends`
+  (reusable, opt-in). Compact one-liners for the common cases (`dest`, `compress`, `encrypt`).
+- **v1 (still supported)** — the original deeply-nested layout
+  (`[profiles.<name>.features.encryption]`, …). Existing v1 configs keep loading unchanged.
+
+**Detection:** a singular `[profile]`/`[defaults]`/`[base]` table means v2; a plural
+`[profiles]` table means v1. **Mixing the two in one file is an error** — pick one.
+
+#### v2 (recommended)
+
+The whole prod profile above, in v2 — shared compression/encryption live once in `[defaults]`:
+
+```toml
+default_profile = "prod"
+
+[output]
+language = "ko"                  # description/help language (en | ko); labels stay English
+
+[defaults]                       # applied to every profile (lowest precedence)
+compress = "zstd:10"             # algorithm[:level]
+encrypt  = "age:/etc/x-backup/age.pub"   # "age:<public-key-path>" | true | false | "off"
+
+[profile.prod]
+uri_env = "MONGO_URI"            # prod: env reference (config can leak — keep secrets out)
+# uri = "mongodb://localhost:27017/?replicaSet=rs0"   # dev/no-secret: literal is fine
+                                 # if both set, uri_env (when its env is present) wins
+prefer_secondary     = true      # back up from a secondary when possible
+connect_timeout_secs = 5         # connect/server-selection timeout (default 5s)
+dest      = "s3:db-backups/mongo/prod"   # "local:/path" | "s3:bucket/prefix"
+dest_name = "central-s3"
+s3_region = "ap-northeast-2"
+s3_endpoint = "https://s3.example.com"
+s3_creds  = "S3_CREDS"           # env var NAME holding "ACCESS_KEY:SECRET_KEY"
+keep_last = 100                  # retention: keep the newest 100 backups (per chain)
+keep_days = 30                   # ...and anything from the last 30 days
+
+[profile.pg]
+uri_env    = "PG_URI"            # postgresql:// → PostgreSQL engine auto-selected
+dest       = "local:/var/backups/pg"
+pg_logical = true                # PostgreSQL incremental/PITR (needs server wal_level=logical)
+```
+
+`[profile.pg]` inherits `compress`/`encrypt` from `[defaults]`; it does **not** repeat them.
+
+#### v2 — inheritance (`[defaults]`, `[base.<name>]`, `extends`)
+
+Factor shared policy out once and override per profile. Precedence, low → high:
+
+```
+[defaults]  <  extends chain (left→right, later wins)  <  the profile's own keys
+```
+
+`extends` references a `[base.<name>]` (reusable, not selectable as a profile) or another
+`[profile.<name>]`; it takes a string or an array (`extends = ["a", "b"]`, where `b` overrides
+`a`). For endpoint-only target profiles, **emit no `dest`** (they stay restore/migrate targets)
+and override the inherited encryption with `encrypt = false`:
+
+```toml
+default_profile = "mongo"
+
+[defaults]
+compress = "zstd:6"
+encrypt  = "age:/etc/x-backup/age.pub"
+
+[base.s3-central]                # reusable destination policy, not a profile itself
+dest      = "s3:db-backups"
+s3_region = "ap-northeast-2"
+s3_creds  = "S3_CREDS"
+
+[profile.mongo]                  # backup job: source + dest + inherited policy
+uri  = "mongodb://localhost:27017/?replicaSet=rs0&directConnection=true"
+extends   = "s3-central"
+s3_prefix = "mongo"
+
+[profile.mongo-target]           # endpoint-only: source only, no dest, encryption off
+uri     = "mongodb://localhost:27117/?replicaSet=rs0&directConnection=true"
+encrypt = false
+
+[profile.pg]
+uri        = "postgres://xbackup:xbackup-dev@localhost:5432/app"
+dest       = "local:/var/backups/pg"
+pg_logical = true
+
+[profile.pg-target]              # endpoint-only
+uri     = "postgres://xbackup:xbackup-dev@localhost:5433/app_restore"
+encrypt = false
+```
+
+#### v2 — full key reference
+
+Every key below is a **flat** key inside `[profile.<name>]` (or `[defaults]` / `[base.<name>]`).
+The normalizer rewrites them into the v1 nested tree, so behaviour is identical.
+
+| Flat key(s) | Maps to | Notes |
+|-------------|---------|-------|
+| `uri`, `uri_env` | `source.uri` / `source.uri_env` | `uri_env` holds an env var **name** (secret) |
+| `prefer_secondary`, `connect_timeout_secs` | `source.*` | |
+| `backup_type` | `mode.backup_type` | `full` (default) \| `incr` |
+| `output_mode` | `mode.output` | `progress` (default) \| `quiet` |
+| `precheck` | `mode.precheck` | default `true` |
+| `engine` | `mode.engine` | `native` (default) \| `mongodump` |
+| `dest = "local:/path"` \| `"s3:bucket/prefix"` | `destination.{type,path}` or `destination.s3.{bucket,prefix}` | compact single destination |
+| `dest_name` | `destination.name` | |
+| `s3_bucket`, `s3_prefix`, `s3_region`, `s3_endpoint`, `s3_creds` | `destination.s3.{bucket,prefix,region,endpoint,credentials_env}` | `s3_creds` is an env var **name** |
+| `[[profile.x.dest]]` (array of tables) | `destinations[]` | multi-destination; see below |
+| `compress = "zstd:6"` | `features.compression.{algorithm,level}` | or `compress_algorithm` + `compress_level` |
+| `encrypt = "age:/path"` \| `true` \| `false` \| `"off"` | `features.encryption.{enabled,algorithm,recipient_file}` | or `encrypt_algorithm` + `recipient_file`; `recipient_file` is a public-key **path** |
+| `incr_interval`, `incr_on_gap`, `pg_logical` | `features.incremental.{interval,on_gap,pg_logical}` | |
+| `keep_full`, `keep_days`, `keep_last` | `retention.{keep_full,keep_days,keep_last}` | |
+| `extends = "name"` \| `["a","b"]` | (inheritance) | references a base or profile; later wins |
+
+Omittable defaults (emitters can leave them out): `backup_type=full`, `output_mode=progress`,
+`precheck=true`, `engine=native`, compression `zstd`/level `10`, encryption `enabled=true`+`age`,
+incremental `interval=15m`/`on_gap=promote_full`/`pg_logical=false`, `prefer_secondary=false`.
+
+A richer v2 example — S3 + retention + per-profile overrides:
+
+```toml
+default_profile = "prod"
+
+[defaults]
+compress = "zstd:10"
+encrypt  = "age:/etc/x-backup/age.pub"
+
+[base.s3-central]
+dest      = "s3:db-backups"
+s3_region = "ap-northeast-2"
+s3_endpoint = "https://s3.ap-northeast-2.amazonaws.com"
+s3_creds  = "S3_CREDS"
+
+[profile.prod]
+extends     = "s3-central"
+uri_env     = "MONGO_PROD_URI"
+prefer_secondary = true
+s3_prefix   = "mongo/prod"
+incr_interval = "15m"
+incr_on_gap = "promote_full"
+keep_last   = 30
+keep_days   = 14
+
+[profile.pg-prod]
+extends     = "s3-central"
+uri_env     = "PG_PROD_URI"
+s3_prefix   = "pg/prod"
+pg_logical  = true
+keep_last   = 30
+keep_days   = 14
+```
+
+#### v1 (still supported)
+
+The original nested layout still loads unchanged — no migration required:
 
 ```toml
 default_profile = "prod"
@@ -150,10 +306,10 @@ default_profile = "prod"
 uri_env = "MONGO_URI"            # prod: env reference (config can leak — keep secrets out)
 # uri = "mongodb://localhost:27017/?replicaSet=rs0"   # dev/no-secret: literal is fine
                                  # if both set, uri_env (when its env is present) wins
-connect_timeout_secs = 5         # MongoDB connect/server-selection timeout (default 5s)
+connect_timeout_secs = 5         # connect/server-selection timeout (default 5s)
                                  # a serverSelectionTimeoutMS in the URI wins (warns if it differs)
 
-[profiles.prod.destination]      # where backup FILES go — storage, not a MongoDB
+[profiles.prod.destination]      # where backup FILES go — storage, not a database
 type = "s3"                      # local | s3
 
 [profiles.prod.destination.s3]
@@ -180,13 +336,36 @@ keep_days = 30                   # ...and anything from the last 30 days
 # pg_logical = true                       # needs server wal_level=logical (see PostgreSQL below)
 ```
 
-Any value can be overridden by an `XB_`-prefixed environment variable (`XB_DESTINATION__S3__BUCKET=...`). Precedence is `CLI > ENV > config.toml > built-in default`.
+Any value can be overridden by an `XB_`-prefixed environment variable
+(`XB_DESTINATION__S3__BUCKET=...`). **ENV overrides always use the v1 nested dot-path**,
+regardless of which format the file uses — they target the normalized tree, not the v2 flat
+keys. Precedence is `CLI > ENV > config.toml > built-in default`.
 
 ### Multiple destinations
 
-Back up to several places at once with `[[...destinations]]` (an array). The backup runs
+Back up to several places at once with an array of destination tables. The backup runs
 once; the artifact is then replicated **byte-for-byte** to each destination, so every copy
 has the same checksum and the same backup id — `verify`/`restore` work against any of them.
+
+In v2, use `[[profile.<name>.dest]]` (each entry takes the compact `dest = "..."` form or
+explicit `type`/`path`/`name`/`s3_*` keys):
+
+```toml
+[profile.prod]
+uri_env = "MONGO_URI"
+
+[[profile.prod.dest]]               # first entry = primary (required)
+name = "local"
+dest = "local:/var/backups/mongo"
+
+[[profile.prod.dest]]               # secondary (best-effort)
+name = "offsite"
+dest = "s3:db-backups"
+s3_endpoint = "https://s3.example.com"
+s3_creds    = "S3_CREDS"
+```
+
+The v1 equivalent uses `[[profiles.<name>.destinations]]`:
 
 ```toml
 [[profiles.prod.destinations]]      # first entry = primary (required)
@@ -215,8 +394,12 @@ Each profile picks how it reads and writes MongoDB with `mode.engine`. The defau
 `native` — no external binaries needed.
 
 ```toml
-[profiles.prod.mode]
-engine = "native"     # native (default) | mongodump
+[profile.prod]
+engine = "native"     # native (default) | mongodump     (v2 flat key → mode.engine)
+
+# v1 equivalent:
+# [profiles.prod.mode]
+# engine = "native"
 ```
 
 | Engine | External tools | Archive format | What it captures | Use when |
@@ -239,20 +422,33 @@ driver's COPY protocol (the same path those tools use internally), so it stays a
 self-contained binary.
 
 ```toml
+[profile.pg]                     # v2: one flat table
+uri_env    = "PG_URI"            # e.g. postgresql://user:pass@host:5432/mydb
+dest       = "local:/var/backups/pg"
+pg_logical = true                # opt in to incremental/PITR via logical decoding
+                                 # (requires server wal_level=logical)
+keep_last  = 100
+keep_days  = 30
+```
+
+<details><summary>v1 equivalent</summary>
+
+```toml
 [profiles.pg.source]
-uri_env = "PG_URI"               # e.g. postgresql://user:pass@host:5432/mydb
+uri_env = "PG_URI"
 [profiles.pg.destination]
 type = "local"
 path = "/var/backups/pg"
 
 [profiles.pg.features.incremental]
-pg_logical = true                # opt in to incremental/PITR via logical decoding
-                                 # (requires server wal_level=logical)
+pg_logical = true
 
 [profiles.pg.retention]
 keep_last = 100
 keep_days = 30
 ```
+
+</details>
 
 All the DB-agnostic commands work the same as MongoDB:
 
@@ -284,7 +480,8 @@ TLS. Data moves as text COPY (the portable format pg_dump uses), so restoring ac
 PostgreSQL major versions is safe; a major-version mismatch is logged as a warning.
 
 Incremental backup and PITR work via **logical decoding** (not WAL archiving): opt in with the
-server's `wal_level=logical` plus `[profiles.<name>.features.incremental] pg_logical = true`. A full
+server's `wal_level=logical` plus `pg_logical = true` (v2: a flat key on `[profile.<name>]`;
+v1: `[profiles.<name>.features.incremental] pg_logical = true`). A full
 backup then creates a replication slot, `backup --type incr` captures the changes since, and
 `restore --at <RFC3339>|latest` replays them up to the target time (`latest` replays everything).
 
@@ -337,8 +534,8 @@ x-backup prune --profile prod --keep-days 30 --force      # keep anything from t
 ```
 
 `--keep-last N`, `--keep-full N`, and `--keep-days D` can be combined. When a CLI flag is absent,
-`prune` falls back to the profile's `[profiles.<name>.retention]` (`keep_last` / `keep_full` /
-`keep_days`) as the default; CLI flags override config. With no rule from either source, `prune`
+`prune` falls back to the profile's retention defaults (`keep_last` / `keep_full` / `keep_days`
+— v2 flat keys, or `[profiles.<name>.retention]` in v1); CLI flags override config. With no rule from either source, `prune`
 deletes nothing and reports the error.
 
 ### Exit codes

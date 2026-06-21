@@ -137,10 +137,166 @@ replica set을 정확한 시점으로 옮기거나 검증 가능한 산출물을
 
 config에는 헷갈리기 쉬운 세 축이 있다:
 
-- **source** — 백업 대상 MongoDB(prod). 자격증명이 있으면 `uri_env`(환경변수 *이름*),
+- **source** — 백업 대상 DB(prod). 자격증명이 있으면 `uri_env`(환경변수 *이름*),
   로컬·무자격증명이면 `uri`(직접 값)도 된다.
-- **destination** — 백업 *파일*을 둘 곳. 저장소(`local`/`s3`)이며 **MongoDB가 아니다**.
-- **복구 대상** — 복구를 부을 MongoDB. config가 아니라 복구 시 `restore --target <uri>`로 지정.
+- **destination** — 백업 *파일*을 둘 곳. 저장소(`local`/`s3`)이며 **DB가 아니다**.
+- **복구 대상** — 복구를 부을 DB. config가 아니라 복구 시 `restore --target <uri>`로 지정.
+
+x-backup은 **두 가지 config 형식**을 읽고, 파일이 어느 쪽인지 자동 판별한다:
+
+- **v2 (권장)** — 프로파일마다 flat한 `[profile.<name>]` 테이블 하나. 공통 정책은
+  `[defaults]`(전체 프로파일에 적용)·`[base.<name>]` + `extends`(재사용, opt-in)로 한 번만
+  정의한다. 흔한 경우는 compact 한 줄(`dest`·`compress`·`encrypt`)로 쓴다.
+- **v1 (계속 지원)** — 기존의 깊은 중첩 레이아웃(`[profiles.<name>.features.encryption]` …).
+  기존 v1 config는 무변경으로 그대로 로드된다.
+
+**판별:** 단수 `[profile]`/`[defaults]`/`[base]` 테이블이 있으면 v2, 복수 `[profiles]`이면 v1.
+**한 파일에 둘을 섞으면 에러**다 — 한 형식만 쓴다.
+
+#### v2 (권장)
+
+위 prod 프로파일 전체를 v2로 — 공통 압축/암호화는 `[defaults]`에 한 번만:
+
+```toml
+default_profile = "prod"
+
+[output]
+language = "ko"                  # 설명/안내 문구 언어(en | ko). 라벨·기술용어는 항상 영문.
+
+[defaults]                       # 모든 프로파일에 적용(최하위 우선순위)
+compress = "zstd:10"             # 알고리즘[:레벨]
+encrypt  = "age:/etc/x-backup/age.pub"   # "age:<공개키-경로>" | true | false | "off"
+
+[profile.prod]
+uri_env = "MONGO_URI"            # prod: env 참조(config는 유출될 수 있으니 시크릿은 밖에)
+# uri = "mongodb://localhost:27017/?replicaSet=rs0"   # 개발·무자격증명: 직접 값도 OK
+                                 # 둘 다 있으면 uri_env(해당 env가 있을 때)가 우선
+prefer_secondary     = true      # 가능하면 secondary에서 백업
+connect_timeout_secs = 5         # 접속/server-selection 타임아웃(기본 5초)
+dest      = "s3:db-backups/mongo/prod"   # "local:/path" | "s3:bucket/prefix"
+dest_name = "central-s3"
+s3_region = "ap-northeast-2"
+s3_endpoint = "https://s3.example.com"
+s3_creds  = "S3_CREDS"           # "ACCESS_KEY:SECRET_KEY"를 담은 환경변수 *이름*
+keep_last = 100                  # retention: 최신 100벌 보존(체인 단위)
+keep_days = 30                   # 최근 30일 이내 체인 보존
+
+[profile.pg]
+uri_env    = "PG_URI"            # postgresql:// → PostgreSQL 엔진 자동 선택
+dest       = "local:/var/backups/pg"
+pg_logical = true                # PG 증분/PITR(서버 wal_level=logical 필요)
+```
+
+`[profile.pg]`는 `[defaults]`의 `compress`/`encrypt`를 상속한다 — 다시 적지 않는다.
+
+#### v2 — 상속(`[defaults]`·`[base.<name>]`·`extends`)
+
+공통 정책을 한 번만 정의하고 프로파일마다 덮어쓴다. 우선순위(낮음→높음):
+
+```
+[defaults]  <  extends 체인(왼→오, 뒤가 우선)  <  프로파일 자신의 키
+```
+
+`extends`는 `[base.<name>]`(재사용 전용, 프로파일로 선택 불가) 또는 다른 `[profile.<name>]`를
+가리키며, 문자열·배열을 받는다(`extends = ["a", "b"]`이면 `b`가 `a`를 덮음). endpoint 전용
+대상 프로파일은 **`dest`를 적지 않고**(복구/이관 대상으로만 남게) 상속된 암호화를
+`encrypt = false`로 끈다:
+
+```toml
+default_profile = "mongo"
+
+[defaults]
+compress = "zstd:6"
+encrypt  = "age:/etc/x-backup/age.pub"
+
+[base.s3-central]                # 재사용 destination 정책(프로파일 아님)
+dest      = "s3:db-backups"
+s3_region = "ap-northeast-2"
+s3_creds  = "S3_CREDS"
+
+[profile.mongo]                  # 백업 잡: source + dest + 상속 정책
+uri  = "mongodb://localhost:27017/?replicaSet=rs0&directConnection=true"
+extends   = "s3-central"
+s3_prefix = "mongo"
+
+[profile.mongo-target]           # endpoint 전용: source만, dest 없음, 암호화 off
+uri     = "mongodb://localhost:27117/?replicaSet=rs0&directConnection=true"
+encrypt = false
+
+[profile.pg]
+uri        = "postgres://xbackup:xbackup-dev@localhost:5432/app"
+dest       = "local:/var/backups/pg"
+pg_logical = true
+
+[profile.pg-target]              # endpoint 전용
+uri     = "postgres://xbackup:xbackup-dev@localhost:5433/app_restore"
+encrypt = false
+```
+
+#### v2 — 전체 키 레퍼런스
+
+아래 키는 모두 `[profile.<name>]`(또는 `[defaults]`/`[base.<name>]`) 안의 **flat** 키다.
+정규화기가 이를 v1 중첩 트리로 다시 쓰므로 동작은 동일하다.
+
+| flat 키 | 매핑 | 비고 |
+|---------|------|------|
+| `uri`, `uri_env` | `source.uri` / `source.uri_env` | `uri_env`는 env 변수 *이름*(시크릿) |
+| `prefer_secondary`, `connect_timeout_secs` | `source.*` | |
+| `backup_type` | `mode.backup_type` | `full`(기본) \| `incr` |
+| `output_mode` | `mode.output` | `progress`(기본) \| `quiet` |
+| `precheck` | `mode.precheck` | 기본 `true` |
+| `engine` | `mode.engine` | `native`(기본) \| `mongodump` |
+| `dest = "local:/path"` \| `"s3:bucket/prefix"` | `destination.{type,path}` 또는 `destination.s3.{bucket,prefix}` | compact 단일 destination |
+| `dest_name` | `destination.name` | |
+| `s3_bucket`, `s3_prefix`, `s3_region`, `s3_endpoint`, `s3_creds` | `destination.s3.{bucket,prefix,region,endpoint,credentials_env}` | `s3_creds`는 env 변수 *이름* |
+| `[[profile.x.dest]]`(테이블 배열) | `destinations[]` | 멀티 destination(아래 참조) |
+| `compress = "zstd:6"` | `features.compression.{algorithm,level}` | 또는 `compress_algorithm` + `compress_level` |
+| `encrypt = "age:/path"` \| `true` \| `false` \| `"off"` | `features.encryption.{enabled,algorithm,recipient_file}` | 또는 `encrypt_algorithm` + `recipient_file`. `recipient_file`은 공개키 *경로* |
+| `incr_interval`, `incr_on_gap`, `pg_logical` | `features.incremental.{interval,on_gap,pg_logical}` | |
+| `keep_full`, `keep_days`, `keep_last` | `retention.{keep_full,keep_days,keep_last}` | |
+| `extends = "name"` \| `["a","b"]` | (상속) | base/profile 참조, 뒤가 우선 |
+
+생략 가능한 기본값(emitter가 생략 가능): `backup_type=full`, `output_mode=progress`,
+`precheck=true`, `engine=native`, 압축 `zstd`/레벨 `10`, 암호화 `enabled=true`+`age`,
+증분 `interval=15m`/`on_gap=promote_full`/`pg_logical=false`, `prefer_secondary=false`.
+
+더 풍부한 v2 예시 — S3 + retention + 프로파일별 오버라이드:
+
+```toml
+default_profile = "prod"
+
+[defaults]
+compress = "zstd:10"
+encrypt  = "age:/etc/x-backup/age.pub"
+
+[base.s3-central]
+dest      = "s3:db-backups"
+s3_region = "ap-northeast-2"
+s3_endpoint = "https://s3.ap-northeast-2.amazonaws.com"
+s3_creds  = "S3_CREDS"
+
+[profile.prod]
+extends     = "s3-central"
+uri_env     = "MONGO_PROD_URI"
+prefer_secondary = true
+s3_prefix   = "mongo/prod"
+incr_interval = "15m"
+incr_on_gap = "promote_full"
+keep_last   = 30
+keep_days   = 14
+
+[profile.pg-prod]
+extends     = "s3-central"
+uri_env     = "PG_PROD_URI"
+s3_prefix   = "pg/prod"
+pg_logical  = true
+keep_last   = 30
+keep_days   = 14
+```
+
+#### v1 (계속 지원)
+
+기존 중첩 레이아웃은 마이그레이션 없이 그대로 로드된다:
 
 ```toml
 default_profile = "prod"
@@ -149,10 +305,10 @@ default_profile = "prod"
 uri_env = "MONGO_URI"            # prod: env 참조(config는 유출될 수 있으니 시크릿은 밖에)
 # uri = "mongodb://localhost:27017/?replicaSet=rs0"   # 개발·무자격증명: 직접 값도 OK
                                  # 둘 다 있으면 uri_env(해당 env가 있을 때)가 우선
-connect_timeout_secs = 5         # MongoDB 접속/server-selection 타임아웃(기본 5초)
+connect_timeout_secs = 5         # 접속/server-selection 타임아웃(기본 5초)
                                  # URI의 serverSelectionTimeoutMS가 우선(다르면 경고)
 
-[profiles.prod.destination]      # 백업 *파일*을 둘 곳 — 저장소이지 MongoDB가 아님
+[profiles.prod.destination]      # 백업 *파일*을 둘 곳 — 저장소이지 DB가 아님
 type = "s3"                      # local | s3
 
 [profiles.prod.destination.s3]
@@ -177,13 +333,34 @@ keep_days = 30                   # 최근 30일 이내 체인 보존
 ```
 
 모든 값은 `XB_` 접두사 환경변수로 오버라이드된다(`XB_DESTINATION__S3__BUCKET=...`).
-우선순위: `CLI > ENV > config.toml > 기본값`.
+**ENV 오버라이드는 파일 형식과 무관하게 항상 v1 중첩 dot-path를 쓴다** — v2 flat 키가
+아니라 정규화된 트리를 가리킨다. 우선순위: `CLI > ENV > config.toml > 기본값`.
 
 ### 여러 destination
 
-`[[...destinations]]`(배열)로 여러 곳에 동시 백업한다. 백업은 한 번만 돌고,
+destination 테이블 배열로 여러 곳에 동시 백업한다. 백업은 한 번만 돌고,
 산출물을 각 destination으로 **바이트 단위 동일하게** 복제하므로 모든 복제본이 같은
 체크섬·같은 백업 id를 갖는다 — 어느 복제본에서든 `verify`/`restore`가 동일하게 동작한다.
+
+v2는 `[[profile.<name>.dest]]`를 쓴다(각 항목은 compact `dest = "..."` 또는 명시
+`type`/`path`/`name`/`s3_*` 키):
+
+```toml
+[profile.prod]
+uri_env = "MONGO_URI"
+
+[[profile.prod.dest]]               # 첫 항목 = primary(필수)
+name = "local"
+dest = "local:/var/backups/mongo"
+
+[[profile.prod.dest]]               # 보조(best-effort)
+name = "offsite"
+dest = "s3:db-backups"
+s3_endpoint = "https://s3.example.com"
+s3_creds    = "S3_CREDS"
+```
+
+v1은 `[[profiles.<name>.destinations]]`를 쓴다:
 
 ```toml
 [[profiles.prod.destinations]]      # 첫 항목 = primary(필수)
@@ -211,8 +388,12 @@ exit 4(경고)로 실패한 destination을 알린다. 복구는 기본적으로 
 외부 바이너리가 필요 없다.
 
 ```toml
-[profiles.prod.mode]
-engine = "native"     # native(기본) | mongodump
+[profile.prod]
+engine = "native"     # native(기본) | mongodump     (v2 flat 키 → mode.engine)
+
+# v1 등가:
+# [profiles.prod.mode]
+# engine = "native"
 ```
 
 | 엔진 | 외부 도구 | 아카이브 포맷 | 캡처 대상 | 사용 시점 |
@@ -233,19 +414,32 @@ engine = "native"     # native(기본) | mongodump
 내부적으로 쓰는 바로 그 경로)로 백업하므로 단일 바이너리로 완결된다.
 
 ```toml
+[profile.pg]                     # v2: flat 테이블 하나
+uri_env    = "PG_URI"            # 예: postgresql://user:pass@host:5432/mydb
+dest       = "local:/var/backups/pg"
+pg_logical = true                # PG 증분/PITR opt-in(서버 wal_level=logical 필요)
+keep_last  = 100                 # prune 기본값(CLI 플래그 없을 때, CLI 우선)
+keep_days  = 30
+```
+
+<details><summary>v1 등가</summary>
+
+```toml
 [profiles.pg.source]
-uri_env = "PG_URI"               # 예: postgresql://user:pass@host:5432/mydb
+uri_env = "PG_URI"
 [profiles.pg.destination]
 type = "local"
 path = "/var/backups/pg"
 
 [profiles.pg.features.incremental]
-pg_logical = true                # PG 증분/PITR opt-in(서버 wal_level=logical 필요)
+pg_logical = true
 
-[profiles.pg.retention]          # prune 기본값(CLI 플래그 없을 때, CLI 우선)
+[profiles.pg.retention]
 keep_last = 100
 keep_days = 30
 ```
+
+</details>
 
 DB 비의존 명령은 MongoDB와 동일하게 동작한다:
 
@@ -273,8 +467,8 @@ x-backup list/verify/prune ...                    # manifest 기반(DB 비의존
 이식성 포맷)로 옮기므로 PostgreSQL 메이저 버전이 달라도 복구가 안전하다(메이저 불일치는 경고).
 
 증분·PITR: PG PITR은 **logical decoding**(pgoutput)으로 동작한다 — WAL 아카이빙이 아니다.
-서버 `wal_level=logical` + 프로파일 `[profiles.<name>.features.incremental] pg_logical = true`로
-opt-in하면, 풀 백업이 replication slot을 만들어 그 시점부터 WAL을 잡고, `backup --type incr`가
+서버 `wal_level=logical` + 프로파일 `pg_logical = true`(v2: `[profile.<name>]`의 flat 키,
+v1: `[profiles.<name>.features.incremental] pg_logical = true`)로 opt-in하면, 풀 백업이 replication slot을 만들어 그 시점부터 WAL을 잡고, `backup --type incr`가
 변경을 캡처하며, `restore --at <RFC3339>|latest`가 base 복원 후 증분을 목표 시점까지 재생한다
 (`latest`=전체 재생). PITR 정밀도는 변경 단위 commit 타임스탬프로 마이크로초까지 간다.
 
@@ -319,8 +513,9 @@ x-backup status --profile prod --watch --count 5       # 5회 샘플 후 종료(
 - `--keep-days D` — 최근 D일 이내 체인 보존
 - `--keep-last N` — 최신 N벌 보존(체인 단위 누적이라, 살아있는 증분의 base는 단독으로 삭제되지 않는다)
 
-CLI 플래그가 없으면 config의 `[profiles.<name>.retention]`(`keep_full`/`keep_days`/`keep_last`)을
-기본값으로 쓴다(**CLI 우선**). 기준이 하나도 없으면 아무것도 삭제하지 않는다(안전).
+CLI 플래그가 없으면 config의 retention 기본값(`keep_full`/`keep_days`/`keep_last` — v2 flat
+키, v1은 `[profiles.<name>.retention]`)을 쓴다(**CLI 우선**). 기준이 하나도 없으면 아무것도
+삭제하지 않는다(안전).
 
 ```bash
 x-backup prune --profile prod --keep-last 100 --dry-run   # 삭제 대상만 출력(무변경)
@@ -379,6 +574,24 @@ make xbenv-clean        # 격리 워크스페이스 제거
 config·키·`XB_PROFILE`을 따로 두고 `source <dir>/activate`로 활성화한다. `make xbenv-pg`/
 `xbenv-mongo`/`xbenv-clean`으로 간편하게 준비·정리할 수 있다(상세는 [docs/postgres.md](docs/postgres.md)).
 
+**mongo+pg를 한 환경에서** 다루려면 `make xbenv-both`(또는 `scripts/xbenv new <dir> --engine both`).
+한 config에 백업 잡 `mongo`/`pg`와 복구·이관 대상(endpoint 전용) `mongo-target`/`pg-target`
+프로파일을 만든다(source URI는 config에 직접 기재 — 로컬 테스트라 어디로 붙는지 한눈에).
+PostgreSQL도 MongoDB처럼 소스(:5432)·타깃(:5433) **두 서버**를 띄운다. 기본 프로파일은 `mongo`라
+plain `x-backup status`/`backup`은 mongo를 대상으로 동작하고, `--profile pg`로 전환하며,
+`x-backup status --all`은 전체를 본다:
+
+```bash
+make xbenv-both                  # mongo·pg 컨테이너 기동 + 결합 워크스페이스 생성
+source .xbenv-both/activate
+x-backup status --all
+x-backup backup  --profile mongo &&  x-backup restore --profile mongo --target-profile mongo-target --force
+x-backup backup  --profile pg    &&  x-backup restore --profile pg    --target-profile pg-target
+x-backup migrate --profile mongo --target-profile mongo-target   # 파일 없이 서버→서버
+deactivate
+make xbenv-clean                 # 워크스페이스 + 격리 PG DB·slot 정리
+```
+
 ```bash
 make mongodb-up           # 컨테이너 기동
 scripts/xb setup          # .devenv 준비 + status 점검
@@ -422,6 +635,7 @@ gap 가드가 동작하는 것이지 오류가 아니다. churn으로 데이터�
 
 | 문서 | 내용 |
 |------|------|
+| [docs/control-server.ko.md](docs/control-server.ko.md) | 중앙 control 서버 운영(다중 DB 백업·복구·마이그레이션) — 예시: [examples/control-server.toml](examples/control-server.toml) |
 | [docs/PRD.md](docs/PRD.md) | 제품 요구사항(FR-1~12, 증분 설계, 암호화 설계) |
 | [docs/test-scenario.md](docs/test-scenario.md) | E2E 시나리오 정의 |
 | [docs/acceptance-report.md](docs/acceptance-report.md) | 수용 기준 10/10 실측 근거 |

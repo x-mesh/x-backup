@@ -174,7 +174,68 @@
 - 잠금 충돌 시 즉시 실패하고 전용 exit code(§9)로 보고한다.
 - 비정상 종료로 남은 stale lock의 감지·해제 절차를 둔다(구현 방식은 §13).
 
-#### config.toml 정의 범위 (예시 스키마)
+#### config.toml 정의 범위 (스키마)
+
+config는 **두 형식**으로 쓸 수 있고, 로더가 자동 판별한다:
+
+- **v2 (권장)** — 프로파일마다 flat한 `[profile.<name>]` 테이블. 공통 정책은 `[defaults]`
+  (전체 적용)·`[base.<name>]` + `extends`(재사용)로 한 번만 정의한다. compact 한 줄 표기
+  (`dest`·`compress`·`encrypt`)를 지원한다.
+- **v1 (계속 지원)** — 아래 §"v1 중첩 스키마(레거시)"의 깊은 중첩 레이아웃. 기존 config는
+  무변경으로 로드된다.
+
+**판별:** 단수 `[profile]`/`[defaults]`/`[base]` 테이블 → v2, 복수 `[profiles]` → v1. **한 파일에
+둘을 섞으면 에러**(반쪽 마이그레이션 방지). v2 표면 문법은 `normalize_v2`가 v1 중첩 트리로
+정규화하므로 내부 구조·역직렬화·ENV 오버라이드 파이프라인은 무변경이다.
+
+##### v2 표면 문법 (권장)
+```toml
+default_profile = "prod"
+
+[output]
+language = "ko"             # 설명/안내 문구 언어(en | ko). 라벨·기술용어는 항상 영문.
+
+[defaults]                  # 모든 프로파일에 적용(최하위 우선순위)
+compress = "zstd:10"        # 알고리즘[:레벨]
+encrypt  = "age:/etc/x-backup/age.pub"   # "age:<공개키-경로>" | true | false | "off"
+
+[base.s3-central]           # 재사용 destination 정책(프로파일 아님, extends로만 참조)
+dest      = "s3:db-backups" # "local:/path" | "s3:bucket/prefix"
+s3_region = "ap-northeast-2"
+s3_endpoint = "https://s3.example.com"    # MinIO/R2/OCI 등 S3 호환
+s3_creds  = "S3_CREDS"      # "ACCESS_KEY:SECRET_KEY"를 담은 env 변수 *이름*
+
+[profile.prod]
+extends          = "s3-central"  # base/다른 프로파일 상속. 배열도 가능(뒤가 우선)
+uri_env          = "MONGO_URI"   # 시크릿은 env 참조(평문 금지)
+prefer_secondary = true          # 가능하면 secondary에서 백업
+s3_prefix        = "mongo/prod"
+incr_interval    = "15m"         # gap 위험 경고 기준(스케줄러 아님 — cron에 위임)
+incr_on_gap      = "promote_full"# gap 감지 시 풀백업으로 자동 승격
+keep_last        = 100           # retention(prune 기본값, CLI 우선)
+keep_days        = 30
+
+[profile.pg]
+extends    = "s3-central"
+uri_env    = "PG_URI"            # postgresql:// → PostgreSQL 엔진 자동 선택
+s3_prefix  = "pg/prod"
+pg_logical = true                # PG 증분/PITR opt-in(서버 wal_level=logical 필요)
+```
+
+상속 우선순위(낮음→높음): `[defaults] < extends 체인(왼→오, 뒤가 우선) < 프로파일 자신 키`,
+그 위로 `ENV(XB_*) > 파일`, `CLI > ENV`. 생략 가능한 기본값: `backup_type=full`,
+`output_mode=progress`, `precheck=true`, `engine=native`, 압축 `zstd`/레벨 `10`, 암호화
+`enabled=true`+`age`, 증분 `interval=15m`/`on_gap=promote_full`/`pg_logical=false`,
+`prefer_secondary=false`.
+
+v2 flat 키 → v1 중첩 매핑: `uri`/`uri_env`/`prefer_secondary`/`connect_timeout_secs` →
+`source.*`; `backup_type`/`output_mode`(→`mode.output`)/`precheck`/`engine` → `mode.*`;
+`dest`/`dest_name`/`s3_*` → `destination.*`(또는 `[[profile.x.dest]]` 배열 → `destinations[]`);
+`compress` → `features.compression.*`; `encrypt` → `features.encryption.*`;
+`incr_interval`/`incr_on_gap`/`pg_logical` → `features.incremental.*`;
+`keep_full`/`keep_days`/`keep_last` → `retention.*`.
+
+##### v1 중첩 스키마 (레거시 — 계속 지원)
 ```toml
 default_profile = "prod"
 
@@ -218,8 +279,6 @@ interval = "15m"            # 권장: oplog 윈도우보다 충분히 짧게
 on_gap   = "promote_full"   # gap 감지 시 풀백업으로 자동 승격
 # retention: 1차는 prune의 CLI 인자로 지정(FR-11). 정책 기반 자동화는 로드맵(§12)
 ```
-
-> 위 스키마는 정의 범위 예시다. 필드명·구조 최종안은 구현 시 확정한다(*세부는 현 시점 단정하지 않음*).
 
 ---
 

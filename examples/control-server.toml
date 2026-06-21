@@ -1,0 +1,115 @@
+# x-backup — 중앙 control/백업 서버용 다중 DB config 예시 (config v2)
+# =============================================================================
+# 한 대의 control 서버가 여러 DB(MongoDB·PostgreSQL)를 하나의 config로 백업·복구·
+# 마이그레이션하는 패턴이다. 핵심 개념:
+#
+#   profile = ① endpoint(source 접속) + ② storage(destination) + ③ policy(엔진·압축·
+#             암호화·증분·retention)
+#
+# "백업 잡" 프로파일은 ①②③를 모두 갖고, "endpoint 전용" 프로파일은 ①(source)만 둔다.
+# endpoint 전용 프로파일은 `restore --target-profile`·`migrate --target-profile`의
+# 대상으로 쓴다(복구/이관 목적지를 URI 직타 대신 이름으로 가리키기 위함).
+#
+# 이 파일은 config **v2** 표면 문법이다 — 프로파일마다 flat한 [profile.<name>] 테이블,
+# 공통 정책은 [defaults](전체 적용)·[base.<name>] + extends(재사용)로 한 번만 정의한다.
+# 로더가 자동 판별한다(단수 profile/defaults/base → v2, 복수 profiles → v1). 기존 v1
+# 중첩 config도 무변경으로 그대로 로드된다 — 한 파일에 둘을 섞지만 않으면 된다.
+#
+# 시크릿(접속 URI·S3 키)은 평문으로 담지 않는다 — `uri_env`/`s3_creds`로 환경변수
+# 이름만 보관하고 실제 값은 실행 환경에서 주입한다(아래 "필요한 환경변수" 참고).
+#
+# 정적 점검:  x-backup doctor --config examples/control-server.toml
+# =============================================================================
+
+# --profile 미지정 시 사용할 기본 프로파일.
+default_profile = "mongo-prod"
+
+[output]
+# 설명/안내 문구 언어(en | ko). 라벨·기술용어는 항상 영문.
+language = "ko"
+
+
+# ── 공통 정책 (모든 프로파일에 적용, 최하위 우선순위) ────────────────────────
+# 압축·암호화는 거의 모든 백업 잡이 공유하므로 여기 한 번만 둔다. 개별 프로파일이
+# 같은 키를 다시 쓰면 그 값이 우선한다(endpoint 전용은 encrypt=false로 끈다).
+[defaults]
+compress = "zstd:10"                       # 알고리즘[:레벨]
+encrypt  = "age:/etc/x-backup/age.pub"     # 공개키(recipient) 경로. 복호화 개인키는 별도 격리.
+
+
+# ── 재사용 destination 정책 (프로파일 아님 — extends로만 참조) ───────────────
+# 중앙 S3 버킷·리전·자격증명을 한 번만 정의하고, 각 백업 잡은 prefix만 덧붙인다.
+[base.central-s3]
+dest        = "s3:db-backups"              # "s3:bucket[/prefix]" (prefix는 프로파일에서 s3_prefix로)
+dest_name   = "central-s3"
+s3_region   = "ap-northeast-2"
+s3_endpoint = "https://s3.ap-northeast-2.amazonaws.com"
+# 단일 env에 "ACCESS_KEY:SECRET_KEY"(콜론 구분). 예) export S3_CREDS="AKIA...:wJalr..."
+s3_creds    = "S3_CREDS"
+
+
+# ── MongoDB: 운영 백업 잡 (source → S3, 암호화·증분) ─────────────────────────
+[profile.mongo-prod]
+extends          = "central-s3"   # 중앙 S3 정책 상속(+ [defaults]의 압축·암호화)
+backup_type      = "full"         # 기본 백업 유형(full | incr). incr는 oplog 기반.
+output_mode      = "progress"     # 기본 출력 모드(progress | quiet). cron은 CLI에서 --quiet 권장.
+engine           = "native"       # native(드라이버 직접) | mongodump(외부 도구). 기본 native.
+precheck         = true           # 백업 전 status 자동 선행.
+# mongodb://...  — 시크릿이라 env 참조. 예) export MONGO_PROD_URI="mongodb://user:pass@prod:27017/?replicaSet=rs0"
+uri_env          = "MONGO_PROD_URI"
+prefer_secondary = true           # 가능하면 secondary에서 백업(운영 primary 부하 회피).
+connect_timeout_secs = 5
+s3_prefix        = "mongo-prod"   # 중앙 버킷 안의 이 잡 전용 prefix
+incr_interval    = "15m"          # gap 위험 판단용 기준 간격(스케줄러 아님).
+incr_on_gap      = "promote_full" # oplog gap 감지 시 다음 증분을 풀백업으로 승격.
+keep_last        = 30             # 최신 백업 세트(체인) 30벌 보존. prune의 기본값.
+keep_days        = 14
+
+
+# ── MongoDB: DR 엔드포인트 (복구/이관 대상 전용 — source만) ───────────────────
+# 백업 storage(dest)가 없으므로 backup 대상이 아니다. restore/migrate의 --target-profile로만 쓴다.
+# dest가 없으면 status/doctor가 자동으로 endpoint 전용으로 인식해 backup 잡 점검을 건너뛴다.
+# [defaults]가 암호화를 켜므로 endpoint 전용은 encrypt=false로 끈다(복구 대상엔 불필요).
+[profile.mongo-dr]
+uri_env = "MONGO_DR_URI"  # 예) export MONGO_DR_URI="mongodb://user:pass@dr:27017/?replicaSet=rs1"
+encrypt = false
+
+
+# ── PostgreSQL: 운영 백업 잡 (source → S3, logical decoding 증분) ─────────────
+[profile.pg-prod]
+extends     = "central-s3"
+backup_type = "full"
+engine      = "native"
+uri_env     = "PG_PROD_URI"  # 예) export PG_PROD_URI="postgresql://user:pass@prod:5432/maindb"
+connect_timeout_secs = 5
+s3_prefix   = "pg-prod"
+# PostgreSQL 증분(logical decoding/pgoutput) opt-in. true면 풀백업이 replication slot +
+# publication(FOR ALL TABLES)을 만들어 WAL을 잡고 `backup --type incr`로 변경을 캡처한다.
+# 전제: 서버 wal_level=logical(재시작 필요). 미사용 slot은 WAL을 무한 보존하니 주의.
+pg_logical  = true
+keep_last   = 30
+keep_days   = 14
+
+
+# ── PostgreSQL: DR 엔드포인트 (복구/이관 대상 전용) ──────────────────────────
+[profile.pg-dr]
+uri_env = "PG_DR_URI"  # 예) export PG_DR_URI="postgresql://user:pass@dr:5432/maindb"
+encrypt = false
+
+
+# ── MongoDB: 로컬 미러 백업 잡 (server → 로컬 디스크 + S3 이중화) ─────────────
+# 멀티 destination 예시 — [[profile.x.dest]] 배열의 첫 항목이 primary다. restore는 --from으로
+# 특정 복제본을 고를 수 있고(미지정 시 primary), 모든 복제본은 동일 바이트라 어디서 읽어도 결과가 같다.
+[profile.mongo-archive]
+uri_env   = "MONGO_PROD_URI"  # 같은 운영 DB를 로컬+S3로도 보관
+keep_last = 90
+
+[[profile.mongo-archive.dest]]
+name = "local-disk"
+dest = "local:/var/backups/x-backup/mongo"
+
+[[profile.mongo-archive.dest]]
+name        = "offsite-s3"
+dest        = "s3:db-backups-offsite/mongo-archive"
+s3_region   = "ap-northeast-2"
+s3_creds    = "S3_CREDS"
