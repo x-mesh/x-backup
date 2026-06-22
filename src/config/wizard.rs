@@ -98,8 +98,60 @@ fn ask_required(prompt: &mut dyn Prompt, question: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
+/// 환경변수 이름으로 유효한지 — 첫 글자는 알파벳/`_`, 이후는 영숫자/`_`(POSIX 관례).
+///
+/// 사용자가 변수명 칸에 URI 값(`mongodb://...`)을 붙여 넣는 흔한 실수를 잡는다 —
+/// URI에는 `:`/`/`/`@`/`.` 등 변수명에 못 쓰는 문자가 있어 자연히 걸러진다.
+fn is_valid_env_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// 접속 정보를 묻는다 — 반환은 `(uri, uri_env)`(둘 중 하나만 Some).
+///
+/// 두 가지 입력을 모두 정식으로 받는다:
+/// - **환경변수 이름**(권장, 기본 `MONGO_URI`) → `uri_env`로 보관(시크릿 평문 미저장, FR-10).
+/// - **URI 직접 입력**(`mongodb://...`/`mongodb+srv://...`) → `source.uri`로 저장. 자격증명이
+///   포함되면 config에 평문으로 남으므로 로컬/개발용이다 — 그 자리에서 한 줄 경고만 띄우고
+///   추가 확인 없이 받는다(URI를 친 건 의도이므로). 양끝 따옴표/공백은 자동 정리한다.
+///
+/// 둘 다 아닌 입력(오타 등)은 다시 묻는다 — 변수명 칸에 잘못 친 값이 그대로 *변수 이름*으로
+/// 저장돼 백업/status가 "환경변수가 설정되지 않았습니다"로 실패하던 함정을 막는다.
+fn ask_connection(prompt: &mut dyn Prompt) -> Result<(Option<String>, Option<String>)> {
+    loop {
+        let answer = ask_default(
+            prompt,
+            "MongoDB 접속 — URI가 담긴 환경변수 이름(권장, 시크릿 미저장) 또는 URI 직접 입력",
+            "MONGO_URI",
+        )?;
+        // 붙여넣기 실수 대비 양끝 따옴표/공백 정리.
+        let cleaned = answer.trim().trim_matches(['"', '\'']).trim().to_string();
+
+        // URI 직접 입력("://" 포함) — source.uri로 평문 저장(로컬/개발 전용).
+        if cleaned.contains("://") {
+            eprintln!(
+                "  ! URI를 config에 평문으로 저장합니다(자격증명 포함 시 로컬/개발 전용). \
+                 운영에선 환경변수 이름을 쓰세요."
+            );
+            return Ok((Some(cleaned), None));
+        }
+        // 환경변수 이름 — uri_env로 보관(시크릿 평문 미저장).
+        if is_valid_env_name(&cleaned) {
+            return Ok((None, Some(cleaned)));
+        }
+        // 둘 다 아님(오타 등) — 안내 후 다시 묻는다.
+        prompt.read_line(
+            "  ! 환경변수 이름(예: MONGO_URI) 또는 URI(mongodb://...)를 입력하세요. Enter로 다시 입력",
+        )?;
+    }
+}
+
 /// y/n 질문. 빈 응답이면 `default`를 쓴다.
-fn ask_yes_no(prompt: &mut dyn Prompt, question: &str, default: bool) -> Result<bool> {
+pub(crate) fn ask_yes_no(prompt: &mut dyn Prompt, question: &str, default: bool) -> Result<bool> {
     let hint = if default { "Y/n" } else { "y/N" };
     let answer = prompt.read_line(&format!("{question} [{hint}]: "))?;
     let t = answer.trim().to_ascii_lowercase();
@@ -117,12 +169,9 @@ pub fn run_wizard(prompt: &mut dyn Prompt) -> Result<Config> {
     // 1) 프로파일 이름.
     let profile_name = ask_default(prompt, "프로파일 이름", "prod")?;
 
-    // 2) 접속 — URI는 시크릿이므로 *env 변수명*만 받는다(값 직접 입력 금지).
-    let uri_env = ask_default(
-        prompt,
-        "MongoDB URI가 담긴 환경변수 이름(시크릿 평문 금지 — 값이 아니라 변수명)",
-        "MONGO_URI",
-    )?;
+    // 2) 접속 — 기본은 *env 변수명*(시크릿 평문 금지). 변수명 칸에 URI를 붙여 넣는
+    //    실수는 ask_connection이 잡아 다시 묻거나 직접 저장(opt-in)으로 처리한다.
+    let (uri, uri_env) = ask_connection(prompt)?;
     let prefer_secondary = ask_yes_no(prompt, "가능하면 secondary에서 백업하시겠습니까?", false)?;
 
     // 3) destination — local 경로 또는 s3 설정.
@@ -241,8 +290,8 @@ pub fn run_wizard(prompt: &mut dyn Prompt) -> Result<Config> {
             engine: "native".to_string(),
         },
         source: SourceConfig {
-            uri: None,
-            uri_env: Some(uri_env),
+            uri,
+            uri_env,
             prefer_secondary,
             connect_timeout_secs: None,
         },
@@ -426,6 +475,119 @@ mod tests {
         let mut prompt = VecPrompt::new(answers);
         let err = run_wizard(&mut prompt).unwrap_err();
         assert_eq!(err.exit_code(), 2);
+    }
+
+    /// is_valid_env_name: 변수명만 통과하고 URI 값/따옴표/빈 값은 거른다.
+    #[test]
+    fn env_name_validation() {
+        assert!(is_valid_env_name("MONGO_URI"));
+        assert!(is_valid_env_name("_x9"));
+        assert!(!is_valid_env_name(""));
+        assert!(!is_valid_env_name("9ABC")); // 숫자로 시작
+        assert!(!is_valid_env_name("mongodb://localhost:27017"));
+        assert!(!is_valid_env_name("\"mongodb://admin:pw@host:27017")); // 사용자가 친 그 입력
+    }
+
+    /// URI를 직접 입력하면(따옴표 포함) 추가 확인 없이 source.uri로 저장된다
+    /// (따옴표·공백 제거, 끝의 `/`는 보존). uri_env는 비어 있다.
+    #[test]
+    fn direct_uri_accepted_as_source_uri() {
+        let answers = vec![
+            "prod",                                                   // 프로파일명
+            "\"mongodb://admin:adminpassword@100.100.202.71:27017/", // 변수명 칸에 붙인 URI
+            "n",                                                      // prefer_secondary
+            "local",                                                  // dest
+            "/data",
+            "10",
+            "n", // 암호화 off
+            "15m",
+            "progress",
+        ];
+        let mut prompt = VecPrompt::new(answers);
+        let cfg = run_wizard(&mut prompt).unwrap();
+        let p = cfg.profile("prod").unwrap();
+        assert_eq!(
+            p.source.uri.as_deref(),
+            Some("mongodb://admin:adminpassword@100.100.202.71:27017/"),
+            "양끝 따옴표는 제거하되 URI(끝 `/` 포함)는 그대로 source.uri로 저장돼야 함"
+        );
+        assert!(p.source.uri_env.is_none(), "직접 저장이면 uri_env는 없어야 함");
+    }
+
+    /// mongodb+srv URI도 직접 입력으로 인식해 source.uri에 저장한다.
+    #[test]
+    fn direct_srv_uri_accepted() {
+        let answers = vec![
+            "prod",
+            "mongodb+srv://u:p@cluster.example.net/?retryWrites=true",
+            "n",
+            "local",
+            "/data",
+            "10",
+            "n",
+            "15m",
+            "progress",
+        ];
+        let mut prompt = VecPrompt::new(answers);
+        let cfg = run_wizard(&mut prompt).unwrap();
+        let p = cfg.profile("prod").unwrap();
+        assert_eq!(
+            p.source.uri.as_deref(),
+            Some("mongodb+srv://u:p@cluster.example.net/?retryWrites=true")
+        );
+        assert!(p.source.uri_env.is_none());
+    }
+
+    /// 직접 입력한 URI는 config.toml(v2)에 source.uri로 직렬화되고 다시 파싱된다
+    /// (평문 저장 경로가 실제로 config에 살아남는지 — 사용자 요구의 핵심).
+    #[test]
+    fn direct_uri_serializes_and_reparses() {
+        let answers = vec![
+            "prod",
+            "mongodb://admin:adminpassword@100.100.202.71:27017/",
+            "n",
+            "local",
+            "/data",
+            "10",
+            "n",
+            "15m",
+            "progress",
+        ];
+        let cfg = run_wizard(&mut VecPrompt::new(answers)).unwrap();
+        let toml = config_to_toml(&cfg).unwrap();
+        assert!(
+            toml.contains("uri = \"mongodb://admin:adminpassword@100.100.202.71:27017/\""),
+            "직접 URI가 source.uri로 기록돼야 함:\n{toml}"
+        );
+        // 재파싱해도 동일 URI가 보존된다.
+        let reparsed = Config::from_toml_str(&toml).unwrap();
+        assert_eq!(
+            reparsed.profile("prod").unwrap().source.uri.as_deref(),
+            Some("mongodb://admin:adminpassword@100.100.202.71:27017/")
+        );
+    }
+
+    /// 변수명도 URI도 아닌 입력(오타)은 다시 묻고, 이후 올바른 변수명을 uri_env로 받는다.
+    #[test]
+    fn neither_env_name_nor_uri_reasks() {
+        let answers = vec![
+            "prod",           // 프로파일명
+            "mongo-uri",      // 변수명 형식 아님(대시), URI도 아님 → 재질문
+            "",               // 재질문 Enter
+            "PROD_MONGO_URI", // 올바른 변수명
+            "n",              // prefer_secondary
+            "local",
+            "/data",
+            "10",
+            "n",
+            "15m",
+            "progress",
+        ];
+        let mut prompt = VecPrompt::new(answers);
+        let cfg = run_wizard(&mut prompt).unwrap();
+        let p = cfg.profile("prod").unwrap();
+        assert_eq!(p.source.uri_env.as_deref(), Some("PROD_MONGO_URI"));
+        assert!(p.source.uri.is_none());
     }
 
     /// 잘못된 destination 유형은 재질문 후 올바른 값으로 진행한다.

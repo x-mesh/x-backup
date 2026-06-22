@@ -16,7 +16,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     propagate_version = true
 )]
 pub struct Cli {
-    /// config.toml 경로(미지정 시 `XB_CONFIG` 환경변수 — 자동 탐색은 없다).
+    /// config.toml 경로(미지정 시 `XB_CONFIG` 환경변수, 그다음 현재 디렉터리의
+    /// `xbackup.toml`/`config.toml`/`.xbackup/config.toml`을 순서대로 자동 탐색).
     ///
     /// 어떤 config를 참조 중인지는 `status`/`doctor` 출력의 `config:` 줄에서 확인할 수 있다.
     /// 시크릿은 config에 평문 저장하지 않고 ENV 참조(uri_env 등)로 주입한다(FR-10).
@@ -303,13 +304,9 @@ pub struct PruneArgs {
 /// `status` — 대상 서버 상태 점검(FR-8, R14).
 #[derive(Debug, Args)]
 pub struct StatusArgs {
-    /// 사용할 프로파일 이름. `--all`이면 생략 가능.
-    #[arg(
-        long,
-        value_name = "NAME",
-        required_unless_present = "all",
-        env = "XB_PROFILE"
-    )]
+    /// 사용할 프로파일 이름. 생략하면 config의 `default_profile`로 폴백한다(`--all`이면 전체).
+    /// `--profile`/`XB_PROFILE`/`default_profile`이 모두 없을 때만 오류다(list/backup과 일관).
+    #[arg(long, value_name = "NAME", env = "XB_PROFILE")]
     pub profile: Option<String>,
     /// config의 모든 프로파일을 한 번에 점검한다(한 줄 요약 + 최악 exit code).
     /// `--profile`/`XB_PROFILE`보다 우선한다(둘 다 있으면 --all로 동작 — 워크스페이스

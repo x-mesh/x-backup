@@ -21,6 +21,7 @@
 
 use std::str::FromStr;
 
+use age::secrecy::ExposeSecret;
 use age::x25519;
 use age::{Decryptor, Identity, Recipient};
 use futures::io::{AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt};
@@ -220,6 +221,52 @@ fn parse_identity(raw: &str) -> Option<x25519::Identity> {
         .find_map(|l| x25519::Identity::from_str(l).ok())
 }
 
+/// age(X25519) 키쌍을 새로 만들어 파일로 쓴다 — 개인키(identity)를 `key_path`에
+/// **0600**으로, 공개키(recipient)를 `pub_path`에 일반 권한으로 기록한다.
+///
+/// `init` 마법사의 "공개키 파일이 없으면 만들어 주기"와 `gen_age_key` 예제가 공유하는
+/// 단일 진입점이다(중복 구현 방지). 부모 디렉터리는 필요 시 생성한다. 반환값은
+/// recipient 공개키 문자열(`age1...`) — 생성 안내 출력용.
+///
+/// 시크릿(개인키)은 0600으로 격리되며, 백업 호스트엔 공개키만 두면 된다(§8.1/§8.5).
+pub fn generate_keypair_files(key_path: &std::path::Path, pub_path: &std::path::Path) -> Result<String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let identity = x25519::Identity::generate();
+    let recipient = identity.to_public();
+
+    for p in [key_path, pub_path] {
+        if let Some(parent) = p.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    XBackupError::Config(format!("키 디렉터리 생성 실패({}): {e}", parent.display()))
+                })?;
+            }
+        }
+    }
+
+    // 개인키 — 0600(소유자 전용)으로 격리 기록.
+    let mut key_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(key_path)
+        .map_err(|e| {
+            XBackupError::Config(format!("개인키 파일 생성 실패({}): {e}", key_path.display()))
+        })?;
+    writeln!(key_file, "{}", identity.to_string().expose_secret())
+        .map_err(|e| XBackupError::Config(format!("개인키 기록 실패({}): {e}", key_path.display())))?;
+
+    // 공개키(recipient) — 시크릿 아님.
+    std::fs::write(pub_path, format!("{recipient}\n")).map_err(|e| {
+        XBackupError::Config(format!("공개키 파일 기록 실패({}): {e}", pub_path.display()))
+    })?;
+
+    Ok(recipient.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,6 +281,41 @@ mod tests {
         let mut r = reader;
         r.read_to_end(&mut out).await?;
         Ok(out)
+    }
+
+    /// generate_keypair_files: 키쌍을 만들고, 그 공개키로 암호화한 산출물을 같은
+    /// 개인키로 복호화하면 원본이 복원된다(생성물이 실제로 짝이 맞는 유효한 키쌍).
+    #[tokio::test]
+    async fn generated_keypair_round_trips() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("age.key");
+        let pub_path = dir.path().join("nested").join("age.pub"); // 부모 디렉터리 자동 생성 확인
+
+        let recipient = generate_keypair_files(&key_path, &pub_path).unwrap();
+        assert!(recipient.starts_with("age1"), "recipient는 age1 공개키여야 함");
+        assert!(key_path.exists() && pub_path.exists());
+
+        // 개인키는 0600으로 격리돼야 한다.
+        let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "개인키는 0600이어야 함");
+
+        // 공개키 파일로 암호화 → 개인키 파일로 복호화 → 원본 복원.
+        let plaintext = b"generated-keypair-round-trip".to_vec();
+        let encrypt = Box::new(
+            AgeEncryptStage::from_recipient_file(pub_path.to_str().unwrap()).unwrap(),
+        );
+        let encrypted = drain_result(encrypt.wrap(reader_from(&plaintext)))
+            .await
+            .unwrap();
+        let decrypt = Box::new(
+            AgeDecryptStage::from_identity_file(key_path.to_str().unwrap()).unwrap(),
+        );
+        let decrypted = drain_result(decrypt.wrap(reader_from(&encrypted)))
+            .await
+            .unwrap();
+        assert_eq!(decrypted, plaintext);
     }
 
     /// age 암호화 → 같은 키로 복호화가 원본을 복원한다(round-trip).

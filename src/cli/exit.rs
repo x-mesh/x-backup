@@ -28,8 +28,8 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
     if needs_config && config.is_none() && std::io::stderr().is_terminal() {
         eprintln!(
             "ℹ config 미지정 — `--config <PATH>`/`XB_CONFIG`로 지정하거나, 현재 디렉터리에 \
-             `xbackup.toml`을 두면 자동 인식합니다. xbenv 워크스페이스면 `source <ws>/activate`, \
-             env로 직접 주입하려면 `XB_SOURCE__URI` 등을 설정하세요."
+             `xbackup.toml`(또는 `config.toml`)을 두면 자동 인식합니다. xbenv 워크스페이스면 \
+             `source <ws>/activate`, env로 직접 주입하려면 `XB_SOURCE__URI` 등을 설정하세요."
         );
     }
     match command {

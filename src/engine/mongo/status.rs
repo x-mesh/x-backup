@@ -453,10 +453,14 @@ impl StatusChecker {
     }
 
     /// 전체 status 점검(FR-8 1~8) — 사람·`--json` 출력용 보고서를 만든다.
+    ///
+    /// `mongodump_program`이 `Some`이면 mongodump 엔진으로 보고 도구 존재/버전 정합까지
+    /// 점검한다. `None`이면 native 엔진 — 외부 도구가 필요 없으므로 버전 항목은 서버 버전만
+    /// 표시한다(mongodump 부재를 실패로 보지 않음). precheck_subset과 동일한 규약이다.
     pub async fn full_report(
         &self,
         profile: &str,
-        mongodump_program: &str,
+        mongodump_program: Option<&str>,
         interval: &str,
         prefer_secondary: bool,
         lang: crate::i18n::Lang,
@@ -479,8 +483,11 @@ impl StatusChecker {
 
         // 2) 권한.
         items.push(self.check_privileges(lang).await);
-        // 3) 버전 정합.
-        items.push(self.check_version(mongodump_program, lang).await);
+        // 3) 버전 — mongodump 엔진은 도구 정합까지, native 엔진은 서버 버전만(도구 불필요).
+        items.push(match mongodump_program {
+            Some(prog) => self.check_version(prog, lang).await,
+            None => self.check_version_native(lang).await,
+        });
         // 3.5) FCV(호환성 경계).
         items.push(self.check_fcv(lang).await);
         // 6) 저장 엔진.
@@ -788,6 +795,37 @@ impl StatusChecker {
             status,
             message: msg,
             // 비교는 서버 버전 기준(mongodump는 로컬 도구라 서버 간 diff 의미 없음).
+            value: Some(server_version),
+        }
+    }
+
+    /// 3') 버전 — native 엔진 경로. 외부 도구(mongodump)가 필요 없으므로 서버 버전만
+    /// 표시하고 항상 `Ok`다(도구 부재가 백업을 막지 않는다). 서버 조회 자체가 실패하면 Fail.
+    async fn check_version_native(&self, lang: crate::i18n::Lang) -> CheckItem {
+        let server_version = match self.run_admin(doc! { "buildInfo": 1 }).await {
+            Ok(doc) => doc.get_str("version").unwrap_or("unknown").to_string(),
+            Err(e) => {
+                return CheckItem::fail(
+                    "version",
+                    "version",
+                    lang.sel(
+                        &format!("buildInfo lookup failed: {e}"),
+                        &format!("buildInfo 조회 실패: {e}"),
+                    ),
+                )
+                .with_value("조회 실패");
+            }
+        };
+        CheckItem {
+            key: "version",
+            label: "version",
+            status: CheckStatus::Ok,
+            message: lang
+                .sel(
+                    &format!("server={server_version}, engine=native (mongodump not required)"),
+                    &format!("서버={server_version}, 엔진=native (mongodump 불필요)"),
+                )
+                .to_string(),
             value: Some(server_version),
         }
     }

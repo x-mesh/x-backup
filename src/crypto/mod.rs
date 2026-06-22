@@ -32,7 +32,7 @@ use crate::pipeline::stage::PipelineStage;
 use crate::storage::BoxAsyncRead;
 
 pub use self::aes_gcm::{AesGcmDecryptStage, AesGcmEncryptStage, ALGORITHM_AES_GCM};
-pub use self::age::{AgeDecryptStage, AgeEncryptStage, ALGORITHM_AGE};
+pub use self::age::{generate_keypair_files, AgeDecryptStage, AgeEncryptStage, ALGORITHM_AGE};
 
 /// 암복호 펌프 reader 어댑터 — 펌프 태스크의 [`JoinHandle`]을 붙잡아, duplex가
 /// EOF를 줄 때 **펌프 결과를 확인한다**.

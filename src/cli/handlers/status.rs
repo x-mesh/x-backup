@@ -65,11 +65,9 @@ pub async fn handle(
         return handle_all(config_toml.as_deref(), args.json, args.ns_detail, lang).await;
     }
 
-    // 단일 프로파일(--all 아니면 --profile 필수 — clap이 강제).
-    let profile = args
-        .profile
-        .as_deref()
-        .ok_or_else(|| XBackupError::Usage("--profile 또는 --all이 필요합니다".into()))?;
+    // 단일 프로파일 — 미지정이면 빈 문자열로 두어 build가 config의 default_profile로
+    // 폴백한다(list/backup과 일관). 셋 다 없으면 build/ResolvedConfig가 명확히 거부한다.
+    let profile = args.profile.as_deref().unwrap_or("");
     // --json은 기계 판독 안정성을 위해 언어를 En으로 고정한다(사람 출력만 resolve된 lang 사용).
     let report_lang = if args.json {
         crate::i18n::Lang::En
@@ -268,12 +266,17 @@ async fn build_report(
         crate::engine::postgres::status::full_report(&resolved.profile_name, &uri, timeout, lang)
             .await
     } else {
+        // 엔진별 도구 점검 — native는 외부 도구 불필요(None), mongodump는 도구 존재/버전 점검.
+        let tool = match crate::pipeline::backup::Engine::parse(&resolved.profile.mode.engine)? {
+            crate::pipeline::backup::Engine::Native => None,
+            crate::pipeline::backup::Engine::Mongodump => Some(DEFAULT_MONGODUMP),
+        };
         match StatusChecker::connect(&uri, timeout).await {
             Ok(checker) => {
                 checker
                     .full_report(
                         &resolved.profile_name,
-                        DEFAULT_MONGODUMP,
+                        tool,
                         &interval,
                         prefer_secondary,
                         lang,

@@ -33,7 +33,9 @@ pub fn resolve_config_path(explicit: Option<std::path::PathBuf>) -> Option<std::
     if explicit.is_some() {
         return explicit;
     }
-    const CANDIDATES: [&str; 2] = ["xbackup.toml", ".xbackup/config.toml"];
+    // `config.toml`은 `init`이 생성하는 기본 파일명 — init 직후 같은 디렉터리에서
+    // `status`/`doctor`가 바로 인식되도록 후보에 포함한다(xbackup.toml 우선).
+    const CANDIDATES: [&str; 3] = ["xbackup.toml", "config.toml", ".xbackup/config.toml"];
     CANDIDATES
         .iter()
         .map(std::path::PathBuf::from)
