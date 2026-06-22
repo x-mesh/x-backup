@@ -34,7 +34,7 @@ BINDIR := $(PREFIX)/bin
         bump-patch bump-minor bump-major tag release release-dry release-skip-tap \
         test test-integration test-s3 test-pg test-pg-integration \
         mongodb-up mongodb-down postgres-up postgres-down tools scenario scenario-pg \
-        clean devenv devenv-down xbenv-mongo xbenv-pg xbenv-both xbenv-clean
+        clean clean-all devenv devenv-down xbenv-mongo xbenv-pg xbenv-both xbenv-clean
 
 help: ## 타깃 목록 출력
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -206,6 +206,11 @@ xbenv-clean: ## 격리 워크스페이스 제거(.xbenv-mongo/.xbenv-pg/.xbenv-b
 	  if [ -e "$$d" ]; then scripts/xbenv destroy "$$d" --yes; fi; \
 	done
 
-clean: ## 빌드 산출물·도구 제거(컨테이너는 *-down 타깃으로)
+clean: ## 빌드·릴리스 산출물·도구 제거(target/dist/.tools, 컨테이너는 *-down 타깃으로)
 	cargo clean
-	rm -rf $(TOOLS_DIR)
+	rm -rf $(TOOLS_DIR) dist
+
+# 컨테이너는 유지 — devenv-down은 mongodb-down까지 호출하므로 의존 대신 .devenv만 직접 제거.
+# xbenv-clean은 컨테이너를 내리지 않고 워크스페이스+격리 DB만 정리하므로 그대로 위임한다.
+clean-all: clean xbenv-clean ## clean + 격리 워크스페이스(.xbenv-*)·.devenv 메타 제거(컨테이너는 유지)
+	rm -rf .devenv
