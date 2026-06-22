@@ -22,6 +22,7 @@
 #     --engine both : mongo+pg를 한 워크스페이스에(프로파일 mongo/mongo-target/pg/pg-target).
 #                     'make mongodb-up && make postgres-up' 둘 다 필요.
 #   adopt <dir> [--name PROFILE]   # 기존 config 디렉터리(.devenv 등)를 복사 없이 activate로 감싸기
+#   ensure-db [dir]                # PG 격리 DB 자가복구(누락 시 멱등 생성, 기본 dir=$PWD)
 #   destroy <dir> [--yes]
 #   help
 #
@@ -75,6 +76,30 @@ pg_create_db() {
   else
     docker exec -i "$ctr" psql -v ON_ERROR_STOP=1 -U "$PGUSER" -d postgres \
       -c "CREATE DATABASE \"$db\"" >/dev/null && log "PG DB 생성: $db ($ctr)"
+  fi
+}
+
+# 컨테이너가 healthy가 될 때까지 폴링(기본 30초). compose가 `--wait` 없이 떴거나 막 기동
+# 중인 레이스를 흡수한다. healthy면 0, 타임아웃이면 1을 반환(종료하지 않음).
+pg_wait_healthy() {
+  local ctr="${1:-$PG_CTR}" secs="${2:-30}" i=0
+  pg_healthy "$ctr" && return 0
+  log "$ctr healthy 대기 중(최대 ${secs}s)…"
+  while [ "$i" -lt "$secs" ]; do
+    sleep 1; i=$((i+1))
+    pg_healthy "$ctr" && return 0
+  done
+  return 1
+}
+
+# healthy 대기 후 DB를 멱등 생성. 끝내 healthy가 아니면 실행 가능한 복구 명령만 안내하고
+# (워크스페이스 생성은 계속) 종료하지 않는다 — 생성 시점 레이스/컨테이너 미기동 대비.
+pg_ensure_db() {
+  local ctr="$1" db="$2"
+  if pg_wait_healthy "$ctr"; then
+    pg_create_db "$ctr" "$db"
+  else
+    warn "$ctr healthy 아님 — DB '$db' 미생성. 'make postgres-up' 후 'scripts/xbenv ensure-db <워크스페이스>'로 자가복구하세요."
   fi
 }
 
@@ -286,10 +311,8 @@ cmd_new() {
     src_db="xbenv_$name"; tgt_db="xbenv_${name}_restore"; pg_profile="$name"
     src="postgres://$PGUSER:$PGPASS@localhost:$PGPORT/$src_db"
     tgt="postgres://$PGUSER:$PGPASS@localhost:$PG_TGT_PORT/$tgt_db"
-    if pg_healthy "$PG_CTR"; then pg_create_db "$PG_CTR" "$src_db"
-    else warn "$PG_CTR healthy 아님 — 소스 DB 미생성. 'make postgres-up' 후 createdb 하세요($src_db)."; fi
-    if pg_healthy "$PG_TGT_CTR"; then pg_create_db "$PG_TGT_CTR" "$tgt_db"
-    else warn "$PG_TGT_CTR healthy 아님 — 타깃 DB 미생성. 'make postgres-up' 후 createdb 하세요($tgt_db)."; fi
+    pg_ensure_db "$PG_CTR" "$src_db"
+    pg_ensure_db "$PG_TGT_CTR" "$tgt_db"
   else
     src="mongodb://localhost:$MONGO_PORT/?replicaSet=rs0&directConnection=true"
     tgt="mongodb://localhost:$MONGO_TGT_PORT/?replicaSet=rs0&directConnection=true"
@@ -330,10 +353,8 @@ cmd_new_both() {
   local p_src p_tgt
   p_src="postgres://$PGUSER:$PGPASS@localhost:$PGPORT/$pg_src_db"
   p_tgt="postgres://$PGUSER:$PGPASS@localhost:$PG_TGT_PORT/$pg_tgt_db"
-  if pg_healthy "$PG_CTR"; then pg_create_db "$PG_CTR" "$pg_src_db"
-  else warn "$PG_CTR healthy 아님 — PG 소스 DB 미생성. 'make postgres-up' 후 createdb 하세요($pg_src_db)."; fi
-  if pg_healthy "$PG_TGT_CTR"; then pg_create_db "$PG_TGT_CTR" "$pg_tgt_db"
-  else warn "$PG_TGT_CTR healthy 아님 — PG 타깃 DB 미생성. 'make postgres-up' 후 createdb 하세요($pg_tgt_db)."; fi
+  pg_ensure_db "$PG_CTR" "$pg_src_db"
+  pg_ensure_db "$PG_TGT_CTR" "$pg_tgt_db"
 
   write_config_both "$dir" "$m_src" "$m_tgt" "$p_src" "$p_tgt"
   # XB_PROFILE은 default_profile(mongo)로 고정한다 — plain `x-backup status/backup`이 바로
@@ -455,12 +476,32 @@ cmd_destroy() {
   log "제거 완료: $dir"
 }
 
+# ── ensure-db: 기존 워크스페이스의 PG 격리 DB 자가복구 ──────────────────────────
+# 워크스페이스를 컨테이너 기동 전에 만들어 DB가 누락된 경우(생성 시점 레이스)나 destroy -v
+# 후 컨테이너만 재기동한 경우를 위해, .xbenv 메타가 가리키는 src_db/tgt_db를 멱등 생성한다.
+# src_db→소스 컨테이너(:PGPORT), tgt_db→타깃 컨테이너(:PG_TGT_PORT). engine=mongo면 무동작.
+cmd_ensure_db() {
+  local dir="${1:-$PWD}"
+  [ -f "$dir/.xbenv" ] || err "워크스페이스 메타 없음: $dir/.xbenv (xbenv 워크스페이스 경로를 지정하세요)"
+  local engine="" name="" src_db="" tgt_db="" pg_profile=""
+  # shellcheck disable=SC1090,SC1091
+  . "$dir/.xbenv"
+  case "$engine" in
+    pg|both) ;;
+    *) log "engine=$engine — PG 격리 DB 없음(ensure-db 불필요): $dir"; return 0 ;;
+  esac
+  [ -n "$src_db" ] && pg_ensure_db "$PG_CTR" "$src_db"
+  [ -n "$tgt_db" ] && pg_ensure_db "$PG_TGT_CTR" "$tgt_db"
+  log "ensure-db 완료: $dir"
+}
+
 # ── 라우팅 ──────────────────────────────────────────────────────────────────
 cmd="${1:-help}"; shift || true
 case "$cmd" in
   new)            cmd_new "$@" ;;
   adopt)          cmd_adopt "$@" ;;
+  ensure-db)      cmd_ensure_db "$@" ;;
   destroy|rm)     cmd_destroy "$@" ;;
   help|-h|--help) usage ;;
-  *) err "알 수 없는 명령: $cmd (new|adopt|destroy|help)" ;;
+  *) err "알 수 없는 명령: $cmd (new|adopt|ensure-db|destroy|help)" ;;
 esac
