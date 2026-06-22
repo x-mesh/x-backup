@@ -24,8 +24,11 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, ReadBuf};
 
+use std::path::{Path, PathBuf};
+
 use crate::engine::mongo::meta::ServerMeta;
 use crate::engine::mongo::{MongoMeta, RestoreProcess, RestoreSpec, UriConfigFile};
+use crate::engine::native::{native_export_to_dir, ExportSummary};
 use crate::error::{Result, XBackupError};
 use crate::manifest::schema::{BackupManifest, BackupType};
 use crate::manifest::store::{data_path, ManifestStore, MANIFEST_FILE};
@@ -265,6 +268,66 @@ where
         backup_id: plan.backup_id.clone(),
         stored_size_bytes: plan.stored_size_bytes,
         plan,
+    })
+}
+
+/// `restore --to-dir` 결과 — 추출한 백업 ID·출력 경로·집계.
+#[derive(Debug, Clone)]
+pub struct ExportOutcome {
+    /// 추출한 백업 ID.
+    pub backup_id: String,
+    /// 출력 디렉터리(mongodump 레이아웃 루트).
+    pub out_dir: PathBuf,
+    /// 컬렉션/문서/바이트 집계.
+    pub summary: ExportSummary,
+}
+
+/// 백업을 **서버 없이** mongodump `--out` 레이아웃의 로컬 디렉터리로 추출한다.
+///
+/// 백업 선택(`--id` 우선, 없으면 최신 풀)·역스택(복호화→압축해제)은 복구 경로와 동일하게
+/// 재사용하고, mongorestore 대신 [`native_export_to_dir`]로 `.bson`+`.metadata.json`을 쓴다.
+/// **native(기본) 풀 백업만** 지원한다 — mongodump/PG 포맷·증분은 명확히 거부한다(추출 결과가
+/// 표준 도구로 안 열리거나 단독 덤프가 아니기 때문). `only`는 ns 필터(`db.collection`).
+pub async fn export_to_dir(
+    storage: &dyn Storage,
+    backup_id: Option<&str>,
+    out_dir: &Path,
+    only: Option<&str>,
+) -> Result<ExportOutcome> {
+    let store = ManifestStore::new(storage);
+    let manifest = match backup_id {
+        Some(id) => store.read(id).await?,
+        None => latest_full_manifest(storage).await?,
+    };
+
+    // 가드 1: native 포맷만(mongodump archive/PG는 표준 BSON 덤프로 못 푼다).
+    let fmt = manifest.tool_versions.archive_format.as_deref();
+    if fmt != Some(crate::engine::native::archive::FORMAT_ID) {
+        return Err(XBackupError::Usage(format!(
+            "--to-dir는 native(기본) mongo 백업만 BSON 덤프로 추출합니다(이 백업 포맷: {}). \
+             mongodump/PG 백업은 임시 서버로 복구한 뒤 표준 도구로 추출하세요.",
+            fmt.unwrap_or("unknown")
+        )));
+    }
+    // 가드 2: 풀 백업만(증분은 oplog 슬라이스라 단독 덤프 디렉터리가 아니다).
+    if !matches!(manifest.backup_type, BackupType::Full) {
+        return Err(XBackupError::Usage(
+            "증분 백업은 --to-dir로 추출할 수 없습니다 — 풀 백업만 가능합니다(증분은 \
+             서버 복구/PITR로 적용하세요)."
+                .into(),
+        ));
+    }
+
+    // data.bin → 역스택(복호화→압축해제) → 네이티브 프레임 스트림.
+    let stages = reverse_stack_for(&manifest)?;
+    let raw = storage.get_stream(&data_path(&manifest.id)).await?;
+    let mut stream = stages.apply(raw);
+    let summary = native_export_to_dir(&mut stream, out_dir, only).await?;
+
+    Ok(ExportOutcome {
+        backup_id: manifest.id,
+        out_dir: out_dir.to_path_buf(),
+        summary,
     })
 }
 

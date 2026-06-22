@@ -213,6 +213,15 @@ pub struct RestoreArgs {
     /// 진행/결과를 기계 판독 JSON으로 출력한다.
     #[arg(long)]
     pub json: bool,
+    /// DB 서버로 복원하는 대신, 백업을 mongodump 레이아웃(`<db>/<coll>.bson` +
+    /// `.metadata.json`)으로 이 디렉터리에 추출한다. 서버 없이 `mongorestore <DIR>`로 쓸 수
+    /// 있다. native(기본) 풀 백업만 지원. `--target`/`--target-profile`/`--at`과 택일.
+    #[arg(
+        long = "to-dir",
+        value_name = "DIR",
+        conflicts_with_all = ["target", "target_profile", "at"]
+    )]
+    pub to_dir: Option<PathBuf>,
 }
 
 /// list 정렬 기준.

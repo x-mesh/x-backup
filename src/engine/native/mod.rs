@@ -14,7 +14,9 @@
 
 pub mod archive;
 pub mod backup;
+pub mod export;
 pub mod restore;
 
 pub use backup::{NativeDumpStream, NativeDumper};
+pub use export::{native_export_to_dir, ExportSummary};
 pub use restore::native_restore;

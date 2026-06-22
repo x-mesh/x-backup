@@ -23,7 +23,7 @@ use crate::error::{Result, XBackupError};
 use crate::i18n::Lang;
 use crate::pipeline::pg_pitr::{run_pg_pitr, PgPitrPlan, PgPitrRequest};
 use crate::pipeline::pitr::{run_pitr, PitrPlan, PitrRequest};
-use crate::pipeline::restore::{run_restore, RestorePlan, RestoreRequest};
+use crate::pipeline::restore::{export_to_dir, run_restore, RestorePlan, RestoreRequest};
 use crate::storage::{from_config, Storage};
 
 /// `restore` 핸들러 진입점.
@@ -56,6 +56,12 @@ pub async fn handle(
         profile_name: &args.profile,
         overrides: &overrides,
     })?;
+
+    // --to-dir: DB 서버로 복원하는 대신 백업을 로컬 mongodump 덤프로 추출한다(서버 불필요).
+    //   target 해석·연결을 전부 건너뛰는 별도 경로.
+    if let Some(to_dir) = args.to_dir.clone() {
+        return handle_export(&resolved, &args, to_dir, lang).await;
+    }
 
     // 2) 복구 대상 URI·출처: --target(URI) > --target-profile(다른 프로파일 source) >
     //    프로파일 자신 source(in-place 기본).
@@ -190,6 +196,170 @@ pub async fn handle(
         }
     }
 
+    Ok(())
+}
+
+/// `--to-dir` 경로 — 백업을 **서버 없이** 로컬 mongodump 덤프 디렉터리로 추출한다.
+///
+/// target 해석·연결을 전혀 하지 않는다. 백업 선택(`--id`/피커/최신)·`--from`·`--only`·dry-run·
+/// `--json`은 일반 복구와 동일하게 동작하고, 실제 쓰기는 [`export_to_dir`]가 한다(native 풀
+/// 백업만 — 가드는 거기서). 끝에 `mongorestore <DIR>` 안내를 덧붙인다.
+async fn handle_export(
+    resolved: &ResolvedConfig,
+    args: &RestoreArgs,
+    to_dir: PathBuf,
+    lang: Lang,
+) -> Result<()> {
+    let storage = select_restore_storage(
+        &resolved.profile,
+        &resolved.profile_name,
+        args.from.as_deref(),
+    )?;
+    let mode = OutputMode::resolve_from_env(
+        OutputFlags {
+            json: args.json,
+            quiet: args.quiet,
+            progress: args.progress,
+        },
+        Some(resolved.profile.mode.output.as_str()),
+    );
+    crate::cli::output::print_run_context(&args.profile, None, mode);
+
+    let is_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let backup_id = resolve_backup_id(args, storage.as_ref(), is_tty, lang).await?;
+
+    // dry-run: 무엇을 어디로 추출할지만 알리고 무변경(피커는 위에서 이미 선택값 반영).
+    if args.dry_run {
+        let target = backup_id.as_deref().unwrap_or("(latest full)");
+        if mode.emits_json() {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "dry_run": true,
+                    "backup_id": backup_id,
+                    "to_dir": to_dir.display().to_string(),
+                })
+            );
+        } else {
+            const W: usize = 12;
+            println!(
+                "{}",
+                style(
+                    lang.sel(
+                        "Export plan (dry-run) — no files written",
+                        "추출 계획(dry-run) — 파일 미생성"
+                    ),
+                    Tone::Plan,
+                )
+            );
+            println!("{}", field_line_toned("backup", target, W, Tone::Value));
+            println!(
+                "{}",
+                field_line_toned("to-dir", to_dir.display().to_string(), W, Tone::Value)
+            );
+        }
+        return Ok(());
+    }
+
+    // 출력 디렉터리에 기존 내용이 있으면 경고(같은 이름 파일은 덮어쓴다).
+    if !mode.emits_json() && crate::engine::native::export::dir_nonempty(&to_dir) {
+        eprintln!(
+            "{}",
+            style_stderr(
+                &lang.sel(
+                    &format!(
+                        "⚠ output dir is not empty — same-named files will be overwritten: {}",
+                        to_dir.display()
+                    ),
+                    &format!(
+                        "⚠ 출력 디렉터리가 비어있지 않습니다 — 같은 이름 파일은 덮어씁니다: {}",
+                        to_dir.display()
+                    ),
+                ),
+                Tone::Warning,
+            )
+        );
+    }
+
+    let outcome = export_to_dir(
+        storage.as_ref(),
+        backup_id.as_deref(),
+        &to_dir,
+        args.only.as_deref(),
+    )
+    .await?;
+
+    if mode.emits_json() {
+        println!(
+            "{}",
+            serde_json::json!({
+                "backup_id": outcome.backup_id,
+                "to_dir": outcome.out_dir.display().to_string(),
+                "collections": outcome.summary.collections,
+                "documents": outcome.summary.documents,
+                "bytes": outcome.summary.bytes,
+                "exported": true,
+            })
+        );
+    } else if mode.shows_human_summary() {
+        const W: usize = 14;
+        println!(
+            "{}",
+            style(lang.sel("Export complete", "추출 완료"), Tone::Success)
+        );
+        println!(
+            "{}",
+            field_line_toned("backup id", &outcome.backup_id, W, Tone::Value)
+        );
+        println!(
+            "{}",
+            field_line_toned(
+                "to-dir",
+                outcome.out_dir.display().to_string(),
+                W,
+                Tone::Value
+            )
+        );
+        println!(
+            "{}",
+            field_line_toned(
+                "collections",
+                outcome.summary.collections.to_string(),
+                W,
+                Tone::Value
+            )
+        );
+        println!(
+            "{}",
+            field_line_toned(
+                "documents",
+                outcome.summary.documents.to_string(),
+                W,
+                Tone::Value
+            )
+        );
+        println!(
+            "{}",
+            field_line(
+                "size",
+                crate::engine::mongo::status::human_bytes(outcome.summary.bytes as i64),
+                W,
+            )
+        );
+        println!(
+            "{}",
+            style(
+                &lang.sel(
+                    &format!(
+                        "→ restore with:  mongorestore {}",
+                        outcome.out_dir.display()
+                    ),
+                    &format!("→ 복원:  mongorestore {}", outcome.out_dir.display())
+                ),
+                Tone::Plan,
+            )
+        );
+    }
     Ok(())
 }
 
