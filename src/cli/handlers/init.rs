@@ -76,6 +76,7 @@ pub async fn handle(
                 watch: false,
                 interval: 1.0,
                 count: 0,
+                ns_detail: false,
             };
             return crate::cli::handlers::status::handle(Some(target), lang_flag, status_args)
                 .await;

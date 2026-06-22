@@ -46,6 +46,10 @@ pub struct CatalogRow {
     pub chain_status: String,
     /// base 풀백업 ID(증분만; full/orphan은 None).
     pub base_id: Option<String>,
+    /// 증분 요청이 gap으로 풀 승격된 백업인지(`kind`=full + 이 값 true). 표시에서 일반
+    /// full과 구분한다 — "증분 했는데 full" 혼란 방지(SC2). `kind`는 `--type` 필터용이라
+    /// 손대지 않고 별도 플래그로 둔다.
+    pub promoted_from_gap: bool,
 }
 
 /// `list` 핸들러 진입점.
@@ -231,6 +235,7 @@ pub async fn build_catalog(storage: &dyn Storage) -> Result<Vec<CatalogRow>> {
             stored_size_bytes: m.stored_size_bytes,
             chain_status,
             base_id: m.base_id.clone(),
+            promoted_from_gap: m.promoted_from_gap,
         });
     }
 
@@ -251,6 +256,7 @@ pub async fn build_catalog(storage: &dyn Storage) -> Result<Vec<CatalogRow>> {
             stored_size_bytes: size,
             chain_status: "corrupt".to_string(),
             base_id: None,
+            promoted_from_gap: false,
         });
     }
 
@@ -301,6 +307,7 @@ fn detect_orphans(entries: &[StorageEntry], known_ids: &[String]) -> Vec<Catalog
             stored_size_bytes: e.size,
             chain_status: "orphan".to_string(),
             base_id: None,
+            promoted_from_gap: false,
         });
     }
     rows
@@ -397,9 +404,15 @@ fn print_human(
         ],
     );
     for r in rows {
+        // gap 승격 full은 TYPE을 `full(gap)`으로 — 일반 full과 구분(증분→full 폴백 가시화).
+        let type_label = if r.promoted_from_gap {
+            "full(gap)".to_string()
+        } else {
+            r.kind.clone()
+        };
         let cells = vec![
             r.id.clone(),
-            r.kind.clone(),
+            type_label,
             r.engine.clone(), // DB 엔진(postgresql/mongodb)
             short_created(r.created_at.as_deref()),
             human_bytes(r.stored_size_bytes as i64), // raw bytes → "1.9 MiB"
@@ -523,6 +536,7 @@ fn print_json(rows: &[CatalogRow], store_loc: &str) {
             serde_json::json!({
                 "id": r.id,
                 "type": r.kind,
+                "promoted_from_gap": r.promoted_from_gap,
                 "engine": r.engine,
                 "created_at": r.created_at,
                 "stored_size_bytes": r.stored_size_bytes,
@@ -573,6 +587,22 @@ mod tests {
 
     async fn write_manifest(fs: &LocalFs, m: &BackupManifest) {
         ManifestStore::new(fs).write(m).await.unwrap();
+    }
+
+    /// gap 승격 full은 kind=full을 유지하면서 promoted_from_gap=true로 표식된다
+    /// (TYPE 표시는 `full(gap)`, `--type full` 필터는 그대로 매칭).
+    #[tokio::test]
+    async fn catalog_marks_gap_promoted_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = LocalFs::new(dir.path()).unwrap();
+        let mut m = manifest("g1", BackupType::Full, None);
+        m.promoted_from_gap = true;
+        write_manifest(&fs, &m).await;
+
+        let rows = build_catalog(&fs).await.unwrap();
+        let row = rows.iter().find(|r| r.id == "g1").expect("행 존재");
+        assert_eq!(row.kind, "full", "필터용 kind는 full 유지");
+        assert!(row.promoted_from_gap, "gap 승격 표식");
     }
 
     /// 연속 체인은 모든 행이 ok.

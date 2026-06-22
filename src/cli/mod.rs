@@ -21,3 +21,21 @@ pub mod table;
 
 pub use crate::i18n::Lang;
 pub use args::{Cli, Command};
+
+/// 명시적 config(`--config`/`XB_CONFIG`)가 없을 때만 프로젝트 로컬 표준 위치를 탐색한다.
+///
+/// x-backup은 의도적으로 광범위한 자동 탐색을 하지 않는다(어느 config를 보는지 모호해지지
+/// 않게 — FR-10). 다만 현재 디렉터리의 표준 파일 하나 정도는 매번 `--config` 풀패스를 적는
+/// 마찰을 줄여준다. 발견 경로는 핸들러의 `config:` 라인으로 그대로 표면화되어 "지금 무엇을
+/// 보는지"가 가려지지 않는다. clap이 `XB_CONFIG`를 `--config`로 접어주므로 여기서 `explicit`이
+/// `Some`이면 둘 중 하나가 지정된 것 — 그땐 탐색하지 않는다.
+pub fn resolve_config_path(explicit: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    const CANDIDATES: [&str; 2] = ["xbackup.toml", ".xbackup/config.toml"];
+    CANDIDATES
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.is_file())
+}

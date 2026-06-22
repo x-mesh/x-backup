@@ -3,6 +3,8 @@
 //! 모든 서브커맨드가 실제 핸들러로 라우팅된다. 각 핸들러는 [`crate::error::Result`]를
 //! 반환하고, `main`이 에러의 [`crate::error::XBackupError::exit_code`]로 프로세스를 종료한다.
 
+use std::io::IsTerminal;
+
 use crate::cli::{handlers, Cli, Command};
 use crate::error::Result;
 
@@ -17,6 +19,19 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         command,
         ..
     } = cli;
+    // --config/XB_CONFIG 미지정이면 프로젝트 로컬 표준 위치를 탐색한다(매번 풀패스 입력 완화).
+    let config = crate::cli::resolve_config_path(config);
+    // config를 쓰는 서브커맨드인데 끝내 못 찾았으면, 대화형에서만 한 줄 안내한다(범용 cryptic
+    // 에러를 보기 전에 길을 알려줌). env-only(XB_SOURCE__URI 등) 주입은 유효하므로 차단하지
+    // 않고, 비대화형(cron/CI)은 노이즈 방지를 위해 침묵한다. init/update는 config가 불필요.
+    let needs_config = !matches!(command, Command::Init(_) | Command::Update(_));
+    if needs_config && config.is_none() && std::io::stderr().is_terminal() {
+        eprintln!(
+            "ℹ config 미지정 — `--config <PATH>`/`XB_CONFIG`로 지정하거나, 현재 디렉터리에 \
+             `xbackup.toml`을 두면 자동 인식합니다. xbenv 워크스페이스면 `source <ws>/activate`, \
+             env로 직접 주입하려면 `XB_SOURCE__URI` 등을 설정하세요."
+        );
+    }
     match command {
         Command::Init(args) => handlers::init::handle(config, lang, args).await,
         Command::Backup(args) => handlers::backup::handle(config, lang, args).await,
@@ -67,6 +82,7 @@ mod tests {
             watch: false,
             interval: 1.0,
             count: 0,
+            ns_detail: false,
         })))
         .await;
         // uri_env가 없는 프로파일 → Config(exit 2). 더 이상 미구현 스텁(exit 1)이 아니다.

@@ -62,7 +62,7 @@ pub async fn handle(
     }
 
     if args.all {
-        return handle_all(config_toml.as_deref(), args.json, lang).await;
+        return handle_all(config_toml.as_deref(), args.json, args.ns_detail, lang).await;
     }
 
     // 단일 프로파일(--all 아니면 --profile 필수 — clap이 강제).
@@ -101,11 +101,33 @@ pub async fn handle(
         crate::cli::output::context_mode(args.json),
     );
 
-    // 출력 — --json 구조화 또는 사람용 표.
+    // 출력 — --json 구조화 또는 사람용 표. --ns-detail이면 ns별 문서 수를 덧붙인다.
     if args.json {
-        render_json(&report)?;
+        if args.ns_detail {
+            let counts = collect_ns_counts(config_toml.as_deref(), profile)
+                .await
+                .unwrap_or_default();
+            let mut v = serde_json::to_value(&report)
+                .map_err(|e| XBackupError::Failure(format!("status JSON 직렬화 실패: {e}")))?;
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("namespaces".to_string(), ns_counts_json(&counts));
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&v)
+                    .map_err(|e| XBackupError::Failure(format!("status JSON 직렬화 실패: {e}")))?
+            );
+        } else {
+            render_json(&report)?;
+        }
     } else {
         render_human(&report, lang);
+        if args.ns_detail {
+            match collect_ns_counts(config_toml.as_deref(), profile).await {
+                Ok(counts) => print_ns_detail_human(profile, &counts, lang),
+                Err(e) => eprintln!("⚠ ns-detail 조회 실패(profile {profile}): {e}"),
+            }
+        }
     }
 
     // 신호등 → 종료 코드. fail이면 PrecheckFailed(exit 3), warn이면 Warning(exit 4), ok면 0.
@@ -115,7 +137,12 @@ pub async fn handle(
 /// `--all` — config의 모든 프로파일을 점검한다. 사람용 출력은 **프로파일별 전체 상세**
 /// (단일 `status`와 동일한 신호등 표)를 차례로 찍은 뒤, 마지막에 한 줄씩 종합 표를 붙인다.
 /// 종료 코드는 최악 신호등을 따른다. `-v`는 로그 레벨일 뿐 이 보고서 상세도와 무관하다.
-async fn handle_all(config_toml: Option<&str>, json: bool, lang: Lang) -> Result<()> {
+async fn handle_all(
+    config_toml: Option<&str>,
+    json: bool,
+    ns_detail: bool,
+    lang: Lang,
+) -> Result<()> {
     let raw = config_toml.ok_or_else(|| {
         XBackupError::Usage("--all에는 config 파일이 필요합니다(프로파일 목록)".into())
     })?;
@@ -135,12 +162,29 @@ async fn handle_all(config_toml: Option<&str>, json: bool, lang: Lang) -> Result
         reports.push(build_report(config_toml, name, report_lang).await?);
     }
 
+    // --ns-detail이면 프로파일별 ns 카운트를 best-effort로 미리 모은다(names와 인덱스 정렬).
+    // 연결 실패는 Err 문자열로 남겨 human은 경고로, json은 빈 배열로 처리한다.
+    let ns_results: Vec<std::result::Result<Vec<(String, u64)>, String>> = if ns_detail {
+        let mut v = Vec::with_capacity(names.len());
+        for name in &names {
+            v.push(
+                collect_ns_counts(config_toml, name)
+                    .await
+                    .map_err(|e| e.to_string()),
+            );
+        }
+        v
+    } else {
+        Vec::new()
+    };
+
     // 출력.
     if json {
         let items: Vec<serde_json::Value> = reports
             .iter()
-            .map(|r| {
-                serde_json::json!({
+            .enumerate()
+            .map(|(idx, r)| {
+                let mut obj = serde_json::json!({
                     "profile": r.profile,
                     "overall": format!("{:?}", r.overall).to_lowercase(),
                     "items": r.items.iter().map(|i| serde_json::json!({
@@ -150,7 +194,17 @@ async fn handle_all(config_toml: Option<&str>, json: bool, lang: Lang) -> Result
                         "value": i.value,
                         "message": i.message,
                     })).collect::<Vec<_>>(),
-                })
+                });
+                if ns_detail {
+                    let counts = ns_results[idx]
+                        .as_ref()
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[]);
+                    obj.as_object_mut()
+                        .unwrap()
+                        .insert("namespaces".to_string(), ns_counts_json(counts));
+                }
+                obj
             })
             .collect();
         println!("{}", serde_json::json!({ "profiles": items }));
@@ -160,6 +214,17 @@ async fn handle_all(config_toml: Option<&str>, json: bool, lang: Lang) -> Result
     } else {
         // 둘 이상이면 source(왼쪽=첫 열) 기준 비교 표.
         render_comparison(&reports, lang);
+    }
+
+    // --ns-detail 사람용 — 비교 표 뒤에 프로파일별 ns 섹션을 붙인다(json은 위에서 끼웠음).
+    if ns_detail && !json {
+        for (idx, name) in names.iter().enumerate() {
+            println!();
+            match &ns_results[idx] {
+                Ok(counts) => print_ns_detail_human(name, counts, lang),
+                Err(e) => eprintln!("⚠ ns-detail 조회 실패(profile {name}): {e}"),
+            }
+        }
     }
 
     // 최악 신호등으로 종료 코드 결정.
@@ -665,7 +730,6 @@ fn fmt_cell(text: &str, status: CheckStatus, differs: bool, width: usize, color:
         };
         return pad(&marked, width);
     }
-    let padded = pad(text, width);
     let status_code = match status {
         CheckStatus::Ok => "",
         CheckStatus::Warn => YELLOW,
@@ -684,10 +748,13 @@ fn fmt_cell(text: &str, status: CheckStatus, differs: bool, width: usize, color:
     } else {
         prefix.push_str(status_code);
     }
+    // 스타일은 **글자에만** 입히고 정렬용 패딩 공백은 RESET 뒤에 둔다 — UNDERLINE이 셀 폭
+    // 전체(공백 포함)로 번져 컬럼이 통째로 밑줄처럼 보이는 가독성 저하를 막는다.
+    let spaces = " ".repeat(width.saturating_sub(display_width(text)));
     if prefix.is_empty() {
-        padded
+        format!("{text}{spaces}")
     } else {
-        format!("{prefix}{padded}{RESET}")
+        format!("{prefix}{text}{RESET}{spaces}")
     }
 }
 
@@ -712,6 +779,88 @@ fn render_json(report: &StatusReport) -> Result<()> {
         .map_err(|e| XBackupError::Failure(format!("status JSON 직렬화 실패: {e}")))?;
     println!("{json}");
     Ok(())
+}
+
+/// `--ns-detail`: 한 프로파일의 ns별(컬렉션/테이블) 문서 수를 모은다(엔진 자동 분기, 읽기 전용).
+///
+/// mongo는 [`MongoMeta::namespace_counts`](crate::engine::mongo::MongoMeta)(사용자 컬렉션),
+/// PG는 [`table_counts_exact`](crate::engine::postgres::meta::table_counts_exact)(사용자 테이블)을
+/// 재사용한다 — peek와 동일 기준이라 결과가 일치한다. 연결/조회 실패는 호출자가 best-effort로
+/// 처리한다(한 프로파일 실패가 전체 status를 막지 않게).
+async fn collect_ns_counts(config_toml: Option<&str>, profile: &str) -> Result<Vec<(String, u64)>> {
+    let overrides = collect_overrides_from_process();
+    let resolved = ResolvedConfig::build(MergeInput {
+        config_toml,
+        profile_name: profile,
+        overrides: &overrides,
+    })?;
+    let uri = resolved.resolved_uri.clone().ok_or_else(|| {
+        XBackupError::Config(format!(
+            "프로파일 '{}'에 source.uri/uri_env가 없습니다",
+            resolved.profile_name
+        ))
+    })?;
+    let timeout = resolved.profile.source.connect_timeout_secs;
+    if crate::engine::DbKind::from_uri(uri.expose()) == crate::engine::DbKind::Postgres {
+        let pg = crate::engine::postgres::meta::connect(&uri, timeout).await?;
+        crate::engine::postgres::meta::table_counts_exact(pg.client()).await
+    } else {
+        let mongo = MongoMeta::connect(&uri, timeout).await?;
+        mongo.namespace_counts().await
+    }
+}
+
+/// ns별 문서 수를 사람용 섹션으로 stdout에 출력한다(정렬 폭 맞춤, 합계 한 줄).
+fn print_ns_detail_human(profile: &str, counts: &[(String, u64)], lang: Lang) {
+    let color = use_color();
+    println!(
+        "{}",
+        paint(
+            &lang.sel(
+                &format!("namespaces — profile: {profile} (user data)"),
+                &format!("네임스페이스 — 프로파일: {profile} (사용자 데이터)")
+            ),
+            &[BOLD],
+            color
+        )
+    );
+    if counts.is_empty() {
+        println!(
+            "  {}",
+            paint(
+                lang.sel("(no user namespaces)", "(사용자 네임스페이스 없음)"),
+                &[DIM],
+                color
+            )
+        );
+        return;
+    }
+    let w = counts
+        .iter()
+        .map(|(ns, _)| display_width(ns))
+        .max()
+        .unwrap_or(0);
+    let mut total = 0u64;
+    for (ns, c) in counts {
+        total += *c;
+        println!("  {}  {}", pad(ns, w), pad_left(&c.to_string(), 12));
+    }
+    println!(
+        "  {}  {}",
+        pad(lang.sel("TOTAL", "합계"), w),
+        pad_left(&total.to_string(), 12)
+    );
+}
+
+/// `--ns-detail` + `--json`: 보고서 JSON에 `namespaces` 배열을 끼워 한 객체로 출력한다
+/// (별도 객체를 또 찍어 기계 판독을 깨지 않도록).
+fn ns_counts_json(counts: &[(String, u64)]) -> serde_json::Value {
+    serde_json::Value::Array(
+        counts
+            .iter()
+            .map(|(ns, c)| serde_json::json!({ "ns": ns, "count": c }))
+            .collect(),
+    )
 }
 
 /// 점검 결과를 사람이 읽는 신호등 표로 stdout에 출력한다.
@@ -1323,6 +1472,14 @@ mod tests {
     fn fmt_cell_color_marks_diff_with_ansi() {
         let s = fmt_cell("7.0.35", CheckStatus::Ok, true, 8, true);
         assert!(s.contains(BOLD) && s.contains(UNDERLINE) && s.contains(RESET));
+        // 정렬 패딩 공백은 RESET 뒤에 와야 한다 — UNDERLINE이 공백까지 번지면 컬럼이 통째로
+        // 밑줄처럼 보여 가독성이 떨어진다(회귀 방지).
+        let (styled, tail) = s.split_once(RESET).expect("RESET 존재");
+        assert!(
+            !tail.is_empty() && tail.bytes().all(|b| b == b' '),
+            "패딩은 RESET 뒤 공백만"
+        );
+        assert!(!styled.contains(' '), "스타일 구간엔 공백이 없어야 한다");
     }
 
     #[test]

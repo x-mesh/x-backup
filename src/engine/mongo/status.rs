@@ -38,6 +38,12 @@ use crate::config::secret::Secret;
 use crate::error::{Result, XBackupError};
 
 /// 사용자 DB `dbStats` 합산 — 문서·컬렉션·인덱스 수와 데이터·저장·인덱스 크기(바이트).
+///
+/// **백업 범위와의 관계(실측):** 백업(mongodump, `--db` 미지정)은 사용자 DB 전체 +
+/// `admin`의 시스템 컬렉션 일부(`system.version`, 인증 시 `system.users`/`system.roles`)를
+/// 담고 `config`/`local`은 제외한다. 이 합산은 사용자 DB만 센다 — `admin`을 통째로 dbStats로
+/// 더하면 백업되지 않는 `admin.system.keys` 등까지 세어 **과다 계상**되므로, 정확한 사용자
+/// 데이터 수치를 값으로 쓰고 "백업이 추가로 담는 admin 메타"는 메시지로만 알린다.
 #[derive(Debug, Default, Clone, Copy)]
 struct DbTotals {
     objects: i64,
@@ -907,7 +913,8 @@ impl StatusChecker {
         })?;
         let mut t = DbTotals::default();
         for name in &db_names {
-            // 시스템 DB(local 등)는 백업 대상 추정에서 제외.
+            // 사용자 DB만 합산한다. config/local은 백업도 제외하고, admin은 백업이 시스템
+            // 메타 일부만 담아(system.version 등) dbStats 전량으로는 과다 계상되므로 뺀다.
             if matches!(name.as_str(), "admin" | "config" | "local") {
                 continue;
             }
@@ -928,7 +935,8 @@ impl StatusChecker {
         Ok(t)
     }
 
-    /// 7) 예상 크기 — dataSize/storageSize(+ 인덱스 크기)를 [`DbTotals`]에서 만든다.
+    /// 7) 예상 크기 — 사용자 DB의 dataSize/storageSize(+ 인덱스 크기). 백업이 추가로 담는
+    /// admin 시스템 메타는 수 KB 수준이라 크기 추정에선 무시한다.
     fn estimated_size_item(totals: &DbTotals) -> CheckItem {
         CheckItem::ok(
             "estimated_size",
@@ -946,7 +954,9 @@ impl StatusChecker {
         .with_value(human_bytes(totals.data_size))
     }
 
-    /// 데이터 형상 항목 — 문서 수·컬렉션 수·인덱스 수(+ 인덱스 크기). 비교 뷰의 drift 확인용.
+    /// 데이터 형상 항목 — 사용자 DB의 문서 수·컬렉션 수·인덱스 수(+ 인덱스 크기). 비교 뷰의
+    /// drift 확인용. 값은 사용자 데이터 기준(정확)이며, 백업 범위(= 사용자 DB + admin 시스템
+    /// 메타, config/local 제외)는 documents 메시지에 한 줄로 명시한다.
     fn shape_items(totals: &DbTotals, lang: crate::i18n::Lang) -> Vec<CheckItem> {
         vec![
             CheckItem::ok(
@@ -954,10 +964,13 @@ impl StatusChecker {
                 "documents",
                 lang.sel(
                     &format!(
-                        "~{} documents (sum of estimatedDocumentCount)",
+                        "~{} user documents — backup scope = user DBs + admin system metadata (config/local excluded)",
                         totals.objects
                     ),
-                    &format!("추정 문서 {}건(estimatedDocumentCount 합)", totals.objects),
+                    &format!(
+                        "사용자 문서 ~{}건 — 백업 범위 = 사용자 DB + admin 시스템 메타(config/local 제외)",
+                        totals.objects
+                    ),
                 ),
             )
             .with_value(totals.objects.to_string()),

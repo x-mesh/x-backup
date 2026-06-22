@@ -63,16 +63,27 @@ pub async fn full_backup_choices(storage: &dyn Storage) -> Result<Vec<BackupChoi
         .collect())
 }
 
-/// 후보 한 줄 라벨: `<id>  full  <db>  <created>  <size>`.
+/// 후보 한 줄 라벨: `<id>  full  <db> v<server>  <created>  <size>`.
+///
+/// `server_version`을 넣어 "어느 서버에서 뜬 백업인지"를 행에서 바로 구분할 수 있게 한다
+/// (피커는 한 프로파일의 저장소를 보지만, 시점마다 서버 버전이 다를 수 있다).
 fn format_choice(m: &BackupManifest) -> String {
     let engine = match m.tool_versions.archive_format.as_deref() {
         Some(f) if f.starts_with("xb-pg") => "postgresql",
         _ => "mongodb",
     };
+    // gap 승격 full은 일반 full과 구분 표시(증분 요청이 풀로 폴백된 백업).
+    let kind = if m.promoted_from_gap {
+        "full(gap)"
+    } else {
+        "full"
+    };
     format!(
-        "{}  full  {}  {}  {}",
+        "{}  {}  {} v{}  {}  {}",
         m.id,
+        kind,
         engine,
+        m.server_version,
         short_created(&m.created_at),
         human_bytes(m.stored_size_bytes as i64),
     )
@@ -225,7 +236,22 @@ mod tests {
         assert!(label.contains("bk-1"), "id 포함: {label}");
         assert!(label.contains("full"), "유형 포함: {label}");
         assert!(label.contains("mongodb"), "DB 엔진 포함: {label}");
+        assert!(label.contains("v7.0.35"), "서버 버전 포함: {label}");
         assert!(label.contains("2026-06-14 14:56:11"), "축약 시각: {label}");
         assert!(!label.contains('T'), "RFC3339 T는 공백으로 치환: {label}");
+    }
+
+    /// gap 승격 full은 라벨에서 `full(gap)`으로 구분 표시된다.
+    #[test]
+    fn label_marks_gap_promoted_full() {
+        let mut m = manifest(
+            "bk-2",
+            "2026-06-14T14:56:11+00:00",
+            BackupType::Full,
+            BackupStatus::Complete,
+        );
+        m.promoted_from_gap = true;
+        let label = format_choice(&m);
+        assert!(label.contains("full(gap)"), "gap 승격 표식: {label}");
     }
 }

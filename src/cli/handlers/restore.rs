@@ -15,7 +15,7 @@ use crate::cli::output::{
 };
 use crate::cli::progress::{new_counter, ProgressKind, ProgressReporter};
 use crate::config::env::collect_overrides_from_process;
-use crate::config::file::Profile;
+use crate::config::file::{DestinationConfig, Profile};
 use crate::config::merged::MergeInput;
 use crate::config::secret::Secret;
 use crate::config::ResolvedConfig;
@@ -65,15 +65,11 @@ pub async fn handle(
     // 3) destination 구성 — local/s3 모두 from_config로. 멀티 destination이면 --from으로
     //    특정 복제본을 고를 수 있고(미지정 시 primary), 모든 복제본은 동일 바이트라 어디서
     //    읽어도 같다.
-    let storage = select_restore_storage(&resolved.profile, args.from.as_deref())?;
-
-    // TTY 여부 — 대화형 선택/확인 가능 여부. stdin/stderr 모두 터미널일 때만 인터랙션한다
-    //   (선택·확인 입력은 stdin, 표시는 stderr; stdout은 결과 전용).
-    let is_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-
-    // 복구할 백업 결정: --id 있으면 그대로, 없고 대화형(TTY·비-json·비-quiet)이면 fuzzy
-    //   피커로 고르게 한다(최신이 기본). 비대화형/기계출력은 최신 풀백업 자동선택으로 폴백.
-    let backup_id = resolve_backup_id(&args, storage.as_ref(), is_tty, lang).await?;
+    let storage = select_restore_storage(
+        &resolved.profile,
+        &resolved.profile_name,
+        args.from.as_deref(),
+    )?;
 
     // 출력 모드 결정(R15) — CLI > config(mode.output) > stderr TTY 자동.
     let mode = OutputMode::resolve_from_env(
@@ -85,15 +81,28 @@ pub async fn handle(
         Some(resolved.profile.mode.output.as_str()),
     );
 
-    // 실행 컨텍스트(프로파일·복구 대상 DB) 표시 — 다중 DB 툴.
+    // 실행 컨텍스트를 **백업 선택(피커) 전에** 먼저 보여준다 — "어떤 프로파일·어느 store의
+    // 백업을, 어디로 복구하는지"가 고를 때부터 보이도록(다중 DB·다중 프로파일 오조작 방지).
     crate::cli::output::print_run_context(
         &args.profile,
         Some(crate::engine::DbKind::from_uri(target_uri.expose())),
         mode,
     );
+    // 백업을 읽어올 store 위치(list의 `store:`와 동일 의미) — 선택 대상이 어느 저장소인지 명시.
+    let store_label =
+        store_location_label(choose_destination(&resolved.profile, args.from.as_deref())?);
+    crate::cli::output::print_backup_store(&store_label, mode);
     // 복구가 어느 host로 들어가는지 명시(자격증명 마스킹) — in-place 기본값이라 운영 DB
     // 오버라이트 사고를 막는다. 대상 출처(--target / --target-profile / 프로파일 source)도 함께 보인다.
     crate::cli::output::print_restore_target(&target_uri, &target_origin, mode, lang);
+
+    // TTY 여부 — 대화형 선택/확인 가능 여부. stdin/stderr 모두 터미널일 때만 인터랙션한다
+    //   (선택·확인 입력은 stdin, 표시는 stderr; stdout은 결과 전용).
+    let is_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+
+    // 복구할 백업 결정: --id 있으면 그대로, 없고 대화형(TTY·비-json·비-quiet)이면 fuzzy
+    //   피커로 고르게 한다(최신이 기본). 비대화형/기계출력은 최신 풀백업 자동선택으로 폴백.
+    let backup_id = resolve_backup_id(&args, storage.as_ref(), is_tty, lang).await?;
 
     // 진행 표시(R16): mongorestore stdin으로 흘리는 바이트를 폴링한다. 복원 입력 총량은
     //   압축 백업이면 복호화·압축해제 후 크기라 사전에 정확히 모르므로 부정형(spinner)으로
@@ -809,7 +818,11 @@ fn resolve_target_and_storage(
     let (target_uri, origin) =
         resolve_restore_target(args, config_toml.as_deref(), &overrides, &resolved)?;
 
-    let storage = select_restore_storage(&resolved.profile, args.from.as_deref())?;
+    let storage = select_restore_storage(
+        &resolved.profile,
+        &resolved.profile_name,
+        args.from.as_deref(),
+    )?;
     Ok((
         target_uri,
         storage,
@@ -821,10 +834,37 @@ fn resolve_target_and_storage(
 /// 복구에 쓸 destination 백엔드를 고른다 — 멀티 destination 중 `--from`(이름 또는
 /// `type#idx`)으로 특정 복제본을, 미지정 시 primary(첫 destination)를 [`from_config`]로
 /// 구성한다. 모든 복제본은 동일 바이트이므로 어디서 읽어도 결과가 같다.
-fn select_restore_storage(profile: &Profile, from: Option<&str>) -> Result<Box<dyn Storage>> {
+///
+/// dest(store)가 없는 **endpoint 전용** 프로파일(복구/이관 *대상*용)을 `--profile`로 넘기면,
+/// 범용 "destination.type이 필요합니다" 대신 의도를 짚어주는 에러를 낸다 — 흔한 혼동이
+/// "이 서버로 복구"인데, 그건 `--profile <백업프로파일> --target-profile <이 프로파일>`이다.
+fn select_restore_storage(
+    profile: &Profile,
+    profile_name: &str,
+    from: Option<&str>,
+) -> Result<Box<dyn Storage>> {
+    let dest = choose_destination(profile, from)?;
+    if dest.r#type.is_none() {
+        return Err(XBackupError::Usage(format!(
+            "프로파일 '{profile_name}'은(는) 백업 store(dest)가 없어 복구 소스가 될 수 없습니다\
+             (endpoint 전용 — 복구/이관 대상용). 이 서버로 복구하려면 백업을 가진 프로파일을 \
+             소스로, 이 프로파일을 대상으로 지정하세요:\n  \
+             x-backup restore --profile <백업프로파일> --target-profile {profile_name}"
+        )));
+    }
+    from_config(dest)
+}
+
+/// `--from`(이름/라벨)으로 복구에 쓸 destination을 고른다 — 미지정이면 첫(primary) destination.
+/// 스토리지 생성([`select_restore_storage`])과 표시용 라벨([`store_location_label`])이 **같은**
+/// 대상을 가리키도록 선택 로직을 한 곳에 둔다.
+fn choose_destination<'a>(
+    profile: &'a Profile,
+    from: Option<&str>,
+) -> Result<&'a DestinationConfig> {
     let dests = profile.effective_destinations();
-    let chosen = match from {
-        None => dests[0],
+    match from {
+        None => Ok(dests[0]),
         Some(name) => dests
             .iter()
             .enumerate()
@@ -837,9 +877,25 @@ fn select_restore_storage(profile: &Profile, from: Option<&str>) -> Result<Box<d
                     "--from '{name}'에 해당하는 destination이 없습니다(가용: {})",
                     avail.join(", ")
                 ))
-            })?,
-    };
-    from_config(chosen)
+            }),
+    }
+}
+
+/// destination의 사람용 위치 라벨(local 경로 / s3 버킷) — `list`의 `store:` 표기와 일관.
+fn store_location_label(dest: &DestinationConfig) -> String {
+    match dest.r#type.as_deref() {
+        Some("local") => dest
+            .path
+            .clone()
+            .unwrap_or_else(|| "local(경로 미설정)".to_string()),
+        Some("s3") => dest
+            .s3
+            .as_ref()
+            .and_then(|s| s.bucket.clone())
+            .map(|b| format!("s3://{b}"))
+            .unwrap_or_else(|| "s3".to_string()),
+        _ => "(미설정)".to_string(),
+    }
 }
 
 /// PITR dry-run 계획을 출력한다(base·증분 체인·결정 종료 ts·예상 크기 — 무변경). 시크릿 미출력.

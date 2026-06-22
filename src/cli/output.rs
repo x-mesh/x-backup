@@ -201,6 +201,20 @@ pub fn print_run_context(profile: &str, db: Option<crate::engine::DbKind>, mode:
     eprintln!("{}", style_stderr(&line, Tone::Muted));
 }
 
+/// 복구가 백업을 **읽어올** 저장소 위치를 stderr에 한 줄로 표시한다.
+///
+/// restore에서 백업을 고르기 전에 "어느 store의 어떤 백업을 보고 있는지"를 분명히 한다
+/// (`list`의 `store:` 표기와 의미가 같다). json은 기계 출력 오염 방지로 생략한다.
+pub fn print_backup_store(location: &str, mode: OutputMode) {
+    if mode.emits_json() {
+        return;
+    }
+    eprintln!(
+        "{}",
+        style_stderr(&format!("▸ store {location}"), Tone::Muted)
+    );
+}
+
 /// 접속 URI에서 자격증명(userinfo)·민감 쿼리 값을 가린 표시용 문자열을 만든다.
 ///
 /// "어디로 연결/복구되는지"(scheme·host:port·DB)는 사람이 확인할 수 있어야 하지만, 비밀번호·

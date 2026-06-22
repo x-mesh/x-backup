@@ -319,6 +319,10 @@ pub struct StatusArgs {
     /// watch를 N회 갱신 후 종료(0=무한, 기본 0). 스크립트·테스트용.
     #[arg(long, value_name = "N", default_value_t = 0, requires = "watch")]
     pub count: u64,
+    /// ns별(컬렉션/테이블) 문서 수를 함께 출력한다(읽기 전용 — 신호등 점검과 별개 섹션).
+    /// mongo는 사용자 컬렉션, PG는 사용자 테이블을 센다. 연결 실패 프로파일은 건너뛴다.
+    #[arg(long = "ns-detail")]
+    pub ns_detail: bool,
 }
 
 /// `doctor` — config 정적 점검(오프라인). DB 연결 없이 모든 프로파일의 설정 문제를 찾는다.
