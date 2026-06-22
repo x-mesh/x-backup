@@ -33,7 +33,9 @@ impl PgClient {
             .map_err(|_| {
                 XBackupError::Failure(format!("PostgreSQL 연결 타임아웃({}s)", dur.as_secs()))
             })?
-            .map_err(|e| XBackupError::Failure(format!("PostgreSQL 연결 실패: {e}")))?;
+            .map_err(|e| {
+                XBackupError::Failure(format!("PostgreSQL 연결 실패: {}", describe(&e)))
+            })?;
         tokio::spawn(async move {
             if let Err(e) = connection.await {
                 tracing::debug!("PostgreSQL 연결 종료: {e}");
@@ -46,6 +48,25 @@ impl PgClient {
     pub fn client(&self) -> &Client {
         &self.client
     }
+}
+
+/// `tokio_postgres::Error`의 Display는 최상위 종류(`db error`, `error connecting to server`
+/// 등)만 내고 실제 사유(예: `ERROR: database "xbenv_both_pg" does not exist`,
+/// `Connection refused`)는 `source()` 체인에 둔다. 체인을 펼쳐 한 줄로 합쳐 진짜 원인이
+/// `db error`로 뭉개지지 않게 한다.
+fn describe(e: &tokio_postgres::Error) -> String {
+    use std::error::Error;
+    let mut msg = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        let detail = s.to_string();
+        if !detail.is_empty() && !msg.contains(&detail) {
+            msg.push_str(": ");
+            msg.push_str(&detail);
+        }
+        src = s.source();
+    }
+    msg
 }
 
 /// rustls 기반 TLS 커넥터 — ring provider + webpki 신뢰 루트(서버 인증서 검증).
