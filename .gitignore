@@ -29,3 +29,5 @@
 
 # scripts/xbenv 격리 워크스페이스(로컬, config·키·store 포함)
 .xbenv-*/
+temp/*
+data/*
