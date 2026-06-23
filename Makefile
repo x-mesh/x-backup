@@ -6,6 +6,7 @@ SHELL := /bin/bash
 
 COMPOSE_MONGO := docker compose -f docker/docker-compose.mongodb.yaml
 COMPOSE_PG    := docker compose -f docker/docker-compose.postgres.yaml
+COMPOSE_MYSQL := docker compose -f docker/docker-compose.mysql.yaml
 
 # MongoDB Database Tools — 프로젝트 로컬 설치(.tools/, gitignore 대상).
 # 버전·sha256은 docs/spike-oplog-archive.md §2와 동일하게 핀.
@@ -32,9 +33,10 @@ BINDIR := $(PREFIX)/bin
 
 .PHONY: help build build-debug run debug lint fmt install uninstall \
         bump-patch bump-minor bump-major tag release release-dry release-skip-tap \
-        test test-integration test-s3 test-pg test-pg-integration \
-        mongodb-up mongodb-down postgres-up postgres-down tools scenario scenario-pg \
-        clean clean-all devenv devenv-down xbenv-mongo xbenv-pg xbenv-both xbenv-clean
+        test test-integration test-s3 test-pg test-pg-integration test-mysql test-mysql-integration \
+        mongodb-up mongodb-down postgres-up postgres-down mysql-up mysql-down \
+        tools scenario scenario-pg scenario-mysql \
+        clean clean-all devenv devenv-down xbenv-mongo xbenv-pg xbenv-mysql xbenv-both xbenv-clean
 
 help: ## 타깃 목록 출력
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -142,6 +144,13 @@ test-pg-integration: postgres-up ## PG cargo 통합 테스트(H3 TOAST·C2 슬�
 	cargo test --features pg-integration --test pg_integration -- --include-ignored --test-threads=1; \
 	  status=$$?; $(COMPOSE_PG) down -v; exit $$status
 
+test-mysql: ## MySQL 엔진 단위 테스트(engine::mysql 모듈) — DB·Docker 불필요
+	cargo test --lib engine::mysql
+
+test-mysql-integration: mysql-up ## MySQL cargo 통합 테스트(풀→복구 라운드트립·binlog 증분) — compose MySQL(binlog/gtid ON) 자체 기동·정리
+	cargo test --features mysql-integration --test mysql_integration -- --include-ignored --test-threads=1; \
+	  status=$$?; $(COMPOSE_MYSQL) down -v; exit $$status
+
 # ── 테스트용 DB 컨테이너 ──────────────────────────────────────────────
 
 mongodb-up: ## MongoDB replica set 기동(소스 :27017 + 복구 타깃 :27117, healthy까지 대기)
@@ -155,6 +164,12 @@ postgres-up: ## PostgreSQL 소스 :5432 + 타깃 :5433 기동(PG 엔진 백업/�
 
 postgres-down: ## PostgreSQL 정리(소스+타깃)
 	$(COMPOSE_PG) down -v
+
+mysql-up: ## MySQL 소스 :3306 + 타깃 :3307 기동(binlog/gtid ON — 백업/복구/migrate·증분 테스트용)
+	$(COMPOSE_MYSQL) up -d --wait
+
+mysql-down: ## MySQL 정리(소스+타깃)
+	$(COMPOSE_MYSQL) down -v
 
 # ── 도구·시나리오 ─────────────────────────────────────────────────────
 
@@ -174,6 +189,9 @@ scenario: build tools mongodb-up ## E2E 시나리오 실행(docs/test-scenario.m
 
 scenario-pg: build postgres-up ## PostgreSQL E2E — 풀/증분(pgoutput)/복구/PITR(전체·중간)/시퀀스 재동기화
 	scripts/scenario-pg-e2e.sh
+
+scenario-mysql: build mysql-up ## MySQL E2E — 풀/증분(binlog ROW)/복구/PITR(전체·중간)
+	scripts/scenario-mysql-e2e.sh
 
 # ── 대화형 테스트 환경(scripts/xb 래퍼) ───────────────────────────────
 
@@ -195,6 +213,10 @@ xbenv-mongo: build mongodb-up ## Mongo 격리 워크스페이스 준비 + activa
 
 xbenv-pg: build postgres-up ## PG 격리 워크스페이스 준비 + activate 안내(DIR=로 경로 변경)
 	@d='$(or $(DIR),.xbenv-pg)'; [ -f "$$d/activate" ] || scripts/xbenv new "$$d" --engine pg --name pg; \
+	  printf '\n  활성화: \033[36msource %s/activate\033[0m   (해제: deactivate · 제거: make xbenv-clean)\n' "$$d"
+
+xbenv-mysql: build mysql-up ## MySQL 격리 워크스페이스 준비 + activate 안내(DIR=로 경로 변경)
+	@d='$(or $(DIR),.xbenv-mysql)'; [ -f "$$d/activate" ] || scripts/xbenv new "$$d" --engine mysql --name mysql; \
 	  printf '\n  활성화: \033[36msource %s/activate\033[0m   (해제: deactivate · 제거: make xbenv-clean)\n' "$$d"
 
 xbenv-both: build mongodb-up postgres-up ## mongo+pg 결합 워크스페이스(프로파일 mongo/pg + *-target) + 안내
