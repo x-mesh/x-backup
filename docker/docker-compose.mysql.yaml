@@ -1,0 +1,70 @@
+# 테스트용 MySQL — MySQL 엔진(드라이버 SHOW CREATE+SELECT 백업/복구/status·binlog 증분) 검증 환경.
+#
+# 소스 + 복구/이관 타깃 2식으로 띄운다(server→server 복구·migrate 검증).
+#   소스:  mysql://root:…@127.0.0.1:${XB_MYSQL_PORT:-3306}/<db>
+#   타깃:  mysql://root:…@127.0.0.1:${XB_MYSQL_TARGET_PORT:-3307}/<db>
+#
+# 기본 자격증명은 로컬 테스트 전용 — 외부 노출 금지. 운영 값은 환경변수로 주입:
+#   XB_MYSQL_PORT / XB_MYSQL_TARGET_PORT / XB_MYSQL_PASSWORD / XB_MYSQL_DB
+#
+# 사용: make mysql-up / make mysql-down (둘 다 한 번에 기동·정리)
+
+services:
+  mysql:
+    image: ${XB_MYSQL_IMAGE:-mysql:8.0}
+    container_name: x-backup-mysql
+    # 증분(binlog ROW 디코드)의 전제:
+    #   log-bin: binlog 활성. binlog-format=ROW: 값 디코드 가능(STATEMENT 불가).
+    #   binlog-row-image=FULL: before/after 전 컬럼 이미지(키 매칭·idempotency).
+    #   binlog-row-metadata=FULL: Table_map에 컬럼명/PK 메타(스키마 없이 디코드 — 8.0.1+).
+    #   gtid-mode=ON + enforce-gtid-consistency=ON: GTID 좌표·체인.
+    # 풀/복구만 써도 무해하다.
+    command:
+      - --server-id=1
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --binlog-row-metadata=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --local-infile=1
+    environment:
+      MYSQL_ROOT_PASSWORD: ${XB_MYSQL_PASSWORD:-xbackup-dev} # 로컬 전용 기본값
+      MYSQL_DATABASE: ${XB_MYSQL_DB:-xbackup}
+    ports:
+      - "${XB_MYSQL_PORT:-3306}:3306"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mysqladmin ping -h 127.0.0.1 -uroot -p"$${MYSQL_ROOT_PASSWORD}" --silent
+      interval: 2s
+      timeout: 5s
+      retries: 40
+      start_period: 8s
+
+  # 타깃 분리 복구·migrate(server→server) 검증용 별도 인스턴스(:3307). 데이터는 비영속.
+  mysql-target:
+    image: ${XB_MYSQL_IMAGE:-mysql:8.0}
+    container_name: x-backup-mysql-target
+    command:
+      - --server-id=2
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --binlog-row-metadata=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --local-infile=1
+    environment:
+      MYSQL_ROOT_PASSWORD: ${XB_MYSQL_PASSWORD:-xbackup-dev} # 로컬 전용 기본값
+      MYSQL_DATABASE: ${XB_MYSQL_DB:-xbackup}
+    ports:
+      - "${XB_MYSQL_TARGET_PORT:-3307}:3306"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mysqladmin ping -h 127.0.0.1 -uroot -p"$${MYSQL_ROOT_PASSWORD}" --silent
+      interval: 2s
+      timeout: 5s
+      retries: 40
+      start_period: 8s

@@ -46,6 +46,11 @@ PGPORT="${XB_PG_PORT:-5432}"
 PG_TGT_PORT="${XB_PG_TARGET_PORT:-5433}"
 MONGO_PORT="${XB_MONGO_PORT:-27017}"
 MONGO_TGT_PORT="${XB_MONGO_TARGET_PORT:-27117}"
+MYSQL_CTR="x-backup-mysql"            # 소스 MySQL 컨테이너
+MYSQL_TGT_CTR="x-backup-mysql-target" # 복구/이관 타깃 MySQL 컨테이너(별도 서버)
+MYSQL_PASS="${XB_MYSQL_PASSWORD:-xbackup-dev}"
+MYSQL_PORT="${XB_MYSQL_PORT:-3306}"
+MYSQL_TGT_PORT="${XB_MYSQL_TARGET_PORT:-3307}"
 
 log()  { printf '\033[36m[xbenv]\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[33m[xbenv] %s\033[0m\n' "$*" >&2; }
@@ -109,6 +114,35 @@ pg_drop_db() {
     -c "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE)" >/dev/null 2>&1 && log "PG DB 제거: $db ($ctr)" || true
 }
 
+# ── MySQL 헬퍼(PG와 동형) ───────────────────────────────────────────────────
+mysql_healthy() { docker inspect -f '{{.State.Health.Status}}' "${1:-$MYSQL_CTR}" 2>/dev/null | grep -qx healthy; }
+mysql_admin()   { docker exec -i "$1" mysql -uroot -p"$MYSQL_PASS" -Nse "$2" 2>/dev/null; }
+mysql_create_db() {
+  local ctr="$1" db="$2"
+  docker exec -i "$ctr" mysql -uroot -p"$MYSQL_PASS" -e "CREATE DATABASE IF NOT EXISTS \`$db\`" >/dev/null 2>&1 \
+    && log "MySQL DB 생성: $db ($ctr)"
+}
+mysql_wait_healthy() {
+  local ctr="${1:-$MYSQL_CTR}" secs="${2:-30}" i=0
+  mysql_healthy "$ctr" && return 0
+  log "$ctr healthy 대기 중(최대 ${secs}s)…"
+  while [ "$i" -lt "$secs" ]; do sleep 1; i=$((i+1)); mysql_healthy "$ctr" && return 0; done
+  return 1
+}
+mysql_ensure_db() {
+  local ctr="$1" db="$2"
+  if mysql_wait_healthy "$ctr"; then
+    mysql_create_db "$ctr" "$db"
+  else
+    warn "$ctr healthy 아님 — DB '$db' 미생성. 'make mysql-up' 후 'scripts/xbenv ensure-db <워크스페이스>'로 자가복구하세요."
+  fi
+}
+mysql_drop_db() {
+  local ctr="$1" db="$2"
+  docker exec -i "$ctr" mysql -uroot -p"$MYSQL_PASS" -e "DROP DATABASE IF EXISTS \`$db\`" >/dev/null 2>&1 \
+    && log "MySQL DB 제거: $db ($ctr)" || true
+}
+
 # ── 워크스페이스 메타(.xbenv) ───────────────────────────────────────────────
 # pg_profile: PG replication slot(xb_<profile>) 정리에 쓸 PG 프로파일 이름. 단일 pg면
 #   워크스페이스 이름, 결합(both)이면 "pg", mongo면 빈 값.
@@ -141,6 +175,9 @@ write_config() {
     echo "dest = \"local:$dir/store\""
     if [ "$engine" = "pg" ]; then
       echo "pg_logical = true        # PG 증분(logical decoding) 활성"
+    fi
+    if [ "$engine" = "mysql" ]; then
+      echo "mysql_binlog = true      # MySQL 증분(binlog ROW) 활성"
     fi
   } > "$dir/config.toml"
 }
@@ -279,7 +316,7 @@ cmd_new() {
     esac
   done
   [ -n "$dir" ] || err "사용법: xbenv new <dir> [--engine mongo|pg|both] [--name NAME]"
-  case "$engine" in mongo|pg|both|all) ;; *) err "--engine은 mongo|pg|both" ;; esac
+  case "$engine" in mongo|pg|mysql|both|all) ;; *) err "--engine은 mongo|pg|mysql|both" ;; esac
   [ "$engine" = "all" ] && engine="both"
 
   if [ -e "$dir" ] && [ "$force" != 1 ]; then
@@ -313,6 +350,12 @@ cmd_new() {
     tgt="postgres://$PGUSER:$PGPASS@localhost:$PG_TGT_PORT/$tgt_db"
     pg_ensure_db "$PG_CTR" "$src_db"
     pg_ensure_db "$PG_TGT_CTR" "$tgt_db"
+  elif [ "$engine" = "mysql" ]; then
+    src_db="xbenv_$name"; tgt_db="xbenv_${name}_restore"
+    src="mysql://root:$MYSQL_PASS@127.0.0.1:$MYSQL_PORT/$src_db"
+    tgt="mysql://root:$MYSQL_PASS@127.0.0.1:$MYSQL_TGT_PORT/$tgt_db"
+    mysql_ensure_db "$MYSQL_CTR" "$src_db"
+    mysql_ensure_db "$MYSQL_TGT_CTR" "$tgt_db"
   else
     src="mongodb://localhost:$MONGO_PORT/?replicaSet=rs0&directConnection=true"
     tgt="mongodb://localhost:$MONGO_TGT_PORT/?replicaSet=rs0&directConnection=true"
@@ -470,6 +513,11 @@ cmd_destroy() {
     fi
     # 타깃 서버: 복구 대상 DB 제거.
     [ -n "$tgt_db" ] && pg_healthy "$PG_TGT_CTR" && pg_drop_db "$PG_TGT_CTR" "$tgt_db"
+  fi
+
+  if [ "$engine" = "mysql" ]; then
+    [ -n "$src_db" ] && mysql_healthy "$MYSQL_CTR" && mysql_drop_db "$MYSQL_CTR" "$src_db"
+    [ -n "$tgt_db" ] && mysql_healthy "$MYSQL_TGT_CTR" && mysql_drop_db "$MYSQL_TGT_CTR" "$tgt_db"
   fi
 
   rm -rf "$dir"

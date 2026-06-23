@@ -4,13 +4,13 @@
 
 # x-backup
 
-> MongoDB·PostgreSQL 백업·복구 CLI — 풀/증분(oplog), PITR, 로컬/S3 호환 스토리지, 암호화 중심. Rust 단일 바이너리, **외부 덤프 도구 불필요.**
+> MongoDB·PostgreSQL·MySQL 백업·복구 CLI — 풀/증분, PITR, 로컬/S3 호환 스토리지, 암호화 중심. Rust 단일 바이너리, **외부 덤프 도구 불필요.**
 
-운영 중인 MongoDB(standalone/replica set) 또는 PostgreSQL을 **암호화·검증 가능·복구 가능**한
+운영 중인 MongoDB(standalone/replica set)·PostgreSQL·MySQL을 **암호화·검증 가능·복구 가능**한
 형태로 백업한다. 기본적으로 Rust 드라이버로 DB와 **직접** 통신하므로
-**`mongodump`/`mongorestore`·`pg_dump`/`pg_restore`가 필요 없다.** 전 구간 스트리밍(데이터
-크기와 무관한 상수 메모리 — [실측 보고서](docs/memory-profile.md): 6 GiB 백업 피크 RSS
-54.6 MiB)으로 동작한다. DB 종류는 source URI 스킴(`mongodb://` vs `postgresql://`)으로 자동 선택된다.
+**`mongodump`/`mongorestore`·`pg_dump`/`pg_restore`·`mysqldump`/`mysql`이 필요 없다.** 전 구간
+스트리밍(데이터 크기와 무관한 상수 메모리 — [실측 보고서](docs/memory-profile.md): 6 GiB 백업
+피크 RSS 54.6 MiB)으로 동작한다. DB 종류는 source URI 스킴(`mongodb://`·`postgresql://`·`mysql://`/`mariadb://`)으로 자동 선택된다.
 
 ## Features
 
@@ -22,9 +22,10 @@
 - ✅ **무결성** — manifest + sha256, `verify`(키 불필요 구조 검증) / `--deep` / `--chain`
 - ✅ **운영** — `doctor` config 정적 점검(오프라인·DB 연결 없음), `status` 사전 점검(연결·토폴로지·권한·버전/FCV·시계차·oplog 윈도우·데이터 형상·**마지막 백업 나이**·**destination 쓰기 가능+여유 공간**), `--all` source/target 비교, `--watch` 라이브 모니터, `prune` 체인 안전 삭제(`--keep-last`·config retention), 동시 실행 잠금, exit code 규약 0~5
 - ✅ **PostgreSQL** — COPY 프로토콜 기반 드라이버 네이티브 풀 백업/복구(데이터 + 테이블 + 제약 + 인덱스 + 시퀀스), `pg_dump`/`pg_restore` 불필요. 동일 파이프라인(압축→암호화→저장)·동일 `status`/`list`/`verify`/`restore`
+- ✅ **MySQL** — `mysql_async` 기반 드라이버 네이티브 풀 백업/복구(데이터 + DDL — 테이블·뷰·트리거·루틴·이벤트), `mysqldump`/`mysql` 불필요. 동일 파이프라인·동일 `status`/`list`/`verify`/`restore`. 증분·PITR은 binlog ROW 스트리밍(opt-in).
 - ✅ **headless** — 비-TTY 자동 quiet, `--json`, cron/CI 친화
 
-지원 범위: MongoDB replica set(풀+증분)/standalone(풀만)/샤딩은 감지 시 거부. PostgreSQL은 풀 백업+복구+status에 더해 증분(logical decoding)·PITR(opt-in). [PostgreSQL](#postgresql-1) 참조.
+지원 범위: MongoDB replica set(풀+증분)/standalone(풀만)/샤딩은 감지 시 거부. PostgreSQL은 풀 백업+복구+status에 더해 증분(logical decoding)·PITR(opt-in). [PostgreSQL](#postgresql-1) 참조. MySQL은 동일한 명령 세트(풀/복구/status/peek/migrate)에 더해 증분·PITR(binlog ROW 스트리밍, opt-in — 서버에 `log_bin=ROW` 필요). [MySQL](#mysql-1) 참조.
 
 ## Install
 
@@ -252,7 +253,7 @@ encrypt = false
 | `[[profile.x.dest]]`(테이블 배열) | `destinations[]` | 멀티 destination(아래 참조) |
 | `compress = "zstd:6"` | `features.compression.{algorithm,level}` | 또는 `compress_algorithm` + `compress_level` |
 | `encrypt = "age:/path"` \| `true` \| `false` \| `"off"` | `features.encryption.{enabled,algorithm,recipient_file}` | 또는 `encrypt_algorithm` + `recipient_file`. `recipient_file`은 공개키 *경로* |
-| `incr_interval`, `incr_on_gap`, `pg_logical` | `features.incremental.{interval,on_gap,pg_logical}` | |
+| `incr_interval`, `incr_on_gap`, `pg_logical`, `mysql_binlog` | `features.incremental.{interval,on_gap,pg_logical,mysql_binlog}` | |
 | `keep_full`, `keep_days`, `keep_last` | `retention.{keep_full,keep_days,keep_last}` | |
 | `extends = "name"` \| `["a","b"]` | (상속) | base/profile 참조, 뒤가 우선 |
 
@@ -476,6 +477,79 @@ v1: `[profiles.<name>.features.incremental] pg_logical = true`)로 opt-in하면,
 데이터가 있는 DB로 복구할 땐 `--force`(백업에 든 테이블을 drop 후 재생성)를 쓰고, 빈 대상은
 플래그가 필요 없다. `migrate`는 PG → PG만(엔진 간 불가).
 
+### MySQL
+
+프로파일의 `source.uri`를 `mysql://…`(또는 `mariadb://…`)로 두면 MySQL 엔진이 자동 선택된다 —
+**`mysqldump`/`mysql` 불필요**. 순수 Rust `mysql_async` 드라이버로 동작하므로 단일 바이너리로
+완결된다. URI에 데이터베이스 이름이 반드시 포함돼야 한다(`mysql://user:pass@host:3306/dbname`).
+
+```toml
+[profile.mysql]                  # v2: flat 테이블 하나
+uri_env      = "MYSQL_URI"       # 예: mysql://root:pass@127.0.0.1:3306/mydb
+dest         = "local:/var/backups/mysql"
+mysql_binlog = true              # MySQL 증분/PITR opt-in(서버 log_bin=ROW 필요)
+keep_last    = 100
+keep_days    = 30
+```
+
+<details><summary>v1 등가</summary>
+
+```toml
+[profiles.mysql.source]
+uri_env = "MYSQL_URI"
+[profiles.mysql.destination]
+type = "local"
+path = "/var/backups/mysql"
+
+[profiles.mysql.features.incremental]
+mysql_binlog = true
+
+[profiles.mysql.retention]
+keep_last = 100
+keep_days = 30
+```
+
+</details>
+
+DB 비의존 명령은 MongoDB·PostgreSQL과 동일하게 동작한다:
+
+```bash
+x-backup backup  --profile mysql                   # SELECT 스트리밍 풀 백업 → 압축 → 암호화 → 저장
+x-backup backup  --profile mysql --type incr       # binlog ROW 증분(mysql_binlog=true 전제)
+x-backup restore --profile mysql --target mysql://host:3306/restored --force
+x-backup restore --profile mysql --target mysql://host/restored --at latest --force  # PITR(latest=전체)
+x-backup status  --profile mysql [--all] [--watch] # 버전·DB 크기·테이블/행 수·레플리카 상태; 라이브 Δ
+x-backup peek    --profile mysql                   # 데이터 육안 확인: 테이블 행 수 + 최신 행
+x-backup migrate --profile mysql --target mysql://host/other --drop --force   # 드라이버 직접, MySQL → MySQL
+x-backup list/verify/prune ...                     # manifest 기반(DB 비의존)
+```
+
+잡는 것: **테이블 데이터**(SELECT 스트리밍, 값 정확)와 스키마 대부분 — **테이블**(`SHOW CREATE TABLE`)·
+**뷰**·**트리거**·**스토어드 프로시저**·**함수**·**이벤트**(`SHOW CREATE …`). 바이트 타입 →
+`0x` hex, JSON 컬럼 보존, STORED 생성 컬럼은 INSERT 목록에서 제외(서버 재계산), 인비저블 컬럼
+포함. FK 의존 순서로 테이블 덤프(`FOREIGN_KEY_CHECKS=0`). `AUTO_INCREMENT` 값 보존. 뷰·트리거·
+루틴·이벤트는 데이터 적재 후 적용하며 `DEFINER` 절은 이식성을 위해 제거한다. 복구 세션 preamble:
+`FOREIGN_KEY_CHECKS=0`·`UNIQUE_CHECKS=0`·`SQL_MODE='NO_AUTO_VALUE_ON_ZERO'`·`time_zone='+00:00'`·`NAMES utf8mb4`.
+
+풀 백업은 스냅샷 시점 binlog 좌표(`file:pos` + `gtid_executed`)를 매니페스트에 기록해 증분 체인의 앵커로 쓴다.
+
+증분·PITR: **binlog ROW 스트리밍**으로 동작한다(WAL 아카이빙이나 logical decoding이 아니다).
+서버에 `log_bin=ON`·`binlog_format=ROW`·`binlog_row_image=FULL`·`binlog_row_metadata=FULL`
+(MySQL 8.0.1+)·`gtid_mode=ON`(권장)을 설정하고, 프로파일에 `mysql_binlog = true`(v2 flat 키,
+v1: `[profiles.<name>.features.incremental] mysql_binlog = true`)로 opt-in하면,
+풀 백업이 binlog 좌표를 기록하고, `backup --type incr`가 ROW 이벤트를 캡처하며,
+`restore --at <RFC3339>|latest`가 base 복원 후 목표 시점까지 재생한다(`latest`=전체 재생).
+PITR 타임스탬프 정밀도는 **1초 단위**(binlog 이벤트 헤더 해상도) — 정확한 컷은 파일:포지션 또는
+GTID 권장. gap: base binlog 파일이 서버에서 퍼지됐으면 증분은 거부되고 풀 백업으로 자동 승격(exit 4).
+
+계정에는 `REPLICATION SLAVE`·`REPLICATION CLIENT` 권한이 필요하다. 풀 백업·복구·status·peek는
+이 요건 없이 MySQL 8.0+·MariaDB 10.x에서 동작한다.
+
+알려진 제한: FLOAT/DOUBLE는 서버 텍스트 표현(`mysqldump` 동등 — 10진 소수 완전 보존 미보장),
+일관 스냅샷은 InnoDB에만 유효(병행 DDL 차단 불가), 뷰·트리거별 `sql_mode` 미재현. MySQL 8.4의
+`SHOW MASTER STATUS` 이름 변경(`SHOW BINARY LOG STATUS`) — 엔진이 양쪽 모두 처리. `migrate`는
+MySQL → MySQL만(엔진 간 불가). 상세: [docs/mysql.md](docs/mysql.md).
+
 ### 카탈로그 (`list`)
 
 `list`는 store(destination)의 백업·증분 체인을 한 표로 보여준다. 첫 줄에 **store 위치**를,
@@ -560,6 +634,10 @@ make postgres-up        # 테스트용 PostgreSQL :5432 기동(PG 엔진 백업/
 make scenario-pg        # PostgreSQL E2E(풀→증분(pgoutput)→복구→PITR 전체·중간→시퀀스 재동기화)
 make xbenv-pg           # PG 격리 테스트 워크스페이스 준비 + activate 안내
 make xbenv-mongo        # Mongo 격리 테스트 워크스페이스 준비 + activate 안내
+make mysql-up           # 테스트용 MySQL 소스(:3306) + 타깃(:3307) 기동
+make test-mysql         # MySQL 엔진 단위 테스트(DB 불필요)
+make scenario-mysql     # MySQL E2E(풀→증분→복구→PITR)
+make xbenv-mysql        # MySQL 격리 테스트 워크스페이스 준비 + activate 안내
 make xbenv-clean        # 격리 워크스페이스 제거
 ```
 
@@ -635,6 +713,7 @@ gap 가드가 동작하는 것이지 오류가 아니다. churn으로 데이터�
 
 | 문서 | 내용 |
 |------|------|
+| [docs/mysql.md](docs/mysql.md) | MySQL 엔진 상세(스키마 충실도·binlog 내부 구조·PITR·개발/CI) |
 | [docs/control-server.ko.md](docs/control-server.ko.md) | 중앙 control 서버 운영(다중 DB 백업·복구·마이그레이션) — 예시: [examples/control-server.toml](examples/control-server.toml) |
 | [docs/PRD.md](docs/PRD.md) | 제품 요구사항(FR-1~12, 증분 설계, 암호화 설계) |
 | [docs/test-scenario.md](docs/test-scenario.md) | E2E 시나리오 정의 |

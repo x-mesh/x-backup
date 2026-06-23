@@ -18,6 +18,10 @@ s3-integration = []
 # 기본 빌드/단위 테스트에는 포함하지 않으며 `--features pg-integration`으로만 활성화한다.
 # 검증: H3(unchanged-TOAST 보존)·C2(슬롯 gap 감지)·풀→복구 라운드트립(H1 스냅샷 경로).
 pg-integration = []
+# MySQL 통합 테스트 격리(환경에 MySQL log_bin=ON·binlog_format=ROW·gtid_mode=ON 필요 — make mysql-up).
+# 기본 빌드/단위 테스트에는 포함하지 않으며 `--features mysql-integration`으로만 활성화한다.
+# 검증: 풀→복구 라운드트립·binlog ROW 디코드·PITR(GTID 컷).
+mysql-integration = []
 
 [[bin]]
 name = "x-backup"
@@ -120,6 +124,12 @@ bytes = "1"
 tokio-postgres-rustls = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "1"
+# MySQL/MariaDB 드라이버(3차) — 외부 mysqldump/mysql/mysqlbinlog 없이 SHOW CREATE + SELECT 스트림으로
+# 백업/복구하고, 내장 binlog stream(Conn::get_binlog_stream)으로 ROW 이벤트 증분/PITR을 수행한다.
+# default-features=false로 native-tls·C-zlib를 배제하고 default-rustls-ring(rustls + ring +
+# webpki-roots + 순수 Rust zlib)로 musl 정적 빌드와 호환한다. binlog feature가 mysql_common의
+# binlog 파서(TableMapEvent/WriteRows/UpdateRows/DeleteRows 디코드)를 켠다.
+mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring", "binlog"] }
 
 [dev-dependencies]
 # Storage trait mock 자동 생성(단위 테스트에서 파이프라인 로직 주입).

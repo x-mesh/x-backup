@@ -4,9 +4,9 @@
 
 # x-backup
 
-> MongoDB & PostgreSQL backup and restore CLI — full and incremental (oplog) backups, PITR, local or S3-compatible storage, encrypted by default. A single Rust binary, **no external dump tools**.
+> MongoDB, PostgreSQL & MySQL backup and restore CLI — full and incremental backups, PITR, local or S3-compatible storage, encrypted by default. A single Rust binary, **no external dump tools**.
 
-x-backup backs up a running MongoDB (standalone or replica set) or PostgreSQL into an encrypted form you can verify and actually restore from. By default it talks to the database directly through the Rust driver — **no `mongodump`/`mongorestore` or `pg_dump`/`pg_restore` required** — and streams every stage, so memory stays flat no matter how large the dataset is. A 6 GiB backup peaks at 54.6 MiB RSS ([measured](docs/memory-profile.md)). The database is chosen automatically from the source URI scheme (`mongodb://` vs `postgresql://`).
+x-backup backs up a running MongoDB (standalone or replica set), PostgreSQL, or MySQL into an encrypted form you can verify and actually restore from. By default it talks to the database directly through the Rust driver — **no `mongodump`/`mongorestore`, `pg_dump`/`pg_restore`, or `mysqldump`/`mysql` required** — and streams every stage, so memory stays flat no matter how large the dataset is. A 6 GiB backup peaks at 54.6 MiB RSS ([measured](docs/memory-profile.md)). The database is chosen automatically from the source URI scheme (`mongodb://`, `postgresql://`, or `mysql://`/`mariadb://`).
 
 ## Features
 
@@ -18,9 +18,10 @@ x-backup backs up a running MongoDB (standalone or replica set) or PostgreSQL in
 - ✅ **Integrity** — manifest + sha256, with `verify` (structural check, no key needed), `--deep`, and `--chain`
 - ✅ **Operations** — `doctor` offline config check (all profiles, no DB connection), `status` preflight (connection, topology, privileges, version/FCV, clock skew, oplog window, data shape, **last backup age**, **destination writability + free space**), `--all` source-vs-target diff, `--watch` live monitor, chain-safe `prune`, concurrent-run locking, a defined exit-code contract (0–5)
 - ✅ **PostgreSQL** — driver-native full backup/restore via the COPY protocol (data + tables + constraints + indexes + sequences), no `pg_dump`/`pg_restore`. Same pipeline (compress → encrypt → store), same `status`/`list`/`verify`/`restore`
+- ✅ **MySQL** — driver-native full backup/restore via `mysql_async` (data + DDL — tables, views, triggers, routines, events), no `mysqldump`/`mysql`. Same pipeline (compress → encrypt → store), same `status`/`list`/`verify`/`restore`. Incremental and PITR via binlog ROW streaming (opt-in).
 - ✅ **Headless** — auto-quiet when not a TTY, `--json` output, built for cron and CI
 
-Scope: MongoDB replica sets get full and incremental backups, standalone gets full only, and sharded clusters are detected and refused. PostgreSQL gets full backup, restore, migrate, status/peek/watch, plus incremental backup and PITR via logical decoding (opt-in). See [PostgreSQL](#postgresql).
+Scope: MongoDB replica sets get full and incremental backups, standalone gets full only, and sharded clusters are detected and refused. PostgreSQL gets full backup, restore, migrate, status/peek/watch, plus incremental backup and PITR via logical decoding (opt-in). See [PostgreSQL](#postgresql). MySQL gets the same command set (full/restore/status/peek/migrate), plus incremental backup and PITR via binlog ROW streaming (opt-in, requires `log_bin=ROW` on the server). See [MySQL](#mysql).
 
 ## Install
 
@@ -253,7 +254,7 @@ The normalizer rewrites them into the v1 nested tree, so behaviour is identical.
 | `[[profile.x.dest]]` (array of tables) | `destinations[]` | multi-destination; see below |
 | `compress = "zstd:6"` | `features.compression.{algorithm,level}` | or `compress_algorithm` + `compress_level` |
 | `encrypt = "age:/path"` \| `true` \| `false` \| `"off"` | `features.encryption.{enabled,algorithm,recipient_file}` | or `encrypt_algorithm` + `recipient_file`; `recipient_file` is a public-key **path** |
-| `incr_interval`, `incr_on_gap`, `pg_logical` | `features.incremental.{interval,on_gap,pg_logical}` | |
+| `incr_interval`, `incr_on_gap`, `pg_logical`, `mysql_binlog` | `features.incremental.{interval,on_gap,pg_logical,mysql_binlog}` | |
 | `keep_full`, `keep_days`, `keep_last` | `retention.{keep_full,keep_days,keep_last}` | |
 | `extends = "name"` \| `["a","b"]` | (inheritance) | references a base or profile; later wins |
 
@@ -489,6 +490,87 @@ Not yet covered (roadmap): ownership/grants, comments, aggregate/window function
 base/range types. Restoring into a non-empty database should use `--force` (drops and recreates each
 backed-up table); an empty target needs no flag. `migrate` is PG → PG only (no cross-engine).
 
+### MySQL
+
+Point a profile's `source.uri` at `mysql://…` (or `mariadb://…`) and x-backup uses its
+MySQL engine automatically — **no `mysqldump`/`mysql`**. It backs up through `mysql_async`,
+a pure-Rust driver, so it stays a single self-contained binary. The database name is required
+in the URI (`mysql://user:pass@host:3306/dbname`).
+
+```toml
+[profile.mysql]                  # v2: one flat table
+uri_env      = "MYSQL_URI"       # e.g. mysql://root:pass@127.0.0.1:3306/mydb
+dest         = "local:/var/backups/mysql"
+mysql_binlog = true              # opt in to incremental/PITR via binlog ROW streaming
+                                 # (requires log_bin=ON, binlog_format=ROW, binlog_row_image=FULL on server)
+keep_last    = 100
+keep_days    = 30
+```
+
+<details><summary>v1 equivalent</summary>
+
+```toml
+[profiles.mysql.source]
+uri_env = "MYSQL_URI"
+[profiles.mysql.destination]
+type = "local"
+path = "/var/backups/mysql"
+
+[profiles.mysql.features.incremental]
+mysql_binlog = true
+
+[profiles.mysql.retention]
+keep_last = 100
+keep_days = 30
+```
+
+</details>
+
+All the DB-agnostic commands work the same as MongoDB and PostgreSQL:
+
+```bash
+x-backup backup  --profile mysql                   # SELECT-streaming full backup → compress → encrypt → store
+x-backup backup  --profile mysql --type incr       # binlog ROW increment (needs mysql_binlog = true)
+x-backup restore --profile mysql --target mysql://host:3306/restored --force
+x-backup restore --profile mysql --target mysql://host/restored --at latest --force   # PITR (latest = all)
+x-backup status  --profile mysql [--all] [--watch] # version, db size, table/row counts, replica status
+x-backup peek    --profile mysql                   # eyeball data: per-table counts + latest rows
+x-backup migrate --profile mysql --target mysql://host/other --drop --force   # driver streaming, MySQL → MySQL
+x-backup list/verify/prune ...                     # manifest-based (DB-agnostic)
+```
+
+What it captures: **table data** (SELECT streaming, exact values) and a broad slice of the schema —
+**tables** (`SHOW CREATE TABLE`), **views**, **triggers**, **stored procedures**, **functions**, and
+**events** (`SHOW CREATE …`). Byte columns are encoded as `0x` hex; JSON columns are preserved as-is.
+`STORED` generated columns are excluded from INSERT (the server recomputes them). Invisible columns
+are included. Tables are dumped in FK dependency order with `FOREIGN_KEY_CHECKS=0`. `AUTO_INCREMENT`
+values are preserved. Views, triggers, routines, and events are applied after data; `DEFINER` clauses
+are stripped for portability. The restore session opens with `FOREIGN_KEY_CHECKS=0`,
+`UNIQUE_CHECKS=0`, `SQL_MODE='NO_AUTO_VALUE_ON_ZERO'`, `time_zone='+00:00'`, `NAMES utf8mb4`.
+
+The full backup records the binlog coordinates at snapshot time (`file:pos` + `gtid_executed`) in
+the manifest, so incremental chains can anchor to it.
+
+Incremental backup and PITR work via **binlog ROW streaming** (not server-side logical decoding):
+opt in with `mysql_binlog = true` (v2: a flat key on `[profile.<name>]`; v1:
+`[profiles.<name>.features.incremental] mysql_binlog = true`). A full backup then records the
+binlog position, `backup --type incr` captures ROW events (WriteRows/UpdateRows/DeleteRows) since,
+and `restore --at <RFC3339>|latest` replays them up to the target time (`latest` replays everything).
+PITR timestamp granularity is **1 second** (binlog event header resolution) — for an exact cut,
+prefer binlog file:position or GTID over a timestamp. Gap detection: if the base binlog file has
+been purged from the server, the increment is refused and promoted to a full backup (exit 4).
+
+Server requirements for incremental: `log_bin=ON`, `binlog_format=ROW`, `binlog_row_image=FULL`,
+`binlog_row_metadata=FULL` (MySQL 8.0.1+), `gtid_mode=ON` (recommended), a unique `server_id`,
+and a MySQL account with `REPLICATION SLAVE` + `REPLICATION CLIENT` privileges. Full
+backup/restore/status/peek work on any MySQL 8.0+ or MariaDB 10.x without these requirements.
+
+Known limitations: FLOAT/DOUBLE use the server's text representation (mysqldump parity — not
+guaranteed 10-decimal lossless); the consistent snapshot does not isolate concurrent DDL (InnoDB
+only); per-object `sql_mode` for views/triggers is not reproduced. MySQL 8.4 renames
+`SHOW MASTER STATUS` → `SHOW BINARY LOG STATUS`; the engine handles both.
+`migrate` is MySQL → MySQL only (no cross-engine). See [docs/mysql.md](docs/mysql.md).
+
 ### Live monitor (`status --watch`)
 
 `status --watch` turns the read-only check into a live dashboard, refreshing on an interval
@@ -572,6 +654,10 @@ make scenario           # E2E scenario (full → incr → verify → restore →
 make postgres-up        # PostgreSQL test server
 make xbenv-pg           # isolated PostgreSQL test workspace (then: source <dir>/activate)
 make xbenv-mongo        # isolated MongoDB test workspace
+make mysql-up           # MySQL test servers (source :3306 + target :3307)
+make test-mysql         # MySQL engine unit tests (no DB needed)
+make scenario-mysql     # MySQL E2E (full → incr → restore → PITR)
+make xbenv-mysql        # isolated MySQL test workspace (then: source <dir>/activate)
 make xbenv-clean        # remove the isolated workspaces
 ```
 
@@ -632,6 +718,7 @@ The docs are written in Korean.
 
 | Document | Contents |
 |------|------|
+| [docs/mysql.md](docs/mysql.md) | MySQL engine deep-dive (schema fidelity, binlog internals, PITR, dev/CI) |
 | [docs/PRD.md](docs/PRD.md) | Product requirements (FR-1–12, incremental design, encryption design) |
 | [docs/test-scenario.md](docs/test-scenario.md) | E2E scenario definition |
 | [docs/acceptance-report.md](docs/acceptance-report.md) | Acceptance criteria 10/10, with measured evidence |
