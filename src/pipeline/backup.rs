@@ -468,6 +468,7 @@ fn build_manifest(
         oplog_count: None,
         // 풀 백업은 gap 승격이 아니다(증분 핸들러가 풀로 승격할 때만 true로 덮어쓴다).
         promoted_from_gap: false,
+        mysql_binlog: None,
         status: BackupStatus::Complete,
     }
 }
@@ -593,6 +594,7 @@ pub async fn run_pg_full_backup(
         oplog_range: None,
         oplog_count: None,
         promoted_from_gap: false,
+        mysql_binlog: None,
         status: BackupStatus::Complete,
     };
     let store = ManifestStore::new(storage);
@@ -612,6 +614,298 @@ pub async fn run_pg_full_backup(
         encryption: meta.encryption.clone(),
         oplog_range: None,
     })
+}
+
+/// MySQL 풀 백업 — 드라이버(SHOW CREATE + SELECT) 아카이브를 압축·암호화·저장한다.
+///
+/// PG 경로와 같은 storage/stage/sha256/카운터 골격을 공유한다. 슬롯이 없는 대신 덤프 task가
+/// 스냅샷 시점 binlog 좌표를 캡처하고, [`finish`](crate::engine::mysql::backup::MysqlDumpHandle::finish)가
+/// 그것을 반환하면 manifest의 `mysql_binlog`에 기록한다(증분 base). `table_filter`는 `--collection`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_mysql_full_backup(
+    uri: &crate::config::secret::Secret,
+    timeout_secs: Option<u64>,
+    table_filter: Option<String>,
+    storage: &dyn Storage,
+    stages: StageStack,
+    meta: BackupMeta,
+    progress_counter: Option<Arc<AtomicU64>>,
+    promoted_from_gap: bool,
+) -> Result<BackupOutcome> {
+    use crate::engine::mysql::{archive as my_archive, backup::MysqlDumper};
+
+    let selective = table_filter.is_some();
+
+    let mut dumper = MysqlDumper::connect(uri, timeout_secs).await?;
+    let server_version = dumper
+        .server_version()
+        .await
+        .map(|v| format!("mysql {v}"))
+        .unwrap_or_else(|| "mysql".to_string());
+    let dump = dumper.dump_stream(table_filter);
+    let dump_handle = dump.handle();
+    let dump_stream: BoxAsyncRead = Box::pin(dump);
+
+    let counted = CountingReader::new(dump_stream);
+    let original_size_handle = counted.handle();
+    let staged: BoxAsyncRead = stages.apply(Box::pin(counted));
+    let checksummed = Sha256Reader::new(staged);
+    let checksum_handle = checksummed.handle();
+    let stored_counted = match &progress_counter {
+        Some(counter) => CountingReader::with_counter(Box::pin(checksummed), Arc::clone(counter)),
+        None => CountingReader::new(Box::pin(checksummed)),
+    };
+    let stored_size_handle = stored_counted.handle();
+
+    let backup_id = Uuid::now_v7().to_string();
+    let data_rel = data_path(&backup_id);
+    let put_result = storage
+        .put_stream(&data_rel, Box::pin(stored_counted), None)
+        .await;
+    if let Err(put_err) = put_result {
+        let _ = dump_handle.finish().await;
+        return Err(put_err);
+    }
+    // finish는 백업 task 오류 전파 + 스냅샷 binlog 좌표(증분 base) 반환.
+    let mysql_binlog = match dump_handle.finish().await {
+        Ok(coords) => coords,
+        Err(dump_err) => {
+            cleanup(storage, &backup_id).await;
+            return Err(dump_err);
+        }
+    };
+
+    let checksum = checksum_handle
+        .finalize()
+        .ok_or_else(|| XBackupError::Failure("체크섬 확정 실패(이미 소비됨)".into()))?;
+    let stored_size = stored_size_handle.total();
+    let original_size = original_size_handle.total();
+
+    let manifest = BackupManifest {
+        format_version: FORMAT_VERSION,
+        id: backup_id.clone(),
+        created_at: Utc::now().to_rfc3339(),
+        backup_type: BackupType::Full,
+        base_id: None,
+        topology: Topology::Standalone,
+        server_version,
+        tool_versions: ToolVersions {
+            mongodump: None,
+            archive_format: Some(my_archive::FORMAT_ID.to_string()),
+        },
+        selective,
+        original_size_bytes: original_size,
+        stored_size_bytes: stored_size,
+        compression: meta.compression.clone(),
+        encryption: meta.encryption.clone(),
+        checksum_sha256: checksum.clone(),
+        oplog_range: None,
+        oplog_count: None,
+        promoted_from_gap,
+        mysql_binlog,
+        status: BackupStatus::Complete,
+    };
+    let store = ManifestStore::new(storage);
+    if let Err(write_err) = store.write(&manifest).await {
+        cleanup(storage, &backup_id).await;
+        return Err(write_err);
+    }
+
+    tracing::info!(backup_id = %backup_id, bytes = stored_size, checksum = %checksum, "MySQL 풀 백업 완료");
+    Ok(BackupOutcome {
+        backup_id,
+        stored_size_bytes: stored_size,
+        original_size_bytes: original_size,
+        checksum_sha256: checksum,
+        topology: Topology::Standalone,
+        compression: meta.compression.clone(),
+        encryption: meta.encryption.clone(),
+        oplog_range: None,
+    })
+}
+
+/// MySQL 증분 백업 결과.
+pub struct MysqlIncrementalOutcome {
+    pub backup_id: String,
+    pub base_id: String,
+    pub change_count: u64,
+    pub stored_size_bytes: u64,
+    /// gap 감지로 풀 백업으로 승격됐는지.
+    pub promoted: bool,
+}
+
+/// MySQL 증분 백업 — base 체인 이후의 binlog ROW 변경을 캡처해 저장한다(`xb-mysql-incr-v1`).
+///
+/// base(최신 풀백업)의 binlog 파일이 purge됐으면(gap) 풀 백업으로 **승격**한다(FR-2). 변경이
+/// 없으면 빈 슬라이스(data.bin 없이 manifest만)로 체인 좌표만 전진시킨다.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_mysql_incremental_backup(
+    uri: &crate::config::secret::Secret,
+    timeout_secs: Option<u64>,
+    profile_name: &str,
+    storage: &dyn Storage,
+    stages: StageStack,
+    meta: BackupMeta,
+    progress_counter: Option<Arc<AtomicU64>>,
+) -> Result<MysqlIncrementalOutcome> {
+    use crate::engine::mysql::{conn::MysqlClient, incremental};
+    use crate::pipeline::mysql_pitr::{chain_start_coords, latest_mysql_full};
+
+    // 1) base 선택 + 체인 시작 좌표.
+    let base_id = latest_mysql_full(storage).await?;
+    let start = chain_start_coords(storage, &base_id).await?;
+
+    // 2) gap 체크 + 서버 버전.
+    let mut admin = MysqlClient::connect(uri, timeout_secs).await?;
+    let server_version = admin
+        .server_version()
+        .await
+        .ok()
+        .flatten()
+        .map(|v| format!("mysql {v}"))
+        .unwrap_or_else(|| "mysql".to_string());
+    let available = incremental::binlog_available(admin.conn_mut(), &start).await?;
+    drop(admin);
+
+    // 3) gap → 풀 승격(promoted_from_gap=true).
+    if !available {
+        tracing::warn!(base_id = %base_id, "MySQL 증분 gap(base binlog purge) — 풀 백업으로 승격");
+        let out = run_mysql_full_backup(
+            uri,
+            timeout_secs,
+            None,
+            storage,
+            stages,
+            meta,
+            progress_counter,
+            true,
+        )
+        .await?;
+        return Ok(MysqlIncrementalOutcome {
+            backup_id: out.backup_id,
+            base_id,
+            change_count: 0,
+            stored_size_bytes: out.stored_size_bytes,
+            promoted: true,
+        });
+    }
+
+    // 4) binlog ROW 변경 캡처.
+    let server_id = incremental::server_id_for(profile_name);
+    let captured = incremental::capture(uri, timeout_secs, &start, server_id).await?;
+
+    // 5) 변경 0건 — data 없이 manifest만(빈 슬라이스 계약), 체인 좌표만 전진.
+    if captured.count == 0 {
+        let backup_id = Uuid::now_v7().to_string();
+        let manifest = mysql_incremental_manifest(
+            &backup_id,
+            &base_id,
+            &server_version,
+            0,
+            &empty_sha256(),
+            0,
+            &BackupMeta::none(),
+            Some(captured.end),
+        );
+        ManifestStore::new(storage).write(&manifest).await?;
+        tracing::info!(backup_id = %backup_id, base_id = %base_id, "MySQL 증분 — 변경 없음(빈 슬라이스)");
+        return Ok(MysqlIncrementalOutcome {
+            backup_id,
+            base_id,
+            change_count: 0,
+            stored_size_bytes: 0,
+            promoted: false,
+        });
+    }
+
+    // 6) 캡처 바이트를 파이프라인(압축→암호화)→sha256→저장으로(풀과 동형).
+    let end = captured.end.clone();
+    let reader: BoxAsyncRead = Box::pin(std::io::Cursor::new(captured.archive));
+    let staged: BoxAsyncRead = stages.apply(reader);
+    let checksummed = Sha256Reader::new(staged);
+    let checksum_handle = checksummed.handle();
+    let stored_counted = match &progress_counter {
+        Some(counter) => CountingReader::with_counter(Box::pin(checksummed), Arc::clone(counter)),
+        None => CountingReader::new(Box::pin(checksummed)),
+    };
+    let stored_size_handle = stored_counted.handle();
+
+    let backup_id = Uuid::now_v7().to_string();
+    let data_rel = data_path(&backup_id);
+    if let Err(put_err) = storage
+        .put_stream(&data_rel, Box::pin(stored_counted), None)
+        .await
+    {
+        cleanup(storage, &backup_id).await;
+        return Err(put_err);
+    }
+    let checksum = checksum_handle
+        .finalize()
+        .ok_or_else(|| XBackupError::Failure("체크섬 확정 실패(이미 소비됨)".into()))?;
+    let stored_size = stored_size_handle.total();
+
+    let manifest = mysql_incremental_manifest(
+        &backup_id,
+        &base_id,
+        &server_version,
+        stored_size,
+        &checksum,
+        captured.count,
+        &meta,
+        Some(end),
+    );
+    if let Err(write_err) = ManifestStore::new(storage).write(&manifest).await {
+        cleanup(storage, &backup_id).await;
+        return Err(write_err);
+    }
+
+    tracing::info!(backup_id = %backup_id, base_id = %base_id, changes = captured.count, bytes = stored_size, "MySQL 증분 백업 완료");
+    Ok(MysqlIncrementalOutcome {
+        backup_id,
+        base_id,
+        change_count: captured.count,
+        stored_size_bytes: stored_size,
+        promoted: false,
+    })
+}
+
+/// MySQL 증분 manifest — 변경 수를 oplog_count에 재사용(빈 슬라이스 Some(0) 계약), end 좌표를
+/// mysql_binlog에 기록(다음 증분 시작점·체인).
+#[allow(clippy::too_many_arguments)]
+fn mysql_incremental_manifest(
+    backup_id: &str,
+    base_id: &str,
+    server_version: &str,
+    stored_size: u64,
+    checksum: &str,
+    change_count: u64,
+    meta: &BackupMeta,
+    end_coords: Option<crate::manifest::schema::MysqlBinlogCoords>,
+) -> BackupManifest {
+    BackupManifest {
+        format_version: FORMAT_VERSION,
+        id: backup_id.to_string(),
+        created_at: Utc::now().to_rfc3339(),
+        backup_type: BackupType::Incremental,
+        base_id: Some(base_id.to_string()),
+        topology: Topology::Standalone,
+        server_version: server_version.to_string(),
+        tool_versions: ToolVersions {
+            mongodump: None,
+            archive_format: Some(crate::engine::mysql::incremental::INCR_FORMAT_ID.to_string()),
+        },
+        selective: false,
+        original_size_bytes: stored_size,
+        stored_size_bytes: stored_size,
+        compression: meta.compression.clone(),
+        encryption: meta.encryption.clone(),
+        checksum_sha256: checksum.to_string(),
+        oplog_range: None,
+        oplog_count: Some(change_count),
+        promoted_from_gap: false,
+        mysql_binlog: end_coords,
+        status: BackupStatus::Complete,
+    }
 }
 
 /// `wal_level=logical`을 확인한다 — 아니면 증분 slot을 만들 수 없으므로 명확히 거부(exit 3).
@@ -796,6 +1090,7 @@ fn pg_incremental_manifest(
         // 변경 레코드 수를 oplog_count에 재사용 — 빈 슬라이스(Some(0)) 계약을 그대로 따른다.
         oplog_count: Some(change_count),
         promoted_from_gap: false,
+        mysql_binlog: None,
         status: BackupStatus::Complete,
     }
 }
@@ -936,6 +1231,7 @@ mod tests {
             oplog_range: None,
             oplog_count: None,
             promoted_from_gap: false,
+            mysql_binlog: None,
             status: BackupStatus::Complete,
         };
         let write_err = store.write(&manifest).await.unwrap_err();

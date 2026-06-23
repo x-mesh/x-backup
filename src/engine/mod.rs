@@ -4,11 +4,14 @@
 //! - [`native`]: Mongo 드라이버 네이티브 아카이브(`xb-native-v1`).
 //! - [`postgres`]: PostgreSQL 드라이버 백업/복구/증분/PITR(`xb-pg-v1` 풀 + `xb-pg-incr-v1`
 //!   증분, logical decoding, 2차).
+//! - [`mysql`]: MySQL/MariaDB 드라이버 백업/복구/증분/PITR(`xb-mysql-v1` 풀 +
+//!   `xb-mysql-incr-v1` 증분, binlog ROW 디코드, 3차).
 //!
 //! 전면 `Engine` trait 대신 핸들러 레벨에서 DB 종류([`crate::engine::DbKind`])로 분기하고,
 //! 덤프/복구/status에만 얇은 seam을 둔다(작동하는 Mongo 코드의 전면 재작성 회피).
 
 pub mod mongo;
+pub mod mysql;
 pub mod native;
 pub mod postgres;
 
@@ -19,6 +22,8 @@ pub enum DbKind {
     Mongo,
     /// PostgreSQL(`postgres://`, `postgresql://`).
     Postgres,
+    /// MySQL·MariaDB(`mysql://`, `mariadb://`).
+    Mysql,
 }
 
 impl DbKind {
@@ -27,6 +32,8 @@ impl DbKind {
         let lower = uri.trim_start().to_ascii_lowercase();
         if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
             DbKind::Postgres
+        } else if lower.starts_with("mysql://") || lower.starts_with("mariadb://") {
+            DbKind::Mysql
         } else {
             DbKind::Mongo
         }
@@ -37,6 +44,7 @@ impl DbKind {
         match self {
             DbKind::Postgres => "postgresql",
             DbKind::Mongo => "mongodb",
+            DbKind::Mysql => "mysql",
         }
     }
 }
@@ -54,5 +62,7 @@ mod tests {
             DbKind::Mongo
         );
         assert_eq!(DbKind::from_uri("mongodb+srv://h/db"), DbKind::Mongo);
+        assert_eq!(DbKind::from_uri("mysql://u:p@h:3306/db"), DbKind::Mysql);
+        assert_eq!(DbKind::from_uri("mariadb://h/db"), DbKind::Mysql);
     }
 }

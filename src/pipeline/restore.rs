@@ -191,15 +191,18 @@ pub async fn run_restore<C>(
 where
     C: FnOnce(&RestorePlan) -> bool,
 {
-    let is_pg = crate::engine::DbKind::from_uri(request.target_uri.expose())
-        == crate::engine::DbKind::Postgres;
+    let target_kind = crate::engine::DbKind::from_uri(request.target_uri.expose());
+    let is_pg = target_kind == crate::engine::DbKind::Postgres;
+    let is_mysql = target_kind == crate::engine::DbKind::Mysql;
+    // PG·MySQL은 드라이버 기반 SQL 복구라 Mongo 메타/가드 경로가 다르다(공통 처리).
+    let is_driver = is_pg || is_mysql;
 
-    // H6: PG 복구는 `--only`(선택적 복구)를 지원하지 않는다 — pg_restore에 ns 필터가 없어
+    // H6: 드라이버 복구(PG/MySQL)는 `--only`(선택적 복구)를 지원하지 않는다 — ns 필터가 없어
     //   전체를 복구하면서 계획만 좁게 보여주면 데이터 범위가 거짓 보고된다. 명확히 거부한다
-    //   (exit 2). PG 시점 복구(--at) 경로도 동일하게 --only를 거부한다.
-    if is_pg && request.only.is_some() {
+    //   (exit 2). 시점 복구(--at) 경로도 동일하게 --only를 거부한다.
+    if is_driver && request.only.is_some() {
         return Err(XBackupError::Usage(
-            "PG 복구는 --only(선택적 복구)를 지원하지 않습니다 — 전체 복구만 가능합니다. \
+            "PG/MySQL 복구는 --only(선택적 복구)를 지원하지 않습니다 — 전체 복구만 가능합니다. \
              특정 테이블만 필요하면 복구 후 정리하거나 별도 도구를 사용하세요."
                 .into(),
         ));
@@ -208,7 +211,7 @@ where
     // 사전 점검 메타(Mongo): skip-precheck가 아니면 대상에 연결해 점검에 활용한다.
     // dry-run도 충돌 목록을 보여주려면 점검이 필요하므로 동일하게 연결한다. PG는 드라이버가
     // 달라 Mongo 메타 경로를 타지 않고, 아래에서 별도로 충돌을 채운다(H5).
-    let meta = if request.skip_precheck || is_pg {
+    let meta = if request.skip_precheck || is_driver {
         None
     } else {
         Some(
@@ -232,6 +235,18 @@ where
         .await
         .map_err(|e| XBackupError::PrecheckFailed(format!("복구 대상(PG) 연결 실패: {e}")))?;
         let existing = crate::engine::postgres::meta::list_qualified(pg.client())
+            .await
+            .map_err(|e| XBackupError::PrecheckFailed(format!("기존 테이블 조회 실패: {e}")))?;
+        plan.conflicting_namespaces = existing;
+    }
+    if is_mysql && !request.skip_precheck {
+        let mut my = crate::engine::mysql::conn::MysqlClient::connect(
+            &request.target_uri,
+            request.timeout_secs,
+        )
+        .await
+        .map_err(|e| XBackupError::PrecheckFailed(format!("복구 대상(MySQL) 연결 실패: {e}")))?;
+        let existing = crate::engine::mysql::meta::list_qualified(my.conn_mut())
             .await
             .map_err(|e| XBackupError::PrecheckFailed(format!("기존 테이블 조회 실패: {e}")))?;
         plan.conflicting_namespaces = existing;
@@ -412,6 +427,17 @@ async fn stream_restore(
         tracing::debug!(backup_id = %plan.backup_id, inserted, "PG 복구: 행 삽입 완료");
         return Ok(());
     }
+    if archive_format == Some(crate::engine::mysql::archive::FORMAT_ID) {
+        let inserted = crate::engine::mysql::restore::mysql_restore(
+            &mut restored_stream,
+            &request.target_uri,
+            request.timeout_secs,
+            drop_existing,
+        )
+        .await?;
+        tracing::debug!(backup_id = %plan.backup_id, inserted, "MySQL 복구: 행 삽입 완료");
+        return Ok(());
+    }
 
     // 3) (mongodump 경로) URI를 0600 임시 config로(argv 노출 금지). 핸들은 restore 종료까지 유지.
     let uri_config = UriConfigFile::create(&request.target_uri)?;
@@ -590,6 +616,7 @@ mod tests {
             oplog_range: None,
             oplog_count: None,
             promoted_from_gap: false,
+            mysql_binlog: None,
             status: BackupStatus::Complete,
         }
     }

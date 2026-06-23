@@ -54,9 +54,12 @@ pub async fn handle(
         crate::cli::output::context_mode(args.json),
     );
 
-    // DB 종류 분기 — postgres URI면 PG peek(테이블 행 수 + 최신 행), 그 외는 Mongo.
+    // DB 종류 분기 — postgres/mysql URI면 드라이버 peek(테이블 행 수 + 최신 행), 그 외는 Mongo.
     if db == crate::engine::DbKind::Postgres {
         return peek_pg(&uri, timeout, &args, lang).await;
+    }
+    if db == crate::engine::DbKind::Mysql {
+        return peek_mysql(&uri, timeout, &args, lang).await;
     }
 
     let mongo = MongoMeta::connect(&uri, timeout).await?;
@@ -140,6 +143,97 @@ async fn peek_pg(
     }
     for (ns, count) in &counts {
         let latest = meta::latest_rows(client, ns, 1).await?.into_iter().next();
+        let preview = match latest {
+            Some(s) => truncate(&s, lang),
+            None => lang.sel("(empty)", "(비어 있음)").to_string(),
+        };
+        let ns_cell = pad(ns, 28);
+        println!(
+            "  {} {}={}  {} {}",
+            style(&ns_cell, Tone::Value),
+            style("count", Tone::Label),
+            style(&count.to_string(), Tone::Value),
+            style("latest:", Tone::Label),
+            preview
+        );
+    }
+    Ok(())
+}
+
+/// MySQL peek — `--ns`(db.table) 없으면 테이블별 행 수 + 최신 1행, 있으면 그 테이블 최신 N행.
+async fn peek_mysql(
+    uri: &crate::config::secret::Secret,
+    timeout: Option<u64>,
+    args: &PeekArgs,
+    lang: crate::i18n::Lang,
+) -> Result<()> {
+    use crate::engine::mysql::meta;
+    let mut my = meta::connect(uri, timeout).await?;
+
+    if let Some(ns) = &args.ns {
+        let rows = meta::latest_rows(my.conn_mut(), ns, args.limit.max(1)).await?;
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({ "ns": ns, "rows": rows.iter().map(|r| serde_json::from_str::<serde_json::Value>(r).unwrap_or(serde_json::Value::Null)).collect::<Vec<_>>() })
+            );
+            return Ok(());
+        }
+        println!(
+            "{ns} — {} {}",
+            style(lang.sel("latest", "최신"), Tone::Label),
+            style(
+                &lang.sel(&format!("{} rows", rows.len()), &format!("{}행", rows.len())),
+                Tone::Value,
+            )
+        );
+        if rows.is_empty() {
+            println!(
+                "  {}",
+                style(lang.sel("(empty)", "(비어 있음)"), Tone::Muted)
+            );
+        }
+        for r in &rows {
+            println!("  {}", truncate(r, lang));
+        }
+        return Ok(());
+    }
+
+    let counts = meta::table_counts_exact(my.conn_mut()).await?;
+    if args.json {
+        let mut items = Vec::new();
+        for (ns, count) in &counts {
+            let latest = meta::latest_rows(my.conn_mut(), ns, 1)
+                .await?
+                .into_iter()
+                .next();
+            items.push(serde_json::json!({
+                "ns": ns,
+                "count": count,
+                "latest": latest.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+            }));
+        }
+        println!("{}", serde_json::json!({ "namespaces": items }));
+        return Ok(());
+    }
+    if counts.is_empty() {
+        println!(
+            "{}",
+            style(
+                lang.sel(
+                    "(no user data — empty database)",
+                    "(사용자 데이터 없음 — 비어 있는 데이터베이스)"
+                ),
+                Tone::Muted,
+            )
+        );
+        return Ok(());
+    }
+    for (ns, count) in &counts {
+        let latest = meta::latest_rows(my.conn_mut(), ns, 1)
+            .await?
+            .into_iter()
+            .next();
         let preview = match latest {
             Some(s) => truncate(&s, lang),
             None => lang.sel("(empty)", "(비어 있음)").to_string(),

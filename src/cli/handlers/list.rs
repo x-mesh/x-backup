@@ -151,8 +151,9 @@ fn normalize_engine_filter(f: Option<&str>) -> Result<Option<String>> {
         Some(e) => match e.to_ascii_lowercase().as_str() {
             "postgresql" | "postgres" | "pg" => Ok(Some("postgresql".to_string())),
             "mongodb" | "mongo" => Ok(Some("mongodb".to_string())),
+            "mysql" | "mariadb" => Ok(Some("mysql".to_string())),
             other => Err(XBackupError::Usage(format!(
-                "--engine 값이 올바르지 않습니다: '{other}'(postgresql|mongodb)"
+                "--engine 값이 올바르지 않습니다: '{other}'(postgresql|mongodb|mysql)"
             ))),
         },
     }
@@ -499,9 +500,10 @@ fn print_human(
     }
 }
 
-/// manifest의 archive_format으로 DB 엔진을 판별한다(`xb-pg*`=postgresql, 그 외=mongodb).
+/// manifest의 archive_format으로 DB 엔진을 판별한다(`xb-pg*`=postgresql, `xb-mysql*`=mysql, 그 외=mongodb).
 fn engine_from_archive(fmt: Option<&str>) -> &'static str {
     match fmt {
+        Some(f) if f.starts_with("xb-mysql") => "mysql",
         Some(f) if f.starts_with("xb-pg") => "postgresql",
         _ => "mongodb",
     }
@@ -581,6 +583,7 @@ mod tests {
             }),
             oplog_count: None,
             promoted_from_gap: false,
+            mysql_binlog: None,
             status: BackupStatus::Complete,
         }
     }

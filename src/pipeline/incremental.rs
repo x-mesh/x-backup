@@ -510,6 +510,7 @@ fn build_incremental_manifest(
         oplog_range: Some(oplog_range),
         oplog_count: Some(oplog_count),
         promoted_from_gap: false,
+        mysql_binlog: None,
         status: BackupStatus::Complete,
     }
 }
@@ -630,6 +631,7 @@ mod tests {
             oplog_range,
             oplog_count: None,
             promoted_from_gap: false,
+            mysql_binlog: None,
             status,
         };
         ManifestStore::new(storage).write(&m).await.unwrap();
@@ -708,6 +710,7 @@ mod tests {
             }),
             oplog_count: Some(3),
             promoted_from_gap: false,
+            mysql_binlog: None,
             status: BackupStatus::Complete,
         };
         ManifestStore::new(&fs).write(&incr).await.unwrap();

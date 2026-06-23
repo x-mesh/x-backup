@@ -19,6 +19,7 @@ pub mod backup;
 pub mod checksum;
 pub mod incremental;
 pub mod migrate;
+pub mod mysql_pitr;
 pub mod pg_pitr;
 pub mod pitr;
 pub mod prune;

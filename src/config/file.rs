@@ -271,6 +271,13 @@ pub struct IncrementalConfig {
     /// 있기 때문이다. Mongo 증분(oplog)에는 영향이 없다.
     #[serde(default)]
     pub pg_logical: bool,
+    /// MySQL/MariaDB 증분(binlog ROW 디코드) 사용 여부(기본 false).
+    ///
+    /// true면 `backup --type incr`가 풀 백업이 기록한 binlog 좌표 이후의 ROW 변경을 캡처한다.
+    /// **명시적 opt-in**인 이유: 서버에 `log_bin=ON`·`binlog_format=ROW`·`binlog_row_image=FULL`
+    /// 전제와 REPLICATION SLAVE/CLIENT 권한이 필요하기 때문이다. Mongo/PG 증분에는 영향이 없다.
+    #[serde(default)]
+    pub mysql_binlog: bool,
 }
 
 impl Default for IncrementalConfig {
@@ -279,6 +286,7 @@ impl Default for IncrementalConfig {
             interval: default_incremental_interval(),
             on_gap: default_on_gap(),
             pg_logical: false,
+            mysql_binlog: false,
         }
     }
 }

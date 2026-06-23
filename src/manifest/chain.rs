@@ -305,13 +305,18 @@ pub fn verify_chain(nodes: &[ChainNode], target_id: &str) -> ChainReport {
     let incremental_ids: Vec<String> = incrementals.iter().map(|n| n.id.clone()).collect();
 
     // 4) 각 증분 적격성(incomplete·oplog_range 부재).
+    //    oplog_range 연속성은 **Mongo 체인**의 추적 수단이다. 드라이버 엔진(PG logical decoding
+    //    slot, MySQL binlog 좌표)은 oplog가 없고 서버측/manifest 좌표로 체인을 추적하므로,
+    //    base에 oplog_range가 없으면(=드라이버 엔진) 증분의 oplog_range 부재를 끊김으로 보지
+    //    않는다(step 5의 base-no-oplog 처리와 동일한 판단).
+    let mongo_chain = base.oplog_range.is_some();
     for incr in &incrementals {
         if incr.is_incomplete() {
             breaks.push(ChainBreak::IncompleteMember {
                 id: incr.id.clone(),
             });
         }
-        if incr.oplog_range.is_none() {
+        if mongo_chain && incr.oplog_range.is_none() {
             breaks.push(ChainBreak::MissingOplogRange {
                 id: incr.id.clone(),
             });
@@ -610,6 +615,7 @@ mod tests {
             }),
             oplog_count: Some(0),
             promoted_from_gap: false,
+            mysql_binlog: None,
             status: BackupStatus::Complete,
         };
         let node = ChainNode::from_manifest(&m);

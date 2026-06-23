@@ -484,6 +484,7 @@ mod tests {
             }),
             oplog_count: None,
             promoted_from_gap: false,
+            mysql_binlog: None,
             status: BackupStatus::Complete,
         }
     }

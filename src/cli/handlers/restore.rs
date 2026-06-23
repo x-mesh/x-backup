@@ -21,6 +21,7 @@ use crate::config::secret::Secret;
 use crate::config::ResolvedConfig;
 use crate::error::{Result, XBackupError};
 use crate::i18n::Lang;
+use crate::pipeline::mysql_pitr::{run_mysql_pitr, MysqlPitrPlan, MysqlPitrRequest};
 use crate::pipeline::pg_pitr::{run_pg_pitr, PgPitrPlan, PgPitrRequest};
 use crate::pipeline::pitr::{run_pitr, PitrPlan, PitrRequest};
 use crate::pipeline::restore::{export_to_dir, run_restore, RestorePlan, RestoreRequest};
@@ -588,6 +589,11 @@ async fn handle_pitr(
         return handle_pg_pitr(target_uri, storage, timeout_secs, target_origin, args, at, lang)
             .await;
     }
+    // MySQL 대상은 binlog 기반 PITR로 분기한다(base 풀 복원 + 증분 ROW 재생).
+    if crate::engine::DbKind::from_uri(target_uri.expose()) == crate::engine::DbKind::Mysql {
+        return handle_mysql_pitr(target_uri, storage, timeout_secs, target_origin, args, at, lang)
+            .await;
+    }
 
     // 여기까지 왔으면 Mongo PITR. 실행 컨텍스트 + 복구 대상(host) 표시.
     let mode = crate::cli::output::context_mode(args.json);
@@ -767,6 +773,188 @@ async fn handle_pg_pitr(
     }
 
     Ok(())
+}
+
+/// MySQL 시점 복구 핸들러 — base 풀 복원 + 증분 ROW 슬라이스 재생(`--at <RFC3339>|latest`).
+async fn handle_mysql_pitr(
+    target_uri: Secret,
+    storage: Box<dyn Storage>,
+    timeout_secs: Option<u64>,
+    target_origin: crate::cli::output::RestoreTargetOrigin,
+    args: RestoreArgs,
+    at: String,
+    lang: Lang,
+) -> Result<()> {
+    if args.only.is_some() {
+        return Err(XBackupError::Usage(
+            "MySQL 시점 복구(--at)는 --only(선택적 복구)와 함께 쓸 수 없습니다".into(),
+        ));
+    }
+
+    let mode = crate::cli::output::context_mode(args.json);
+    crate::cli::output::print_run_context(&args.profile, Some(crate::engine::DbKind::Mysql), mode);
+    crate::cli::output::print_restore_target(&target_uri, &target_origin, mode, lang);
+    let destination = crate::cli::output::redact_uri(target_uri.expose());
+
+    let request = MysqlPitrRequest {
+        target_uri,
+        at,
+        base_id: args.id.clone(),
+        force: args.force,
+        dry_run: args.dry_run,
+        timeout_secs,
+    };
+
+    let is_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let outcome = run_mysql_pitr(&request, storage.as_ref(), is_tty, |conflicts| {
+        prompt_confirm_pg(conflicts, lang)
+    })
+    .await?;
+
+    if request.dry_run {
+        print_mysql_pitr_plan(&outcome.plan, args.json, &destination, lang);
+    } else if args.json {
+        let summary = serde_json::json!({
+            "base_id": outcome.plan.base_id,
+            "incremental_ids": outcome.plan.incremental_ids,
+            "target": outcome.plan.target_label,
+            "destination": destination,
+            "replayed_slices": outcome.replayed_slices,
+            "applied_changes": outcome.applied_changes,
+            "database": "mysql",
+            "restored": true,
+        });
+        println!("{summary}");
+    } else if !args.quiet {
+        const W: usize = 20;
+        println!(
+            "{}",
+            style(
+                lang.sel("PITR restore complete (MySQL)", "PITR 복구 완료(MySQL)"),
+                Tone::Success,
+            )
+        );
+        println!(
+            "{}",
+            field_line_toned("destination", &destination, W, Tone::Value)
+        );
+        println!(
+            "{}",
+            field_line_toned("base id", &outcome.plan.base_id, W, Tone::Value)
+        );
+        println!(
+            "{}",
+            field_line_toned(
+                "replayed slices",
+                outcome.replayed_slices.to_string(),
+                W,
+                Tone::Value,
+            )
+        );
+        println!(
+            "{}",
+            field_line_toned(
+                "applied changes",
+                outcome.applied_changes.to_string(),
+                W,
+                Tone::Value,
+            )
+        );
+        println!(
+            "{}",
+            field_line_toned("target", &outcome.plan.target_label, W, Tone::Value)
+        );
+    }
+
+    Ok(())
+}
+
+/// MySQL PITR dry-run 계획을 출력한다(PG와 동일 형식).
+fn print_mysql_pitr_plan(plan: &MysqlPitrPlan, json: bool, destination: &str, lang: Lang) {
+    if json {
+        let summary = serde_json::json!({
+            "dry_run": true,
+            "base_id": plan.base_id,
+            "destination": destination,
+            "incremental_ids": plan.incremental_ids,
+            "target": plan.target_label,
+            "conflicting_tables": plan.conflicting_tables,
+            "database": "mysql",
+        });
+        println!("{summary}");
+        return;
+    }
+    const W: usize = 22;
+    println!(
+        "{}",
+        style(
+            lang.sel(
+                "PITR restore plan (dry-run, MySQL) — no changes applied",
+                "PITR 복구 계획(dry-run, MySQL) — 실제 변경 없음"
+            ),
+            Tone::Plan,
+        )
+    );
+    println!(
+        "{}",
+        field_line_toned("destination", destination, W, Tone::Value)
+    );
+    println!(
+        "{}",
+        field_line_toned("base id", &plan.base_id, W, Tone::Value)
+    );
+    if plan.incremental_ids.is_empty() {
+        println!(
+            "{}",
+            field_line_toned(
+                "incremental chain",
+                lang.sel("none (base only)", "없음(base만 복원)"),
+                W,
+                Tone::Muted,
+            )
+        );
+    } else {
+        println!(
+            "{}",
+            field_line(
+                "incremental chain",
+                format!(
+                    "{} — {}",
+                    style(&plan.incremental_ids.len().to_string(), Tone::Value),
+                    plan.incremental_ids.join(", ")
+                ),
+                W,
+            )
+        );
+    }
+    println!(
+        "{}",
+        field_line_toned("target", &plan.target_label, W, Tone::Value)
+    );
+    if plan.conflicting_tables.is_empty() {
+        println!(
+            "{}",
+            field_line_toned(
+                "conflicting tables",
+                lang.sel("none (empty target)", "없음(빈 대상)"),
+                W,
+                Tone::Success,
+            )
+        );
+    } else {
+        println!(
+            "{}",
+            field_line(
+                "conflicting tables",
+                format!(
+                    "{} — {}",
+                    style(&plan.conflicting_tables.len().to_string(), Tone::Warning),
+                    preview_list(&plan.conflicting_tables)
+                ),
+                W,
+            )
+        );
+    }
 }
 
 /// 목록을 최대 5개까지 미리보기로 잘라 표시한다(나머지는 "+N more").

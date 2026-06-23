@@ -110,6 +110,22 @@ pub async fn handle(
         )
         .await;
     }
+    if db == crate::engine::DbKind::Mysql {
+        return handle_mysql_backup(
+            &resolved,
+            &args,
+            uri,
+            timeout_secs,
+            primary.as_ref(),
+            &dests[0],
+            secondaries,
+            dests.len(),
+            mode,
+            backup_type,
+            lang,
+        )
+        .await;
+    }
 
     // backup 실행 전 status 핵심 점검(연결·권한·토폴로지·도구 존재)을 자동 선행한다(FR-8,
     //   PRD §9). 전체 status보다 가벼운 서브셋([`StatusChecker::precheck_subset`])으로, 백업을
@@ -526,6 +542,246 @@ async fn handle_pg_backup(
 
     if let Some(w) = replicate_warning {
         return Err(XBackupError::Warning(w));
+    }
+    Ok(())
+}
+
+/// MySQL 풀 백업 경로 — 드라이버(SHOW CREATE + SELECT) 아카이브를 압축·암호화·저장한다.
+///
+/// PG 경로의 storage/stage/summary 골격을 공유한다. 덤프가 스냅샷 시점 binlog 좌표를 manifest에
+/// 기록한다(증분 base). 증분(`--type incr`)은 t7에서 binlog 캡처 파이프라인으로 배선한다.
+#[allow(clippy::too_many_arguments)]
+async fn handle_mysql_backup(
+    resolved: &ResolvedConfig,
+    args: &BackupArgs,
+    uri: Secret,
+    timeout_secs: Option<u64>,
+    primary: &dyn Storage,
+    primary_dest: &DestinationConfig,
+    secondaries: &[DestinationConfig],
+    dest_count: usize,
+    mode: OutputMode,
+    backup_type: BackupType,
+    lang: Lang,
+) -> Result<()> {
+    // FR-8 자동 사전 점검 — 연결·대상 DB 점검(차단 결함이면 exit 3로 미시작).
+    let should_precheck = resolved.profile.mode.precheck && !args.skip_precheck;
+    if should_precheck {
+        crate::engine::mysql::status::precheck(&uri, timeout_secs).await?;
+    } else if args.skip_precheck {
+        tracing::warn!("--skip-precheck 지정 — MySQL 백업 사전 점검을 건너뜁니다(FR-8 우회)");
+    }
+
+    // 증분(--type incr)은 binlog 캡처 경로로 분기한다. mysql_binlog 미활성이면 명확히 거부.
+    if matches!(backup_type, BackupType::Incr) {
+        if !resolved.profile.features.incremental.mysql_binlog {
+            return Err(XBackupError::Usage(
+                "MySQL 증분(--type incr)은 features.incremental.mysql_binlog=true가 필요합니다 \
+                 (서버 log_bin=ON·binlog_format=ROW·binlog_row_image=FULL 전제). 설정을 켜고 \
+                 풀 백업을 한 번 수행한 뒤 증분을 사용하세요."
+                    .into(),
+            ));
+        }
+        if args.collection.is_some() {
+            return Err(XBackupError::Usage(
+                "MySQL 증분(--type incr)은 선택적 백업(--collection)과 병용할 수 없습니다 \
+                 — 증분은 전체 변경 슬라이스를 캡처합니다."
+                    .into(),
+            ));
+        }
+        return handle_mysql_incremental(
+            resolved,
+            args,
+            uri,
+            timeout_secs,
+            primary,
+            primary_dest,
+            secondaries,
+            dest_count,
+            mode,
+            lang,
+        )
+        .await;
+    }
+
+    let (stages, meta) = build_stages(resolved, args)?;
+    let progress_counter = new_counter();
+    let reporter = ProgressReporter::start(
+        mode,
+        ProgressKind::Indeterminate {
+            label: lang.sel("MySQL backup", "MySQL 백업").into(),
+        },
+        std::sync::Arc::clone(&progress_counter),
+    );
+    let result = crate::pipeline::backup::run_mysql_full_backup(
+        &uri,
+        timeout_secs,
+        args.collection.clone(),
+        primary,
+        stages,
+        meta,
+        Some(progress_counter),
+        /* promoted_from_gap */ false,
+    )
+    .await;
+    reporter.finish().await;
+    let outcome = result?;
+
+    let replicate_warning = replicate_and_warn(
+        primary,
+        secondaries,
+        &outcome.backup_id,
+        outcome.stored_size_bytes > 0,
+    )
+    .await;
+
+    if mode.emits_json() {
+        let summary = serde_json::json!({
+            "backup_id": outcome.backup_id,
+            "stored_size_bytes": outcome.stored_size_bytes,
+            "checksum_sha256": outcome.checksum_sha256,
+            "database": "mysql",
+            "destinations": dest_count,
+        });
+        println!("{summary}");
+    } else if mode.shows_human_summary() {
+        print_backup_summary(
+            &BackupSummary {
+                kind: "full",
+                detail: "MySQL",
+                backup_id: &outcome.backup_id,
+                primary_dest,
+                stored_size: outcome.stored_size_bytes,
+                original_size: Some(outcome.original_size_bytes),
+                compression: outcome.compression.as_ref(),
+                encryption: outcome.encryption.as_ref(),
+                checksum: Some(&outcome.checksum_sha256),
+                dest_count,
+                base_id: None,
+                change: None,
+                oplog_range: None,
+                note: None,
+            },
+            lang,
+        );
+    }
+
+    if let Some(w) = replicate_warning {
+        return Err(XBackupError::Warning(w));
+    }
+    Ok(())
+}
+
+/// MySQL 증분 백업 경로 — binlog ROW 변경을 캡처해 저장한다(gap이면 풀 승격).
+#[allow(clippy::too_many_arguments)]
+async fn handle_mysql_incremental(
+    resolved: &ResolvedConfig,
+    args: &BackupArgs,
+    uri: Secret,
+    timeout_secs: Option<u64>,
+    primary: &dyn Storage,
+    primary_dest: &DestinationConfig,
+    secondaries: &[DestinationConfig],
+    dest_count: usize,
+    mode: OutputMode,
+    lang: Lang,
+) -> Result<()> {
+    let should_precheck = resolved.profile.mode.precheck && !args.skip_precheck;
+    if should_precheck {
+        crate::engine::mysql::status::precheck(&uri, timeout_secs).await?;
+    }
+
+    let (stages, meta) = build_stages(resolved, args)?;
+    let summary_meta = meta.clone();
+    let progress_counter = new_counter();
+    let reporter = ProgressReporter::start(
+        mode,
+        ProgressKind::Indeterminate {
+            label: lang.sel("MySQL incremental", "MySQL 증분").into(),
+        },
+        std::sync::Arc::clone(&progress_counter),
+    );
+    let result = crate::pipeline::backup::run_mysql_incremental_backup(
+        &uri,
+        timeout_secs,
+        &resolved.profile_name,
+        primary,
+        stages,
+        meta,
+        Some(progress_counter),
+    )
+    .await;
+    reporter.finish().await;
+    let outcome = result?;
+
+    let replicate_warning = replicate_and_warn(
+        primary,
+        secondaries,
+        &outcome.backup_id,
+        outcome.stored_size_bytes > 0,
+    )
+    .await;
+
+    if mode.emits_json() {
+        let summary = serde_json::json!({
+            "backup_type": if outcome.promoted { "full" } else { "incremental" },
+            "backup_id": outcome.backup_id,
+            "base_id": outcome.base_id,
+            "change_count": outcome.change_count,
+            "stored_size_bytes": outcome.stored_size_bytes,
+            "promoted_from_gap": outcome.promoted,
+            "database": "mysql",
+            "destinations": dest_count,
+        });
+        println!("{summary}");
+    } else if mode.shows_human_summary() {
+        let note = if outcome.promoted {
+            Some(lang.sel(
+                "(gap — promoted to full backup)",
+                "(gap — 풀 백업으로 승격됨)",
+            ))
+        } else if outcome.change_count == 0 {
+            Some(lang.sel(
+                "(no changes — empty slice: manifest only)",
+                "(변경 없음 — 빈 슬라이스: manifest만 기록)",
+            ))
+        } else {
+            None
+        };
+        print_backup_summary(
+            &BackupSummary {
+                kind: if outcome.promoted { "full" } else { "incr" },
+                detail: "MySQL",
+                backup_id: &outcome.backup_id,
+                primary_dest,
+                stored_size: outcome.stored_size_bytes,
+                original_size: None,
+                compression: summary_meta.compression.as_ref(),
+                encryption: summary_meta.encryption.as_ref(),
+                checksum: None,
+                dest_count,
+                base_id: Some(&outcome.base_id),
+                change: Some(("changes", outcome.change_count)),
+                oplog_range: None,
+                note,
+            },
+            lang,
+        );
+    }
+
+    if let Some(w) = replicate_warning {
+        return Err(XBackupError::Warning(w));
+    }
+    // gap으로 풀 승격됐으면 경고 동반 성공(exit 4) — 증분을 요청했으나 base가 끊겨 풀로 대체됨을
+    // 운영/모니터링에 신호한다(PG promote_pg_incremental_to_full과 동일 의미).
+    if outcome.promoted {
+        return Err(XBackupError::Warning(
+            lang.sel(
+                "incremental promoted to full backup (gap — base binlog purged)",
+                "증분이 풀 백업으로 승격됨(gap — base binlog가 purge됨)",
+            )
+            .to_string(),
+        ));
     }
     Ok(())
 }

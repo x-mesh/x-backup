@@ -473,6 +473,128 @@ fn migrate_guard(target_had_data: bool, drop: bool, force: bool) -> GuardOutcome
     GuardOutcome::Proceed
 }
 
+/// MySQL 서버 버전 문자열(`SELECT VERSION()`).
+async fn mysql_server_version(conn: &mut mysql_async::Conn) -> String {
+    use mysql_async::prelude::Queryable;
+    conn.query_first::<String, _>("SELECT VERSION()")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "mysql".to_string())
+}
+
+/// MySQL 마이그레이션 계획 — source/target 연결, 충돌 테이블·버전·카운트 수집.
+pub async fn plan_mysql_migrate(request: &MigrateRequest) -> Result<MigratePlan> {
+    use crate::engine::mysql::meta as my_meta;
+    let mut src = my_meta::connect(&request.source_uri, request.timeout_secs).await?;
+    let mut tgt = my_meta::connect(&request.target_uri, request.timeout_secs)
+        .await
+        .map_err(|e| XBackupError::PrecheckFailed(format!("target 연결 실패: {e}")))?;
+    let source_server_version = mysql_server_version(src.conn_mut()).await;
+    let target_server_version = mysql_server_version(tgt.conn_mut()).await;
+    let version_warning = version_compat_warning(&source_server_version, &target_server_version);
+
+    let ns = ns_of(&request.db, &request.collection);
+    let conflicting_namespaces = {
+        let names = my_meta::list_qualified(tgt.conn_mut())
+            .await
+            .map_err(|e| XBackupError::PrecheckFailed(format!("target 테이블 열거 실패: {e}")))?;
+        filter_names(names, &ns)
+    };
+    let source_counts = filter_counts(
+        my_meta::table_counts_exact(src.conn_mut())
+            .await
+            .unwrap_or_default(),
+        &ns,
+    );
+    let target_counts = filter_counts(
+        my_meta::table_counts_exact(tgt.conn_mut())
+            .await
+            .unwrap_or_default(),
+        &ns,
+    );
+
+    Ok(MigratePlan {
+        source_topology: "MySQL".to_string(),
+        source_server_version,
+        target_server_version,
+        ns,
+        conflicting_namespaces,
+        version_warning,
+        source_counts,
+        target_counts,
+    })
+}
+
+/// MySQL→MySQL 마이그레이션 — source 덤프를 target에 직접 복원(외부 도구 없이).
+pub async fn run_mysql_migrate<C>(
+    request: &MigrateRequest,
+    force: bool,
+    is_tty: bool,
+    confirm: C,
+) -> Result<(MigratePlan, Option<MigrateOutcome>)>
+where
+    C: FnOnce(&MigratePlan) -> bool,
+{
+    use crate::engine::mysql::{backup::MysqlDumper, conn::MysqlClient, restore::restore_into};
+
+    let plan = plan_mysql_migrate(request).await?;
+    if request.dry_run {
+        return Ok((plan, None));
+    }
+
+    let target_had_data = !plan.conflicting_namespaces.is_empty();
+    match migrate_guard(target_had_data, request.drop, force) {
+        GuardOutcome::Proceed => {}
+        GuardOutcome::NeedDrop => {
+            return Err(XBackupError::Usage(format!(
+                "target에 기존 테이블이 있습니다({}개). 마이그레이션은 교체를 의미하므로 \
+                 --drop이 필요합니다. 빈 target으로 옮기거나 --drop --force를 쓰세요.",
+                plan.conflicting_namespaces.len()
+            )));
+        }
+        GuardOutcome::NeedConfirm => {
+            if !(is_tty && confirm(&plan)) {
+                return Err(XBackupError::Failure(
+                    "target 기존 테이블을 --drop으로 교체하려면 --force 또는 대화형 확인이 \
+                     필요합니다(프로덕션 가드레일)."
+                        .into(),
+                ));
+            }
+        }
+    }
+
+    // 전송: MysqlDumper(source) → restore_into(target). EOF 후 양측 결과 회수.
+    let dumper = MysqlDumper::connect(&request.source_uri, request.timeout_secs).await?;
+    let mut stream = dumper.dump_stream(request.collection.clone());
+    let handle = stream.handle();
+    let mut tgt = MysqlClient::connect(&request.target_uri, request.timeout_secs)
+        .await
+        .map_err(|e| XBackupError::PrecheckFailed(format!("target 연결 실패: {e}")))?;
+    let restore_res = restore_into(&mut stream, tgt.conn_mut(), request.drop).await;
+    drop(stream);
+    let dump_res = handle.finish().await;
+    let inserted = match (restore_res, dump_res) {
+        (Ok(n), Ok(_)) => n,
+        (Err(re), Err(de)) => {
+            return Err(XBackupError::Failure(format!(
+                "복구 실패: {re} (덤프도 실패 — 원인일 수 있음: {de})"
+            )))
+        }
+        (Err(re), Ok(_)) => return Err(re),
+        (Ok(_), Err(de)) => return Err(de),
+    };
+    tracing::info!(inserted, "MySQL 마이그레이션 완료(파일 없음)");
+
+    Ok((
+        plan,
+        Some(MigrateOutcome {
+            source_topology: "MySQL".to_string(),
+            target_had_data,
+        }),
+    ))
+}
+
 /// 서버 버전 메이저가 다르면 경고 문자열, 같으면 None.
 fn version_compat_warning(source: &str, target: &str) -> Option<String> {
     let major = |v: &str| v.split('.').next().unwrap_or("").to_string();

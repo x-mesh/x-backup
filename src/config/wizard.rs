@@ -125,8 +125,9 @@ fn ask_connection(prompt: &mut dyn Prompt) -> Result<(Option<String>, Option<Str
     loop {
         let answer = ask_default(
             prompt,
-            "MongoDB 접속 — URI가 담긴 환경변수 이름(권장, 시크릿 미저장) 또는 URI 직접 입력",
-            "MONGO_URI",
+            "DB 접속 — URI가 담긴 환경변수 이름(권장, 시크릿 미저장) 또는 URI 직접 입력 \
+             (mongodb:// · postgres:// · mysql:// — 스킴으로 엔진 자동 판별)",
+            "DB_URI",
         )?;
         // 붙여넣기 실수 대비 양끝 따옴표/공백 정리.
         let cleaned = answer.trim().trim_matches(['"', '\'']).trim().to_string();
@@ -145,7 +146,7 @@ fn ask_connection(prompt: &mut dyn Prompt) -> Result<(Option<String>, Option<Str
         }
         // 둘 다 아님(오타 등) — 안내 후 다시 묻는다.
         prompt.read_line(
-            "  ! 환경변수 이름(예: MONGO_URI) 또는 URI(mongodb://...)를 입력하세요. Enter로 다시 입력",
+            "  ! 환경변수 이름(예: DB_URI) 또는 URI(mongodb:// · postgres:// · mysql://)를 입력하세요. Enter로 다시 입력",
         )?;
     }
 }
@@ -445,7 +446,7 @@ mod tests {
         let mut prompt = VecPrompt::new(answers);
         let cfg = run_wizard(&mut prompt).unwrap();
         let p = cfg.profile("prod").unwrap();
-        assert_eq!(p.source.uri_env.as_deref(), Some("MONGO_URI"));
+        assert_eq!(p.source.uri_env.as_deref(), Some("DB_URI"));
         assert_eq!(p.destination.r#type.as_deref(), Some("local"));
         assert_eq!(p.features.compression.level, 10);
         assert!(p.features.encryption.enabled);

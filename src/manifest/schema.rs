@@ -127,6 +127,23 @@ pub enum BackupStatus {
     Incomplete,
 }
 
+/// MySQL binlog 좌표 — 풀 백업 스냅샷 시점의 binlog 위치(증분 체인의 base).
+///
+/// PostgreSQL은 서버측 replication slot이 위치를 보존하지만 MySQL은 슬롯 개념이 없어
+/// manifest에 기록한다. 증분([`crate::engine::mysql::incremental`])이 `gtid_executed`(우선)
+/// 또는 `file`/`position`을 시작점으로 binlog 스트림을 연다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MysqlBinlogCoords {
+    /// binlog 파일명(`SHOW MASTER STATUS`/`SHOW BINARY LOG STATUS`의 `File`).
+    pub file: String,
+    /// binlog 파일 내 바이트 위치(`Position`).
+    pub position: u64,
+    /// 실행된 GTID 집합(`gtid_executed`/`Executed_Gtid_Set`) — 증분 시작점·체인 식별.
+    /// GTID 미사용 서버는 빈 문자열(이때는 `file`/`position`으로 체이닝).
+    #[serde(default)]
+    pub gtid_executed: String,
+}
+
 /// mongodump/mongorestore 등 외부 도구 버전(버전 호환 추적, pitfall 1-5).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ToolVersions {
@@ -199,6 +216,9 @@ pub struct BackupManifest {
     /// 의미한다(SC2, exit 4 경고 동반). 운영 진단·체인 분석용 표식이다.
     #[serde(default, skip_serializing_if = "is_false")]
     pub promoted_from_gap: bool,
+    /// MySQL 풀 백업 스냅샷 시점의 binlog 좌표(증분 base). Mongo/PG는 항상 None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mysql_binlog: Option<MysqlBinlogCoords>,
     /// 완료 상태.
     pub status: BackupStatus,
 }
@@ -238,6 +258,7 @@ mod tests {
             }),
             oplog_count: None,
             promoted_from_gap: false,
+            mysql_binlog: None,
             status: BackupStatus::Complete,
         }
     }

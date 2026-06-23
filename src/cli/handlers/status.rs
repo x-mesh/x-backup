@@ -260,11 +260,13 @@ async fn build_report(
     let prefer_secondary = resolved.profile.source.prefer_secondary;
     let timeout = resolved.profile.source.connect_timeout_secs;
 
-    // DB 종류 분기 — postgres URI면 PG status, 그 외는 Mongo status.
-    let report = if crate::engine::DbKind::from_uri(uri.expose()) == crate::engine::DbKind::Postgres
-    {
+    // DB 종류 분기 — postgres/mysql URI면 드라이버 status, 그 외는 Mongo status.
+    let db_kind = crate::engine::DbKind::from_uri(uri.expose());
+    let report = if db_kind == crate::engine::DbKind::Postgres {
         crate::engine::postgres::status::full_report(&resolved.profile_name, &uri, timeout, lang)
             .await
+    } else if db_kind == crate::engine::DbKind::Mysql {
+        crate::engine::mysql::status::full_report(&resolved.profile_name, &uri, timeout, lang).await
     } else {
         // 엔진별 도구 점검 — native는 외부 도구 불필요(None), mongodump는 도구 존재/버전 점검.
         let tool = match crate::pipeline::backup::Engine::parse(&resolved.profile.mode.engine)? {
@@ -804,12 +806,19 @@ async fn collect_ns_counts(config_toml: Option<&str>, profile: &str) -> Result<V
         ))
     })?;
     let timeout = resolved.profile.source.connect_timeout_secs;
-    if crate::engine::DbKind::from_uri(uri.expose()) == crate::engine::DbKind::Postgres {
-        let pg = crate::engine::postgres::meta::connect(&uri, timeout).await?;
-        crate::engine::postgres::meta::table_counts_exact(pg.client()).await
-    } else {
-        let mongo = MongoMeta::connect(&uri, timeout).await?;
-        mongo.namespace_counts().await
+    match crate::engine::DbKind::from_uri(uri.expose()) {
+        crate::engine::DbKind::Postgres => {
+            let pg = crate::engine::postgres::meta::connect(&uri, timeout).await?;
+            crate::engine::postgres::meta::table_counts_exact(pg.client()).await
+        }
+        crate::engine::DbKind::Mysql => {
+            let mut my = crate::engine::mysql::meta::connect(&uri, timeout).await?;
+            crate::engine::mysql::meta::table_counts_exact(my.conn_mut()).await
+        }
+        crate::engine::DbKind::Mongo => {
+            let mongo = MongoMeta::connect(&uri, timeout).await?;
+            mongo.namespace_counts().await
+        }
     }
 }
 
@@ -973,6 +982,7 @@ impl LiveSnapshot {
 enum LiveConn {
     Mongo(Option<MongoMeta>),
     Postgres(Option<crate::engine::postgres::conn::PgClient>),
+    Mysql(Option<crate::engine::mysql::conn::MysqlClient>),
 }
 
 /// 프로파일별 라이브 모니터 — 드라이버 클라이언트를 재사용하고, 끊기면 다음 틱에 재연결한다.
@@ -1039,6 +1049,32 @@ impl Monitor {
                     data_size,
                 }
             }
+            LiveConn::Mysql(my) => {
+                use crate::engine::mysql::{conn::MysqlClient, meta};
+                if my.is_none() {
+                    *my = MysqlClient::connect(&self.uri, self.timeout_secs).await.ok();
+                }
+                let c = match my {
+                    Some(c) => c,
+                    None => return LiveSnapshot::disconnected(&self.profile),
+                };
+                let namespaces = match meta::table_counts_estimated(c.conn_mut()).await {
+                    Ok(n) => n,
+                    Err(_) => {
+                        *my = None;
+                        return LiveSnapshot::disconnected(&self.profile);
+                    }
+                };
+                let data_size = meta::data_size_bytes(c.conn_mut()).await.unwrap_or(0);
+                let total_docs = namespaces.iter().map(|(_, c)| c).sum();
+                LiveSnapshot {
+                    profile: self.profile.clone(),
+                    connected: true,
+                    namespaces,
+                    total_docs,
+                    data_size,
+                }
+            }
         }
     }
 }
@@ -1062,6 +1098,7 @@ fn build_monitors(config_toml: Option<&str>, profiles: &[String]) -> Result<Vec<
         let conn = match crate::engine::DbKind::from_uri(uri.expose()) {
             crate::engine::DbKind::Postgres => LiveConn::Postgres(None),
             crate::engine::DbKind::Mongo => LiveConn::Mongo(None),
+            crate::engine::DbKind::Mysql => LiveConn::Mysql(None),
         };
         monitors.push(Monitor {
             profile: resolved.profile_name.clone(),

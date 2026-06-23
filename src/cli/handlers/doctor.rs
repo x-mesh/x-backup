@@ -345,6 +345,19 @@ fn check_profile(
                 });
             }
         }
+        Some(DbKind::Mysql) if prof.features.incremental.mysql_binlog => {
+            items.push(Item {
+                status: CheckStatus::Ok,
+                label: "incremental",
+                message: lang
+                    .sel(
+                        "mysql_binlog=true (server requires log_bin=ON, binlog_format=ROW, binlog_row_image=FULL)",
+                        "mysql_binlog=true(서버 log_bin=ON·binlog_format=ROW·binlog_row_image=FULL 필요)",
+                    )
+                    .into(),
+            });
+        }
+        Some(DbKind::Mysql) => {}
         None => {}
     }
 

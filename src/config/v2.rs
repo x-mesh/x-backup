@@ -230,6 +230,7 @@ fn expand_profile(name: &str, flat: &Table) -> Result<Table> {
             "incr_interval" => insert_into(&mut incremental, "interval", v),
             "incr_on_gap" => insert_into(&mut incremental, "on_gap", v),
             "pg_logical" => insert_into(&mut incremental, "pg_logical", v),
+            "mysql_binlog" => insert_into(&mut incremental, "mysql_binlog", v),
             // ── retention ──
             "keep_full" => insert_into(&mut retention, "keep_full", v),
             "keep_days" => insert_into(&mut retention, "keep_days", v),
@@ -615,6 +616,9 @@ fn emit_profile_body(buf: &mut String, p: &Profile) {
     }
     if i.pg_logical {
         line_raw(buf, "pg_logical", "true");
+    }
+    if i.mysql_binlog {
+        line_raw(buf, "mysql_binlog", "true");
     }
 
     // ── retention(모두 선택) ──
@@ -1119,6 +1123,7 @@ mod tests {
                         interval: "15m".to_string(),
                         on_gap: "promote_full".to_string(),
                         pg_logical: true,
+                        mysql_binlog: false,
                     },
                     ..FeaturesConfig::default()
                 },

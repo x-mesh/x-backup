@@ -124,6 +124,12 @@ pub async fn handle(
         DbKind::Mongo => {
             run_migrate(&request, args.force, is_tty, |p| prompt_confirm(p, lang)).await?
         }
+        DbKind::Mysql => {
+            crate::pipeline::migrate::run_mysql_migrate(&request, args.force, is_tty, |p| {
+                prompt_confirm(p, lang)
+            })
+            .await?
+        }
     };
 
     // 3) 출력. dry-run은 계획을, 실제 실행은 완료 요약을 낸다(진행=stderr, 결과=stdout).
