@@ -244,6 +244,47 @@ jobs:
         if: always()
         run: make postgres-down
 
+  # ── 3-2) MySQL 엔진 E2E (push + nightly) ─────────────────────────────────
+  # GitHub service container는 binlog/gtid command 플래그 오버라이드가 어려워
+  # docker compose(docker-compose.mysql.yaml: binlog ROW + row_metadata FULL + gtid ON)를 쓴다.
+  mysql:
+    name: mysql (binlog ROW E2E)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name == 'push' || github.event_name == 'schedule'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned 1.93.0)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: mysql
+
+      - name: Verify Docker is available (compose brings up MySQL)
+        run: docker info >/dev/null
+
+      # make scenario-mysql = build(release) + mysql-up(compose, binlog/gtid ON, --wait)
+      # + scripts/scenario-mysql-e2e.sh(풀→증분(binlog ROW)→구조검증→풀복구→PITR 전체/중간, 8 단언).
+      - name: MySQL E2E (full → incremental → PITR)
+        run: make scenario-mysql
+
+      # 위 시나리오가 MySQL 컨테이너를 띄운 상태를 재사용한다. cargo 통합 테스트로
+      # 풀→복구 라운드트립(교차 DB)·binlog 증분 캡처/멱등 적용을 직접 검증한다.
+      - name: MySQL cargo integration tests (round-trip / binlog incremental)
+        run: cargo test --features mysql-integration --test mysql_integration -- --include-ignored --nocapture --test-threads=1
+        env:
+          XB_MYSQL_TEST_URI: mysql://root:xbackup-dev@127.0.0.1:3306/xbackup
+
+      - name: Tear down MySQL
+        if: always()
+        run: make mysql-down
+
   # ── 4) musl 정적 빌드 (모든 PR/push) ─────────────────────────────────────
   # acceptance-report §5 방식: cross 0.2.5 + ghcr.io/cross-rs/x86_64-unknown-linux-musl.
   # zstd C 빌드 + ring 어셈블리를 컨테이너 안 musl 툴체인이 함께 컴파일한다.
