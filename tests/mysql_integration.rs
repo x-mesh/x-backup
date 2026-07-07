@@ -63,7 +63,9 @@ async fn recreate_database(server: &str, db: &str) {
     c.query_drop(format!("DROP DATABASE IF EXISTS `{db}`"))
         .await
         .unwrap();
-    c.query_drop(format!("CREATE DATABASE `{db}`")).await.unwrap();
+    c.query_drop(format!("CREATE DATABASE `{db}`"))
+        .await
+        .unwrap();
     drop(c);
 }
 
@@ -122,9 +124,11 @@ async fn full_backup_restore_round_trip_preserves_data() {
         timeout_secs: None,
         progress_counter: None,
     };
-    run_restore(&req, &storage, false, |_| panic!("빈 대상이라 confirm 미호출"))
-        .await
-        .expect("빈 대상 복구 성공");
+    run_restore(&req, &storage, false, |_| {
+        panic!("빈 대상이라 confirm 미호출")
+    })
+    .await
+    .expect("빈 대상 복구 성공");
 
     let mut tgt = connect(&tgt_uri).await;
     let n: i64 = tgt
@@ -134,7 +138,10 @@ async fn full_backup_restore_round_trip_preserves_data() {
         .unwrap();
     assert_eq!(n, 3, "복구 후 행 수 일치");
     let tgt_content: String = tgt.query_first(content_sql).await.unwrap().unwrap();
-    assert_eq!(tgt_content, src_content, "복구 후 콘텐츠 지문 일치(decimal·datetime·generated)");
+    assert_eq!(
+        tgt_content, src_content,
+        "복구 후 콘텐츠 지문 일치(decimal·datetime·generated)"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -143,11 +150,9 @@ async fn incremental_binlog_capture_and_apply_round_trip() {
     let src_uri = src_uri();
     let mut src = connect(&src_uri).await;
     src.query_drop("DROP TABLE IF EXISTS incr_t").await.unwrap();
-    src.query_drop(
-        "CREATE TABLE incr_t (id INT PRIMARY KEY, v VARCHAR(32), n INT)",
-    )
-    .await
-    .unwrap();
+    src.query_drop("CREATE TABLE incr_t (id INT PRIMARY KEY, v VARCHAR(32), n INT)")
+        .await
+        .unwrap();
     src.query_drop("INSERT INTO incr_t VALUES (1,'a',10),(2,'b',20),(3,'c',30)")
         .await
         .unwrap();
@@ -190,7 +195,9 @@ async fn incremental_binlog_capture_and_apply_round_trip() {
     // base 좌표 회수.
     let store = ManifestStore::new(&storage);
     let base = store.read(&full.backup_id).await.unwrap();
-    let start = base.mysql_binlog.expect("풀 백업이 binlog 좌표를 기록해야 함");
+    let start = base
+        .mysql_binlog
+        .expect("풀 백업이 binlog 좌표를 기록해야 함");
 
     // 소스 변경: insert 4, update 1, delete 2.
     src.query_drop("INSERT INTO incr_t VALUES (4,'d',40)")
@@ -199,7 +206,9 @@ async fn incremental_binlog_capture_and_apply_round_trip() {
     src.query_drop("UPDATE incr_t SET n=111 WHERE id=1")
         .await
         .unwrap();
-    src.query_drop("DELETE FROM incr_t WHERE id=2").await.unwrap();
+    src.query_drop("DELETE FROM incr_t WHERE id=2")
+        .await
+        .unwrap();
     // binlog가 디스크에 반영되도록 flush.
     src.query_drop("FLUSH BINARY LOGS").await.ok();
 
@@ -212,12 +221,18 @@ async fn incremental_binlog_capture_and_apply_round_trip() {
     )
     .await
     .expect("binlog 캡처 성공");
-    assert!(captured.count >= 3, "최소 3개 변경(insert/update/delete) 캡처: {}", captured.count);
+    assert!(
+        captured.count >= 3,
+        "최소 3개 변경(insert/update/delete) 캡처: {}",
+        captured.count
+    );
 
     // 대상에 멱등 적용.
     let mut tgt = connect(&tgt_uri).await;
     let mut reader = Cursor::new(captured.archive.clone());
-    let applied = apply(&mut reader, &mut tgt, None).await.expect("증분 적용 성공");
+    let applied = apply(&mut reader, &mut tgt, None)
+        .await
+        .expect("증분 적용 성공");
     assert!(applied >= 3, "적용 변경 수 >= 3: {applied}");
 
     // 멱등 재적용(같은 슬라이스 다시) — 안전해야 한다.
@@ -247,7 +262,9 @@ async fn incremental_binlog_capture_and_apply_round_trip() {
 async fn incremental_typed_columns_round_trip() {
     let src_uri = src_uri();
     let mut src = connect(&src_uri).await;
-    src.query_drop("DROP TABLE IF EXISTS typed_t").await.unwrap();
+    src.query_drop("DROP TABLE IF EXISTS typed_t")
+        .await
+        .unwrap();
     src.query_drop(
         "CREATE TABLE typed_t (\
            id INT PRIMARY KEY, \
@@ -303,7 +320,12 @@ async fn incremental_typed_columns_round_trip() {
         .expect("base 복구");
 
     let store = ManifestStore::new(&storage);
-    let start = store.read(&full.backup_id).await.unwrap().mysql_binlog.unwrap();
+    let start = store
+        .read(&full.backup_id)
+        .await
+        .unwrap()
+        .mysql_binlog
+        .unwrap();
 
     // 변경: 모든 타입 들어간 INSERT, 값 UPDATE, PK 변경 UPDATE, DELETE.
     src.query_drop(
@@ -320,9 +342,14 @@ async fn incremental_typed_columns_round_trip() {
         .unwrap();
     src.query_drop("FLUSH BINARY LOGS").await.ok();
 
-    let captured = capture(&Secret::new(src_uri.clone()), None, &start, server_id_for("typed"))
-        .await
-        .expect("캡처");
+    let captured = capture(
+        &Secret::new(src_uri.clone()),
+        None,
+        &start,
+        server_id_for("typed"),
+    )
+    .await
+    .expect("캡처");
     assert!(captured.count >= 3, "변경 캡처: {}", captured.count);
 
     let mut tgt = connect(&tgt_uri).await;
@@ -337,8 +364,14 @@ async fn incremental_typed_columns_round_trip() {
     let tgt_fp: String = tgt.query_first(fp).await.unwrap().unwrap();
     assert_eq!(tgt_fp, src_fp, "타입별 증분 적용 후 소스와 일치(BIT/SET/ENUM/TIMESTAMP/DECIMAL/JSON/VARBINARY/PK변경/DEFAULT)");
     // 구체 검증.
-    assert!(tgt_fp.contains("1|81|a,b,c|y|"), "id=1 SET·BIT·decimal 갱신: {tgt_fp}");
-    assert!(tgt_fp.contains("3|2|b|z|"), "PK 2→3 변경 + BIT(2)·SET·ENUM: {tgt_fp}");
+    assert!(
+        tgt_fp.contains("1|81|a,b,c|y|"),
+        "id=1 SET·BIT·decimal 갱신: {tgt_fp}"
+    );
+    assert!(
+        tgt_fp.contains("3|2|b|z|"),
+        "PK 2→3 변경 + BIT(2)·SET·ENUM: {tgt_fp}"
+    );
 }
 
 /// PK 없는 테이블: 중복 행 중 하나만 DELETE해도 대상에서 한 행만 지워져야 한다(LIMIT 1).
@@ -382,9 +415,16 @@ async fn incremental_no_pk_deletes_single_row() {
         timeout_secs: None,
         progress_counter: None,
     };
-    run_restore(&req, &storage, false, |_| true).await.expect("base 복구");
+    run_restore(&req, &storage, false, |_| true)
+        .await
+        .expect("base 복구");
     let store = ManifestStore::new(&storage);
-    let start = store.read(&full.backup_id).await.unwrap().mysql_binlog.unwrap();
+    let start = store
+        .read(&full.backup_id)
+        .await
+        .unwrap()
+        .mysql_binlog
+        .unwrap();
 
     // 중복 (1,2) 두 행 중 하나만 삭제.
     src.query_drop("DELETE FROM nopk_t WHERE a=1 AND b=2 LIMIT 1")
@@ -392,15 +432,31 @@ async fn incremental_no_pk_deletes_single_row() {
         .unwrap();
     src.query_drop("FLUSH BINARY LOGS").await.ok();
 
-    let captured = capture(&Secret::new(src_uri.clone()), None, &start, server_id_for("nopk"))
-        .await
-        .expect("캡처");
+    let captured = capture(
+        &Secret::new(src_uri.clone()),
+        None,
+        &start,
+        server_id_for("nopk"),
+    )
+    .await
+    .expect("캡처");
     let mut tgt = connect(&tgt_uri).await;
     let mut reader = Cursor::new(captured.archive);
     apply(&mut reader, &mut tgt, None).await.expect("적용");
 
-    let src_n: i64 = src.query_first("SELECT COUNT(*) FROM nopk_t").await.unwrap().unwrap();
-    let tgt_n: i64 = tgt.query_first("SELECT COUNT(*) FROM nopk_t").await.unwrap().unwrap();
+    let src_n: i64 = src
+        .query_first("SELECT COUNT(*) FROM nopk_t")
+        .await
+        .unwrap()
+        .unwrap();
+    let tgt_n: i64 = tgt
+        .query_first("SELECT COUNT(*) FROM nopk_t")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(src_n, 2, "소스는 (1,2) 하나만 남음");
-    assert_eq!(tgt_n, src_n, "대상도 한 행만 삭제(LIMIT 1) — 중복 행 전체 삭제 아님");
+    assert_eq!(
+        tgt_n, src_n,
+        "대상도 한 행만 삭제(LIMIT 1) — 중복 행 전체 삭제 아님"
+    );
 }

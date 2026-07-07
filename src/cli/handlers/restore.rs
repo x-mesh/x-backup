@@ -267,7 +267,7 @@ async fn handle_export(
         eprintln!(
             "{}",
             style_stderr(
-                &lang.sel(
+                lang.sel(
                     &format!(
                         "⚠ output dir is not empty — same-named files will be overwritten: {}",
                         to_dir.display()
@@ -350,7 +350,7 @@ async fn handle_export(
         println!(
             "{}",
             style(
-                &lang.sel(
+                lang.sel(
                     &format!(
                         "→ restore with:  mongorestore {}",
                         outcome.out_dir.display()
@@ -586,13 +586,29 @@ async fn handle_pitr(
 
     // PostgreSQL 대상은 logical decoding 기반 PITR로 분기한다(base 풀 복원 + 증분 DML 재생).
     if crate::engine::DbKind::from_uri(target_uri.expose()) == crate::engine::DbKind::Postgres {
-        return handle_pg_pitr(target_uri, storage, timeout_secs, target_origin, args, at, lang)
-            .await;
+        return handle_pg_pitr(
+            target_uri,
+            storage,
+            timeout_secs,
+            target_origin,
+            args,
+            at,
+            lang,
+        )
+        .await;
     }
     // MySQL 대상은 binlog 기반 PITR로 분기한다(base 풀 복원 + 증분 ROW 재생).
     if crate::engine::DbKind::from_uri(target_uri.expose()) == crate::engine::DbKind::Mysql {
-        return handle_mysql_pitr(target_uri, storage, timeout_secs, target_origin, args, at, lang)
-            .await;
+        return handle_mysql_pitr(
+            target_uri,
+            storage,
+            timeout_secs,
+            target_origin,
+            args,
+            at,
+            lang,
+        )
+        .await;
     }
 
     // 여기까지 왔으면 Mongo PITR. 실행 컨텍스트 + 복구 대상(host) 표시.
@@ -695,7 +711,11 @@ async fn handle_pg_pitr(
     }
 
     let mode = crate::cli::output::context_mode(args.json);
-    crate::cli::output::print_run_context(&args.profile, Some(crate::engine::DbKind::Postgres), mode);
+    crate::cli::output::print_run_context(
+        &args.profile,
+        Some(crate::engine::DbKind::Postgres),
+        mode,
+    );
     crate::cli::output::print_restore_target(&target_uri, &target_origin, mode, lang);
     let destination = crate::cli::output::redact_uri(target_uri.expose());
 

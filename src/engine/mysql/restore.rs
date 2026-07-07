@@ -90,7 +90,9 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
     loop {
         match archive::read_frame(reader).await? {
             Frame::Header(_) => {
-                return Err(XBackupError::Failure("MySQL 아카이브 헤더가 중복됩니다".into()))
+                return Err(XBackupError::Failure(
+                    "MySQL 아카이브 헤더가 중복됩니다".into(),
+                ))
             }
             Frame::Pre(d) => {
                 if let Ok(sql) = d.get_str("sql") {
@@ -103,7 +105,9 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
                     name: d.get_str("name").unwrap_or("").to_string(),
                     sql: d
                         .get_str("sql")
-                        .map_err(|_| XBackupError::Failure("후행 DDL 프레임에 sql이 없습니다".into()))?
+                        .map_err(|_| {
+                            XBackupError::Failure("후행 DDL 프레임에 sql이 없습니다".into())
+                        })?
                         .to_string(),
                 });
             }
@@ -118,7 +122,11 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
                 })?;
                 let insert_cols: Vec<String> = meta
                     .get_array("insert_cols")
-                    .map(|a| a.iter().filter_map(|b| b.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|b| b.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
 
                 if drop {

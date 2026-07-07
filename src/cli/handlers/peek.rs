@@ -95,7 +95,7 @@ async fn peek_pg(
             "{ns} — {} {}",
             style(lang.sel("latest", "최신"), Tone::Label),
             style(
-                &lang.sel(
+                lang.sel(
                     &format!("{} rows", rows.len()),
                     &format!("{}행", rows.len())
                 ),
@@ -183,7 +183,10 @@ async fn peek_mysql(
             "{ns} — {} {}",
             style(lang.sel("latest", "최신"), Tone::Label),
             style(
-                &lang.sel(&format!("{} rows", rows.len()), &format!("{}행", rows.len())),
+                lang.sel(
+                    &format!("{} rows", rows.len()),
+                    &format!("{}행", rows.len())
+                ),
                 Tone::Value,
             )
         );
@@ -324,7 +327,7 @@ async fn peek_namespace(
         "{ns} — {} {}",
         style(lang.sel("latest", "최신"), Tone::Label),
         style(
-            &lang.sel(
+            lang.sel(
                 &format!("{} documents", docs.len()),
                 &format!("{}건", docs.len())
             ),

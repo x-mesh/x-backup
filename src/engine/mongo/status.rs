@@ -973,8 +973,8 @@ impl StatusChecker {
         Ok(t)
     }
 
-    /// 7) 예상 크기 — 사용자 DB의 dataSize/storageSize(+ 인덱스 크기). 백업이 추가로 담는
-    /// admin 시스템 메타는 수 KB 수준이라 크기 추정에선 무시한다.
+    /// 7) 예상 크기 — 사용자 DB의 dataSize/storageSize(+ 인덱스 크기). 백업이 추가로
+    ///    담는 admin 시스템 메타는 수 KB 수준이라 크기 추정에선 무시한다.
     fn estimated_size_item(totals: &DbTotals) -> CheckItem {
         CheckItem::ok(
             "estimated_size",

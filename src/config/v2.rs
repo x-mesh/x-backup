@@ -142,7 +142,8 @@ fn resolve_flat(
                     ))
                 })?;
             visiting.push(base_name.clone());
-            let base_flat = resolve_flat(&base_name, base_entity, defaults, bases, profiles, visiting)?;
+            let base_flat =
+                resolve_flat(&base_name, base_entity, defaults, bases, profiles, visiting)?;
             visiting.pop();
             for (k, v) in base_flat {
                 acc.insert(k, v); // base가 defaults를 덮음
@@ -168,7 +169,9 @@ fn extends_names(profile: &str, ext: &Value) -> Result<Vec<String>> {
             .iter()
             .map(|v| {
                 v.as_str().map(str::to_string).ok_or_else(|| {
-                    cfg_err(format!("[profile.{profile}] extends 배열 항목은 문자열이어야 합니다"))
+                    cfg_err(format!(
+                        "[profile.{profile}] extends 배열 항목은 문자열이어야 합니다"
+                    ))
                 })
             })
             .collect(),
@@ -334,7 +337,9 @@ fn expand_dest_array(name: &str, arr: &[Value]) -> Result<Value> {
     let mut out = Vec::with_capacity(arr.len());
     for (i, elem) in arr.iter().enumerate() {
         let t = elem.as_table().ok_or_else(|| {
-            cfg_err(format!("[[profile.{name}.dest]] {i}번 항목이 테이블이 아닙니다"))
+            cfg_err(format!(
+                "[[profile.{name}.dest]] {i}번 항목이 테이블이 아닙니다"
+            ))
         })?;
         let mut d = Table::new();
         let mut s3 = Table::new();
@@ -342,7 +347,9 @@ fn expand_dest_array(name: &str, arr: &[Value]) -> Result<Value> {
             match k.as_str() {
                 "dest" => {
                     let s = v.as_str().ok_or_else(|| {
-                        cfg_err(format!("[[profile.{name}.dest]] {i}: dest는 문자열이어야 합니다"))
+                        cfg_err(format!(
+                            "[[profile.{name}.dest]] {i}: dest는 문자열이어야 합니다"
+                        ))
                     })?;
                     parse_dest_compact(name, s, &mut d, &mut s3)?;
                 }
@@ -768,7 +775,10 @@ mod tests {
         let cfg: crate::config::file::Config = v.try_into().unwrap();
         assert_eq!(cfg.default_profile.as_deref(), Some("mongo"));
         let p = cfg.profile("mongo").unwrap();
-        assert_eq!(p.source.uri.as_deref(), Some("mongodb://localhost:27017/db"));
+        assert_eq!(
+            p.source.uri.as_deref(),
+            Some("mongodb://localhost:27017/db")
+        );
         assert_eq!(p.destination.r#type.as_deref(), Some("local"));
         assert_eq!(p.destination.path.as_deref(), Some("/srv/store/mongo"));
         assert_eq!(p.features.compression.algorithm, "zstd");
@@ -831,7 +841,10 @@ mod tests {
         // target: encrypt=false 오버라이드 + destination 없음(endpoint 전용).
         let t = cfg.profile("target").unwrap();
         assert!(!t.features.encryption.enabled);
-        assert!(t.is_endpoint_only(), "target은 dest가 없어 endpoint 전용이어야 함");
+        assert!(
+            t.is_endpoint_only(),
+            "target은 dest가 없어 endpoint 전용이어야 함"
+        );
     }
 
     /// extends 체인(base) — base가 defaults를 덮고, 프로파일이 base를 덮는다.
@@ -852,7 +865,10 @@ mod tests {
         let cfg: crate::config::file::Config = v.try_into().unwrap();
         let p = cfg.profile("prod").unwrap();
         assert_eq!(p.destination.r#type.as_deref(), Some("s3"));
-        assert_eq!(p.features.compression.level, 9, "base가 defaults(3)를 덮어 9");
+        assert_eq!(
+            p.features.compression.level, 9,
+            "base가 defaults(3)를 덮어 9"
+        );
         assert_eq!(p.source.uri_env.as_deref(), Some("U"));
     }
 
@@ -895,7 +911,10 @@ mod tests {
         assert_eq!(dests.len(), 2);
         assert_eq!(dests[0].name.as_deref(), Some("primary"));
         assert_eq!(dests[0].r#type.as_deref(), Some("s3"));
-        assert_eq!(dests[0].s3.as_ref().unwrap().bucket.as_deref(), Some("bucket"));
+        assert_eq!(
+            dests[0].s3.as_ref().unwrap().bucket.as_deref(),
+            Some("bucket")
+        );
         assert_eq!(dests[1].name.as_deref(), Some("offsite"));
         assert_eq!(dests[1].path.as_deref(), Some("/mnt/off"));
     }
@@ -1019,7 +1038,10 @@ mod tests {
                 .unwrap_or_else(|_| panic!("프로파일 {name} 누락\n{text}"));
             assert_profile_eq(p, q, name);
         }
-        assert_eq!(cfg.default_profile, parsed.default_profile, "default_profile");
+        assert_eq!(
+            cfg.default_profile, parsed.default_profile,
+            "default_profile"
+        );
         parsed
     }
 
@@ -1166,7 +1188,10 @@ mod tests {
         );
         // 출력에 dest 키가 없어야 한다.
         let text = to_v2_string(&cfg).unwrap();
-        assert!(!text.contains("dest"), "endpoint 전용엔 dest가 없어야 함:\n{text}");
+        assert!(
+            !text.contains("dest"),
+            "endpoint 전용엔 dest가 없어야 함:\n{text}"
+        );
     }
 
     #[test]

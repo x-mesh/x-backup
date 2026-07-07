@@ -66,7 +66,9 @@ async fn drop_slot_if_exists(c: &Client, slot: &str) {
         .map(|r| r.get(0))
         .unwrap_or(false);
     if exists {
-        let _ = c.execute("SELECT pg_drop_replication_slot($1)", &[&slot]).await;
+        let _ = c
+            .execute("SELECT pg_drop_replication_slot($1)", &[&slot])
+            .await;
     }
 }
 
@@ -103,8 +105,12 @@ async fn h3_unchanged_toast_preserved_on_apply() {
 
     // clean slate.
     drop_slot_if_exists(&src, "xb_h3").await;
-    let _ = src.batch_execute("DROP PUBLICATION IF EXISTS xb_h3_pub").await;
-    let _ = src.batch_execute("DROP TABLE IF EXISTS public.h3docs").await;
+    let _ = src
+        .batch_execute("DROP PUBLICATION IF EXISTS xb_h3_pub")
+        .await;
+    let _ = src
+        .batch_execute("DROP TABLE IF EXISTS public.h3docs")
+        .await;
 
     // body를 STORAGE EXTERNAL(압축 없음)로 둬 큰 값이 확실히 out-of-line(TOAST)이 되게 한다.
     src.batch_execute(
@@ -173,7 +179,9 @@ async fn h3_unchanged_toast_preserved_on_apply() {
 
     // cleanup.
     drop_slot_if_exists(&src, "xb_h3").await;
-    let _ = src.batch_execute("DROP PUBLICATION IF EXISTS xb_h3_pub").await;
+    let _ = src
+        .batch_execute("DROP PUBLICATION IF EXISTS xb_h3_pub")
+        .await;
 }
 
 /// C2 — slot_health가 Missing/Active를 정확히 판정한다(없음→생성→drop→재생성).
@@ -185,7 +193,9 @@ async fn h3_unchanged_toast_preserved_on_apply() {
 async fn c2_slot_health_missing_then_active_then_recreate() {
     let src = connect(&src_uri()).await;
     drop_slot_if_exists(&src, "xb_c2").await;
-    let _ = src.batch_execute("DROP PUBLICATION IF EXISTS xb_c2_pub").await;
+    let _ = src
+        .batch_execute("DROP PUBLICATION IF EXISTS xb_c2_pub")
+        .await;
 
     // 슬롯 없음 → Missing.
     assert_eq!(
@@ -227,7 +237,9 @@ async fn c2_slot_health_missing_then_active_then_recreate() {
 
     // cleanup.
     drop_slot_if_exists(&src, "xb_c2").await;
-    let _ = src.batch_execute("DROP PUBLICATION IF EXISTS xb_c2_pub").await;
+    let _ = src
+        .batch_execute("DROP PUBLICATION IF EXISTS xb_c2_pub")
+        .await;
 }
 
 /// 풀 백업(H1 REPEATABLE READ 스냅샷) → 빈 대상으로 복구(H5 가드 happy path) 후
@@ -290,9 +302,11 @@ async fn full_backup_restore_round_trip_preserves_data() {
         timeout_secs: None,
         progress_counter: None,
     };
-    run_restore(&req, &storage, false, |_| panic!("빈 대상이라 confirm 미호출"))
-        .await
-        .expect("빈 대상 복구 성공");
+    run_restore(&req, &storage, false, |_| {
+        panic!("빈 대상이라 confirm 미호출")
+    })
+    .await
+    .expect("빈 대상 복구 성공");
 
     // 검증: 행 수 + 콘텐츠 지문 일치.
     let tgt = connect(&tgt_uri).await;

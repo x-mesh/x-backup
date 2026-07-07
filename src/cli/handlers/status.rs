@@ -561,7 +561,7 @@ fn free_space_bytes(path: &str) -> Option<u64> {
     if rc != 0 {
         return None;
     }
-    Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+    Some(st.f_bavail.saturating_mul(st.f_frsize))
 }
 
 /// 신호등 합산을 [`report_to_result`]에 태우기 위한 단일 항목 보고서(--all 종합용).
@@ -828,7 +828,7 @@ fn print_ns_detail_human(profile: &str, counts: &[(String, u64)], lang: Lang) {
     println!(
         "{}",
         paint(
-            &lang.sel(
+            lang.sel(
                 &format!("namespaces — profile: {profile} (user data)"),
                 &format!("네임스페이스 — 프로파일: {profile} (사용자 데이터)")
             ),
@@ -1052,7 +1052,9 @@ impl Monitor {
             LiveConn::Mysql(my) => {
                 use crate::engine::mysql::{conn::MysqlClient, meta};
                 if my.is_none() {
-                    *my = MysqlClient::connect(&self.uri, self.timeout_secs).await.ok();
+                    *my = MysqlClient::connect(&self.uri, self.timeout_secs)
+                        .await
+                        .ok();
                 }
                 let c = match my {
                     Some(c) => c,
