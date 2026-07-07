@@ -584,6 +584,14 @@ async fn handle_pitr(
     let (target_uri, storage, timeout_secs, target_origin) =
         resolve_target_and_storage(&config_path, &args)?;
 
+    // 파일 대상은 시점 복구 개념이 없다(변경 스트림 부재) — 명확히 거부(P2-1).
+    if crate::engine::DbKind::from_uri(target_uri.expose()) == crate::engine::DbKind::File {
+        return Err(XBackupError::Usage(
+            "PITR(--at)은 파일 백업을 지원하지 않습니다 — 파일 백업은 풀 스냅샷 복구만 \
+             가능합니다(restore --id <백업ID>)"
+                .into(),
+        ));
+    }
     // PostgreSQL 대상은 logical decoding 기반 PITR로 분기한다(base 풀 복원 + 증분 DML 재생).
     if crate::engine::DbKind::from_uri(target_uri.expose()) == crate::engine::DbKind::Postgres {
         return handle_pg_pitr(

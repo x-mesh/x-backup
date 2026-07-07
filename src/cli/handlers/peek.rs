@@ -61,6 +61,13 @@ pub async fn handle(
     if db == crate::engine::DbKind::Mysql {
         return peek_mysql(&uri, timeout, &args, lang).await;
     }
+    if db == crate::engine::DbKind::File {
+        return Err(XBackupError::Usage(
+            "peek는 파일 소스(file://)를 지원하지 않습니다 — 경로 점검은 status/doctor를 \
+             사용하세요"
+                .into(),
+        ));
+    }
 
     let mongo = MongoMeta::connect(&uri, timeout).await?;
 

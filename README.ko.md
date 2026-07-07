@@ -23,6 +23,7 @@
 - ✅ **운영** — `doctor` config 정적 점검(오프라인·DB 연결 없음), `status` 사전 점검(연결·토폴로지·권한·버전/FCV·시계차·oplog 윈도우·데이터 형상·**마지막 백업 나이**·**destination 쓰기 가능+여유 공간**), `--all` source/target 비교, `--watch` 라이브 모니터, `prune` 체인 안전 삭제(`--keep-last`·config retention), 동시 실행 잠금, exit code 규약 0~5
 - ✅ **PostgreSQL** — COPY 프로토콜 기반 드라이버 네이티브 풀 백업/복구(데이터 + 테이블 + 제약 + 인덱스 + 시퀀스), `pg_dump`/`pg_restore` 불필요. 동일 파이프라인(압축→암호화→저장)·동일 `status`/`list`/`verify`/`restore`
 - ✅ **MySQL** — `mysql_async` 기반 드라이버 네이티브 풀 백업/복구(데이터 + DDL — 테이블·뷰·트리거·루틴·이벤트), `mysqldump`/`mysql` 불필요. 동일 파이프라인·동일 `status`/`list`/`verify`/`restore`. 증분·PITR은 binlog ROW 스트리밍(opt-in).
+- ✅ **파일/디렉터리** — `file:///path` 소스는 로컬 트리를 tar 스트림으로 동일 파이프라인(압축 → 암호화 → 저장, manifest/verify/list/prune)에 태워 백업하고, 동일한 덮어쓰기 가드레일로 `file://` 대상에 복구
 - ✅ **headless** — 비-TTY 자동 quiet, `--json`, cron/CI 친화
 
 지원 범위: MongoDB replica set(풀+증분)/standalone(풀만)/샤딩은 감지 시 거부. PostgreSQL은 풀 백업+복구+status에 더해 증분(logical decoding)·PITR(opt-in). [PostgreSQL](#postgresql-1) 참조. MySQL은 동일한 명령 세트(풀/복구/status/peek/migrate)에 더해 증분·PITR(binlog ROW 스트리밍, opt-in — 서버에 `log_bin=ROW` 필요). [MySQL](#mysql-1) 참조.
@@ -413,6 +414,16 @@ engine = "native"     # native(기본) | mongodump     (v2 flat 키 → mode.eng
 > 기본 빌드에서 `engine = "mongodump"`는 설정 오류로 거부되고, mongodump 포맷 백업
 > 복구는 안내와 함께 실패한다. 이 엔진은 deprecated이며 이후 마이너 릴리스에서 제거
 > 예정이다.
+
+### 파일/디렉터리
+
+프로파일의 `source.uri`를 `file:///path/to/tree`로 지정하면 트리를 tar 스트림(권한·mtime·
+심링크 보존, 심링크는 따라가지 않음)으로 직렬화해 동일한 압축 → 암호화 → 저장 파이프라인에
+태운다 — `list`/`verify --deep`/`prune`이 그대로 동작한다. `status`는 경로 접근성과 예상
+크기를 보고한다. 복구는 `file://` 대상 디렉터리(기본은 프로파일 source, 또는
+`--target file:///other/dir`)에 풀며 동명 파일만 덮어쓴다 — 비어 있지 않은 대상은 다른
+엔진과 동일하게 `--force`/대화형 확인이 필요하다. 증분(스냅샷 인덱스)은 로드맵이며,
+`--type incr`·`--at`·`--only`·`peek`·`migrate`는 파일 소스에서 명확한 오류로 거부된다.
 
 ### PostgreSQL
 

@@ -68,7 +68,7 @@ async-trait = "0.1"
 # 흘러가므로, 이 계층에서 bytes 크레이트를 직접 참조하지 않는다(t4/t7이 필요 시 추가).
 # compat: age async API가 futures-io AsyncRead/AsyncWrite를 쓰므로 tokio↔futures
 # 경계 변환에 tokio-util compat 어댑터가 필요하다(t6 crypto/age).
-tokio-util = { version = "0.7", features = ["io", "compat"] }
+tokio-util = { version = "0.7", features = ["io", "io-util", "compat"] }
 # Stream 콤비네이터(list 결과 수집, GetResult 스트림 매핑).
 futures = "0.3"
 # MongoDB 드라이버 — dump 전후 oplog 최신 ts·서버 버전·토폴로지(setName) 조회용(t4 범위).

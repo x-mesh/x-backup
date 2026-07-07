@@ -126,6 +126,21 @@ pub async fn handle(
         )
         .await;
     }
+    if db == crate::engine::DbKind::File {
+        return handle_file_backup(
+            &resolved,
+            &args,
+            uri,
+            primary.as_ref(),
+            &dests[0],
+            secondaries,
+            dests.len(),
+            mode,
+            backup_type,
+            lang,
+        )
+        .await;
+    }
 
     // backup 실행 전 status 핵심 점검(연결·권한·토폴로지·도구 존재)을 자동 선행한다(FR-8,
     //   PRD §9). 전체 status보다 가벼운 서브셋([`StatusChecker::precheck_subset`])으로, 백업을
@@ -407,6 +422,107 @@ fn print_backup_summary(s: &BackupSummary, lang: Lang) {
     if let Some(n) = s.note {
         println!("  {}", style(n, Tone::Warning));
     }
+}
+
+/// 파일/디렉터리 풀 백업 경로(P2-1) — 로컬 경로의 tar 스트림을 압축·암호화·저장한다.
+///
+/// PG/MySQL 경로의 storage/stage/summary 골격을 공유한다. 증분(스냅샷 인덱스)은 P2-2
+/// 로드맵 — `--type incr`은 명확히 거부한다. `--db/--collection`은 DB 개념이라 거부.
+/// 사전 점검은 소스 경로 접근 확인([`FileDumper::open`])이 겸한다.
+///
+/// [`FileDumper::open`]: crate::engine::file::backup::FileDumper::open
+#[allow(clippy::too_many_arguments)]
+async fn handle_file_backup(
+    resolved: &ResolvedConfig,
+    args: &BackupArgs,
+    uri: Secret,
+    primary: &dyn Storage,
+    primary_dest: &DestinationConfig,
+    secondaries: &[DestinationConfig],
+    dest_count: usize,
+    mode: OutputMode,
+    backup_type: BackupType,
+    lang: Lang,
+) -> Result<()> {
+    if matches!(backup_type, BackupType::Incr) {
+        return Err(XBackupError::Usage(
+            "파일 백업(--type incr)은 아직 증분을 지원하지 않습니다(스냅샷 인덱스 방식 예정) \
+             — 풀 백업(--type full)을 사용하세요."
+                .into(),
+        ));
+    }
+    if args.db.is_some() || args.collection.is_some() {
+        return Err(XBackupError::Usage(
+            "파일 백업은 --db/--collection(DB 선택 백업)과 병용할 수 없습니다 — 백업 범위는 \
+             source URI 경로로 지정합니다."
+                .into(),
+        ));
+    }
+
+    let source_path = crate::engine::file::path_from_uri(uri.expose())?;
+    let (stages, meta) = build_stages(resolved, args)?;
+    let progress_counter = new_counter();
+    let reporter = ProgressReporter::start(
+        mode,
+        ProgressKind::Indeterminate {
+            label: lang.sel("file backup", "파일 백업").into(),
+        },
+        std::sync::Arc::clone(&progress_counter),
+    );
+    let result = crate::pipeline::backup::run_file_full_backup(
+        source_path,
+        primary,
+        stages,
+        meta,
+        Some(progress_counter),
+    )
+    .await;
+    reporter.finish().await;
+    let outcome = result?;
+
+    let replicate_warning = replicate_and_warn(
+        primary,
+        secondaries,
+        &outcome.backup_id,
+        outcome.stored_size_bytes > 0,
+    )
+    .await;
+
+    if mode.emits_json() {
+        let summary = serde_json::json!({
+            "backup_id": outcome.backup_id,
+            "stored_size_bytes": outcome.stored_size_bytes,
+            "checksum_sha256": outcome.checksum_sha256,
+            "database": "file",
+            "destinations": dest_count,
+        });
+        println!("{summary}");
+    } else if mode.shows_human_summary() {
+        print_backup_summary(
+            &BackupSummary {
+                kind: "full",
+                detail: "file",
+                backup_id: &outcome.backup_id,
+                primary_dest,
+                stored_size: outcome.stored_size_bytes,
+                original_size: Some(outcome.original_size_bytes),
+                compression: outcome.compression.as_ref(),
+                encryption: outcome.encryption.as_ref(),
+                checksum: Some(&outcome.checksum_sha256),
+                dest_count,
+                base_id: None,
+                change: None,
+                oplog_range: None,
+                note: None,
+            },
+            lang,
+        );
+    }
+
+    if let Some(w) = replicate_warning {
+        return Err(XBackupError::Warning(w));
+    }
+    Ok(())
 }
 
 /// PostgreSQL 풀 백업 경로 — 드라이버 COPY 아카이브를 압축·암호화·저장하고 보조 복제까지.

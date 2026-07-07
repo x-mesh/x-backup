@@ -19,6 +19,7 @@ x-backup backs up a running MongoDB (standalone or replica set), PostgreSQL, or 
 - ✅ **Operations** — `doctor` offline config check (all profiles, no DB connection), `status` preflight (connection, topology, privileges, version/FCV, clock skew, oplog window, data shape, **last backup age**, **destination writability + free space**), `--all` source-vs-target diff, `--watch` live monitor, chain-safe `prune`, concurrent-run locking, a defined exit-code contract (0–5)
 - ✅ **PostgreSQL** — driver-native full backup/restore via the COPY protocol (data + tables + constraints + indexes + sequences), no `pg_dump`/`pg_restore`. Same pipeline (compress → encrypt → store), same `status`/`list`/`verify`/`restore`
 - ✅ **MySQL** — driver-native full backup/restore via `mysql_async` (data + DDL — tables, views, triggers, routines, events), no `mysqldump`/`mysql`. Same pipeline (compress → encrypt → store), same `status`/`list`/`verify`/`restore`. Incremental and PITR via binlog ROW streaming (opt-in).
+- ✅ **Files & directories** — `file:///path` sources back up a local tree as a tar stream through the exact same pipeline (compress → encrypt → store, manifest/verify/list/prune); restore unpacks to any `file://` target with the same overwrite guardrails
 - ✅ **Headless** — auto-quiet when not a TTY, `--json` output, built for cron and CI
 
 Scope: MongoDB replica sets get full and incremental backups, standalone gets full only, and sharded clusters are detected and refused. PostgreSQL gets full backup, restore, migrate, status/peek/watch, plus incremental backup and PITR via logical decoding (opt-in). See [PostgreSQL](#postgresql). MySQL gets the same command set (full/restore/status/peek/migrate), plus incremental backup and PITR via binlog ROW streaming (opt-in, requires `log_bin=ROW` on the server). See [MySQL](#mysql).
@@ -420,6 +421,18 @@ through `mongorestore`.
 > default build, `engine = "mongodump"` is rejected as a config error and restoring a
 > mongodump-format backup fails with guidance. This engine is deprecated and scheduled
 > for removal in a future minor release.
+
+### Files & directories
+
+Point a profile's `source.uri` at `file:///path/to/tree` and x-backup archives the tree as a
+tar stream (permissions, mtimes, and symlinks preserved; symlinks are not followed) through
+the same compress → encrypt → store pipeline, so `list`/`verify --deep`/`prune` work
+unchanged. `status` reports path accessibility and estimated size. Restore unpacks into a
+`file://` target directory (the profile source by default, or `--target file:///other/dir`),
+overwriting same-named files only — a non-empty target requires `--force` or interactive
+confirmation, like every other engine. Incremental file backups (snapshot index) are on the
+roadmap; `--type incr`, `--at`, `--only`, `peek`, and `migrate` are rejected with clear
+errors for file sources.
 
 ### PostgreSQL
 

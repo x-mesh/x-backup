@@ -196,16 +196,17 @@ where
     let target_kind = crate::engine::DbKind::from_uri(request.target_uri.expose());
     let is_pg = target_kind == crate::engine::DbKind::Postgres;
     let is_mysql = target_kind == crate::engine::DbKind::Mysql;
-    // PG·MySQL은 드라이버 기반 SQL 복구라 Mongo 메타/가드 경로가 다르다(공통 처리).
-    let is_driver = is_pg || is_mysql;
+    let is_file = target_kind == crate::engine::DbKind::File;
+    // PG·MySQL(드라이버 SQL)·파일(tar unpack)은 Mongo 메타/가드 경로를 타지 않는다(공통 처리).
+    let is_driver = is_pg || is_mysql || is_file;
 
-    // H6: 드라이버 복구(PG/MySQL)는 `--only`(선택적 복구)를 지원하지 않는다 — ns 필터가 없어
-    //   전체를 복구하면서 계획만 좁게 보여주면 데이터 범위가 거짓 보고된다. 명확히 거부한다
-    //   (exit 2). 시점 복구(--at) 경로도 동일하게 --only를 거부한다.
+    // H6: 드라이버 복구(PG/MySQL/파일)는 `--only`(선택적 복구)를 지원하지 않는다 — ns 필터가
+    //   없어 전체를 복구하면서 계획만 좁게 보여주면 데이터 범위가 거짓 보고된다. 명확히
+    //   거부한다(exit 2). 시점 복구(--at) 경로도 동일하게 --only를 거부한다.
     if is_driver && request.only.is_some() {
         return Err(XBackupError::Usage(
-            "PG/MySQL 복구는 --only(선택적 복구)를 지원하지 않습니다 — 전체 복구만 가능합니다. \
-             특정 테이블만 필요하면 복구 후 정리하거나 별도 도구를 사용하세요."
+            "PG/MySQL/파일 복구는 --only(선택적 복구)를 지원하지 않습니다 — 전체 복구만 \
+             가능합니다. 특정 부분만 필요하면 복구 후 정리하거나 별도 도구를 사용하세요."
                 .into(),
         ));
     }
@@ -252,6 +253,18 @@ where
             .await
             .map_err(|e| XBackupError::PrecheckFailed(format!("기존 테이블 조회 실패: {e}")))?;
         plan.conflicting_namespaces = existing;
+    }
+    // 파일 대상도 동일 가드레일: 대상 디렉터리가 비어 있지 않으면 충돌로 보고해
+    //   --force/대화형 확인을 강제한다. 복구는 기존 트리를 지우지 않고 **위에 덮어쓴다**
+    //   (동명 파일만 교체 — tar unpack 의미론).
+    if is_file && !request.skip_precheck {
+        let target = crate::engine::file::path_from_uri(request.target_uri.expose())?;
+        let non_empty = std::fs::read_dir(&target)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+        if non_empty {
+            plan.conflicting_namespaces = vec![format!("{} (비어 있지 않음)", target.display())];
+        }
     }
 
     // 버전 호환 경고는 진행 전 항상 알린다(차단하지 않음 — PRD: 경고).
@@ -438,6 +451,13 @@ async fn stream_restore(
         )
         .await?;
         tracing::debug!(backup_id = %plan.backup_id, inserted, "MySQL 복구: 행 삽입 완료");
+        return Ok(());
+    }
+    if archive_format == Some(crate::engine::file::FORMAT_ID) {
+        // 파일 백업은 file:// 대상에만 풀 수 있다(path_from_uri가 형식을 검증).
+        let target = crate::engine::file::path_from_uri(request.target_uri.expose())?;
+        let unpacked = crate::engine::file::restore::file_restore(restored_stream, &target).await?;
+        tracing::debug!(backup_id = %plan.backup_id, unpacked, "파일 복구: tar unpack 완료");
         return Ok(());
     }
 
@@ -927,6 +947,97 @@ mod tests {
             received, payload,
             "stdin으로 전달된 바이트가 data.bin과 불일치"
         );
+    }
+
+    /// 파일 엔진 E2E(파이프라인 경유): 트리 → run_file_full_backup(스토리지 저장) →
+    /// run_restore(archive_format 디스패치) → 다른 디렉터리에 내용 복원. DB·외부 도구 0.
+    #[tokio::test]
+    async fn file_backup_restore_round_trip_through_pipeline() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let fs = LocalFs::new(store_dir.path()).unwrap();
+
+        // 소스 트리.
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir(src.path().join("d")).unwrap();
+        std::fs::write(src.path().join("d/x.txt"), b"file-engine").unwrap();
+
+        let outcome = crate::pipeline::backup::run_file_full_backup(
+            src.path().to_path_buf(),
+            &fs,
+            crate::pipeline::stage::StageStack::new(),
+            crate::pipeline::backup::BackupMeta::none(),
+            None,
+        )
+        .await
+        .expect("파일 풀 백업 성공");
+        assert!(outcome.stored_size_bytes > 0);
+
+        // 복구 대상(빈 디렉터리 — 가드 충돌 없음).
+        let dst = tempfile::tempdir().unwrap();
+        let request = RestoreRequest {
+            target_uri: crate::config::secret::Secret::new(format!(
+                "file://{}",
+                dst.path().display()
+            )),
+            mongorestore_program: "/nonexistent/never-spawned".to_string(),
+            backup_id: Some(outcome.backup_id.clone()),
+            only: None,
+            force: false, // 빈 대상 → 충돌 없음 → 가드 미발동.
+            dry_run: false,
+            skip_precheck: false,
+            timeout_secs: None,
+            progress_counter: None,
+        };
+        run_restore(&request, &fs, false, |_| {
+            panic!("충돌 없음 — confirm 미호출")
+        })
+        .await
+        .expect("파일 복구 성공");
+        assert_eq!(
+            std::fs::read(dst.path().join("d/x.txt")).unwrap(),
+            b"file-engine"
+        );
+    }
+
+    /// 파일 복구 가드: 대상 디렉터리가 비어 있지 않으면 --force 없이(비-TTY) 거부한다.
+    #[tokio::test]
+    async fn file_restore_guards_non_empty_target() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let fs = LocalFs::new(store_dir.path()).unwrap();
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a"), b"1").unwrap();
+        let outcome = crate::pipeline::backup::run_file_full_backup(
+            src.path().to_path_buf(),
+            &fs,
+            crate::pipeline::stage::StageStack::new(),
+            crate::pipeline::backup::BackupMeta::none(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(dst.path().join("existing"), b"keep").unwrap();
+        let request = RestoreRequest {
+            target_uri: crate::config::secret::Secret::new(format!(
+                "file://{}",
+                dst.path().display()
+            )),
+            mongorestore_program: "/nonexistent/never-spawned".to_string(),
+            backup_id: Some(outcome.backup_id),
+            only: None,
+            force: false,
+            dry_run: false,
+            skip_precheck: false,
+            timeout_secs: None,
+            progress_counter: None,
+        };
+        let err = run_restore(&request, &fs, false, |_| false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 1, "비-TTY + 충돌 + --force 없음 → 거부");
+        // 기존 파일은 그대로다(복구 미시작).
+        assert_eq!(std::fs::read(dst.path().join("existing")).unwrap(), b"keep");
     }
 
     /// 미포함(기본) 빌드: mongodump 아카이브 포맷 백업의 복구는 명확한 안내와 함께

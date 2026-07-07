@@ -130,6 +130,14 @@ pub async fn handle(
             })
             .await?
         }
+        // 파일 소스의 이관은 rsync/cp의 영역이다 — 명확히 거부(P2-1 범위 외).
+        DbKind::File => {
+            return Err(XBackupError::Usage(
+                "migrate는 파일 소스(file://)를 지원하지 않습니다 — 파일 트리 복사는 \
+                 rsync/cp를 사용하세요"
+                    .into(),
+            ))
+        }
     };
 
     // 3) 출력. dry-run은 계획을, 실제 실행은 완료 요약을 낸다(진행=stderr, 결과=stdout).

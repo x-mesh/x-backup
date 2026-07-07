@@ -136,14 +136,18 @@ musl 정적 검사(`file`)는 기존 유지.
 manifest/verify/prune/list 공유)에 태우는 것이 차별점 — 별도 도구를 만드는 게 아니라
 **엔진 하나를 추가**한다.
 
-### P2-1. 풀 백업/복구
+### P2-1. 풀 백업/복구 — **구현됨**
 
-- source `file:///path`(복수 경로·exclude 글롭은 config로). 아카이브는 이미 트리에 있는
-  `tar` crate(pure Rust)로 스트리밍 생성 → 기존 StageStack에 그대로 접속.
-- 메타데이터: 권한/소유자/심링크/mtime 보존(tar가 커버), xattr는 로드맵.
-- 복구: `restore --to-dir`(기존 플래그 의미 확장) 또는 원위치.
-- **수용 기준**: 대용량(수십 GiB) 트리에서 RSS 평탄(기존 메모리 프로파일 방법론 재사용,
-  `docs/memory-profile.md`), 라운드트립 후 전 파일 sha256 일치.
+- `DbKind::File`(`file://` 스킴) + `engine/file`(tar 스트리밍 덤프/복구, `xb-file-tar-v1`).
+  tar 직렬화는 blocking task + SyncIoBridge로 async 경계를 잇고, Phase 1 슬라이스 B의
+  `DumpTermination` seam으로 공통 저장 코어에 접속했다 — 설계대로 "엔진 하나 추가"였다.
+- 권한/mtime/심링크 보존(심링크는 따라가지 않음), 복구는 `unpack_in`으로 경로 탈출 방어.
+  비어 있지 않은 대상은 기존 가드레일(--force/확인) 적용. status는 경로/예상 크기 보고,
+  doctor는 URI 형식 검증. incr(--type)·PITR(--at)·--only·peek·migrate는 명확히 거부.
+- 실 바이너리 E2E 검증: doctor→status→backup→list→verify --deep→restore(트리 diff 동일,
+  실행 권한 보존)→덮어쓰기 가드(exit 1)→--force 재복구까지 확인.
+- **잔여**: 복수 경로·exclude 글롭(config), xattr, 대용량 트리 RSS 프로파일
+  (`docs/memory-profile.md` 방법론 재사용).
 
 ### P2-2. 증분 백업 (스냅샷 인덱스 방식)
 

@@ -523,6 +523,17 @@ impl DumpTermination for crate::engine::mysql::backup::MysqlDumpHandle {
     }
 }
 
+impl DumpTermination for crate::engine::file::backup::FileDumpHandle {
+    type Output = ();
+    async fn finish(self) -> Result<()> {
+        crate::engine::file::backup::FileDumpHandle::finish(self).await
+    }
+    // tar 직렬화 task는 리더 drop으로 BrokenPipe 종료된다 — 결과만 흡수.
+    async fn abort(self) {
+        let _ = crate::engine::file::backup::FileDumpHandle::finish(self).await;
+    }
+}
+
 /// 공통 저장 산출물 — 코어가 확정한 ID·크기·체크섬과 종료 훅의 엔진 메타.
 struct StoredDump<T> {
     backup_id: String,
@@ -770,6 +781,68 @@ pub async fn run_mysql_full_backup(
     write_manifest_or_cleanup(storage, &manifest).await?;
 
     tracing::info!(backup_id = %stored.backup_id, bytes = stored.stored_size, checksum = %stored.checksum, "MySQL 풀 백업 완료");
+    Ok(BackupOutcome {
+        backup_id: stored.backup_id,
+        stored_size_bytes: stored.stored_size,
+        original_size_bytes: stored.original_size,
+        checksum_sha256: stored.checksum,
+        topology: Topology::Standalone,
+        compression: meta.compression.clone(),
+        encryption: meta.encryption.clone(),
+        oplog_range: None,
+    })
+}
+
+/// 파일/디렉터리 풀 백업 — 로컬 경로의 tar 스트림(`xb-file-tar-v1`)을 압축→암호화→저장
+/// 파이프라인에 흘린다(P2-1). DB 메타(oplog/topology/서버 버전)가 없어 manifest는
+/// Standalone·버전 `-`로 기록한다. 복구는 manifest.archive_format으로 파일 엔진을 고른다.
+pub async fn run_file_full_backup(
+    source_path: std::path::PathBuf,
+    storage: &dyn Storage,
+    stages: StageStack,
+    meta: BackupMeta,
+    progress_counter: Option<Arc<AtomicU64>>,
+) -> Result<BackupOutcome> {
+    let dump = crate::engine::file::backup::FileDumper::open(source_path)?.dump_stream();
+    let dump_handle = dump.handle();
+
+    // 공통 코어: 합성 → 저장 → 종료 판정 → 확정(DB 엔진들과 동일 골격).
+    let stored = store_dump_stream(
+        storage,
+        Box::pin(dump),
+        stages,
+        &progress_counter,
+        dump_handle,
+    )
+    .await?;
+
+    let manifest = BackupManifest {
+        format_version: FORMAT_VERSION,
+        id: stored.backup_id.clone(),
+        created_at: Utc::now().to_rfc3339(),
+        backup_type: BackupType::Full,
+        base_id: None,
+        topology: Topology::Standalone,
+        server_version: "-".to_string(),
+        tool_versions: ToolVersions {
+            mongodump: None,
+            archive_format: Some(crate::engine::file::FORMAT_ID.to_string()),
+        },
+        selective: false,
+        original_size_bytes: stored.original_size,
+        stored_size_bytes: stored.stored_size,
+        compression: meta.compression.clone(),
+        encryption: meta.encryption.clone(),
+        checksum_sha256: stored.checksum.clone(),
+        oplog_range: None,
+        oplog_count: None,
+        promoted_from_gap: false,
+        mysql_binlog: None,
+        status: BackupStatus::Complete,
+    };
+    write_manifest_or_cleanup(storage, &manifest).await?;
+
+    tracing::info!(backup_id = %stored.backup_id, bytes = stored.stored_size, checksum = %stored.checksum, "파일 풀 백업 완료");
     Ok(BackupOutcome {
         backup_id: stored.backup_id,
         stored_size_bytes: stored.stored_size,

@@ -10,12 +10,13 @@
 //! 전면 `Engine` trait 대신 핸들러 레벨에서 DB 종류([`crate::engine::DbKind`])로 분기하고,
 //! 덤프/복구/status에만 얇은 seam을 둔다(작동하는 Mongo 코드의 전면 재작성 회피).
 
+pub mod file;
 pub mod mongo;
 pub mod mysql;
 pub mod native;
 pub mod postgres;
 
-/// 백업 대상 DB 종류 — source URI 스킴으로 판별한다.
+/// 백업 대상 종류 — source URI 스킴으로 판별한다(DB 3종 + 파일/디렉터리).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbKind {
     /// MongoDB(`mongodb://`, `mongodb+srv://`).
@@ -24,16 +25,20 @@ pub enum DbKind {
     Postgres,
     /// MySQL·MariaDB(`mysql://`, `mariadb://`).
     Mysql,
+    /// 로컬 파일/디렉터리(`file://`) — tar 스트림 엔진(P2-1).
+    File,
 }
 
 impl DbKind {
-    /// URI 스킴으로 DB 종류를 판별한다. 인식 못 하면 Mongo로 본다(1차 기본).
+    /// URI 스킴으로 종류를 판별한다. 인식 못 하면 Mongo로 본다(1차 기본).
     pub fn from_uri(uri: &str) -> Self {
         let lower = uri.trim_start().to_ascii_lowercase();
         if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
             DbKind::Postgres
         } else if lower.starts_with("mysql://") || lower.starts_with("mariadb://") {
             DbKind::Mysql
+        } else if lower.starts_with("file://") {
+            DbKind::File
         } else {
             DbKind::Mongo
         }
@@ -45,6 +50,7 @@ impl DbKind {
             DbKind::Postgres => "postgresql",
             DbKind::Mongo => "mongodb",
             DbKind::Mysql => "mysql",
+            DbKind::File => "file",
         }
     }
 
@@ -59,6 +65,7 @@ impl DbKind {
         match fmt {
             Some(f) if f.starts_with("xb-pg") => DbKind::Postgres,
             Some(f) if f.starts_with("xb-mysql") => DbKind::Mysql,
+            Some(f) if f.starts_with("xb-file") => DbKind::File,
             _ => DbKind::Mongo,
         }
     }

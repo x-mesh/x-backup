@@ -136,6 +136,21 @@ fn check_profile(
             Some(uri) => {
                 let kind = DbKind::from_uri(uri.expose());
                 db = Some(kind);
+                // 파일 엔진은 URI 형식(로컬 절대 경로)을 오프라인에서 정적 검증한다(P2-1).
+                if kind == DbKind::File {
+                    if let Err(e) = crate::engine::file::path_from_uri(uri.expose()) {
+                        items.push(Item {
+                            status: CheckStatus::Fail,
+                            label: "source",
+                            message: lang
+                                .sel(
+                                    &format!("invalid file:// URI: {e}"),
+                                    &format!("file:// URI 형식 오류: {e}"),
+                                )
+                                .into(),
+                        });
+                    }
+                }
                 items.push(Item {
                     status: CheckStatus::Ok,
                     label: "source",
@@ -361,6 +376,8 @@ fn check_profile(
                 });
             }
         }
+        // 파일 엔진: URI 형식 검증은 source 해석 시점에 이미 수행했다(위 1단계).
+        Some(DbKind::File) => {}
         Some(DbKind::Mysql) if prof.features.incremental.mysql_binlog => {
             items.push(Item {
                 status: CheckStatus::Ok,
