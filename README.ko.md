@@ -23,7 +23,7 @@
 - ✅ **운영** — `doctor` config 정적 점검(오프라인·DB 연결 없음), `status` 사전 점검(연결·토폴로지·권한·버전/FCV·시계차·oplog 윈도우·데이터 형상·**마지막 백업 나이**·**destination 쓰기 가능+여유 공간**), `--all` source/target 비교, `--watch` 라이브 모니터, `prune` 체인 안전 삭제(`--keep-last`·config retention), 동시 실행 잠금, exit code 규약 0~5
 - ✅ **PostgreSQL** — COPY 프로토콜 기반 드라이버 네이티브 풀 백업/복구(데이터 + 테이블 + 제약 + 인덱스 + 시퀀스), `pg_dump`/`pg_restore` 불필요. 동일 파이프라인(압축→암호화→저장)·동일 `status`/`list`/`verify`/`restore`
 - ✅ **MySQL** — `mysql_async` 기반 드라이버 네이티브 풀 백업/복구(데이터 + DDL — 테이블·뷰·트리거·루틴·이벤트), `mysqldump`/`mysql` 불필요. 동일 파이프라인·동일 `status`/`list`/`verify`/`restore`. 증분·PITR은 binlog ROW 스트리밍(opt-in).
-- ✅ **파일/디렉터리** — `file:///path` 소스는 로컬 트리를 tar 스트림으로 동일 파이프라인(압축 → 암호화 → 저장, manifest/verify/list/prune)에 태워 백업하고, 동일한 덮어쓰기 가드레일로 `file://` 대상에 복구
+- ✅ **파일/디렉터리** — `file:///path` 소스는 로컬 트리를 tar 스트림으로 동일 파이프라인(압축 → 암호화 → 저장, manifest/verify/list/prune)에 태워 백업하고, 스냅샷 인덱스 기반 증분(변경 파일 + 삭제 tombstone)과 체인 복구(base + 증분 재생)를 지원하며, 동일한 덮어쓰기 가드레일로 `file://` 대상에 복구
 - ✅ **headless** — 비-TTY 자동 quiet, `--json`, cron/CI 친화
 
 지원 범위: MongoDB replica set(풀+증분)/standalone(풀만)/샤딩은 감지 시 거부. PostgreSQL은 풀 백업+복구+status에 더해 증분(logical decoding)·PITR(opt-in). [PostgreSQL](#postgresql-1) 참조. MySQL은 동일한 명령 세트(풀/복구/status/peek/migrate)에 더해 증분·PITR(binlog ROW 스트리밍, opt-in — 서버에 `log_bin=ROW` 필요). [MySQL](#mysql-1) 참조.
@@ -422,8 +422,19 @@ engine = "native"     # native(기본) | mongodump     (v2 flat 키 → mode.eng
 태운다 — `list`/`verify --deep`/`prune`이 그대로 동작한다. `status`는 경로 접근성과 예상
 크기를 보고한다. 복구는 `file://` 대상 디렉터리(기본은 프로파일 source, 또는
 `--target file:///other/dir`)에 풀며 동명 파일만 덮어쓴다 — 비어 있지 않은 대상은 다른
-엔진과 동일하게 `--force`/대화형 확인이 필요하다. 증분(스냅샷 인덱스)은 로드맵이며,
-`--type incr`·`--at`·`--only`·`peek`·`migrate`는 파일 소스에서 명확한 오류로 거부된다.
+엔진과 동일하게 `--force`/대화형 확인이 필요하다.
+
+**증분 파일 백업**(`--type incr`)은 백업마다 기록되는 스냅샷 인덱스와 트리를 대조해
+변경/신규 파일 + 삭제 tombstone만 담는다. 변경 감지는 (종류, 크기, mtime, mode, 링크
+대상) 기준이다 — 메타를 동일하게 위조한 내용만의 변경은 감지하지 못한다. 인덱스
+사이드카(`index.json.zst`)는 zstd 압축만 하고 **암호화하지 않는다**(백업 호스트는
+공개키만 가져 다음 diff를 위해 읽어야 함) — 경로·크기·mtime이 저장소에 보이는
+트레이드오프이며 파일 내용은 여전히 암호화된다. 삭제 tombstone은 암호화 아카이브
+내부에 담긴다. 체인은 `verify --chain`으로 검증되고 prune도 DB 엔진과 동일하게 체인
+단위로 안전하다. `--id <증분>` 복구는 base + 그 지점까지의 증분을 재생하고, 일반
+`restore`는 base 스냅샷만 복구하며 더 새로운 증분이 있으면 안내한다. 체인 헤드
+인덱스가 사라지면(prune 오조작 등) 증분은 풀 백업으로 승격한다(exit 4).
+`--at`·`--only`·`peek`·`migrate`는 여전히 파일 소스에서 거부된다.
 
 ### PostgreSQL
 

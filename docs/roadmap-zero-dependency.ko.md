@@ -149,13 +149,22 @@ manifest/verify/prune/list 공유)에 태우는 것이 차별점 — 별도 도�
 - **잔여**: 복수 경로·exclude 글롭(config), xattr, 대용량 트리 RSS 프로파일
   (`docs/memory-profile.md` 방법론 재사용).
 
-### P2-2. 증분 백업 (스냅샷 인덱스 방식)
+### P2-2. 증분 백업 (스냅샷 인덱스 방식) — **구현됨**
 
-- 백업마다 파일 인덱스(경로, size, mtime, sha256)를 manifest 사이드카로 기록.
-  증분 = 이전 인덱스와 대조해 변경/신규 파일만 tar에 포함, 삭제는 tombstone 기록.
-- 체인 규칙은 기존 `manifest/chain.rs` 계약(base + 연속 슬라이스)을 재사용 —
-  oplog ts 대신 인덱스 세대 번호로 연속성 판정.
-- PITR은 해당 없음(capability 플래그로 비활성 — Phase 1 trait가 이 분기를 흡수).
+- 인덱스 사이드카 `<id>/index.json.zst`(경로·종류·크기·mtime·mode·링크; zstd, **비암호화**
+  — 키 격리 호스트가 다음 diff를 위해 읽어야 함, 메타데이터 노출 트레이드오프 문서화).
+  sha256은 제외(매 백업 전체 해시 비용 회피 — rsync 휴리스틱과 동일).
+- 증분 tar(`xb-file-incr-v1`) = 변경/신규 파일 + `.xb/tombstones.json`(삭제 목록,
+  암호화 스트림 내부). `.xb`는 예약 경로 — 소스에 있으면 백업 거부.
+- 체인은 설계대로 `manifest/chain.rs` 계약 재사용 — oplog ts 자리에 세대 카운터
+  `(gen,0)`을 일반화(풀=(1,0), 증분 n=(n,0)→(n+1,0), 빈 슬라이스=zero-width).
+  **`list`의 CHAIN 표시·`verify --chain`·prune 체인 안전성이 무수정으로 동작**했다.
+  혼재 저장소 안전: mongo PITR base 선택이 파일 풀백업을 집지 않게 필터 추가.
+- 복구: `--id <증분>` = base+슬라이스 순차 재생(verify_chain 통과 전제), 기본 restore는
+  base만 + 최신 증분 안내 경고. gap(헤드 인덱스 소실) = 풀 승격(exit 4, DB 엔진과 동일).
+- 실 바이너리 E2E: 풀(64KiB) → 증분(119B) → 삭제 증분(139B) → 빈 슬라이스(0B) →
+  verify --chain continuous → 증분 id 체인 복구 후 트리 diff 동일 확인.
+- PITR(--at)은 해당 없음 — 거부 유지.
 
 ### P2-3. (검토) SQLite·Redis
 

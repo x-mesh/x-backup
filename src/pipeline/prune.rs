@@ -395,8 +395,10 @@ pub async fn execute_prune(
 async fn delete_one_backup(storage: &dyn Storage, backup_id: &str) -> Result<()> {
     // 1) data.bin(빈 슬라이스·orphan은 없을 수 있음 — 무해).
     delete_if_exists(storage, &data_path(backup_id)).await?;
-    // 2) 사이드카(orphan은 없을 수 있음).
+    // 2) 사이드카(orphan은 없을 수 있음). 파일 엔진 인덱스(P2-2)도 함께 —
+    //    다른 엔진은 없어서 무해.
     delete_if_exists(storage, &manifest_sha_path(backup_id)).await?;
+    delete_if_exists(storage, &crate::manifest::store::file_index_path(backup_id)).await?;
     // 3) manifest.json 마지막(중간 실패 시 추적 가능성 유지).
     delete_if_exists(storage, &manifest_path(backup_id)).await?;
     Ok(())

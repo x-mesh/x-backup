@@ -28,7 +28,8 @@ use crate::engine::mongo::MongoMeta;
 use crate::engine::mongo::{DumpProcess, DumpSpec, UriConfigFile};
 use crate::error::{Result, XBackupError};
 use crate::manifest::schema::{
-    BackupManifest, BackupStatus, BackupType, OplogRange, ToolVersions, Topology, FORMAT_VERSION,
+    BackupManifest, BackupStatus, BackupType, OplogRange, OplogTimestamp, ToolVersions, Topology,
+    FORMAT_VERSION,
 };
 use crate::manifest::store::{data_path, manifest_path, manifest_sha_path, ManifestStore};
 use crate::pipeline::checksum::Sha256Reader;
@@ -474,6 +475,8 @@ async fn cleanup(storage: &dyn Storage, backup_id: &str) {
         data_path(backup_id),
         manifest_path(backup_id),
         manifest_sha_path(backup_id),
+        // 파일 엔진 인덱스 사이드카(P2-2) — 다른 엔진은 없어서 무해.
+        crate::manifest::store::file_index_path(backup_id),
     ] {
         if let Err(e) = storage.delete(&path).await {
             tracing::debug!(path = %path, "정리 중 삭제 실패(무시): {e}");
@@ -793,6 +796,280 @@ pub async fn run_mysql_full_backup(
     })
 }
 
+/// 파일 체인의 풀 백업 세대 좌표 — 모든 파일 풀 백업은 `(1,0)`에서 체인을 시작한다.
+///
+/// 파일 엔진은 oplog ts 대신 **세대 카운터**를 [`OplogRange`]에 일반화해 담는다(P2-2) —
+/// 기존 체인 계약([`crate::manifest::chain`])·`verify --chain`·prune 체인 안전성을 그대로
+/// 재사용하기 위함이다. 좌표는 체인(base_id) 안에서만 의미가 있으므로 풀 백업끼리 같은
+/// 좌표여도 무방하다.
+const FILE_CHAIN_START: OplogTimestamp = OplogTimestamp { t: 1, i: 0 };
+
+/// 파일 인덱스에 예약 경로(`.xb`)가 있으면 거부한다 — 복구가 삭제 지시로 해석하는
+/// 네임스페이스라 사용자 데이터와 충돌한다.
+fn reject_reserved_paths(index: &crate::engine::file::index::FileIndex) -> Result<()> {
+    let reserved = index
+        .entries
+        .keys()
+        .any(|p| p == ".xb" || p.starts_with(".xb/"));
+    if reserved {
+        return Err(XBackupError::Usage(
+            "백업 소스에 예약 경로 '.xb'가 있습니다 — 파일 엔진이 내부 메타(tombstone)에 \
+             쓰는 이름이라 백업할 수 없습니다"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// 인덱스 사이드카(`<id>/index.json.zst`)를 기록한다. 실패 시 산출물 정리 후 전파.
+async fn write_file_index_or_cleanup(
+    storage: &dyn Storage,
+    backup_id: &str,
+    index: &crate::engine::file::index::FileIndex,
+) -> Result<()> {
+    let bytes = index.encode().await?;
+    let reader: BoxAsyncRead = Box::pin(std::io::Cursor::new(bytes));
+    if let Err(e) = storage
+        .put_stream(
+            &crate::manifest::store::file_index_path(backup_id),
+            reader,
+            None,
+        )
+        .await
+    {
+        cleanup(storage, backup_id).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// 파일 증분 백업 결과.
+#[derive(Debug)]
+pub struct FileIncrementalOutcome {
+    pub backup_id: String,
+    pub base_id: Option<String>,
+    /// 변경 엔트리 수(변경/신규 + 삭제; 0이면 빈 슬라이스).
+    pub change_count: u64,
+    pub stored_size_bytes: u64,
+    /// diff 기준(체인 헤드 인덱스) 소실로 풀 백업으로 승격됐는지(exit 4 신호).
+    pub promoted: bool,
+}
+
+/// 파일 증분 백업(P2-2) — 체인 헤드의 스냅샷 인덱스와 현재 트리를 대조해 변경/신규
+/// 파일 + 삭제 tombstone만 담는 슬라이스(`xb-file-incr-v1`)를 저장한다.
+///
+/// - base(최신 파일 풀백업)가 없으면 사용법 오류 — 풀 백업을 먼저 요구한다.
+/// - 체인 헤드의 인덱스 사이드카를 읽지 못하면(**gap** — prune 오조작·버전 불일치 등)
+///   풀 백업으로 승격한다(promoted=true, 핸들러가 exit 4로 신호 — DB 엔진들과 동일 계약).
+/// - 변경이 없으면 빈 슬라이스(data.bin 없이 manifest+인덱스만)로 체인 좌표를 유지한다.
+pub async fn run_file_incremental_backup(
+    source_path: std::path::PathBuf,
+    storage: &dyn Storage,
+    stages: StageStack,
+    meta: BackupMeta,
+    progress_counter: Option<Arc<AtomicU64>>,
+) -> Result<FileIncrementalOutcome> {
+    use crate::engine::file::index::FileIndex;
+
+    // 1) 체인 수집: 최신 파일 풀백업(base) + 그 증분들 → 헤드(다음 diff 기준) 결정.
+    let Some(chain) = collect_file_chain(storage).await? else {
+        return Err(XBackupError::Usage(
+            "파일 증분(--type incr)에는 base 풀 백업이 필요합니다 — 먼저 \
+             `backup --type full`을 수행하세요."
+                .into(),
+        ));
+    };
+
+    // 2) 헤드 인덱스 로드 — 실패는 gap: diff 기준이 없으므로 풀로 승격한다.
+    let prev_index = match read_file_index(storage, &chain.head_id).await {
+        Ok(idx) => idx,
+        Err(e) => {
+            tracing::warn!(
+                head = %chain.head_id,
+                "파일 증분 gap(체인 헤드 인덱스 읽기 실패: {e}) — 풀 백업으로 승격"
+            );
+            let outcome = run_file_full_backup_inner(
+                source_path,
+                storage,
+                stages,
+                meta,
+                progress_counter,
+                /* promoted_from_gap */ true,
+            )
+            .await?;
+            return Ok(FileIncrementalOutcome {
+                backup_id: outcome.backup_id,
+                base_id: None,
+                change_count: 0,
+                stored_size_bytes: outcome.stored_size_bytes,
+                promoted: true,
+            });
+        }
+    };
+
+    // 3) 현재 인덱스 + diff.
+    let cur_index = FileIndex::build(&source_path)?;
+    reject_reserved_paths(&cur_index)?;
+    let diff = cur_index.diff_from(&prev_index);
+
+    let start = OplogTimestamp::new(chain.head_gen, 0);
+    let (backup_id, stored_size, original_size, checksum, end) = if diff.is_empty() {
+        // 4a) 빈 슬라이스 — data 없이 인덱스+manifest만(mongo 증분과 동일 계약:
+        //     start==end, oplog_count=0). 체인 헤드가 이 백업으로 전진한다.
+        (
+            Uuid::now_v7().to_string(),
+            0u64,
+            0u64,
+            crate::pipeline::incremental::empty_sha256(),
+            start,
+        )
+    } else {
+        // 4b) 변경 슬라이스 — 변경/신규 tar + tombstone을 공통 코어로 저장.
+        let dumper = crate::engine::file::backup::FileDumper::open(source_path)?;
+        let dump = dumper.dump_incremental_stream(diff.changed.clone(), diff.deleted.clone());
+        let dump_handle = dump.handle();
+        let stored = store_dump_stream(
+            storage,
+            Box::pin(dump),
+            stages,
+            &progress_counter,
+            dump_handle,
+        )
+        .await?;
+        (
+            stored.backup_id,
+            stored.stored_size,
+            stored.original_size,
+            stored.checksum,
+            OplogTimestamp::new(chain.head_gen + 1, 0),
+        )
+    };
+
+    // 5) 인덱스 사이드카 → manifest(마지막이 manifest — 존재가 완결성의 신호).
+    write_file_index_or_cleanup(storage, &backup_id, &cur_index).await?;
+    let manifest = BackupManifest {
+        format_version: FORMAT_VERSION,
+        id: backup_id.clone(),
+        created_at: Utc::now().to_rfc3339(),
+        backup_type: BackupType::Incremental,
+        base_id: Some(chain.base_id.clone()),
+        topology: Topology::Standalone,
+        server_version: "-".to_string(),
+        tool_versions: ToolVersions {
+            mongodump: None,
+            archive_format: Some(crate::engine::file::INCR_FORMAT_ID.to_string()),
+        },
+        selective: false,
+        original_size_bytes: original_size,
+        stored_size_bytes: stored_size,
+        compression: meta.compression.clone(),
+        encryption: meta.encryption.clone(),
+        checksum_sha256: checksum,
+        oplog_range: Some(OplogRange {
+            start_ts: start,
+            end_ts: end,
+        }),
+        oplog_count: Some(diff.count()),
+        promoted_from_gap: false,
+        mysql_binlog: None,
+        status: BackupStatus::Complete,
+    };
+    write_manifest_or_cleanup(storage, &manifest).await?;
+
+    tracing::info!(
+        backup_id = %backup_id,
+        base_id = %chain.base_id,
+        changes = diff.count(),
+        bytes = stored_size,
+        "파일 증분 백업 완료"
+    );
+    Ok(FileIncrementalOutcome {
+        backup_id,
+        base_id: Some(chain.base_id),
+        change_count: diff.count(),
+        stored_size_bytes: stored_size,
+        promoted: false,
+    })
+}
+
+/// 파일 체인 현황 — base 풀백업과 diff 기준이 되는 헤드.
+pub(crate) struct FileChain {
+    /// 최신 파일 풀백업 ID(체인 base).
+    pub(crate) base_id: String,
+    /// 체인 헤드 백업 ID(base 또는 마지막 증분) — 이 백업의 인덱스가 diff 기준.
+    pub(crate) head_id: String,
+    /// 헤드의 세대(end.t) — 다음 슬라이스는 (head_gen, 0)에서 시작한다.
+    pub(crate) head_gen: u32,
+}
+
+/// destination에서 최신 파일 풀백업과 그 체인 헤드를 찾는다. 파일 풀백업이 없으면 None.
+pub(crate) async fn collect_file_chain(storage: &dyn Storage) -> Result<Option<FileChain>> {
+    let ids = crate::pipeline::verify::collect_manifest_ids(storage).await?;
+    let store = ManifestStore::new(storage);
+
+    let mut base: Option<BackupManifest> = None;
+    let mut manifests = Vec::new();
+    for id in &ids {
+        let Ok(m) = store.read(id).await else {
+            continue;
+        };
+        let is_file_full = m.backup_type == BackupType::Full
+            && m.status == BackupStatus::Complete
+            && m.tool_versions.archive_format.as_deref() == Some(crate::engine::file::FORMAT_ID);
+        if is_file_full {
+            // UUID v7 = 시간 정렬 — id 사전순 최대가 최신.
+            let newer = base.as_ref().map(|b| m.id > b.id).unwrap_or(true);
+            if newer {
+                base = Some(m.clone());
+            }
+        }
+        manifests.push(m);
+    }
+    let Some(base) = base else { return Ok(None) };
+
+    // base의 증분들 중 헤드(최대 end.t; 동률이면 id 최신 — 빈 슬라이스 연속 대응).
+    let mut head_id = base.id.clone();
+    let mut head_gen = FILE_CHAIN_START.t;
+    for m in &manifests {
+        let in_chain = m.backup_type == BackupType::Incremental
+            && m.status == BackupStatus::Complete
+            && m.base_id.as_deref() == Some(base.id.as_str())
+            && m.tool_versions.archive_format.as_deref()
+                == Some(crate::engine::file::INCR_FORMAT_ID);
+        if !in_chain {
+            continue;
+        }
+        let Some(range) = m.oplog_range else { continue };
+        let gen = range.end_ts.t;
+        if gen > head_gen || (gen == head_gen && m.id > head_id) {
+            head_gen = gen;
+            head_id = m.id.clone();
+        }
+    }
+    Ok(Some(FileChain {
+        base_id: base.id,
+        head_id,
+        head_gen,
+    }))
+}
+
+/// 백업의 인덱스 사이드카를 읽어 디코드한다.
+async fn read_file_index(
+    storage: &dyn Storage,
+    backup_id: &str,
+) -> Result<crate::engine::file::index::FileIndex> {
+    use tokio::io::AsyncReadExt;
+    let mut stream = storage
+        .get_stream(&crate::manifest::store::file_index_path(backup_id))
+        .await?;
+    let mut bytes = Vec::new();
+    stream
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|e| XBackupError::Failure(format!("인덱스 사이드카 읽기 실패: {e}")))?;
+    crate::engine::file::index::FileIndex::decode(&bytes).await
+}
+
 /// 파일/디렉터리 풀 백업 — 로컬 경로의 tar 스트림(`xb-file-tar-v1`)을 압축→암호화→저장
 /// 파이프라인에 흘린다(P2-1). DB 메타(oplog/topology/서버 버전)가 없어 manifest는
 /// Standalone·버전 `-`로 기록한다. 복구는 manifest.archive_format으로 파일 엔진을 고른다.
@@ -803,6 +1080,33 @@ pub async fn run_file_full_backup(
     meta: BackupMeta,
     progress_counter: Option<Arc<AtomicU64>>,
 ) -> Result<BackupOutcome> {
+    run_file_full_backup_inner(
+        source_path,
+        storage,
+        stages,
+        meta,
+        progress_counter,
+        /* promoted_from_gap */ false,
+    )
+    .await
+}
+
+/// 풀 백업 본체 — 증분의 gap 승격 경로가 `promoted_from_gap=true`로 재사용한다(P2-2).
+/// 증분 diff의 기준이 될 스냅샷 인덱스를 사이드카로 함께 기록하고, 체인 시작 좌표
+/// ([`FILE_CHAIN_START`])를 manifest에 담는다.
+async fn run_file_full_backup_inner(
+    source_path: std::path::PathBuf,
+    storage: &dyn Storage,
+    stages: StageStack,
+    meta: BackupMeta,
+    progress_counter: Option<Arc<AtomicU64>>,
+    promoted_from_gap: bool,
+) -> Result<BackupOutcome> {
+    // 인덱스를 dump보다 먼저 뜬다 — dump 도중 변한 파일은 인덱스보다 새 내용이 담기고,
+    // 다음 증분이 (더 새로운 mtime을 보고) 다시 담는다: 누락이 아닌 중복 방향의 안전.
+    let index = crate::engine::file::index::FileIndex::build(&source_path)?;
+    reject_reserved_paths(&index)?;
+
     let dump = crate::engine::file::backup::FileDumper::open(source_path)?.dump_stream();
     let dump_handle = dump.handle();
 
@@ -816,6 +1120,13 @@ pub async fn run_file_full_backup(
     )
     .await?;
 
+    // 인덱스 사이드카 → manifest 순서(마지막이 manifest — 존재가 완결성의 신호).
+    write_file_index_or_cleanup(storage, &stored.backup_id, &index).await?;
+
+    let oplog_range = Some(OplogRange {
+        start_ts: FILE_CHAIN_START,
+        end_ts: FILE_CHAIN_START,
+    });
     let manifest = BackupManifest {
         format_version: FORMAT_VERSION,
         id: stored.backup_id.clone(),
@@ -834,9 +1145,9 @@ pub async fn run_file_full_backup(
         compression: meta.compression.clone(),
         encryption: meta.encryption.clone(),
         checksum_sha256: stored.checksum.clone(),
-        oplog_range: None,
+        oplog_range,
         oplog_count: None,
-        promoted_from_gap: false,
+        promoted_from_gap,
         mysql_binlog: None,
         status: BackupStatus::Complete,
     };
@@ -851,7 +1162,7 @@ pub async fn run_file_full_backup(
         topology: Topology::Standalone,
         compression: meta.compression.clone(),
         encryption: meta.encryption.clone(),
-        oplog_range: None,
+        oplog_range,
     })
 }
 
@@ -1326,11 +1637,12 @@ mod tests {
 
     /// cleanup은 data/manifest/사이드카 3종 모두에 delete를 시도해야 한다.
     #[tokio::test]
-    async fn cleanup_deletes_all_three_artifacts() {
+    async fn cleanup_deletes_all_known_artifacts() {
         let mut mock = MockStorage::new();
         let deleted = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let d = Arc::clone(&deleted);
-        mock.expect_delete().times(3).returning(move |p| {
+        // data + manifest + 사이드카 + 파일 인덱스(P2-2) = 4개.
+        mock.expect_delete().times(4).returning(move |p| {
             d.lock().unwrap().push(p.to_string());
             Ok(())
         });

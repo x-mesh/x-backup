@@ -19,7 +19,7 @@ x-backup backs up a running MongoDB (standalone or replica set), PostgreSQL, or 
 - ✅ **Operations** — `doctor` offline config check (all profiles, no DB connection), `status` preflight (connection, topology, privileges, version/FCV, clock skew, oplog window, data shape, **last backup age**, **destination writability + free space**), `--all` source-vs-target diff, `--watch` live monitor, chain-safe `prune`, concurrent-run locking, a defined exit-code contract (0–5)
 - ✅ **PostgreSQL** — driver-native full backup/restore via the COPY protocol (data + tables + constraints + indexes + sequences), no `pg_dump`/`pg_restore`. Same pipeline (compress → encrypt → store), same `status`/`list`/`verify`/`restore`
 - ✅ **MySQL** — driver-native full backup/restore via `mysql_async` (data + DDL — tables, views, triggers, routines, events), no `mysqldump`/`mysql`. Same pipeline (compress → encrypt → store), same `status`/`list`/`verify`/`restore`. Incremental and PITR via binlog ROW streaming (opt-in).
-- ✅ **Files & directories** — `file:///path` sources back up a local tree as a tar stream through the exact same pipeline (compress → encrypt → store, manifest/verify/list/prune); restore unpacks to any `file://` target with the same overwrite guardrails
+- ✅ **Files & directories** — `file:///path` sources back up a local tree as a tar stream through the exact same pipeline (compress → encrypt → store, manifest/verify/list/prune); incremental backups capture only changed files plus deletion tombstones via a snapshot index, and restore replays the chain (base + increments) to any `file://` target with the same overwrite guardrails
 - ✅ **Headless** — auto-quiet when not a TTY, `--json` output, built for cron and CI
 
 Scope: MongoDB replica sets get full and incremental backups, standalone gets full only, and sharded clusters are detected and refused. PostgreSQL gets full backup, restore, migrate, status/peek/watch, plus incremental backup and PITR via logical decoding (opt-in). See [PostgreSQL](#postgresql). MySQL gets the same command set (full/restore/status/peek/migrate), plus incremental backup and PITR via binlog ROW streaming (opt-in, requires `log_bin=ROW` on the server). See [MySQL](#mysql).
@@ -430,9 +430,20 @@ the same compress → encrypt → store pipeline, so `list`/`verify --deep`/`pru
 unchanged. `status` reports path accessibility and estimated size. Restore unpacks into a
 `file://` target directory (the profile source by default, or `--target file:///other/dir`),
 overwriting same-named files only — a non-empty target requires `--force` or interactive
-confirmation, like every other engine. Incremental file backups (snapshot index) are on the
-roadmap; `--type incr`, `--at`, `--only`, `peek`, and `migrate` are rejected with clear
-errors for file sources.
+confirmation, like every other engine.
+
+**Incremental file backups** (`--type incr`) diff the tree against a snapshot index recorded
+with each backup and store only changed/new files plus deletion tombstones. Change detection
+uses (kind, size, mtime, mode, symlink target) — a content-only change that forges identical
+metadata is not detected. The index sidecar (`index.json.zst`) is stored zstd-compressed but
+**not encrypted** (the backup host holds only the public key and must read it for the next
+diff) — paths/sizes/mtimes are visible in the store while file contents stay encrypted;
+deletion tombstones travel inside the encrypted archive. Chains verify with
+`verify --chain` and prune chain-safely like DB engines. Restoring `--id <increment>`
+replays base + increments up to that point; a plain `restore` uses the base snapshot only
+and warns when newer increments exist. If the chain-head index is missing (e.g. after a
+mis-prune), the incremental promotes to a full backup (exit 4). `--at`, `--only`, `peek`,
+and `migrate` remain rejected for file sources.
 
 ### PostgreSQL
 

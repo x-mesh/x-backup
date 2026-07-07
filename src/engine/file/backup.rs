@@ -60,6 +60,74 @@ impl FileDumper {
             task: Arc::new(Mutex::new(Some(task))),
         }
     }
+
+    /// 증분 tar 직렬화 task(P2-2) — 변경/신규 경로만 담고, 삭제 목록은
+    /// [`TOMBSTONE_ENTRY`](super::TOMBSTONE_ENTRY) 엔트리로 함께 담는다(암호화 스트림
+    /// 내부이므로 경로가 평문 노출되지 않는다 — 인덱스 사이드카와 다른 점).
+    pub fn dump_incremental_stream(
+        self,
+        changed: Vec<String>,
+        deleted: Vec<String>,
+    ) -> FileDumpStream {
+        let (reader, writer) = tokio::io::duplex(PIPE_BUFFER_BYTES);
+        let bridge = SyncIoBridge::new(writer);
+        let root = self.root;
+        let task =
+            tokio::task::spawn_blocking(move || build_incr_tar(root, changed, deleted, bridge));
+        FileDumpStream {
+            reader,
+            task: Arc::new(Mutex::new(Some(task))),
+        }
+    }
+}
+
+/// 증분 tar를 bridge에 쓴다(blocking 컨텍스트) — 변경 경로들 + tombstone 엔트리.
+fn build_incr_tar(
+    root: PathBuf,
+    changed: Vec<String>,
+    deleted: Vec<String>,
+    bridge: SyncIoBridge<DuplexStream>,
+) -> Result<()> {
+    let io_err = |ctx: &str, e: std::io::Error| {
+        XBackupError::Failure(format!("파일 증분 {ctx} 실패('{}'): {e}", root.display()))
+    };
+
+    let mut builder = tar::Builder::new(bridge);
+    builder.follow_symlinks(false);
+
+    // 1) tombstone 엔트리(있으면) — 복구가 삭제 지시로 해석한다.
+    if !deleted.is_empty() {
+        let payload = serde_json::to_vec(&deleted)
+            .map_err(|e| XBackupError::Failure(format!("tombstone 직렬화 실패: {e}")))?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o600);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, super::TOMBSTONE_ENTRY, payload.as_slice())
+            .map_err(|e| io_err("tombstone 기록", e))?;
+    }
+
+    // 2) 변경/신규 경로 — 디렉터리는 메타만, 파일/심링크는 내용/링크째 담는다.
+    for rel in &changed {
+        let abs = root.join(rel);
+        let meta = std::fs::symlink_metadata(&abs).map_err(|e| io_err("항목 조회", e))?;
+        if meta.is_dir() {
+            builder
+                .append_dir(rel, &abs)
+                .map_err(|e| io_err("디렉터리 기록", e))?;
+        } else {
+            builder
+                .append_path_with_name(&abs, rel)
+                .map_err(|e| io_err("항목 기록", e))?;
+        }
+    }
+
+    let mut bridge = builder
+        .into_inner()
+        .map_err(|e| io_err("아카이브 종료", e))?;
+    bridge.shutdown().map_err(|e| io_err("스트림 종료", e))?;
+    Ok(())
 }
 
 /// tar 아카이브를 bridge에 쓴다(blocking 컨텍스트). 리더가 먼저 drop되면 쓰기가

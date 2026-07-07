@@ -206,13 +206,23 @@ fn parse_at(at: &str) -> Result<DateTime<Utc>> {
 }
 
 /// destination의 모든 manifest를 모아 체인 노드로 만든다(읽기 실패는 제외·디버그 로그).
+///
+/// **Mongo 백업만** 노드로 삼는다 — 파일 엔진(P2-2)도 체인 좌표(oplog_range 일반화)를
+/// 쓰므로, 혼재 저장소에서 파일 풀백업이 Mongo PITR의 base로 오선택되는 것을 막는다.
 async fn collect_chain_nodes(storage: &dyn Storage) -> Result<Vec<ChainNode>> {
     let ids = crate::pipeline::verify::collect_manifest_ids(storage).await?;
     let store = ManifestStore::new(storage);
     let mut nodes = Vec::with_capacity(ids.len());
     for id in &ids {
         match store.read(id).await {
-            Ok(m) => nodes.push(ChainNode::from_manifest(&m)),
+            Ok(m) => {
+                let kind = crate::engine::DbKind::from_archive_format(
+                    m.tool_versions.archive_format.as_deref(),
+                );
+                if kind == crate::engine::DbKind::Mongo {
+                    nodes.push(ChainNode::from_manifest(&m));
+                }
+            }
             Err(e) => tracing::debug!(id = %id, "manifest 읽기 실패(체인 노드 제외): {e}"),
         }
     }

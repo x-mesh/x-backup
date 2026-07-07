@@ -516,7 +516,8 @@ fn build_incremental_manifest(
 }
 
 /// 빈 입력의 sha256(빈 슬라이스 data 부재 시 manifest checksum 자리값).
-fn empty_sha256() -> String {
+/// 파일 증분(P2-2)의 빈 슬라이스도 같은 자리값을 쓴다(pub(crate)).
+pub(crate) fn empty_sha256() -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(b""))
 }

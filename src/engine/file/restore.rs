@@ -35,6 +35,10 @@ pub async fn file_restore(stream: BoxAsyncRead, target: &Path) -> Result<u64> {
 }
 
 /// tar 아카이브를 순회하며 항목을 대상에 푼다(blocking 컨텍스트).
+///
+/// [`TOMBSTONE_ENTRY`](super::TOMBSTONE_ENTRY) 예약 경로는 파일로 풀지 않고 **삭제
+/// 지시**로 해석한다(증분 슬라이스 — 이전 백업 이후 사라진 경로들). 삭제 경로도
+/// 대상 안으로 정규화 검증한다(경로 탈출 방지, unpack_in과 동일 원칙).
 fn unpack_tar(bridge: SyncIoBridge<BoxAsyncRead>, target: &Path) -> Result<u64> {
     let io_err = |ctx: &str, e: std::io::Error| {
         XBackupError::Failure(format!("파일 복구 {ctx} 실패('{}'): {e}", target.display()))
@@ -48,6 +52,21 @@ fn unpack_tar(bridge: SyncIoBridge<BoxAsyncRead>, target: &Path) -> Result<u64> 
     let entries = archive.entries().map_err(|e| io_err("아카이브 열기", e))?;
     for entry in entries {
         let mut entry = entry.map_err(|e| io_err("항목 읽기", e))?;
+        let is_tombstone = entry
+            .path()
+            .map(|p| p == Path::new(super::TOMBSTONE_ENTRY))
+            .unwrap_or(false);
+        if is_tombstone {
+            use std::io::Read;
+            let mut payload = Vec::new();
+            entry
+                .read_to_end(&mut payload)
+                .map_err(|e| io_err("tombstone 읽기", e))?;
+            let deleted: Vec<String> = serde_json::from_slice(&payload)
+                .map_err(|e| XBackupError::Failure(format!("tombstone 파싱 실패: {e}")))?;
+            unpacked += apply_tombstones(target, &deleted)?;
+            continue;
+        }
         // unpack_in은 경로 탈출(절대 경로·`..`)을 스킵/거부한다 — 대상 밖 쓰기 방지.
         let ok = entry
             .unpack_in(target)
@@ -57,6 +76,37 @@ fn unpack_tar(bridge: SyncIoBridge<BoxAsyncRead>, target: &Path) -> Result<u64> 
         }
     }
     Ok(unpacked)
+}
+
+/// tombstone 경로들을 대상에서 삭제한다. 처리한 항목 수를 반환한다.
+///
+/// 이미 없는 경로는 조용히 넘어간다(멱등 — 재복구·중복 슬라이스 재생 안전).
+/// 절대 경로·`..` 포함 경로는 조작된 아카이브로 보고 거부한다.
+fn apply_tombstones(target: &Path, deleted: &[String]) -> Result<u64> {
+    let mut applied = 0u64;
+    for rel in deleted {
+        let p = Path::new(rel);
+        let escapes = p.is_absolute()
+            || p.components()
+                .any(|c| matches!(c, std::path::Component::ParentDir));
+        if escapes {
+            return Err(XBackupError::Failure(format!(
+                "tombstone 경로가 대상을 벗어납니다(조작 의심): '{rel}'"
+            )));
+        }
+        let abs = target.join(p);
+        let removed = match std::fs::symlink_metadata(&abs) {
+            Ok(m) if m.is_dir() => std::fs::remove_dir_all(&abs).map(|_| true),
+            Ok(_) => std::fs::remove_file(&abs).map(|_| true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+        .map_err(|e| XBackupError::Failure(format!("tombstone 삭제 실패('{rel}'): {e}")))?;
+        if removed {
+            applied += 1;
+        }
+    }
+    Ok(applied)
 }
 
 #[cfg(test)]

@@ -13,6 +13,7 @@
 //! 핸들러가 명확히 거부하거나 최소 보고만 한다.
 
 pub mod backup;
+pub mod index;
 pub mod restore;
 pub mod status;
 
@@ -22,6 +23,13 @@ use crate::error::{Result, XBackupError};
 
 /// 이 엔진의 아카이브 포맷 식별자(manifest.archive_format) — 내용물은 tar 스트림이다.
 pub const FORMAT_ID: &str = "xb-file-tar-v1";
+
+/// 증분 슬라이스 포맷 식별자(P2-2) — 변경 파일 tar + tombstone 엔트리.
+pub const INCR_FORMAT_ID: &str = "xb-file-incr-v1";
+
+/// 증분 tar 내부의 tombstone(삭제 목록) 예약 경로. 복구가 이 엔트리를 파일로 풀지 않고
+/// 삭제 지시로 해석한다. 사용자 트리에 `.xb/`가 실제로 있으면 충돌하므로 백업 시 거부한다.
+pub const TOMBSTONE_ENTRY: &str = ".xb/tombstones.json";
 
 /// `file://` URI에서 로컬 절대 경로를 얻는다.
 ///
