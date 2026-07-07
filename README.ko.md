@@ -613,8 +613,9 @@ cron에서 4를 성공으로 다루려면: `x-backup backup ...; rc=$?; [ $rc -e
 ## 복구 의미론
 
 - `restore`(--at 없음) = **base 풀백업 스냅샷만** 복원
-- `restore --at <시각>` = PITR — base 복원 후 증분 oplog를 해당 시각(이하 최대 ts)까지 재생.
-  `verify --chain` 통과가 전제이며, `--only`(선택 복구)와는 병용 불가(mongorestore 제약)
+- `restore --at <시각>` = PITR — base 복원 후 증분 oplog를 해당 시각(이하 최대 ts)까지
+  드라이버 `applyOps`로 직접 재생(외부 도구 불필요). `verify --chain` 통과가 전제이며,
+  `--only`(선택 복구)와는 병용 불가(oplog 재생은 전체 복구 전제)
 - 복구 검증: `verify --deep`은 개인키 보유 호스트에서만 동작한다(§8.5 키 격리 — 백업
   호스트는 공개키만 가지므로 침해돼도 과거 백업을 복호화할 수 없다)
 

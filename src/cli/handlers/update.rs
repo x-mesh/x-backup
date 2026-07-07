@@ -1,4 +1,7 @@
-//! `update` 핸들러 — 설치 소스 감지 → brew 위임 / 안내 / 자기 교체.
+//! `update` 핸들러 — 설치 소스 감지 → 안내(brew/cargo) / 자기 교체(manual).
+//!
+//! 외부 바이너리는 스폰하지 않는다(로드맵 P0-3) — brew/cargo 설치본에는 갱신 명령만
+//! 안내하고, manual(install.sh) 설치본만 릴리스 자산 검증 후 원자 교체한다.
 
 use crate::cli::args::UpdateArgs;
 use crate::cli::output::{field_line, field_line_toned, style, Tone};
@@ -77,32 +80,27 @@ pub async fn handle(lang_flag: Option<Lang>, args: UpdateArgs) -> Result<()> {
     // 2) 소스별 갱신 경로.
     match source {
         Source::Brew => {
-            // brew가 소유한 바이너리는 brew로 갱신한다(gk와 동일하게 위임).
+            // brew가 소유한 바이너리는 brew로 갱신해야 한다. 종전에는 `brew upgrade`를
+            // 직접 스폰했으나, 외부 바이너리 실행 0 원칙(로드맵 P0-3)에 따라 cargo
+            // 설치와 동일하게 명령만 안내한다(정보성 성공).
             println!(
                 "{}",
                 style(
                     lang.sel(
                         &format!(
-                            "brew install detected — running `brew upgrade {}`",
+                            "brew install detected — not overwriting directly. To upgrade:\n  \
+                             brew upgrade {}",
                             update::BREW_FORMULA
                         ),
                         &format!(
-                            "brew 설치 감지 — `brew upgrade {}` 실행",
+                            "brew 설치 감지 — 직접 덮어쓰지 않습니다. 갱신하려면:\n  \
+                             brew upgrade {}",
                             update::BREW_FORMULA
                         ),
                     ),
                     Tone::Plan,
                 )
             );
-            let status = std::process::Command::new("brew")
-                .args(["upgrade", update::BREW_FORMULA])
-                .status()
-                .map_err(|e| XBackupError::Failure(format!("brew 실행 실패: {e}")))?;
-            if !status.success() {
-                return Err(XBackupError::Failure(
-                    "brew upgrade가 실패했습니다 — 위 brew 출력을 확인하세요".into(),
-                ));
-            }
             Ok(())
         }
         Source::CargoInstall => {

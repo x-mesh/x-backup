@@ -34,6 +34,10 @@
 개발전용 의존(docker compose, `make tools`의 fastdl 다운로드, install.sh의 curl/gh,
 release.sh의 cross/gh/ruby)은 런타임 0 목표와 무관하므로 유지한다.
 
+> **진행 현황**: D1(native applyOps 재생, P0-1)·D3·D4(P0-3)는 **제거 완료**. D2는 P0-2로
+> 잔여(여전히 opt-in), D5는 update 실행 시에만 발동하는 선택 기능으로 잔여(P5에서 feature
+> 격리 예정). CI no-subprocess 가드(P0-4)로 퇴행을 차단한다.
+
 ### 0.3 기능 격차 (다기능화 대상)
 
 | 기능 | 상태 |
@@ -52,22 +56,25 @@ release.sh의 cross/gh/ruby)은 런타임 0 목표와 무관하므로 유지한�
 
 ## Phase 0 — 런타임 외부 의존 0 완성 (최우선, 가장 작고 가장 확실한 가치)
 
-### P0-1. MongoDB PITR native oplog 재생 — `mongorestore` 제거 ★핵심
+### P0-1. MongoDB PITR native oplog 재생 — `mongorestore` 제거 ★핵심 — **구현됨**
 
-유일한 하드 블로커. PG(`src/pipeline/pg_pitr.rs`)·MySQL(`mysql_pitr.rs`)이 이미 드라이버로
-직접 재생하는 것과 동일한 구조를 Mongo에도 만든다.
+유일한 하드 블로커였다. PG(`src/pipeline/pg_pitr.rs`)·MySQL(`mysql_pitr.rs`)이 이미 드라이버로
+직접 재생하는 것과 동일한 구조를 Mongo에도 만들었다.
 
-- **방안**: 증분 슬라이스의 oplog BSON 문서를 스트리밍 디코드하여 드라이버로 직접 적용.
-  - 1차: `applyOps` 커맨드 배치 적용(단순, 서버가 idempotency 처리). 권한 요구(`__system` 수준)가
-    과하면 2차 방안으로.
-  - 2차: op 타입별(i/u/d/c) 해석 → 일반 CRUD·DDL 커맨드로 변환 적용(mongorestore
-    `--oplogReplay`가 하는 일의 부분집합). `--at` 컷은 ts 비교로 스트림에서 직접 절단 —
-    현재 `--oplogLimit` +1 보정 로직(`pitr.rs`)이 순수 비교로 단순해짐.
+- **채택 방안: `applyOps` 배치 적용**(`src/engine/mongo/apply.rs`). CRUD 변환안 대신
+  applyOps를 택한 이유 — `mongorestore --oplogReplay` 자체가 applyOps 기반이라 의미론
+  충실도가 가장 높고, `$v:2` update delta 해석을 **서버에** 맡길 수 있으며(클라이언트
+  재구현 리스크 0), 권한 요구는 종전 mongorestore 경로와 동일해 회귀가 아니다.
+  - 적용 규칙: noop 스킵, `local.*`/`config.*`/`admin.system.version` 제외, `ui`(컬렉션
+    UUID)·세션/재시도 메타 스트립, 트랜잭션(applyOps 체인) 커밋 지점 재조립,
+    CRUD 배치(1000개/12MiB) + 커맨드 단독 적용.
+  - limit 컷은 `--oplogLimit` 문자열 대신 `(t,i)` 비교로 스트림에서 직접 절단 —
+    `+1` 보정 의미론은 유지. 임시 `oplog.bson` 파일도 사라져 재생 단계가 전 구간
+    스트리밍이 됐다(PRD §7 예외 제거).
 - **수용 기준**: 기존 `scenario-e2e.sh` PITR 시나리오가 mongorestore 미설치 환경(PATH에서 제거)에서
-  통과. 기존 백업 체인과 호환(아카이브 포맷 변경 없음 — 재생기만 교체).
-- **공수**: 중(oplog op 의미론 — v2 update 표현(`$v:2` delta) 처리 포함 2~3주).
-- **리스크**: update v2 delta 포맷 디코드가 가장 까다로움. mysql/pgoutput 디코더를 이미 자체
-  구현한 전례가 있어 팀 역량상 실현 가능.
+  통과 — CI integration 잡에서 확인 필요(잔여). 기존 백업 체인과 호환(아카이브 포맷 변경
+  없음 — 재생기만 교체).
+- **잔여 리스크**: prepared/대형 트랜잭션 재조립은 통합 테스트로 실측 필요.
 
 ### P0-2. mongodump 엔진 경로 정리
 
@@ -77,17 +84,17 @@ release.sh의 cross/gh/ruby)은 런타임 0 목표와 무관하므로 유지한�
   `list`가 해당 백업에 deprecation 경고를 표시.
 - **수용 기준**: 기본 빌드 산출물에서 `std::process::Command` 호출이 update 관련 외 0건.
 
-### P0-3. update 서브커맨드의 `brew`/`gh` 스폰 제거
+### P0-3. update 서브커맨드의 `brew`/`gh` 스폰 제거 — **구현됨**
 
-- `gh auth token` 폴백 삭제 → env(`GITHUB_TOKEN`/`GH_TOKEN`)만 허용 (`src/update/mod.rs:130-151`).
-- brew 위임 삭제 → brew 설치본 감지 시 "brew upgrade를 실행하라" 안내만 출력 (`update.rs:97`).
-- **공수**: 소(1일).
+- `gh auth token` 폴백 삭제 → env(`GITHUB_TOKEN`/`GH_TOKEN`)만 허용 (`src/update/mod.rs`).
+- brew 위임 삭제 → brew 설치본 감지 시 `brew upgrade` 명령만 안내(cargo 설치와 동일한 정책).
 
-### P0-4. CI "no-subprocess" 가드 신설
+### P0-4. CI "no-subprocess" 가드 신설 — **구현됨**
 
-퇴행 방지 장치. lint 잡에 스크립트 추가:
-`src/`에서 `std::process::Command`·`tokio::process` 사용을 허용 목록
-(P0-2 feature 게이트 내부만) 대비 검사, 위반 시 실패. musl 정적 검사(`file`)는 기존 유지.
+퇴행 방지 장치. lint 잡에 스텝 추가(ci.yml `no-subprocess guard`): `src/`에서 스폰
+표면(`tokio::process`·`std::process::{Command,Stdio,Child}`) 사용을 허용 목록
+(`engine/mongo/{dump,restore,status}.rs` — opt-in mongodump 엔진) 대비 검사, 위반 시 실패.
+musl 정적 검사(`file`)는 기존 유지.
 
 - **Phase 0 완료 게이트**: *"mongorestore·mongodump·brew·gh가 전혀 없는 컨테이너
   (`FROM scratch` + 바이너리)에서 backup/restore/PITR/verify/prune 전 시나리오 통과"*
@@ -248,8 +255,8 @@ manifest/verify/prune/list 공유)에 태우는 것이 차별점 — 별도 도�
 
 ## 결정이 필요한 사항
 
-1. **P0-1 재생 방식**: `applyOps`(권한 요구 큼, 구현 단순) vs CRUD 변환(권한 최소, 구현 복잡).
-   권장: CRUD 변환 — "권한 최소 원칙"이 status 점검 철학과 일관.
+1. ~~**P0-1 재생 방식**~~ — **applyOps로 확정·구현됨**(P0-1 절 참조). 권한 요구는
+   종전 mongorestore --oplogReplay와 동일하므로 "권한 최소" 관점의 회귀가 없다.
 2. **mongodump 포맷 백업의 지원 종료 시점**: feature 격리 후 몇 버전 유지할지.
 3. **파일 엔진의 URI 표면**: `file://` source 통합 vs 별도 서브커맨드. 권장: URI 통합
    (기존 "URI 스킴으로 엔진 자동 판별" 설계와 일관).

@@ -117,8 +117,8 @@ pub struct MigrateArgs {
     pub json: bool,
 }
 
-/// `update` — 자기 갱신. brew 설치는 brew upgrade로 위임, manual 설치는
-/// 릴리스 자산 다운로드 + sha256 검증 + 원자적 교체(gk 컨벤션).
+/// `update` — 자기 갱신. brew/cargo 설치는 갱신 명령만 안내, manual 설치는
+/// 릴리스 자산 다운로드 + sha256 검증 + 원자적 교체(gk 컨벤션, 외부 바이너리 스폰 없음).
 #[derive(Debug, Args)]
 pub struct UpdateArgs {
     /// 최신 버전 확인만 하고 설치하지 않는다.

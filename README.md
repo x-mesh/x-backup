@@ -636,7 +636,7 @@ To treat 4 as success in cron: `x-backup backup ...; rc=$?; [ $rc -eq 4 ] && rc=
 ## Restore semantics
 
 - `restore` (no `--at`) restores the **base full backup snapshot only**.
-- `restore --at <time>|latest` is PITR: it restores the base, then replays increments up to that time — MongoDB oplog (the largest ts at or before it) or PostgreSQL logical-decoding changes; `latest` replays everything. It requires `verify --chain` to pass, and it cannot be combined with `--only` (selective restore).
+- `restore --at <time>|latest` is PITR: it restores the base, then replays increments up to that time — MongoDB oplog (applied directly through the driver via `applyOps`, no external tools) or PostgreSQL logical-decoding changes; `latest` replays everything. It requires `verify --chain` to pass, and it cannot be combined with `--only` (selective restore).
 - `verify --deep` runs only on a host that holds the private key (key isolation, PRD §8.5). The backup host carries only the public key, so a compromised backup host still cannot decrypt past backups.
 
 ## Development
