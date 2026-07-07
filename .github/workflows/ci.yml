@@ -75,6 +75,11 @@ jobs:
       - name: clippy (all targets, all features, deny warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # 기본(feature 없는) 빌드도 별도로 린트한다 — legacy-mongodump 게이트로 생기는
+      # 미사용 import/dead code는 all-features 실행에서 보이지 않는다(P0-2).
+      - name: clippy (default features — zero-dep build)
+        run: cargo clippy --all-targets -- -D warnings
+
       # 단위 테스트(lib). feature를 켜지 않으므로 통합/S3 스위트는
       # `#![cfg(feature = ...)]`로 아예 컴파일 대상에서 빠진다(DB 불필요).
       - name: cargo test (unit / lib)
@@ -85,9 +90,10 @@ jobs:
         run: cargo test --test exit_codes_e2e
 
       # ── 런타임 외부 바이너리 의존 0 가드(로드맵 P0-4) ──
-      # src/에서 서브프로세스 스폰(std/tokio process)은 opt-in mongodump 엔진
-      # 3개 파일에서만 허용한다. 새 스폰 지점이 생기면 이 스텝이 실패한다 —
-      # 외부 의존을 추가하려면 허용 목록을 의도적으로 고쳐야 한다(리뷰 강제).
+      # src/에서 서브프로세스 스폰(std/tokio process)은 레거시 mongodump 엔진
+      # 3개 파일에서만 허용한다 — 이들은 legacy-mongodump feature에서만 컴파일되므로
+      # (P0-2) **기본 빌드 산출물에는 스폰 코드가 0이다**. 새 스폰 지점이 생기면 이
+      # 스텝이 실패한다 — 외부 의존을 추가하려면 허용 목록을 의도적으로 고쳐야 한다.
       - name: no-subprocess guard (zero external runtime deps)
         run: |
           # process::id()/ExitCode는 스폰이 아니다 — 스폰 표면(Command/Stdio/Child)만 잡는다.

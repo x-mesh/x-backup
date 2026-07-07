@@ -8,9 +8,15 @@ description = "MongoDB·PostgreSQL 백업·복구 CLI — 풀/증분(oplog·logi
 license = "MIT"
 
 [features]
+# 레거시 mongodump/mongorestore 엔진(opt-in) — 로드맵 P0-2.
+# 기본 빌드는 서브프로세스 스폰 코드가 0인 완전 자기완결 바이너리다. 이 feature를 켜면
+# engine="mongodump" 백업과 mongodump 아카이브 포맷 백업의 복구가 가능해진다.
+# deprecated 경로 — native 엔진이 기본이며, 이 feature는 이후 마이너 버전에서 제거 예정.
+legacy-mongodump = []
 # 통합 테스트 격리(환경에 mongodump/mongorestore + replica set 필요).
 # 기본 빌드/CI 단위 테스트에는 포함하지 않는다 — `--features integration-tests`로만 활성화.
-integration-tests = []
+# mongodump 엔진 경로를 검증하므로 legacy-mongodump를 함께 켠다.
+integration-tests = ["legacy-mongodump"]
 # S3 통합 테스트 격리(환경에 docker + MinIO 필요). 기본 빌드/단위 테스트에는
 # 포함하지 않으며 `--features s3-integration`으로만 활성화한다(integration-tests 패턴 동일).
 s3-integration = []

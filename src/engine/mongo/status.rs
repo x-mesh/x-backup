@@ -1270,7 +1270,9 @@ pub fn human_bytes(bytes: i64) -> String {
 /// `mongodump --version`을 실행해 버전 문자열을 파싱한다(PATH/설치 경로 의존).
 ///
 /// 출력 예: `mongodump version: 100.16.1` → `"100.16.1"`. 실행 실패/미설치면 None.
-/// 읽기 전용·부작용 없음(외부 도구의 버전만 묻는다).
+/// 읽기 전용·부작용 없음(외부 도구의 버전만 묻는다). legacy-mongodump feature에서만
+/// 실제 스폰한다 — 미포함 빌드는 항상 None(도구 부재와 동일 취급, 로드맵 P0-2).
+#[cfg(feature = "legacy-mongodump")]
 fn detect_mongodump_version(program: &str) -> Option<String> {
     let output = std::process::Command::new(program)
         .arg("--version")
@@ -1281,6 +1283,12 @@ fn detect_mongodump_version(program: &str) -> Option<String> {
     }
     let text = String::from_utf8_lossy(&output.stdout);
     parse_mongodump_version(&text)
+}
+
+/// 미포함 빌드 스텁 — mongodump 엔진 자체가 조기 거부되므로 도달 불가(방어적 None).
+#[cfg(not(feature = "legacy-mongodump"))]
+fn detect_mongodump_version(_program: &str) -> Option<String> {
+    None
 }
 
 /// `mongodump --version` 출력에서 `version:` 라인의 버전 토큰을 파싱한다(순수 함수).

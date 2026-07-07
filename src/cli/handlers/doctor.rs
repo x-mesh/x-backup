@@ -333,6 +333,9 @@ fn check_profile(
         Some(DbKind::Mongo) => {
             let eng = &prof.mode.engine;
             if eng == "mongodump" {
+                // legacy-mongodump 미포함 빌드에서는 이 엔진으로 backup/restore가 조기
+                // 거부되므로(Engine::parse) doctor도 설정 실패로 알린다(P0-2).
+                #[cfg(feature = "legacy-mongodump")]
                 items.push(Item {
                     status: CheckStatus::Ok,
                     label: "engine",
@@ -340,6 +343,19 @@ fn check_profile(
                         .sel(
                             "mongodump (external tool required — native recommended)",
                             "mongodump(외부 도구 필요 — native 권장)",
+                        )
+                        .into(),
+                });
+                #[cfg(not(feature = "legacy-mongodump"))]
+                items.push(Item {
+                    status: CheckStatus::Fail,
+                    label: "engine",
+                    message: lang
+                        .sel(
+                            "engine=mongodump but this build excludes it (cargo feature \
+                             `legacy-mongodump`) — use engine=\"native\"",
+                            "engine=mongodump이지만 이 빌드에는 미포함(cargo feature \
+                             `legacy-mongodump`) — engine=\"native\"를 사용하세요",
                         )
                         .into(),
                 });

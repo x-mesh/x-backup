@@ -27,7 +27,9 @@ use tokio::io::{AsyncRead, ReadBuf};
 use std::path::{Path, PathBuf};
 
 use crate::engine::mongo::meta::ServerMeta;
-use crate::engine::mongo::{MongoMeta, RestoreProcess, RestoreSpec, UriConfigFile};
+use crate::engine::mongo::MongoMeta;
+#[cfg(feature = "legacy-mongodump")]
+use crate::engine::mongo::{RestoreProcess, RestoreSpec, UriConfigFile};
 use crate::engine::native::{native_export_to_dir, ExportSummary};
 use crate::error::{Result, XBackupError};
 use crate::manifest::schema::{BackupManifest, BackupType};
@@ -439,36 +441,51 @@ async fn stream_restore(
         return Ok(());
     }
 
-    // 3) (mongodump 경로) URI를 0600 임시 config로(argv 노출 금지). 핸들은 restore 종료까지 유지.
-    let uri_config = UriConfigFile::create(&request.target_uri)?;
-
-    // 4) mongorestore 스폰(--archive=- stdin, --drop은 가드 통과 시에만).
-    let spec = RestoreSpec {
-        program: request.mongorestore_program.clone(),
-        uri_config_path: uri_config.path().to_string(),
-        ns_include: plan.ns_include.clone(),
-        drop: drop_existing,
-    };
-    let mut restore = RestoreProcess::spawn(&spec)?;
-    let mut stdin = restore.take_stdin()?;
-
-    // 5) 파이프라인 바이트를 stdin으로 흘린다. 끝나면 stdin을 닫아 EOF를 보낸다.
-    let copy_result = tokio::io::copy(&mut restored_stream, &mut stdin).await;
-    // stdin을 명시적으로 닫는다(Drop이 닫지만 shutdown으로 flush 보장).
-    use tokio::io::AsyncWriteExt;
-    let _ = stdin.shutdown().await;
-    drop(stdin);
-
-    if let Err(copy_err) = copy_result {
-        // 입력/파이프 실패: restore를 kill+wait로 정리(좀비 방지).
-        restore.abort().await;
-        return Err(XBackupError::Failure(format!(
-            "복구 입력 스트리밍 실패: {copy_err}"
-        )));
+    // 3) (레거시 mongodump 아카이브 경로) legacy-mongodump feature 빌드에서만 지원한다 —
+    //    기본 빌드는 서브프로세스 스폰 코드가 없다(로드맵 P0-2).
+    #[cfg(not(feature = "legacy-mongodump"))]
+    {
+        Err(XBackupError::Failure(format!(
+            "백업 '{}'는 mongodump 아카이브 포맷입니다 — 이 빌드에는 mongorestore \
+             오케스트레이션이 포함되지 않았습니다(cargo feature `legacy-mongodump`). \
+             legacy-mongodump feature를 켠 빌드로 복구하거나, native 엔진으로 새 백업을 \
+             만드세요",
+            plan.backup_id
+        )))
     }
+    #[cfg(feature = "legacy-mongodump")]
+    {
+        // URI를 0600 임시 config로(argv 노출 금지). 핸들은 restore 종료까지 유지.
+        let uri_config = UriConfigFile::create(&request.target_uri)?;
 
-    // 6) mongorestore 종료 코드 판정(exit code only).
-    restore.wait().await
+        // 4) mongorestore 스폰(--archive=- stdin, --drop은 가드 통과 시에만).
+        let spec = RestoreSpec {
+            program: request.mongorestore_program.clone(),
+            uri_config_path: uri_config.path().to_string(),
+            ns_include: plan.ns_include.clone(),
+            drop: drop_existing,
+        };
+        let mut restore = RestoreProcess::spawn(&spec)?;
+        let mut stdin = restore.take_stdin()?;
+
+        // 5) 파이프라인 바이트를 stdin으로 흘린다. 끝나면 stdin을 닫아 EOF를 보낸다.
+        let copy_result = tokio::io::copy(&mut restored_stream, &mut stdin).await;
+        // stdin을 명시적으로 닫는다(Drop이 닫지만 shutdown으로 flush 보장).
+        use tokio::io::AsyncWriteExt;
+        let _ = stdin.shutdown().await;
+        drop(stdin);
+
+        if let Err(copy_err) = copy_result {
+            // 입력/파이프 실패: restore를 kill+wait로 정리(좀비 방지).
+            restore.abort().await;
+            return Err(XBackupError::Failure(format!(
+                "복구 입력 스트리밍 실패: {copy_err}"
+            )));
+        }
+
+        // 6) mongorestore 종료 코드 판정(exit code only).
+        restore.wait().await
+    }
 }
 
 /// 네이티브 아카이브를 드라이버로 직접 복원한다(외부 mongorestore 불필요).
@@ -845,6 +862,7 @@ mod tests {
     }
 
     /// 가짜 mongorestore 스크립트 — stdin을 sink 파일로 복사하고 exit 0.
+    #[cfg(feature = "legacy-mongodump")]
     fn fake_mongorestore_sink(sink_path: &str) -> tempfile::TempPath {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
@@ -869,6 +887,7 @@ mod tests {
     /// 평문 풀 복구 스트리밍 E2E(가짜 mongorestore): storage data.bin → identity 역스택
     /// → mongorestore stdin으로 바이트가 손실 없이 전달되는지 확인한다. DB·실제 도구
     /// 없이 파이프라인 합성·스폰·stdin copy·exit 판정 전 구간을 검증한다.
+    #[cfg(feature = "legacy-mongodump")]
     #[tokio::test]
     async fn plaintext_restore_streams_data_to_mongorestore_stdin() {
         let dir = tempfile::tempdir().unwrap();
@@ -910,7 +929,43 @@ mod tests {
         );
     }
 
+    /// 미포함(기본) 빌드: mongodump 아카이브 포맷 백업의 복구는 명확한 안내와 함께
+    /// 실패(exit 1)한다 — legacy-mongodump 빌드 또는 native 재백업 유도(P0-2).
+    #[cfg(not(feature = "legacy-mongodump"))]
+    #[tokio::test]
+    async fn restore_rejects_mongodump_format_without_legacy_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = LocalFs::new(dir.path()).unwrap();
+        seed_backup(
+            &fs,
+            &full_manifest("bk-legacy", "2026-06-12T00:00:00Z", "7.0.35"),
+            b"x",
+        )
+        .await;
+
+        let request = RestoreRequest {
+            target_uri: crate::config::secret::Secret::new("mongodb://unused/db"),
+            mongorestore_program: "/nonexistent/never-spawned".to_string(),
+            backup_id: Some("bk-legacy".to_string()),
+            only: None,
+            force: true,
+            dry_run: false,
+            skip_precheck: true,
+            timeout_secs: None,
+            progress_counter: None,
+        };
+        let err = run_restore(&request, &fs, false, |_| true)
+            .await
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        assert!(
+            err.to_string().contains("legacy-mongodump"),
+            "feature 안내 누락: {err}"
+        );
+    }
+
     /// mongorestore가 비정상 종료(exit 1)하면 복구는 실패(exit 1)로 전파한다.
+    #[cfg(feature = "legacy-mongodump")]
     #[tokio::test]
     async fn restore_propagates_mongorestore_failure() {
         use std::io::Write;

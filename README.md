@@ -406,14 +406,20 @@ engine = "native"     # native (default) | mongodump     (v2 flat key → mode.e
 | Engine | External tools | Archive format | What it captures | Use when |
 |--------|---------------|----------------|------------------|----------|
 | `native` (default) | none | `xb-native-v1` | data + indexes + collection options (capped, validator, collation, …) | the default — zero dependencies, single binary |
-| `mongodump` | `mongodump` / `mongorestore` on PATH | mongodump `--archive` | whatever mongodump emits, plus consistent in-archive `--oplog` | you specifically want mongodump's archive or its in-dump oplog snapshot |
+| `mongodump` (legacy, opt-in build) | `mongodump` / `mongorestore` on PATH | mongodump `--archive` | whatever mongodump emits, plus consistent in-archive `--oplog` | you specifically want mongodump's archive or its in-dump oplog snapshot |
 
 Both engines stream through the same compress → encrypt pipeline and record oplog
 timestamps for chaining, so incremental/PITR work the same way. The engine that produced a
 backup is recorded in the manifest (`tool_versions.archive_format`), and `restore` dispatches
 automatically — a `native` archive is restored through the driver, a mongodump archive
-through `mongorestore`. You can restore an old mongodump backup even after switching the
-profile to `native`.
+through `mongorestore`.
+
+> **Legacy build flag.** The default build ships with **zero subprocess code** — the
+> `mongodump` engine (and restoring mongodump-format archives) requires a build with the
+> `legacy-mongodump` cargo feature (`cargo build --features legacy-mongodump`). On the
+> default build, `engine = "mongodump"` is rejected as a config error and restoring a
+> mongodump-format backup fails with guidance. This engine is deprecated and scheduled
+> for removal in a future minor release.
 
 ### PostgreSQL
 

@@ -76,13 +76,15 @@ release.sh의 cross/gh/ruby)은 런타임 0 목표와 무관하므로 유지한�
   없음 — 재생기만 교체).
 - **잔여 리스크**: prepared/대형 트랜잭션 재조립은 통합 테스트로 실측 필요.
 
-### P0-2. mongodump 엔진 경로 정리
+### P0-2. mongodump 엔진 경로 정리 — **구현됨**
 
-- opt-in `engine=mongodump` 경로(`dump.rs`/`restore.rs`/버전 점검)를 **cargo feature
-  `legacy-mongodump`로 격리**(기본 빌드 제외) 후 1개 마이너 버전 뒤 제거.
-- 기존 `archive_format=="mongodump"` 백업의 복구 호환은 feature 빌드로만 제공하고,
-  `list`가 해당 백업에 deprecation 경고를 표시.
-- **수용 기준**: 기본 빌드 산출물에서 `std::process::Command` 호출이 update 관련 외 0건.
+- opt-in `engine=mongodump` 경로(`dump.rs`/`restore.rs`/버전 점검 스폰)를 **cargo feature
+  `legacy-mongodump`로 격리**(기본 빌드 제외). `integration-tests` feature가 이를 함께 켠다.
+- 기본 빌드에서: `engine = "mongodump"`는 `Engine::parse`에서 설정 오류(exit 2)로 조기
+  거부, mongodump 포맷 백업 복구는 안내와 함께 실패(exit 1), doctor는 engine 항목을
+  Fail로 표시. CI lint 잡에 기본(feature 없는) 빌드 clippy 스텝 추가.
+- **수용 기준 달성**: 기본 빌드 산출물에서 서브프로세스 스폰 코드 0건(컴파일 제외).
+- **잔여**: `list`의 mongodump 포맷 백업 deprecation 경고 표시, 1개 마이너 버전 뒤 제거.
 
 ### P0-3. update 서브커맨드의 `brew`/`gh` 스폰 제거 — **구현됨**
 

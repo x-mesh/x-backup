@@ -23,7 +23,9 @@ use tokio::io::{AsyncRead, ReadBuf};
 use uuid::Uuid;
 
 use crate::engine::mongo::meta::ServerMeta;
-use crate::engine::mongo::{DumpProcess, DumpSpec, MongoMeta, UriConfigFile};
+use crate::engine::mongo::MongoMeta;
+#[cfg(feature = "legacy-mongodump")]
+use crate::engine::mongo::{DumpProcess, DumpSpec, UriConfigFile};
 use crate::error::{Result, XBackupError};
 use crate::manifest::schema::{
     BackupManifest, BackupStatus, BackupType, OplogRange, ToolVersions, Topology, FORMAT_VERSION,
@@ -105,12 +107,31 @@ pub enum Engine {
     Mongodump,
 }
 
+/// legacy-mongodump 미포함 빌드에서 mongodump 엔진 경로가 요구될 때의 설정 오류(exit 2).
+///
+/// 모든 진입점(parse)과 도달 불가 방어 분기가 같은 안내를 낸다.
+#[cfg(not(feature = "legacy-mongodump"))]
+fn legacy_engine_unavailable() -> XBackupError {
+    XBackupError::Config(
+        "이 빌드에는 mongodump 엔진이 포함되지 않았습니다(cargo feature `legacy-mongodump`) — \
+         engine = \"native\"를 사용하세요. 기존 mongodump 포맷 백업의 복구가 필요하면 \
+         legacy-mongodump feature를 켠 빌드를 사용해야 합니다"
+            .into(),
+    )
+}
+
 impl Engine {
     /// config 문자열(`native`|`mongodump`)에서 파싱한다. 그 외 값은 설정 오류.
+    ///
+    /// `mongodump`는 legacy-mongodump feature 빌드에서만 유효하다 — 미포함 빌드에서는
+    /// 여기서 설정 오류(exit 2)로 조기 거부해 하위 분기가 도달 불가가 되게 한다.
     pub fn parse(s: &str) -> Result<Self> {
         match s {
             "native" => Ok(Engine::Native),
+            #[cfg(feature = "legacy-mongodump")]
             "mongodump" => Ok(Engine::Mongodump),
+            #[cfg(not(feature = "legacy-mongodump"))]
+            "mongodump" => Err(legacy_engine_unavailable()),
             other => Err(XBackupError::Config(format!(
                 "알 수 없는 engine: '{other}'(native | mongodump만 지원)"
             ))),
@@ -133,12 +154,14 @@ impl Engine {
 enum DumpFinalizer {
     /// mongodump 자식 프로세스(+ 0600 임시 URI config 핸들 — 종료까지 유지).
     /// Box로 감싼다 — 변형 간 크기 격차 회피(`clippy::large_enum_variant`).
+    #[cfg(feature = "legacy-mongodump")]
     Mongodump(Box<MongodumpFinalizer>),
     /// 네이티브 덤프 task 핸들(EOF 후 결과 회수).
     Native(Option<crate::engine::native::backup::NativeDumpHandle>),
 }
 
 /// mongodump 종료 처리 페이로드 — 자식 프로세스 + 0600 임시 URI config 핸들.
+#[cfg(feature = "legacy-mongodump")]
 struct MongodumpFinalizer {
     proc: Option<DumpProcess>,
     _uri_config: UriConfigFile,
@@ -148,6 +171,7 @@ impl DumpFinalizer {
     /// 정상 경로 — 스트림 EOF 후 종료를 판정한다(mongodump exit code / native task 결과).
     async fn finish(&mut self) -> Result<()> {
         match self {
+            #[cfg(feature = "legacy-mongodump")]
             DumpFinalizer::Mongodump(m) => match m.proc.take() {
                 Some(p) => p.wait().await,
                 None => Ok(()),
@@ -162,6 +186,7 @@ impl DumpFinalizer {
     /// 실패 경로 — 자식/리더를 정리한다(좀비/누수 방지).
     async fn abort(&mut self) {
         match self {
+            #[cfg(feature = "legacy-mongodump")]
             DumpFinalizer::Mongodump(m) => {
                 if let Some(p) = m.proc.take() {
                     p.abort().await;
@@ -301,6 +326,10 @@ pub async fn run_full_backup_with_meta(
     //    native는 드라이버로 직접 아카이브 스트림을 만든다(외부 도구 불필요).
     let archive_format = request.engine.archive_format();
     let (dump_stream, mut finalizer): (BoxAsyncRead, DumpFinalizer) = match request.engine {
+        // parse가 조기 거부하므로 미포함 빌드에서 도달 불가(방어적).
+        #[cfg(not(feature = "legacy-mongodump"))]
+        Engine::Mongodump => return Err(legacy_engine_unavailable()),
+        #[cfg(feature = "legacy-mongodump")]
         Engine::Mongodump => {
             // URI를 0600 임시 config로 — argv 노출 금지(PRD §11). 핸들은 dump 종료까지 유지.
             let uri_config = UriConfigFile::create(&request.uri)?;
@@ -1142,6 +1171,31 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use tokio::io::AsyncReadExt;
+
+    // ── Engine::parse — legacy-mongodump feature 게이트(P0-2) ──
+
+    #[test]
+    fn engine_parse_native_always_ok() {
+        assert_eq!(Engine::parse("native").unwrap(), Engine::Native);
+        assert_eq!(Engine::parse("bogus").unwrap_err().exit_code(), 2);
+    }
+
+    #[cfg(feature = "legacy-mongodump")]
+    #[test]
+    fn engine_parse_mongodump_ok_with_legacy_feature() {
+        assert_eq!(Engine::parse("mongodump").unwrap(), Engine::Mongodump);
+    }
+
+    #[cfg(not(feature = "legacy-mongodump"))]
+    #[test]
+    fn engine_parse_mongodump_rejected_without_legacy_feature() {
+        let err = Engine::parse("mongodump").unwrap_err();
+        assert_eq!(err.exit_code(), 2, "설정 오류(exit 2)여야 함");
+        assert!(
+            err.to_string().contains("legacy-mongodump"),
+            "feature 안내 누락: {err}"
+        );
+    }
 
     // 이 모듈의 단위 테스트는 드라이버·서브프로세스를 제외한 *저장 측* 합성 로직에
     // 집중한다(메타 질의·dump 스폰은 각 모듈 테스트와 통합 테스트가 담당). 여기서는

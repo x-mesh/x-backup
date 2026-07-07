@@ -21,9 +21,9 @@
 use mongodb::Client;
 
 use crate::config::secret::Secret;
-use crate::engine::mongo::{
-    conn, DumpProcess, DumpSpec, MongoMeta, RestoreProcess, RestoreSpec, UriConfigFile,
-};
+use crate::engine::mongo::{conn, MongoMeta};
+#[cfg(feature = "legacy-mongodump")]
+use crate::engine::mongo::{DumpProcess, DumpSpec, RestoreProcess, RestoreSpec, UriConfigFile};
 use crate::engine::native::backup::NativeDumper;
 use crate::engine::native::restore::native_restore;
 use crate::engine::postgres::{backup::PgDumper, meta as pg_meta, restore as pg_restore};
@@ -226,7 +226,17 @@ where
     // 엔진별 전송. native는 드라이버 직접(외부 도구 없음), mongodump는 자식 프로세스 파이프.
     match request.engine {
         Engine::Native => native_transfer(request, &plan).await?,
+        #[cfg(feature = "legacy-mongodump")]
         Engine::Mongodump => mongodump_transfer(request, &plan).await?,
+        // Engine::parse가 조기 거부하므로 미포함 빌드에서 도달 불가(방어적).
+        #[cfg(not(feature = "legacy-mongodump"))]
+        Engine::Mongodump => {
+            return Err(XBackupError::Config(
+                "이 빌드에는 mongodump 엔진이 포함되지 않았습니다(cargo feature \
+                 `legacy-mongodump`) — engine = \"native\"를 사용하세요"
+                    .into(),
+            ))
+        }
     }
 
     let source_topology = plan.source_topology.clone();
@@ -273,6 +283,7 @@ async fn native_transfer(request: &MigrateRequest, plan: &MigratePlan) -> Result
 ///
 /// 직접 복사 경로라 `--oplog`는 쓰지 않는다(모듈 문서 참조). source/target URI는 0600 임시
 /// config로 전달하고, 실패 시 양쪽 자식을 kill+wait로 정리한다(좀비 방지).
+#[cfg(feature = "legacy-mongodump")]
 async fn mongodump_transfer(request: &MigrateRequest, plan: &MigratePlan) -> Result<()> {
     // source/target URI를 각각 0600 임시 config로(argv 노출 금지). 핸들은 종료까지 유지.
     let source_cfg = UriConfigFile::create(&request.source_uri)?;

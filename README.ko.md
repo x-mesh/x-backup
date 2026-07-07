@@ -400,13 +400,19 @@ engine = "native"     # native(기본) | mongodump     (v2 flat 키 → mode.eng
 | 엔진 | 외부 도구 | 아카이브 포맷 | 캡처 대상 | 사용 시점 |
 |------|----------|--------------|----------|----------|
 | `native`(기본) | 없음 | `xb-native-v1` | 데이터 + 인덱스 + 컬렉션 옵션(capped·validator·collation 등) | 기본 — 의존성 없는 단일 바이너리 |
-| `mongodump` | PATH의 `mongodump`/`mongorestore` | mongodump `--archive` | mongodump가 내보내는 것 + 아카이브 내장 `--oplog` 일관 스냅샷 | mongodump 아카이브나 덤프 내장 oplog가 꼭 필요할 때 |
+| `mongodump`(레거시, opt-in 빌드) | PATH의 `mongodump`/`mongorestore` | mongodump `--archive` | mongodump가 내보내는 것 + 아카이브 내장 `--oplog` 일관 스냅샷 | mongodump 아카이브나 덤프 내장 oplog가 꼭 필요할 때 |
 
 두 엔진 모두 동일한 압축 → 암호화 파이프라인을 통과하고 체이닝용 oplog 타임스탬프를
 기록하므로 증분/PITR 동작은 같다. 백업을 만든 엔진은 manifest(`tool_versions.archive_format`)에
 기록되고, `restore`가 자동으로 분기한다 — `native` 아카이브는 드라이버로, mongodump
-아카이브는 `mongorestore`로 복구한다. 프로파일을 `native`로 바꾼 뒤에도 예전 mongodump
-백업을 복구할 수 있다.
+아카이브는 `mongorestore`로 복구한다.
+
+> **레거시 빌드 플래그.** 기본 빌드에는 **서브프로세스 코드가 전혀 포함되지 않는다** —
+> `mongodump` 엔진(및 mongodump 포맷 아카이브의 복구)은 cargo feature
+> `legacy-mongodump`를 켠 빌드(`cargo build --features legacy-mongodump`)가 필요하다.
+> 기본 빌드에서 `engine = "mongodump"`는 설정 오류로 거부되고, mongodump 포맷 백업
+> 복구는 안내와 함께 실패한다. 이 엔진은 deprecated이며 이후 마이너 릴리스에서 제거
+> 예정이다.
 
 ### PostgreSQL
 
