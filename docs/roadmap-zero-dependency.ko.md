@@ -179,24 +179,27 @@ manifest/verify/prune/list 공유)에 태우는 것이 차별점 — 별도 도�
 
 "아무런 외부 의존 없음"의 마지막 조각은 **운영 의존**이다 — 현재는 cron 없이는 주기 백업이 안 된다.
 
-### P3-1. 내장 스케줄러 — `x-backup daemon`
+### P3-1. 내장 스케줄러 — `x-backup daemon` — **구현됨**
 
-- config에 `schedule = "0 3 * * *"`(프로파일별) 추가. `daemon` 서브커맨드가 포그라운드
-  상주하며 스케줄 발화 → 기존 backup 파이프라인 호출(잠금 계약 재사용).
-- cron 표현식 파서는 자체 구현(5필드, ~200 LOC — 외부 크레이트도 pure Rust지만 의존 최소
-  원칙에 부합). PRD의 "interval은 스케줄링용이 아니다" 주석과의 충돌은 config 키 분리로 해소.
-- `daemon --install-systemd`가 systemd unit 파일을 **출력**(설치는 사용자 몫 — 시스템 변경을
-  임의로 하지 않는 기존 원칙 유지). 신뢰성 요건: 발화 누락 시 다음 기동에서 catch-up 여부를
-  config로 명시(`catchup = true`).
-- 실패 시 exit-code 계약(0~5) 유지 — 데몬 내부에서도 실행 단위별로 동일 코드 기록.
+- 프로파일별 `schedule = "0 3 * * *"`(v2 키 동일) + `daemon` 서브커맨드(포그라운드 상주).
+  발화 = 기존 backup 핸들러 호출 — 잠금(FR-12)·exit code 계약·auto-quiet 그대로 적용,
+  잠금 충돌(exit 5)은 "이전 실행 진행 중"으로 해석돼 해당 발화만 건너뛴다.
+- cron 파서 자체 구현(`src/schedule` — `*`·범위·목록·스텝, 0/7=일요일, dom/dow OR
+  Vixie 의미론, 로컬 타임존, 불가능 조합 400일 방어). 외부 크레이트 0.
+- `--dry-run`(프로파일·다음 발화 미리보기, --json), `--print-systemd`(유닛 출력만 —
+  시스템 무변경 원칙). 실패는 로그+webhook 후 루프 계속(daemon은 시작 시 설정 오류에만
+  죽는다 — 빠른 실패).
+- 실측: `* * * * *` 스케줄이 두 분 연속 정각(±0.1s)에 발화, 백업 생성 + webhook 수신 확인.
+- **잔여**: catch-up 옵션(`catchup = true` — 꺼져 있던 동안의 발화 소급), 스케줄 발화의
+  backup type 지정.
 
-### P3-2. 알림 — webhook 우선
+### P3-2. 알림 — webhook 우선 — **구현됨(daemon 발화분)**
 
-- 백업/prune/리허설 완료·실패 시 generic JSON webhook POST(reqwest 이미 트리에 있음 —
-  신규 의존 0). Slack은 webhook의 페이로드 템플릿 한 종. SMTP는 후순위(순수 Rust
-  lettre+rustls 검토 — 의존 추가라 수요 확인 후).
-- 페이로드: profile, backup_id, type, 소요, 크기, exit code, 에러 요약 — `--json` 출력
-  스키마 재사용.
+- `notify.webhook_url_env`(URL은 env 이름만 — 시크릿 비저장 원칙)로 generic JSON
+  webhook POST(`src/notify`, reqwest 재사용 — 신규 의존 0, 10s 타임아웃, best-effort).
+- 페이로드: event/profile/ok/exit_code/error/duration_ms/at. 경고 동반 성공(exit 4)은
+  ok=true + exit_code=4.
+- **잔여**: 수동 backup/prune/리허설 이벤트 발신, Slack 페이로드 템플릿, SMTP(수요 확인 후).
 
 ### P3-3. GFS 리텐션 (정책 기반 자동 prune)
 

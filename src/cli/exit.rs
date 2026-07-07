@@ -44,6 +44,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Peek(args) => handlers::peek::handle(config, lang, args).await,
         Command::Migrate(args) => handlers::migrate::handle(config, lang, args).await,
         Command::Update(args) => handlers::update::handle(lang, args).await,
+        Command::Daemon(args) => handlers::daemon::handle(config, lang, args).await,
     }
 }
 

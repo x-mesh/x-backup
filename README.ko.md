@@ -24,6 +24,7 @@
 - ✅ **PostgreSQL** — COPY 프로토콜 기반 드라이버 네이티브 풀 백업/복구(데이터 + 테이블 + 제약 + 인덱스 + 시퀀스), `pg_dump`/`pg_restore` 불필요. 동일 파이프라인(압축→암호화→저장)·동일 `status`/`list`/`verify`/`restore`
 - ✅ **MySQL** — `mysql_async` 기반 드라이버 네이티브 풀 백업/복구(데이터 + DDL — 테이블·뷰·트리거·루틴·이벤트), `mysqldump`/`mysql` 불필요. 동일 파이프라인·동일 `status`/`list`/`verify`/`restore`. 증분·PITR은 binlog ROW 스트리밍(opt-in).
 - ✅ **파일/디렉터리** — `file:///path` 소스는 로컬 트리를 tar 스트림으로 동일 파이프라인(압축 → 암호화 → 저장, manifest/verify/list/prune)에 태워 백업하고, 스냅샷 인덱스 기반 증분(변경 파일 + 삭제 tombstone)과 체인 복구(base + 증분 재생)를 지원하며, 동일한 덮어쓰기 가드레일로 `file://` 대상에 복구
+- ✅ **내장 스케줄러** — `x-backup daemon`이 프로파일별 5필드 cron `schedule`(자체 파서, 외부 cron 불필요)로 백업을 상주 실행. 프로파일 잠금·exit code 계약 재사용, 실패는 generic JSON **webhook**(`notify.webhook_url_env`)으로 알리고 루프는 계속. `--dry-run`으로 발화 시각 미리보기, `--print-systemd`로 서비스 유닛 출력
 - ✅ **headless** — 비-TTY 자동 quiet, `--json`, cron/CI 친화
 
 지원 범위: MongoDB replica set(풀+증분)/standalone(풀만)/샤딩은 감지 시 거부. PostgreSQL은 풀 백업+복구+status에 더해 증분(logical decoding)·PITR(opt-in). [PostgreSQL](#postgresql-1) 참조. MySQL은 동일한 명령 세트(풀/복구/status/peek/migrate)에 더해 증분·PITR(binlog ROW 스트리밍, opt-in — 서버에 `log_bin=ROW` 필요). [MySQL](#mysql-1) 참조.

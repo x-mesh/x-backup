@@ -72,6 +72,24 @@ pub enum Command {
     Migrate(MigrateArgs),
     /// x-backup 자신을 최신 릴리스로 갱신한다(설치 소스 자동 감지).
     Update(UpdateArgs),
+    /// 내장 스케줄러 — config의 profile.schedule(cron)에 따라 백업을 상주 실행한다.
+    Daemon(DaemonArgs),
+}
+
+/// `daemon` — 포그라운드 상주 스케줄러(P3-1). 외부 cron 없이 profile별 `schedule`
+/// (5필드 cron)에 따라 backup을 실행한다. 실행 단위마다 기존 잠금·exit code 계약을
+/// 그대로 따르고, 실패해도 루프는 계속된다(로그 + webhook 알림).
+#[derive(Debug, Args)]
+pub struct DaemonArgs {
+    /// 스케줄 해석 결과(프로파일·다음 발화 시각)만 출력하고 종료한다(무변경).
+    #[arg(long)]
+    pub dry_run: bool,
+    /// systemd 서비스 유닛 파일을 stdout에 출력하고 종료한다(설치는 사용자 몫).
+    #[arg(long)]
+    pub print_systemd: bool,
+    /// 진행/결과를 기계 판독 JSON으로 출력한다(dry-run 전용).
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `migrate` — source(프로파일) → target으로 파일 없이 직접 복사.

@@ -284,6 +284,8 @@ pub fn run_wizard(prompt: &mut dyn Prompt) -> Result<Config> {
 
     // 조립. compression/incremental의 나머지 필드는 기본값을 따른다.
     let profile = Profile {
+        schedule: None,
+        notify: Default::default(),
         mode: ModeConfig {
             backup_type: "full".to_string(),
             output,
