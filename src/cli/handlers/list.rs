@@ -500,13 +500,12 @@ fn print_human(
     }
 }
 
-/// manifest의 archive_format으로 DB 엔진을 판별한다(`xb-pg*`=postgresql, `xb-mysql*`=mysql, 그 외=mongodb).
+/// manifest의 archive_format으로 DB 엔진을 판별한다 — 판별은 [`DbKind`]가 단일 진실
+/// 원천이다(Phase 1 슬라이스 A, picker와 공유).
+///
+/// [`DbKind`]: crate::engine::DbKind
 fn engine_from_archive(fmt: Option<&str>) -> &'static str {
-    match fmt {
-        Some(f) if f.starts_with("xb-mysql") => "mysql",
-        Some(f) if f.starts_with("xb-pg") => "postgresql",
-        _ => "mongodb",
-    }
+    crate::engine::DbKind::from_archive_format(fmt).label()
 }
 
 /// 생성 시각을 초 단위까지로 축약한다(`2026-06-14 14:56:11`) — RFC3339의 마이크로초·TZ는

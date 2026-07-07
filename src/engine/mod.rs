@@ -47,11 +47,56 @@ impl DbKind {
             DbKind::Mysql => "mysql",
         }
     }
+
+    /// manifest의 `archive_format`으로 백업을 만든 엔진의 DB 종류를 판별한다
+    /// (표시·필터용 — list/picker의 단일 진실 원천, Phase 1 슬라이스 A).
+    ///
+    /// 풀·증분 포맷을 모두 프리픽스로 인식한다(`xb-pg-v1`/`xb-pg-incr-v1` 등).
+    /// 미기록(구버전)·`mongodump`·`xb-native-v1`은 모두 Mongo다(1차 기본과 동일한 관대함).
+    /// 복구 파이프라인의 소비자 선택은 정확한 FORMAT_ID 매칭을 유지한다
+    /// ([`crate::pipeline::restore`]) — 여기는 종류 판별만 담당한다.
+    pub fn from_archive_format(fmt: Option<&str>) -> Self {
+        match fmt {
+            Some(f) if f.starts_with("xb-pg") => DbKind::Postgres,
+            Some(f) if f.starts_with("xb-mysql") => DbKind::Mysql,
+            _ => DbKind::Mongo,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn db_kind_from_archive_format_covers_full_and_incr() {
+        // 풀/증분 포맷 프리픽스 인식 + 미기록·레거시는 Mongo.
+        assert_eq!(
+            DbKind::from_archive_format(Some("xb-pg-v1")),
+            DbKind::Postgres
+        );
+        assert_eq!(
+            DbKind::from_archive_format(Some("xb-pg-incr-v1")),
+            DbKind::Postgres
+        );
+        assert_eq!(
+            DbKind::from_archive_format(Some("xb-mysql-v1")),
+            DbKind::Mysql
+        );
+        assert_eq!(
+            DbKind::from_archive_format(Some("xb-mysql-incr-v1")),
+            DbKind::Mysql
+        );
+        assert_eq!(
+            DbKind::from_archive_format(Some("xb-native-v1")),
+            DbKind::Mongo
+        );
+        assert_eq!(
+            DbKind::from_archive_format(Some("mongodump")),
+            DbKind::Mongo
+        );
+        assert_eq!(DbKind::from_archive_format(None), DbKind::Mongo);
+    }
 
     #[test]
     fn db_kind_from_uri_scheme() {

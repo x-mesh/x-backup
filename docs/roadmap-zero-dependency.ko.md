@@ -110,14 +110,23 @@ musl 정적 검사(`file`)는 기존 유지.
 `DbKind` match를 모두 수정해야 한다(MySQL 추가가 최대 커밋이었던 원인). 파일 엔진(Phase 2)을
 얹기 전에 seam을 정리한다.
 
-- `BackupEngine` trait 정의: `full_backup() -> AsyncRead` / `restore(AsyncRead)` /
-  `incremental_capture` / `pitr_replay` / `status_report` / `peek` (+ capability 플래그:
-  incremental 지원 여부, PITR 지원 여부, selective restore 지원 여부).
-- `DbKind::from_uri`는 trait 객체 팩토리로 승격. 핸들러는 capability 질의로 분기 제거.
-- **원칙**: 동작 불변 리팩터 — 기존 14개 통합 테스트·시나리오가 그대로 통과해야 한다.
-  엔진 내부 파일 구조(conn/backup/restore/incremental/status)는 이미 3엔진이 일관된
-  패턴이므로 trait 표면만 걷어올리면 된다.
-- **공수**: 중(1~2주). Phase 2·3의 비용을 구조적으로 낮추는 투자.
+슬라이스로 나눠 진행한다(동작 불변 원칙 — 기존 테스트가 그대로 통과해야 한다):
+
+- **슬라이스 A — 엔진 판별 단일화: 구현됨.** `DbKind::from_archive_format`이
+  manifest 포맷 → 엔진 판별의 단일 진실 원천(list/picker가 위임). 부수 수정:
+  picker가 xb-mysql을 몰라 MySQL 백업을 "mongodb"로 표기하던 버그 해결.
+- **슬라이스 B — 풀 백업 저장 코어 추출: 구현됨.** 세 엔진이 각자 들고 있던
+  "합성(카운터→스테이지→sha256)→저장→종료 판정→확정→manifest 기록/정리" 골격
+  (~180라인 3중복)을 `store_dump_stream<T: DumpTermination>` + `write_manifest_or_cleanup`
+  공통 코어로 통합(`src/pipeline/backup.rs`). 새 엔진은 dump 스트림과 `DumpTermination`
+  구현(finish/abort 훅, MySQL처럼 종료 시 메타 반환 가능)만 만들면 접속된다 —
+  **Phase 2 파일 엔진이 꽂히는 실제 seam**.
+- **슬라이스 C — 증분 경로 코어 공유(잔여):** mongo/pg/mysql 증분 캡처의 저장 골격도
+  같은 코어를 태운다(빈 슬라이스 특례 포함).
+- **슬라이스 D — 핸들러 플로우 trait(잔여):** backup/status/peek/migrate 핸들러의
+  per-DB 함수(handle_pg_*/handle_mysql_*)를 capability 플래그를 가진 trait 뒤로 —
+  4번째 엔진 추가 시점에 맞춰 진행(먼저 하면 추측성 추상화가 된다).
+- **공수**: A·B 완료. C 소, D 중.
 
 ---
 

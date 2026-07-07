@@ -68,10 +68,11 @@ pub async fn full_backup_choices(storage: &dyn Storage) -> Result<Vec<BackupChoi
 /// `server_version`을 넣어 "어느 서버에서 뜬 백업인지"를 행에서 바로 구분할 수 있게 한다
 /// (피커는 한 프로파일의 저장소를 보지만, 시점마다 서버 버전이 다를 수 있다).
 fn format_choice(m: &BackupManifest) -> String {
-    let engine = match m.tool_versions.archive_format.as_deref() {
-        Some(f) if f.starts_with("xb-pg") => "postgresql",
-        _ => "mongodb",
-    };
+    // 판별은 DbKind가 단일 진실 원천이다(Phase 1 슬라이스 A). 종전의 지역 매칭은
+    // xb-mysql을 몰라 MySQL 백업을 "mongodb"로 잘못 표기했다 — 위임으로 함께 수정.
+    let engine =
+        crate::engine::DbKind::from_archive_format(m.tool_versions.archive_format.as_deref())
+            .label();
     // gap 승격 full은 일반 full과 구분 표시(증분 요청이 풀로 폴백된 백업).
     let kind = if m.promoted_from_gap {
         "full(gap)"
