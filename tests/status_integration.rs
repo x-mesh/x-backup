@@ -35,7 +35,15 @@ async fn full_status_emits_all_check_items() {
         .await
         .expect("status 연결");
 
-    let report = checker.full_report("test", Some("mongodump"), "15m", false, x_backup::i18n::Lang::En).await;
+    let report = checker
+        .full_report(
+            "test",
+            Some("mongodump"),
+            "15m",
+            false,
+            x_backup::i18n::Lang::En,
+        )
+        .await;
 
     // 점검 항목 키 집합 — FR-8 항목들이 모두 보고되어야 한다.
     let keys: BTreeSet<&str> = report.items.iter().map(|i| i.key).collect();
@@ -91,7 +99,15 @@ async fn full_status_serializes_json() {
     let checker = StatusChecker::connect(&Secret::new(test_uri()), None)
         .await
         .expect("status 연결");
-    let report = checker.full_report("test", Some("mongodump"), "15m", false, x_backup::i18n::Lang::En).await;
+    let report = checker
+        .full_report(
+            "test",
+            Some("mongodump"),
+            "15m",
+            false,
+            x_backup::i18n::Lang::En,
+        )
+        .await;
 
     let json = serde_json::to_value(&report).expect("JSON 직렬화");
     assert!(json["items"].is_array(), "items 배열 아님");

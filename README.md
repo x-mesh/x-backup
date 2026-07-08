@@ -19,6 +19,8 @@ x-backup backs up a running MongoDB (standalone or replica set), PostgreSQL, or 
 - ✅ **Operations** — `doctor` offline config check (all profiles, no DB connection), `status` preflight (connection, topology, privileges, version/FCV, clock skew, oplog window, data shape, **last backup age**, **destination writability + free space**), `--all` source-vs-target diff, `--watch` live monitor, chain-safe `prune`, concurrent-run locking, a defined exit-code contract (0–5)
 - ✅ **PostgreSQL** — driver-native full backup/restore via the COPY protocol (data + tables + constraints + indexes + sequences), no `pg_dump`/`pg_restore`. Same pipeline (compress → encrypt → store), same `status`/`list`/`verify`/`restore`
 - ✅ **MySQL** — driver-native full backup/restore via `mysql_async` (data + DDL — tables, views, triggers, routines, events), no `mysqldump`/`mysql`. Same pipeline (compress → encrypt → store), same `status`/`list`/`verify`/`restore`. Incremental and PITR via binlog ROW streaming (opt-in).
+- ✅ **Files & directories** — `file:///path` sources back up a local tree as a tar stream through the exact same pipeline (compress → encrypt → store, manifest/verify/list/prune); incremental backups capture only changed files plus deletion tombstones via a snapshot index, and restore replays the chain (base + increments) to any `file://` target with the same overwrite guardrails
+- ✅ **Built-in scheduler** — `x-backup daemon` runs profile backups on a 5-field cron `schedule` (own parser, no external cron), reusing the per-profile lock and exit-code contract; failures notify a generic JSON **webhook** (`notify.webhook_url_env`) and never kill the loop. `--dry-run` previews fire times, `--print-systemd` emits a service unit
 - ✅ **Headless** — auto-quiet when not a TTY, `--json` output, built for cron and CI
 
 Scope: MongoDB replica sets get full and incremental backups, standalone gets full only, and sharded clusters are detected and refused. PostgreSQL gets full backup, restore, migrate, status/peek/watch, plus incremental backup and PITR via logical decoding (opt-in). See [PostgreSQL](#postgresql). MySQL gets the same command set (full/restore/status/peek/migrate), plus incremental backup and PITR via binlog ROW streaming (opt-in, requires `log_bin=ROW` on the server). See [MySQL](#mysql).
@@ -406,14 +408,43 @@ engine = "native"     # native (default) | mongodump     (v2 flat key → mode.e
 | Engine | External tools | Archive format | What it captures | Use when |
 |--------|---------------|----------------|------------------|----------|
 | `native` (default) | none | `xb-native-v1` | data + indexes + collection options (capped, validator, collation, …) | the default — zero dependencies, single binary |
-| `mongodump` | `mongodump` / `mongorestore` on PATH | mongodump `--archive` | whatever mongodump emits, plus consistent in-archive `--oplog` | you specifically want mongodump's archive or its in-dump oplog snapshot |
+| `mongodump` (legacy, opt-in build) | `mongodump` / `mongorestore` on PATH | mongodump `--archive` | whatever mongodump emits, plus consistent in-archive `--oplog` | you specifically want mongodump's archive or its in-dump oplog snapshot |
 
 Both engines stream through the same compress → encrypt pipeline and record oplog
 timestamps for chaining, so incremental/PITR work the same way. The engine that produced a
 backup is recorded in the manifest (`tool_versions.archive_format`), and `restore` dispatches
 automatically — a `native` archive is restored through the driver, a mongodump archive
-through `mongorestore`. You can restore an old mongodump backup even after switching the
-profile to `native`.
+through `mongorestore`.
+
+> **Legacy build flag.** The default build ships with **zero subprocess code** — the
+> `mongodump` engine (and restoring mongodump-format archives) requires a build with the
+> `legacy-mongodump` cargo feature (`cargo build --features legacy-mongodump`). On the
+> default build, `engine = "mongodump"` is rejected as a config error and restoring a
+> mongodump-format backup fails with guidance. This engine is deprecated and scheduled
+> for removal in a future minor release.
+
+### Files & directories
+
+Point a profile's `source.uri` at `file:///path/to/tree` and x-backup archives the tree as a
+tar stream (permissions, mtimes, and symlinks preserved; symlinks are not followed) through
+the same compress → encrypt → store pipeline, so `list`/`verify --deep`/`prune` work
+unchanged. `status` reports path accessibility and estimated size. Restore unpacks into a
+`file://` target directory (the profile source by default, or `--target file:///other/dir`),
+overwriting same-named files only — a non-empty target requires `--force` or interactive
+confirmation, like every other engine.
+
+**Incremental file backups** (`--type incr`) diff the tree against a snapshot index recorded
+with each backup and store only changed/new files plus deletion tombstones. Change detection
+uses (kind, size, mtime, mode, symlink target) — a content-only change that forges identical
+metadata is not detected. The index sidecar (`index.json.zst`) is stored zstd-compressed but
+**not encrypted** (the backup host holds only the public key and must read it for the next
+diff) — paths/sizes/mtimes are visible in the store while file contents stay encrypted;
+deletion tombstones travel inside the encrypted archive. Chains verify with
+`verify --chain` and prune chain-safely like DB engines. Restoring `--id <increment>`
+replays base + increments up to that point; a plain `restore` uses the base snapshot only
+and warns when newer increments exist. If the chain-head index is missing (e.g. after a
+mis-prune), the incremental promotes to a full backup (exit 4). `--at`, `--only`, `peek`,
+and `migrate` remain rejected for file sources.
 
 ### PostgreSQL
 
@@ -636,7 +667,7 @@ To treat 4 as success in cron: `x-backup backup ...; rc=$?; [ $rc -eq 4 ] && rc=
 ## Restore semantics
 
 - `restore` (no `--at`) restores the **base full backup snapshot only**.
-- `restore --at <time>|latest` is PITR: it restores the base, then replays increments up to that time — MongoDB oplog (the largest ts at or before it) or PostgreSQL logical-decoding changes; `latest` replays everything. It requires `verify --chain` to pass, and it cannot be combined with `--only` (selective restore).
+- `restore --at <time>|latest` is PITR: it restores the base, then replays increments up to that time — MongoDB oplog (applied directly through the driver via `applyOps`, no external tools) or PostgreSQL logical-decoding changes; `latest` replays everything. It requires `verify --chain` to pass, and it cannot be combined with `--only` (selective restore).
 - `verify --deep` runs only on a host that holds the private key (key isolation, PRD §8.5). The backup host carries only the public key, so a compromised backup host still cannot decrypt past backups.
 
 ## Development

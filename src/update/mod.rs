@@ -1,13 +1,14 @@
 //! `x-backup update` — 설치 소스를 감지해 알맞은 경로로 자기 갱신한다.
 //!
-//! gk(`x-mesh/gk`)의 update 설계를 따른다:
-//! - **brew 설치**(Homebrew prefix 아래) → `brew upgrade x-mesh/tap/x-backup`으로 위임.
+//! gk(`x-mesh/gk`)의 update 설계를 따르되, **외부 바이너리는 스폰하지 않는다**
+//! (로드맵 P0-3 — 런타임 외부 의존 0):
+//! - **brew 설치**(Homebrew prefix 아래) → 덮어쓰지 않고 `brew upgrade` 명령만 안내.
 //! - **cargo install**(`~/.cargo/bin`) → 덮어쓰지 않고 갱신 명령만 안내.
 //! - **manual**(install.sh — `~/.local/bin` 등) → GitHub 릴리스 자산을 내려받아
 //!   `checksums.txt`로 sha256 검증 후 **원자적 rename**으로 자기 교체.
 //!
 //! private 저장소 단계에서는 GitHub API 호출·자산 다운로드에 토큰이 필요하다 —
-//! `GITHUB_TOKEN` > `GH_TOKEN` > `gh auth token`(설치돼 있으면) 순으로 찾는다.
+//! `GITHUB_TOKEN` > `GH_TOKEN` env에서만 찾는다(서브프로세스 폴백 없음).
 //! 저장소가 public이 되면 토큰 없이도 동작한다(있으면 rate-limit 완화용으로 사용).
 
 use std::path::{Path, PathBuf};
@@ -18,7 +19,7 @@ use crate::error::{Result, XBackupError};
 
 /// 갱신 대상 저장소(owner/repo).
 pub const REPO: &str = "x-mesh/x-backup";
-/// brew 탭의 formula 경로(brew upgrade 인자).
+/// brew 탭의 formula 경로(사용자에게 안내하는 `brew upgrade` 인자).
 pub const BREW_FORMULA: &str = "x-mesh/tap/x-backup";
 
 /// 실행 중인 바이너리가 어떻게 설치됐는지의 분류.
@@ -27,7 +28,8 @@ pub const BREW_FORMULA: &str = "x-mesh/tap/x-backup";
 /// 경로(다운로드 + 원자적 교체)를 탄다(gk와 동일한 원칙).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
-    /// Homebrew prefix(Cellar/homebrew/linuxbrew) 아래 — `brew upgrade`로 위임.
+    /// Homebrew prefix(Cellar/homebrew/linuxbrew) 아래 — brew가 소유하므로
+    /// 덮어쓰지 않고 `brew upgrade` 명령만 안내.
     Brew,
     /// `~/.cargo/bin` 아래 — cargo가 소유하므로 덮어쓰지 않고 명령만 안내.
     CargoInstall,
@@ -126,7 +128,11 @@ pub struct Asset {
     pub url: String,
 }
 
-/// 토큰 탐색: `GITHUB_TOKEN` > `GH_TOKEN` > `gh auth token`(있으면). 없으면 None.
+/// 토큰 탐색: `GITHUB_TOKEN` > `GH_TOKEN`. 없으면 None.
+///
+/// 종전에는 `gh auth token` 서브프로세스 폴백이 있었으나 제거했다(로드맵 P0-3 —
+/// 런타임 외부 바이너리 의존 0 원칙). gh 인증을 재사용하려면 호출 전에
+/// `GITHUB_TOKEN=$(gh auth token)`처럼 env로 주입한다.
 pub fn github_token() -> Option<String> {
     for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
         if let Ok(v) = std::env::var(key) {
@@ -134,17 +140,6 @@ pub fn github_token() -> Option<String> {
             if !v.is_empty() {
                 return Some(v);
             }
-        }
-    }
-    // gh CLI가 있으면 그 인증을 재사용한다(설치 환경에서 흔한 경로).
-    let out = std::process::Command::new("gh")
-        .args(["auth", "token"])
-        .output()
-        .ok()?;
-    if out.status.success() {
-        let tok = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !tok.is_empty() {
-            return Some(tok);
         }
     }
     None

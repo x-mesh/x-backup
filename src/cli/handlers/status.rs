@@ -267,6 +267,8 @@ async fn build_report(
             .await
     } else if db_kind == crate::engine::DbKind::Mysql {
         crate::engine::mysql::status::full_report(&resolved.profile_name, &uri, timeout, lang).await
+    } else if db_kind == crate::engine::DbKind::File {
+        crate::engine::file::status::full_report(&resolved.profile_name, &uri, lang).await
     } else {
         // 엔진별 도구 점검 — native는 외부 도구 불필요(None), mongodump는 도구 존재/버전 점검.
         let tool = match crate::pipeline::backup::Engine::parse(&resolved.profile.mode.engine)? {
@@ -561,7 +563,7 @@ fn free_space_bytes(path: &str) -> Option<u64> {
     if rc != 0 {
         return None;
     }
-    Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+    Some(st.f_bavail.saturating_mul(st.f_frsize))
 }
 
 /// 신호등 합산을 [`report_to_result`]에 태우기 위한 단일 항목 보고서(--all 종합용).
@@ -819,6 +821,9 @@ async fn collect_ns_counts(config_toml: Option<&str>, profile: &str) -> Result<V
             let mongo = MongoMeta::connect(&uri, timeout).await?;
             mongo.namespace_counts().await
         }
+        crate::engine::DbKind::File => Err(XBackupError::Usage(
+            "--ns-detail은 파일 소스(file://)를 지원하지 않습니다(네임스페이스 개념 없음)".into(),
+        )),
     }
 }
 
@@ -828,7 +833,7 @@ fn print_ns_detail_human(profile: &str, counts: &[(String, u64)], lang: Lang) {
     println!(
         "{}",
         paint(
-            &lang.sel(
+            lang.sel(
                 &format!("namespaces — profile: {profile} (user data)"),
                 &format!("네임스페이스 — 프로파일: {profile} (사용자 데이터)")
             ),
@@ -1052,7 +1057,9 @@ impl Monitor {
             LiveConn::Mysql(my) => {
                 use crate::engine::mysql::{conn::MysqlClient, meta};
                 if my.is_none() {
-                    *my = MysqlClient::connect(&self.uri, self.timeout_secs).await.ok();
+                    *my = MysqlClient::connect(&self.uri, self.timeout_secs)
+                        .await
+                        .ok();
                 }
                 let c = match my {
                     Some(c) => c,
@@ -1099,6 +1106,13 @@ fn build_monitors(config_toml: Option<&str>, profiles: &[String]) -> Result<Vec<
             crate::engine::DbKind::Postgres => LiveConn::Postgres(None),
             crate::engine::DbKind::Mongo => LiveConn::Mongo(None),
             crate::engine::DbKind::Mysql => LiveConn::Mysql(None),
+            crate::engine::DbKind::File => {
+                return Err(XBackupError::Usage(format!(
+                    "--watch는 파일 소스(file://)를 지원하지 않습니다 — 프로파일 '{}' 제외 \
+                     후 다시 실행하세요",
+                    resolved.profile_name
+                )))
+            }
         };
         monitors.push(Monitor {
             profile: resolved.profile_name.clone(),

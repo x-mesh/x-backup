@@ -19,7 +19,9 @@ pub mod error;
 pub mod i18n;
 pub mod lock;
 pub mod manifest;
+pub mod notify;
 pub mod pipeline;
+pub mod schedule;
 pub mod storage;
 pub mod update;
 

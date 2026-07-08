@@ -10,45 +10,28 @@
 //!   → 체인 수집·verify_chain(연속성 거부 시 exit 1, "verify --chain" 안내)
 //!   → base 풀 복원(t5 run_restore 재사용; --at 직전 base를 backup_id로 고정)
 //!   → 증분 슬라이스를 oplog_range 순서로:
-//!        복호화·해제(reverse_stack_for) → temp oplog.bson(0600) 배치 → mongorestore 재생
-//!        마지막(목표 시점이 걸친) 슬라이스에만 --oplogLimit 적용
+//!        복호화·해제(reverse_stack_for) → 드라이버 applyOps 스트리밍 적용(외부 도구 0)
+//!        마지막(목표 시점이 걸친) 슬라이스에만 limit ts 적용
 //!   → 결정된 종료 ts({t,i}) + wall-clock 보고
 //! ```
 //!
-//! ## oplog 재생 경로(실측 채택 — 스파이크 본 태스크)
-//! docs/spike-oplog-archive.md는 풀 archive의 `--oplogReplay`만 실측했고 **증분 슬라이스
-//! 재생은 미실측**이었다. 본 태스크에서 mongo:7 + database-tools 100.x로 두 후보를 실측:
-//! - **① 빈 dump 디렉터리 + `oplog.bson` 배치 + `mongorestore --dir <dir> --oplogReplay`** — ✅ 채택
-//! - ② `--oplogFile <path> --oplogReplay`(+빈 `--dir`) — 동작은 하나 디렉터리 레이아웃이
-//!   덜 표준적이라 미채택.
+//! ## oplog 재생 경로 — 네이티브 applyOps(로드맵 P0-1)
+//! 종전에는 슬라이스를 임시 `oplog.bson`(0600)으로 쓴 뒤 `mongorestore --oplogReplay`를
+//! 스폰했다 — 런타임 외부 의존의 마지막 하드 지점이자 스트리밍 원칙(PRD §7)의 예외였다.
+//! 지금은 [`OplogApplier`](crate::engine::mongo::apply)가 슬라이스 디코드 스트림을 그대로
+//! 드라이버 `applyOps`로 적용한다(적용 규칙·트랜잭션 재조립·권한은 apply 모듈 주석 참조).
+//! 임시 파일이 사라져 재생 단계도 전 구간 스트리밍이다.
 //!
-//! 증분 산출물은 raw oplog BSON 연결 스트림(복호화·해제 후)이며, 이는 mongodump가
-//! `local.oplog.rs`를 dump한 `oplog.bson`과 **바이트 동형**(연결된 BSON 문서들)이라 ①에
-//! 그대로 배치할 수 있음을 확인했다.
-//!
-//! ## --oplogLimit 보정 규칙(실측)
-//! `mongorestore --oplogLimit <seconds>[:<ordinal>]`은 **미만(<) 의미**다 — 한계 ts와
-//! 같거나 큰 엔트리는 적용하지 않는다. FR-3는 "이하(<=)" 복구를 요구하므로, 결정한 종료
-//! ts `{t,i}`를 **그대로** 포함하려면 한계를 `{t, i+1}`로 전달한다(`+1` 보정,
-//! [`oplog_limit_arg`]). 실측 확인:
-//! - limit `t:i`(보정 없음) → 해당 엔트리 **제외**.
-//! - limit `t:(i+1)`(보정) → 해당 엔트리 **포함**, 그 다음은 제외.
-//!
-//! ## 디스크 임시 저장(스트리밍 원칙의 예외 — 재생 단계 한정)
-//! 전 구간 스트리밍이 원칙이나(PRD §7), `mongorestore --oplogReplay`는 `oplog.bson`
-//! **파일**을 기대하므로 슬라이스를 복호화·해제한 평문을 임시 파일(0600)에 잠깐 쓴 뒤
-//! 재생 후 즉시 삭제한다([`TempDir`]가 Drop 시 정리). oplog 슬라이스는 풀 dump 대비
-//! 작아 허용 가능한 예외다(태스크 지침).
-
-use std::path::Path;
-use std::process::Stdio;
+//! ## limit 보정 규칙(미만 의미 유지)
+//! limit ts는 **미만(<) 의미**다 — 한계 ts와 같거나 큰 엔트리는 적용하지 않는다
+//! (종전 `mongorestore --oplogLimit`과 동일한 계약을 [`OplogApplier`]가 그대로 구현).
+//! FR-3는 "이하(<=)" 복구를 요구하므로, 목표 초의 모든 변경을 포함하려면 한계를
+//! `{target_unix+1, 0}`으로 전달한다([`oplog_limit_for_second`]의 `+1` 보정).
 
 use chrono::{DateTime, Utc};
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
 use crate::config::secret::Secret;
-use crate::engine::mongo::UriConfigFile;
+use crate::engine::mongo::OplogApplier;
 use crate::error::{Result, XBackupError};
 use crate::manifest::chain::{verify_chain, ChainNode, ChainReport};
 use crate::manifest::schema::{BackupManifest, BackupType, OplogTimestamp};
@@ -61,7 +44,9 @@ use crate::storage::Storage;
 pub struct PitrRequest {
     /// 복구 대상 MongoDB URI 시크릿(`--target` 우선, 없으면 프로파일 source).
     pub target_uri: Secret,
-    /// mongorestore 실행파일 경로(보통 `"mongorestore"`).
+    /// mongorestore 실행파일 경로 — **base 풀 복원에만** 쓰인다(base가 레거시
+    /// mongodump 포맷일 때 [`run_restore`]가 소비). oplog 재생은 네이티브(applyOps)라
+    /// 외부 도구가 필요 없다.
     pub mongorestore_program: String,
     /// PITR 목표 시점(RFC3339 UTC wall-clock, `--at`).
     pub at: String,
@@ -194,14 +179,15 @@ where
 
 /// PITR + `--only`(선택적 복구) 병용을 거부한다(pitfall 1-4, PRD Edge Case).
 ///
-/// `mongorestore --oplogReplay`는 `--nsInclude`(네임스페이스 필터)와 병용할 수 없다.
+/// oplog 재생은 배포 전체의 변경 스트림을 전제한다 — 선택 복구된 부분 상태 위에
+/// 재생하면 존재하지 않는 네임스페이스에 op가 적용되거나 체인 일관성이 깨진다.
 /// 따라서 PITR(oplog 재생)과 `--only`를 함께 지정하면 즉시 거부한다(exit 2). 핸들러가
 /// 어떤 작업도 시작하기 전에 호출한다.
 pub fn reject_pitr_with_only(only: Option<&str>) -> Result<()> {
     if only.is_some() {
         return Err(XBackupError::Usage(
-            "PITR(--at)은 --only(선택적 복구)와 함께 쓸 수 없습니다 — oplog 재생(--oplogReplay)은 \
-             네임스페이스 필터(--nsInclude)와 병용 불가합니다(전체 복구만 가능)"
+            "PITR(--at)은 --only(선택적 복구)와 함께 쓸 수 없습니다 — oplog 재생은 전체 복구를 \
+             전제하므로 네임스페이스 필터와 병용할 수 없습니다"
                 .into(),
         ));
     }
@@ -220,13 +206,23 @@ fn parse_at(at: &str) -> Result<DateTime<Utc>> {
 }
 
 /// destination의 모든 manifest를 모아 체인 노드로 만든다(읽기 실패는 제외·디버그 로그).
+///
+/// **Mongo 백업만** 노드로 삼는다 — 파일 엔진(P2-2)도 체인 좌표(oplog_range 일반화)를
+/// 쓰므로, 혼재 저장소에서 파일 풀백업이 Mongo PITR의 base로 오선택되는 것을 막는다.
 async fn collect_chain_nodes(storage: &dyn Storage) -> Result<Vec<ChainNode>> {
     let ids = crate::pipeline::verify::collect_manifest_ids(storage).await?;
     let store = ManifestStore::new(storage);
     let mut nodes = Vec::with_capacity(ids.len());
     for id in &ids {
         match store.read(id).await {
-            Ok(m) => nodes.push(ChainNode::from_manifest(&m)),
+            Ok(m) => {
+                let kind = crate::engine::DbKind::from_archive_format(
+                    m.tool_versions.archive_format.as_deref(),
+                );
+                if kind == crate::engine::DbKind::Mongo {
+                    nodes.push(ChainNode::from_manifest(&m));
+                }
+            }
             Err(e) => tracing::debug!(id = %id, "manifest 읽기 실패(체인 노드 제외): {e}"),
         }
     }
@@ -305,18 +301,18 @@ struct EndMapping {
     decided_ts: OplogTimestamp,
     /// 실제 재생할 슬라이스 ID(종료 ts를 포함하는 마지막 슬라이스까지).
     replay_ids: Vec<String>,
-    /// --oplogLimit를 적용할 마지막 슬라이스(종료 ts가 그 안에 걸침). None이면 한계 없이
+    /// limit ts를 적용할 마지막 슬라이스(종료 ts가 그 안에 걸침). None이면 한계 없이
     /// 전부 재생(목표가 마지막 슬라이스 end 이상).
     limit_slice_id: Option<String>,
-    /// limit 슬라이스에 줄 `--oplogLimit <seconds>[:<ordinal>]` 인자(미만 의미, 이미 보정됨).
+    /// limit 슬라이스에 줄 한계 ts(미만 의미, 이미 `+1` 보정됨 — [`oplog_limit_for_second`]).
     /// `limit_slice_id`가 None이면 None(한계 없이 전부 재생).
-    oplog_limit: Option<String>,
+    oplog_limit: Option<OplogTimestamp>,
 }
 
 /// 목표 unix 초를 종료 ts로 내림 매핑하고 재생할 슬라이스·limit 슬라이스·oplogLimit을
 /// 결정한다.
 ///
-/// 슬라이스 메타(`oplog_range`)로 근사한다(엔트리 단위 검사 없이 oplogLimit에 위임).
+/// 슬라이스 메타(`oplog_range`)로 근사한다(엔트리 단위 컷은 재생기의 limit ts에 위임).
 /// **FR-3 "이하(<=)" 매핑**: `ts.t <= target_unix`인 oplog 엔트리는 i와 무관하게 모두
 /// 포함해야 한다(목표 *초* 안의 모든 변경 포함 — 실측: writeA가 base와 같은 초여도 i로
 /// 분리되어 포함돼야 함, t9 스파이크).
@@ -376,194 +372,67 @@ fn map_target_to_end(base: &ChainNode, slices: &[&ChainNode], target_unix: i64) 
     }
 }
 
-/// 목표 *초*(`target_secs`)의 모든 변경을 포함하는 `--oplogLimit` 인자를 만든다.
+/// 목표 *초*(`target_secs`)의 모든 변경을 포함하는 한계 ts를 만든다.
 ///
-/// 실측(t9 스파이크): `mongorestore --oplogLimit <seconds>[:<ordinal>]`은 **미만(<)
-/// 의미**다. `ts.t <= target_secs`(이하)인 엔트리를 모두 포함하려면 한계를 `{target_secs+1,
-/// 0}`으로 준다 — 목표 초 안의 임의 i를 모두 포함하고 다음 초 첫 엔트리부터 제외한다.
-/// `target_secs`가 u32::MAX면(이론상) 오버플로 없이 한계를 그대로 둔다(saturating).
-fn oplog_limit_for_second(target_secs: u32) -> String {
-    let next = target_secs.saturating_add(1);
-    format!("{next}:0")
+/// 한계는 **미만(<) 의미**다(종전 `mongorestore --oplogLimit` 계약을
+/// [`OplogApplier::apply_stream`]이 그대로 구현). `ts.t <= target_secs`(이하)인 엔트리를
+/// 모두 포함하려면 한계를 `{target_secs+1, 0}`으로 준다 — 목표 초 안의 임의 i를 모두
+/// 포함하고 다음 초 첫 엔트리부터 제외한다. `target_secs`가 u32::MAX면(이론상) 오버플로
+/// 없이 한계를 그대로 둔다(saturating).
+fn oplog_limit_for_second(target_secs: u32) -> OplogTimestamp {
+    OplogTimestamp::new(target_secs.saturating_add(1), 0)
 }
 
-/// 증분 슬라이스를 체인 순서로 재생한다. 마지막(limit) 슬라이스에만 --oplogLimit 적용.
+/// 증분 슬라이스를 체인 순서로 재생한다. 마지막(limit) 슬라이스에만 한계 ts 적용.
+///
+/// 적용기 연결은 전체 재생에 1회다(슬라이스마다 재연결하지 않는다).
 async fn replay_slices(
     request: &PitrRequest,
     storage: &dyn Storage,
     store: &ManifestStore<'_>,
     mapping: &EndMapping,
 ) -> Result<u64> {
+    if mapping.replay_ids.is_empty() {
+        return Ok(0);
+    }
+    let applier = OplogApplier::connect(&request.target_uri, request.timeout_secs).await?;
     let mut replayed = 0u64;
     for id in &mapping.replay_ids {
         let manifest = store.read(id).await?;
         let is_limit = mapping.limit_slice_id.as_deref() == Some(id.as_str());
-        let limit = if is_limit {
-            mapping.oplog_limit.as_deref()
-        } else {
-            None
-        };
-        replay_one_slice(request, storage, &manifest, limit).await?;
+        let limit = if is_limit { mapping.oplog_limit } else { None };
+        replay_one_slice(&applier, storage, &manifest, limit).await?;
         replayed += 1;
     }
     Ok(replayed)
 }
 
-/// 단일 슬라이스를 재생한다 — 복호화·해제 → temp `oplog.bson`(0600) 배치 → mongorestore.
-///
-/// 재생 경로 ①(실측 채택): 빈 dump 디렉터리에 `oplog.bson`을 두고
-/// `mongorestore --dir <dir> --oplogReplay [--oplogLimit <t>:<i>]`로 적용한다.
-/// 슬라이스 평문을 임시 파일에 잠깐 쓰는 것은 스트리밍 원칙의 재생-단계 예외다(모듈 주석).
+/// 단일 슬라이스를 재생한다 — 복호화·해제 스트림을 드라이버 applyOps로 직접 적용한다
+/// (임시 파일·외부 도구 없음 — 모듈 주석의 네이티브 재생 경로).
 async fn replay_one_slice(
-    request: &PitrRequest,
+    applier: &OplogApplier,
     storage: &dyn Storage,
     manifest: &BackupManifest,
-    oplog_limit: Option<&str>,
+    oplog_limit: Option<OplogTimestamp>,
 ) -> Result<()> {
-    // 1) storage data.bin → reverse 스택(복호화→해제; 평문은 identity) → 디코드 스트림.
+    // storage data.bin → reverse 스택(복호화→해제; 평문은 identity) → 디코드 스트림.
     let stages = reverse_stack_for(manifest)?;
     let raw = storage.get_stream(&data_path(&manifest.id)).await?;
     let mut decoded = stages.apply(raw);
 
-    // 2) 임시 dump 디렉터리 + oplog.bson(0600)에 디코드 결과를 쓴다(재생 후 자동 삭제).
-    let temp_dir = tempfile::Builder::new()
-        .prefix("xb-pitr-replay-")
-        .tempdir()
-        .map_err(|e| XBackupError::Failure(format!("PITR 임시 디렉터리 생성 실패: {e}")))?;
-    let oplog_path = temp_dir.path().join("oplog.bson");
-    write_oplog_bson(&oplog_path, &mut decoded).await?;
-
-    // 3) mongorestore 재생 스폰(URI는 0600 config, argv 노출 금지).
-    let uri_config = UriConfigFile::create(&request.target_uri)?;
-    spawn_replay(
-        &request.mongorestore_program,
-        temp_dir.path(),
-        uri_config.path(),
-        oplog_limit,
-    )
-    .await?;
+    let stats = applier
+        .apply_stream(&mut decoded, oplog_limit)
+        .await
+        .map_err(|e| XBackupError::Failure(format!("슬라이스 '{}' 재생 실패: {e}", manifest.id)))?;
 
     tracing::info!(
         slice = %manifest.id,
-        limit = oplog_limit.unwrap_or("(없음)"),
+        applied = stats.applied,
+        skipped = stats.skipped,
+        limit = %oplog_limit.map(|l| format!("{}:{}", l.t, l.i)).unwrap_or_else(|| "(없음)".into()),
         "PITR 슬라이스 재생 완료"
     );
-    // temp_dir Drop → oplog.bson 삭제(사용 후 즉시 정리).
     Ok(())
-}
-
-/// 디코드 스트림을 0600 `oplog.bson` 파일로 쓴다(스트리밍 복사, 고정 버퍼).
-async fn write_oplog_bson(path: &Path, decoded: &mut crate::storage::BoxAsyncRead) -> Result<()> {
-    use tokio::io::AsyncReadExt;
-
-    let file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .await
-        .map_err(|e| XBackupError::Failure(format!("oplog.bson 생성 실패: {e}")))?;
-    let mut writer = tokio::io::BufWriter::new(file);
-
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = decoded
-            .read(&mut buf)
-            .await
-            .map_err(|e| XBackupError::Failure(format!("슬라이스 디코드 읽기 실패: {e}")))?;
-        if n == 0 {
-            break;
-        }
-        writer
-            .write_all(&buf[..n])
-            .await
-            .map_err(|e| XBackupError::Failure(format!("oplog.bson 쓰기 실패: {e}")))?;
-    }
-    writer
-        .flush()
-        .await
-        .map_err(|e| XBackupError::Failure(format!("oplog.bson flush 실패: {e}")))?;
-    Ok(())
-}
-
-/// `mongorestore --dir <dir> --oplogReplay [--oplogLimit]`를 스폰해 재생한다.
-///
-/// 풀 복구(engine::mongo::restore)와 동일한 안전 규칙: URI는 `--config`(argv 금지),
-/// stderr 독립 drain, exit code로만 판정, kill_on_drop.
-///
-/// **PITR + ns 필터 병용 금지(pitfall 1-4):** `--oplogReplay`는 `--nsInclude`와 병용
-/// 불가하므로 여기서는 ns 필터를 절대 부여하지 않는다(상위 핸들러가 --only를 거부).
-async fn spawn_replay(
-    program: &str,
-    dir: &Path,
-    uri_config_path: &str,
-    oplog_limit: Option<&str>,
-) -> Result<()> {
-    let mut cmd = Command::new(program);
-    cmd.arg("--dir")
-        .arg(dir)
-        .arg("--oplogReplay")
-        .arg("--config")
-        .arg(uri_config_path);
-    if let Some(limit) = oplog_limit {
-        // mongorestore oplogLimit 형식: <seconds>[:<ordinal>], 미만(<) 의미(oplog_limit_arg가 +1 보정).
-        cmd.arg("--oplogLimit").arg(limit);
-    }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    let mut child = cmd.spawn().map_err(|e| {
-        XBackupError::Failure(format!("'{program}' 실행 실패(설치/PATH 확인): {e}"))
-    })?;
-
-    // stderr를 독립 task로 끝까지 drain(데드락 방지·진단 tail 회수).
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| XBackupError::Failure("mongorestore stderr 파이프 획득 실패".into()))?;
-    let drain = tokio::spawn(drain_stderr(stderr));
-
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| XBackupError::Failure(format!("mongorestore wait 실패: {e}")))?;
-    let tail = drain.await.unwrap_or_default();
-
-    if status.success() {
-        Ok(())
-    } else {
-        let code = status
-            .code()
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "signal".into());
-        let detail = if tail.is_empty() {
-            String::new()
-        } else {
-            format!(" — 마지막 stderr: {}", tail.join(" | "))
-        };
-        Err(XBackupError::Failure(format!(
-            "PITR oplog 재생 실패(mongorestore exit {code}){detail}"
-        )))
-    }
-}
-
-/// stderr를 끝까지 읽어 tracing으로 흘리고 마지막 5줄을 반환한다(진단용).
-async fn drain_stderr(stderr: tokio::process::ChildStderr) -> Vec<String> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    const TAIL: usize = 5;
-    let mut reader = BufReader::new(stderr).lines();
-    let mut tail: Vec<String> = Vec::new();
-    while let Ok(Some(line)) = reader.next_line().await {
-        tracing::debug!(target: "mongorestore", "{line}");
-        tail.push(line);
-        if tail.len() > TAIL {
-            tail.remove(0);
-        }
-    }
-    tail
 }
 
 /// base + 재생 슬라이스들의 저장 바이트 합을 근사한다(읽기 실패는 0으로 무시).
@@ -671,14 +540,14 @@ mod tests {
     #[test]
     fn oplog_limit_uses_next_second_for_inclusive_lower_mapping() {
         // 목표 초 1000의 모든 변경 포함 → 한계 {1001,0}(미만 → 1000:* 전부 포함).
-        assert_eq!(oplog_limit_for_second(1000), "1001:0");
-        assert_eq!(oplog_limit_for_second(42), "43:0");
+        assert_eq!(oplog_limit_for_second(1000), ts(1001, 0));
+        assert_eq!(oplog_limit_for_second(42), ts(43, 0));
     }
 
     #[test]
     fn oplog_limit_handles_second_overflow() {
         // target_secs == u32::MAX면 saturating(한계를 그대로 둔다).
-        assert_eq!(oplog_limit_for_second(u32::MAX), format!("{}:0", u32::MAX));
+        assert_eq!(oplog_limit_for_second(u32::MAX), ts(u32::MAX, 0));
     }
 
     // ── --at 내림 매핑 ──
@@ -712,8 +581,8 @@ mod tests {
         assert_eq!(m.replay_ids, vec!["i1", "i2"]);
         assert_eq!(m.limit_slice_id.as_deref(), Some("i2"));
         assert_eq!(m.decided_ts, ts(160, 0)); // 보고용: 목표 초.
-                                              // 한계 인자는 다음 초(미만) → 목표 초 160의 모든 i 포함, 161+ 제외.
-        assert_eq!(m.oplog_limit.as_deref(), Some("161:0"));
+                                              // 한계 ts는 다음 초(미만) → 목표 초 160의 모든 i 포함, 161+ 제외.
+        assert_eq!(m.oplog_limit, Some(ts(161, 0)));
     }
 
     #[test]

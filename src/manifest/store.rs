@@ -44,6 +44,18 @@ pub fn manifest_sha_path(backup_id: &str) -> String {
     format!("{backup_id}/{MANIFEST_SHA_FILE}")
 }
 
+/// 파일 엔진 인덱스 사이드카 파일명(P2-2 — 다음 증분의 diff 기준).
+///
+/// **비암호화**(zstd만): 백업 호스트는 age 공개키만 가져 자기 산출물을 복호화할 수
+/// 없으므로, 다음 증분이 읽어야 하는 인덱스는 암호화 대상이 아니다. 경로·크기·mtime
+/// 메타데이터가 평문으로 남는 트레이드오프는 문서화한다(내용물은 여전히 암호화).
+pub const FILE_INDEX_FILE: &str = "index.json.zst";
+
+/// `<backup-id>/index.json.zst` 상대 경로(파일 엔진 전용).
+pub fn file_index_path(backup_id: &str) -> String {
+    format!("{backup_id}/{FILE_INDEX_FILE}")
+}
+
 /// [`Storage`] 위에 manifest를 기록·조회하는 얇은 헬퍼.
 pub struct ManifestStore<'a> {
     storage: &'a dyn Storage,

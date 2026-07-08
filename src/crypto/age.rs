@@ -229,7 +229,10 @@ fn parse_identity(raw: &str) -> Option<x25519::Identity> {
 /// recipient 공개키 문자열(`age1...`) — 생성 안내 출력용.
 ///
 /// 시크릿(개인키)은 0600으로 격리되며, 백업 호스트엔 공개키만 두면 된다(§8.1/§8.5).
-pub fn generate_keypair_files(key_path: &std::path::Path, pub_path: &std::path::Path) -> Result<String> {
+pub fn generate_keypair_files(
+    key_path: &std::path::Path,
+    pub_path: &std::path::Path,
+) -> Result<String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -240,7 +243,10 @@ pub fn generate_keypair_files(key_path: &std::path::Path, pub_path: &std::path::
         if let Some(parent) = p.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).map_err(|e| {
-                    XBackupError::Config(format!("키 디렉터리 생성 실패({}): {e}", parent.display()))
+                    XBackupError::Config(format!(
+                        "키 디렉터리 생성 실패({}): {e}",
+                        parent.display()
+                    ))
                 })?;
             }
         }
@@ -254,14 +260,21 @@ pub fn generate_keypair_files(key_path: &std::path::Path, pub_path: &std::path::
         .mode(0o600)
         .open(key_path)
         .map_err(|e| {
-            XBackupError::Config(format!("개인키 파일 생성 실패({}): {e}", key_path.display()))
+            XBackupError::Config(format!(
+                "개인키 파일 생성 실패({}): {e}",
+                key_path.display()
+            ))
         })?;
-    writeln!(key_file, "{}", identity.to_string().expose_secret())
-        .map_err(|e| XBackupError::Config(format!("개인키 기록 실패({}): {e}", key_path.display())))?;
+    writeln!(key_file, "{}", identity.to_string().expose_secret()).map_err(|e| {
+        XBackupError::Config(format!("개인키 기록 실패({}): {e}", key_path.display()))
+    })?;
 
     // 공개키(recipient) — 시크릿 아님.
     std::fs::write(pub_path, format!("{recipient}\n")).map_err(|e| {
-        XBackupError::Config(format!("공개키 파일 기록 실패({}): {e}", pub_path.display()))
+        XBackupError::Config(format!(
+            "공개키 파일 기록 실패({}): {e}",
+            pub_path.display()
+        ))
     })?;
 
     Ok(recipient.to_string())
@@ -294,7 +307,10 @@ mod tests {
         let pub_path = dir.path().join("nested").join("age.pub"); // 부모 디렉터리 자동 생성 확인
 
         let recipient = generate_keypair_files(&key_path, &pub_path).unwrap();
-        assert!(recipient.starts_with("age1"), "recipient는 age1 공개키여야 함");
+        assert!(
+            recipient.starts_with("age1"),
+            "recipient는 age1 공개키여야 함"
+        );
         assert!(key_path.exists() && pub_path.exists());
 
         // 개인키는 0600으로 격리돼야 한다.
@@ -303,15 +319,13 @@ mod tests {
 
         // 공개키 파일로 암호화 → 개인키 파일로 복호화 → 원본 복원.
         let plaintext = b"generated-keypair-round-trip".to_vec();
-        let encrypt = Box::new(
-            AgeEncryptStage::from_recipient_file(pub_path.to_str().unwrap()).unwrap(),
-        );
+        let encrypt =
+            Box::new(AgeEncryptStage::from_recipient_file(pub_path.to_str().unwrap()).unwrap());
         let encrypted = drain_result(encrypt.wrap(reader_from(&plaintext)))
             .await
             .unwrap();
-        let decrypt = Box::new(
-            AgeDecryptStage::from_identity_file(key_path.to_str().unwrap()).unwrap(),
-        );
+        let decrypt =
+            Box::new(AgeDecryptStage::from_identity_file(key_path.to_str().unwrap()).unwrap());
         let decrypted = drain_result(decrypt.wrap(reader_from(&encrypted)))
             .await
             .unwrap();

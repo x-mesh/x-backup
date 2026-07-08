@@ -136,6 +136,21 @@ fn check_profile(
             Some(uri) => {
                 let kind = DbKind::from_uri(uri.expose());
                 db = Some(kind);
+                // 파일 엔진은 URI 형식(로컬 절대 경로)을 오프라인에서 정적 검증한다(P2-1).
+                if kind == DbKind::File {
+                    if let Err(e) = crate::engine::file::path_from_uri(uri.expose()) {
+                        items.push(Item {
+                            status: CheckStatus::Fail,
+                            label: "source",
+                            message: lang
+                                .sel(
+                                    &format!("invalid file:// URI: {e}"),
+                                    &format!("file:// URI 형식 오류: {e}"),
+                                )
+                                .into(),
+                        });
+                    }
+                }
                 items.push(Item {
                     status: CheckStatus::Ok,
                     label: "source",
@@ -333,6 +348,9 @@ fn check_profile(
         Some(DbKind::Mongo) => {
             let eng = &prof.mode.engine;
             if eng == "mongodump" {
+                // legacy-mongodump 미포함 빌드에서는 이 엔진으로 backup/restore가 조기
+                // 거부되므로(Engine::parse) doctor도 설정 실패로 알린다(P0-2).
+                #[cfg(feature = "legacy-mongodump")]
                 items.push(Item {
                     status: CheckStatus::Ok,
                     label: "engine",
@@ -343,8 +361,23 @@ fn check_profile(
                         )
                         .into(),
                 });
+                #[cfg(not(feature = "legacy-mongodump"))]
+                items.push(Item {
+                    status: CheckStatus::Fail,
+                    label: "engine",
+                    message: lang
+                        .sel(
+                            "engine=mongodump but this build excludes it (cargo feature \
+                             `legacy-mongodump`) — use engine=\"native\"",
+                            "engine=mongodump이지만 이 빌드에는 미포함(cargo feature \
+                             `legacy-mongodump`) — engine=\"native\"를 사용하세요",
+                        )
+                        .into(),
+                });
             }
         }
+        // 파일 엔진: URI 형식 검증은 source 해석 시점에 이미 수행했다(위 1단계).
+        Some(DbKind::File) => {}
         Some(DbKind::Mysql) if prof.features.incremental.mysql_binlog => {
             items.push(Item {
                 status: CheckStatus::Ok,

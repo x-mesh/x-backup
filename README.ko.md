@@ -23,6 +23,8 @@
 - ✅ **운영** — `doctor` config 정적 점검(오프라인·DB 연결 없음), `status` 사전 점검(연결·토폴로지·권한·버전/FCV·시계차·oplog 윈도우·데이터 형상·**마지막 백업 나이**·**destination 쓰기 가능+여유 공간**), `--all` source/target 비교, `--watch` 라이브 모니터, `prune` 체인 안전 삭제(`--keep-last`·config retention), 동시 실행 잠금, exit code 규약 0~5
 - ✅ **PostgreSQL** — COPY 프로토콜 기반 드라이버 네이티브 풀 백업/복구(데이터 + 테이블 + 제약 + 인덱스 + 시퀀스), `pg_dump`/`pg_restore` 불필요. 동일 파이프라인(압축→암호화→저장)·동일 `status`/`list`/`verify`/`restore`
 - ✅ **MySQL** — `mysql_async` 기반 드라이버 네이티브 풀 백업/복구(데이터 + DDL — 테이블·뷰·트리거·루틴·이벤트), `mysqldump`/`mysql` 불필요. 동일 파이프라인·동일 `status`/`list`/`verify`/`restore`. 증분·PITR은 binlog ROW 스트리밍(opt-in).
+- ✅ **파일/디렉터리** — `file:///path` 소스는 로컬 트리를 tar 스트림으로 동일 파이프라인(압축 → 암호화 → 저장, manifest/verify/list/prune)에 태워 백업하고, 스냅샷 인덱스 기반 증분(변경 파일 + 삭제 tombstone)과 체인 복구(base + 증분 재생)를 지원하며, 동일한 덮어쓰기 가드레일로 `file://` 대상에 복구
+- ✅ **내장 스케줄러** — `x-backup daemon`이 프로파일별 5필드 cron `schedule`(자체 파서, 외부 cron 불필요)로 백업을 상주 실행. 프로파일 잠금·exit code 계약 재사용, 실패는 generic JSON **webhook**(`notify.webhook_url_env`)으로 알리고 루프는 계속. `--dry-run`으로 발화 시각 미리보기, `--print-systemd`로 서비스 유닛 출력
 - ✅ **headless** — 비-TTY 자동 quiet, `--json`, cron/CI 친화
 
 지원 범위: MongoDB replica set(풀+증분)/standalone(풀만)/샤딩은 감지 시 거부. PostgreSQL은 풀 백업+복구+status에 더해 증분(logical decoding)·PITR(opt-in). [PostgreSQL](#postgresql-1) 참조. MySQL은 동일한 명령 세트(풀/복구/status/peek/migrate)에 더해 증분·PITR(binlog ROW 스트리밍, opt-in — 서버에 `log_bin=ROW` 필요). [MySQL](#mysql-1) 참조.
@@ -400,13 +402,40 @@ engine = "native"     # native(기본) | mongodump     (v2 flat 키 → mode.eng
 | 엔진 | 외부 도구 | 아카이브 포맷 | 캡처 대상 | 사용 시점 |
 |------|----------|--------------|----------|----------|
 | `native`(기본) | 없음 | `xb-native-v1` | 데이터 + 인덱스 + 컬렉션 옵션(capped·validator·collation 등) | 기본 — 의존성 없는 단일 바이너리 |
-| `mongodump` | PATH의 `mongodump`/`mongorestore` | mongodump `--archive` | mongodump가 내보내는 것 + 아카이브 내장 `--oplog` 일관 스냅샷 | mongodump 아카이브나 덤프 내장 oplog가 꼭 필요할 때 |
+| `mongodump`(레거시, opt-in 빌드) | PATH의 `mongodump`/`mongorestore` | mongodump `--archive` | mongodump가 내보내는 것 + 아카이브 내장 `--oplog` 일관 스냅샷 | mongodump 아카이브나 덤프 내장 oplog가 꼭 필요할 때 |
 
 두 엔진 모두 동일한 압축 → 암호화 파이프라인을 통과하고 체이닝용 oplog 타임스탬프를
 기록하므로 증분/PITR 동작은 같다. 백업을 만든 엔진은 manifest(`tool_versions.archive_format`)에
 기록되고, `restore`가 자동으로 분기한다 — `native` 아카이브는 드라이버로, mongodump
-아카이브는 `mongorestore`로 복구한다. 프로파일을 `native`로 바꾼 뒤에도 예전 mongodump
-백업을 복구할 수 있다.
+아카이브는 `mongorestore`로 복구한다.
+
+> **레거시 빌드 플래그.** 기본 빌드에는 **서브프로세스 코드가 전혀 포함되지 않는다** —
+> `mongodump` 엔진(및 mongodump 포맷 아카이브의 복구)은 cargo feature
+> `legacy-mongodump`를 켠 빌드(`cargo build --features legacy-mongodump`)가 필요하다.
+> 기본 빌드에서 `engine = "mongodump"`는 설정 오류로 거부되고, mongodump 포맷 백업
+> 복구는 안내와 함께 실패한다. 이 엔진은 deprecated이며 이후 마이너 릴리스에서 제거
+> 예정이다.
+
+### 파일/디렉터리
+
+프로파일의 `source.uri`를 `file:///path/to/tree`로 지정하면 트리를 tar 스트림(권한·mtime·
+심링크 보존, 심링크는 따라가지 않음)으로 직렬화해 동일한 압축 → 암호화 → 저장 파이프라인에
+태운다 — `list`/`verify --deep`/`prune`이 그대로 동작한다. `status`는 경로 접근성과 예상
+크기를 보고한다. 복구는 `file://` 대상 디렉터리(기본은 프로파일 source, 또는
+`--target file:///other/dir`)에 풀며 동명 파일만 덮어쓴다 — 비어 있지 않은 대상은 다른
+엔진과 동일하게 `--force`/대화형 확인이 필요하다.
+
+**증분 파일 백업**(`--type incr`)은 백업마다 기록되는 스냅샷 인덱스와 트리를 대조해
+변경/신규 파일 + 삭제 tombstone만 담는다. 변경 감지는 (종류, 크기, mtime, mode, 링크
+대상) 기준이다 — 메타를 동일하게 위조한 내용만의 변경은 감지하지 못한다. 인덱스
+사이드카(`index.json.zst`)는 zstd 압축만 하고 **암호화하지 않는다**(백업 호스트는
+공개키만 가져 다음 diff를 위해 읽어야 함) — 경로·크기·mtime이 저장소에 보이는
+트레이드오프이며 파일 내용은 여전히 암호화된다. 삭제 tombstone은 암호화 아카이브
+내부에 담긴다. 체인은 `verify --chain`으로 검증되고 prune도 DB 엔진과 동일하게 체인
+단위로 안전하다. `--id <증분>` 복구는 base + 그 지점까지의 증분을 재생하고, 일반
+`restore`는 base 스냅샷만 복구하며 더 새로운 증분이 있으면 안내한다. 체인 헤드
+인덱스가 사라지면(prune 오조작 등) 증분은 풀 백업으로 승격한다(exit 4).
+`--at`·`--only`·`peek`·`migrate`는 여전히 파일 소스에서 거부된다.
 
 ### PostgreSQL
 
@@ -613,8 +642,9 @@ cron에서 4를 성공으로 다루려면: `x-backup backup ...; rc=$?; [ $rc -e
 ## 복구 의미론
 
 - `restore`(--at 없음) = **base 풀백업 스냅샷만** 복원
-- `restore --at <시각>` = PITR — base 복원 후 증분 oplog를 해당 시각(이하 최대 ts)까지 재생.
-  `verify --chain` 통과가 전제이며, `--only`(선택 복구)와는 병용 불가(mongorestore 제약)
+- `restore --at <시각>` = PITR — base 복원 후 증분 oplog를 해당 시각(이하 최대 ts)까지
+  드라이버 `applyOps`로 직접 재생(외부 도구 불필요). `verify --chain` 통과가 전제이며,
+  `--only`(선택 복구)와는 병용 불가(oplog 재생은 전체 복구 전제)
 - 복구 검증: `verify --deep`은 개인키 보유 호스트에서만 동작한다(§8.5 키 격리 — 백업
   호스트는 공개키만 가지므로 침해돼도 과거 백업을 복호화할 수 없다)
 

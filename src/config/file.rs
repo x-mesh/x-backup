@@ -41,6 +41,13 @@ pub struct OutputSection {
 /// 단일 프로파일 — mode/source/destination/features (PRD §FR-10).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Profile {
+    /// 내장 스케줄러(daemon)의 발화 주기 — 5필드 cron(예: "0 3 * * *"). 미설정이면
+    /// daemon이 이 프로파일을 스케줄하지 않는다(P3-1). 수동 backup에는 영향 없음.
+    #[serde(default)]
+    pub schedule: Option<String>,
+    /// 알림 설정 — daemon 실행 결과 webhook(P3-2).
+    #[serde(default)]
+    pub notify: NotifyConfig,
     #[serde(default)]
     pub mode: ModeConfig,
     #[serde(default)]
@@ -58,6 +65,15 @@ pub struct Profile {
     /// 없을 때). 비어 있으면 prune은 명시적 CLI 기준이 필요하다.
     #[serde(default)]
     pub retention: RetentionConfig,
+}
+
+/// 알림 설정 — `[profiles.<name>.notify]`. daemon(P3-1)이 백업 실행 결과를 보낸다.
+/// URL은 시크릿 취급이라 **환경변수 이름**만 담는다(FR-10 시크릿 비저장 원칙).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NotifyConfig {
+    /// webhook URL이 담긴 환경변수 이름(예: "XB_WEBHOOK_URL"). 미설정이면 알림 없음.
+    #[serde(default)]
+    pub webhook_url_env: Option<String>,
 }
 
 /// 보존 정책 설정 — `[profiles.<name>.retention]`. prune이 CLI 플래그가 없을 때 기본값으로
@@ -408,6 +424,20 @@ on_gap   = "promote_full"
         assert_eq!(prod.features.incremental.on_gap, "promote_full");
     }
 
+    /// v1 profile의 schedule/notify 키 파싱(P3-1/P3-2).
+    #[test]
+    fn schedule_and_notify_parse() {
+        let cfg = Config::from_toml_str(
+            "[profiles.p]\nschedule = \"*/5 * * * *\"\n\
+             [profiles.p.notify]\nwebhook_url_env = \"XB_HOOK\"\n\
+             [profiles.p.source]\nuri = \"mongodb://h/db\"\n",
+        )
+        .unwrap();
+        let p = &cfg.profiles["p"];
+        assert_eq!(p.schedule.as_deref(), Some("*/5 * * * *"));
+        assert_eq!(p.notify.webhook_url_env.as_deref(), Some("XB_HOOK"));
+    }
+
     #[test]
     fn unknown_profile_is_config_error() {
         let cfg = Config::from_toml_str(SAMPLE).unwrap();
@@ -472,10 +502,9 @@ path = \"/var/b2\"
     #[test]
     fn is_endpoint_only_detects_source_only_profile() {
         // source만 있는 프로파일 → endpoint 전용.
-        let cfg = Config::from_toml_str(
-            "[profiles.dr.source]\nuri = \"mongodb://localhost:27117/db\"\n",
-        )
-        .unwrap();
+        let cfg =
+            Config::from_toml_str("[profiles.dr.source]\nuri = \"mongodb://localhost:27117/db\"\n")
+                .unwrap();
         assert!(cfg.profile("dr").unwrap().is_endpoint_only());
 
         // destination이 있으면 endpoint 전용이 아니다(backup 잡).

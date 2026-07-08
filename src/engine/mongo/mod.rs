@@ -15,18 +15,26 @@
 //!
 //! dump/restore 자체는 서브프로세스가 수행하고 드라이버는 메타데이터만 다룬다(태스크 지침 1).
 
+pub mod apply;
 pub mod conn;
+// 레거시 mongodump/mongorestore 오케스트레이션 — legacy-mongodump feature에서만 컴파일
+// (로드맵 P0-2: 기본 빌드는 서브프로세스 스폰 코드 0).
+#[cfg(feature = "legacy-mongodump")]
 pub mod dump;
 pub mod meta;
 pub mod oplog;
+#[cfg(feature = "legacy-mongodump")]
 pub mod restore;
 pub mod status;
 pub mod uri_config;
 
+pub use apply::{ApplyStats, OplogApplier};
 pub use conn::{client_options, DEFAULT_TIMEOUT_SECS};
+#[cfg(feature = "legacy-mongodump")]
 pub use dump::{DumpProcess, DumpSpec};
 pub use meta::{MongoMeta, ServerMeta};
 pub use oplog::{CaptureError, CaptureHandle, GapCheck, OplogCaptureStream, OplogReader};
+#[cfg(feature = "legacy-mongodump")]
 pub use restore::{RestoreProcess, RestoreSpec};
 pub use status::{CheckItem, CheckStatus, StatusChecker, StatusReport};
 pub use uri_config::UriConfigFile;

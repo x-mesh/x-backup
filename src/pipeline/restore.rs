@@ -27,7 +27,9 @@ use tokio::io::{AsyncRead, ReadBuf};
 use std::path::{Path, PathBuf};
 
 use crate::engine::mongo::meta::ServerMeta;
-use crate::engine::mongo::{MongoMeta, RestoreProcess, RestoreSpec, UriConfigFile};
+use crate::engine::mongo::MongoMeta;
+#[cfg(feature = "legacy-mongodump")]
+use crate::engine::mongo::{RestoreProcess, RestoreSpec, UriConfigFile};
 use crate::engine::native::{native_export_to_dir, ExportSummary};
 use crate::error::{Result, XBackupError};
 use crate::manifest::schema::{BackupManifest, BackupType};
@@ -194,16 +196,17 @@ where
     let target_kind = crate::engine::DbKind::from_uri(request.target_uri.expose());
     let is_pg = target_kind == crate::engine::DbKind::Postgres;
     let is_mysql = target_kind == crate::engine::DbKind::Mysql;
-    // PG·MySQL은 드라이버 기반 SQL 복구라 Mongo 메타/가드 경로가 다르다(공통 처리).
-    let is_driver = is_pg || is_mysql;
+    let is_file = target_kind == crate::engine::DbKind::File;
+    // PG·MySQL(드라이버 SQL)·파일(tar unpack)은 Mongo 메타/가드 경로를 타지 않는다(공통 처리).
+    let is_driver = is_pg || is_mysql || is_file;
 
-    // H6: 드라이버 복구(PG/MySQL)는 `--only`(선택적 복구)를 지원하지 않는다 — ns 필터가 없어
-    //   전체를 복구하면서 계획만 좁게 보여주면 데이터 범위가 거짓 보고된다. 명확히 거부한다
-    //   (exit 2). 시점 복구(--at) 경로도 동일하게 --only를 거부한다.
+    // H6: 드라이버 복구(PG/MySQL/파일)는 `--only`(선택적 복구)를 지원하지 않는다 — ns 필터가
+    //   없어 전체를 복구하면서 계획만 좁게 보여주면 데이터 범위가 거짓 보고된다. 명확히
+    //   거부한다(exit 2). 시점 복구(--at) 경로도 동일하게 --only를 거부한다.
     if is_driver && request.only.is_some() {
         return Err(XBackupError::Usage(
-            "PG/MySQL 복구는 --only(선택적 복구)를 지원하지 않습니다 — 전체 복구만 가능합니다. \
-             특정 테이블만 필요하면 복구 후 정리하거나 별도 도구를 사용하세요."
+            "PG/MySQL/파일 복구는 --only(선택적 복구)를 지원하지 않습니다 — 전체 복구만 \
+             가능합니다. 특정 부분만 필요하면 복구 후 정리하거나 별도 도구를 사용하세요."
                 .into(),
         ));
     }
@@ -251,6 +254,18 @@ where
             .map_err(|e| XBackupError::PrecheckFailed(format!("기존 테이블 조회 실패: {e}")))?;
         plan.conflicting_namespaces = existing;
     }
+    // 파일 대상도 동일 가드레일: 대상 디렉터리가 비어 있지 않으면 충돌로 보고해
+    //   --force/대화형 확인을 강제한다. 복구는 기존 트리를 지우지 않고 **위에 덮어쓴다**
+    //   (동명 파일만 교체 — tar unpack 의미론).
+    if is_file && !request.skip_precheck {
+        let target = crate::engine::file::path_from_uri(request.target_uri.expose())?;
+        let non_empty = std::fs::read_dir(&target)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+        if non_empty {
+            plan.conflicting_namespaces = vec![format!("{} (비어 있지 않음)", target.display())];
+        }
+    }
 
     // 버전 호환 경고는 진행 전 항상 알린다(차단하지 않음 — PRD: 경고).
     if let Some(warning) = &plan.version_warning {
@@ -272,7 +287,12 @@ where
     let drop_existing = decide_guard(&plan, request.force, is_tty, confirm)?;
 
     // 실제 복구 스트리밍(진행 카운터는 request.progress_counter에서 가져온다 — R16).
-    stream_restore(request, storage, &plan, drop_existing).await?;
+    // 파일 대상은 체인(base + 증분 슬라이스) 순차 적용 경로(P2-2)로 분기한다.
+    if is_file {
+        file_chain_restore(request, storage, &plan).await?;
+    } else {
+        stream_restore(request, storage, &plan, drop_existing).await?;
+    }
 
     tracing::info!(
         backup_id = %plan.backup_id,
@@ -439,36 +459,166 @@ async fn stream_restore(
         return Ok(());
     }
 
-    // 3) (mongodump 경로) URI를 0600 임시 config로(argv 노출 금지). 핸들은 restore 종료까지 유지.
-    let uri_config = UriConfigFile::create(&request.target_uri)?;
-
-    // 4) mongorestore 스폰(--archive=- stdin, --drop은 가드 통과 시에만).
-    let spec = RestoreSpec {
-        program: request.mongorestore_program.clone(),
-        uri_config_path: uri_config.path().to_string(),
-        ns_include: plan.ns_include.clone(),
-        drop: drop_existing,
-    };
-    let mut restore = RestoreProcess::spawn(&spec)?;
-    let mut stdin = restore.take_stdin()?;
-
-    // 5) 파이프라인 바이트를 stdin으로 흘린다. 끝나면 stdin을 닫아 EOF를 보낸다.
-    let copy_result = tokio::io::copy(&mut restored_stream, &mut stdin).await;
-    // stdin을 명시적으로 닫는다(Drop이 닫지만 shutdown으로 flush 보장).
-    use tokio::io::AsyncWriteExt;
-    let _ = stdin.shutdown().await;
-    drop(stdin);
-
-    if let Err(copy_err) = copy_result {
-        // 입력/파이프 실패: restore를 kill+wait로 정리(좀비 방지).
-        restore.abort().await;
-        return Err(XBackupError::Failure(format!(
-            "복구 입력 스트리밍 실패: {copy_err}"
-        )));
+    // 3) (레거시 mongodump 아카이브 경로) legacy-mongodump feature 빌드에서만 지원한다 —
+    //    기본 빌드는 서브프로세스 스폰 코드가 없다(로드맵 P0-2).
+    #[cfg(not(feature = "legacy-mongodump"))]
+    {
+        Err(XBackupError::Failure(format!(
+            "백업 '{}'는 mongodump 아카이브 포맷입니다 — 이 빌드에는 mongorestore \
+             오케스트레이션이 포함되지 않았습니다(cargo feature `legacy-mongodump`). \
+             legacy-mongodump feature를 켠 빌드로 복구하거나, native 엔진으로 새 백업을 \
+             만드세요",
+            plan.backup_id
+        )))
     }
+    #[cfg(feature = "legacy-mongodump")]
+    {
+        // URI를 0600 임시 config로(argv 노출 금지). 핸들은 restore 종료까지 유지.
+        let uri_config = UriConfigFile::create(&request.target_uri)?;
 
-    // 6) mongorestore 종료 코드 판정(exit code only).
-    restore.wait().await
+        // 4) mongorestore 스폰(--archive=- stdin, --drop은 가드 통과 시에만).
+        let spec = RestoreSpec {
+            program: request.mongorestore_program.clone(),
+            uri_config_path: uri_config.path().to_string(),
+            ns_include: plan.ns_include.clone(),
+            drop: drop_existing,
+        };
+        let mut restore = RestoreProcess::spawn(&spec)?;
+        let mut stdin = restore.take_stdin()?;
+
+        // 5) 파이프라인 바이트를 stdin으로 흘린다. 끝나면 stdin을 닫아 EOF를 보낸다.
+        let copy_result = tokio::io::copy(&mut restored_stream, &mut stdin).await;
+        // stdin을 명시적으로 닫는다(Drop이 닫지만 shutdown으로 flush 보장).
+        use tokio::io::AsyncWriteExt;
+        let _ = stdin.shutdown().await;
+        drop(stdin);
+
+        if let Err(copy_err) = copy_result {
+            // 입력/파이프 실패: restore를 kill+wait로 정리(좀비 방지).
+            restore.abort().await;
+            return Err(XBackupError::Failure(format!(
+                "복구 입력 스트리밍 실패: {copy_err}"
+            )));
+        }
+
+        // 6) mongorestore 종료 코드 판정(exit code only).
+        restore.wait().await
+    }
+}
+
+/// 파일 체인 복구(P2-2) — base 풀백업을 풀고, 선택한 백업이 증분이면 그 지점까지의
+/// 슬라이스를 체인 순서로 순차 적용한다(변경 파일 덮어쓰기 + tombstone 삭제).
+///
+/// 체인 연속성은 [`verify_chain`](crate::manifest::chain::verify_chain) 통과가 전제다
+/// (mongo PITR과 동일 계약 — 끊긴 체인 위 복구는 조용히 틀린 상태를 만들므로 거부).
+/// 빈 슬라이스(oplog_count=0, data 없음)는 체인 마커일 뿐이라 건너뛴다.
+async fn file_chain_restore(
+    request: &RestoreRequest,
+    storage: &dyn Storage,
+    plan: &RestorePlan,
+) -> Result<()> {
+    let target = crate::engine::file::path_from_uri(request.target_uri.expose())?;
+    let store = ManifestStore::new(storage);
+    let selected = store.read(&plan.backup_id).await?;
+
+    let (base_id, slice_ids) = match selected.backup_type {
+        BackupType::Full => {
+            // 기본 선택(--id 미지정)이 base인데 체인에 더 새로운 증분이 있으면 안내한다 —
+            // 기본 복구는 base 스냅샷만이라(DB 엔진과 동일 의미론) 조용히 낡은 상태가
+            // 되지 않게 한다.
+            if request.backup_id.is_none() {
+                if let Ok(Some(chain)) = crate::pipeline::backup::collect_file_chain(storage).await
+                {
+                    if chain.base_id == selected.id && chain.head_id != selected.id {
+                        tracing::warn!(
+                            head = %chain.head_id,
+                            "이 체인에는 더 새로운 증분이 있습니다 — 최신 상태로 복구하려면 \
+                             `--id {}`를 지정하세요(기본 복구는 base 스냅샷만)",
+                            chain.head_id
+                        );
+                    }
+                }
+            }
+            (selected.id.clone(), Vec::new())
+        }
+        BackupType::Incremental => {
+            let base_id = selected.base_id.clone().ok_or_else(|| {
+                XBackupError::Failure(format!(
+                    "증분 '{}'에 base_id가 없습니다 — manifest 손상 의심",
+                    selected.id
+                ))
+            })?;
+            let nodes = collect_file_nodes(storage).await?;
+            let report = crate::manifest::chain::verify_chain(&nodes, &base_id);
+            if !report.is_continuous() {
+                let breaks = report
+                    .breaks
+                    .iter()
+                    .map(|b| b.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(XBackupError::Failure(format!(
+                    "파일 증분 체인이 연속적이지 않아 복구를 거부합니다(base '{base_id}'): \
+                     {breaks} — `x-backup verify --id <id> --chain`으로 확인하세요"
+                )));
+            }
+            let pos = report
+                .incremental_ids
+                .iter()
+                .position(|i| i == &selected.id)
+                .ok_or_else(|| {
+                    XBackupError::Failure(format!(
+                        "선택한 증분 '{}'이 base '{base_id}' 체인에 없습니다",
+                        selected.id
+                    ))
+                })?;
+            (base_id, report.incremental_ids[..=pos].to_vec())
+        }
+    };
+
+    // base → 슬라이스 순서로 적용. 각 산출물은 자체 역스택(복호화→해제)을 탄다.
+    let mut applied = 0u64;
+    for id in std::iter::once(base_id).chain(slice_ids) {
+        let m = store.read(&id).await?;
+        if m.oplog_count == Some(0) {
+            continue; // 빈 슬라이스(변경 없음) — data 없음.
+        }
+        let stages = reverse_stack_for(&m)?;
+        let raw = storage.get_stream(&data_path(&id)).await?;
+        let mut stream: BoxAsyncRead = stages.apply(raw);
+        if let Some(counter) = &request.progress_counter {
+            stream = Box::pin(ProgressCountingReader::new(stream, Arc::clone(counter)));
+        }
+        let unpacked = crate::engine::file::restore::file_restore(stream, &target).await?;
+        applied += 1;
+        tracing::debug!(backup_id = %id, unpacked, "파일 슬라이스 적용 완료");
+    }
+    tracing::info!(backup_id = %plan.backup_id, slices = applied, "파일 복구 완료");
+    Ok(())
+}
+
+/// destination의 **파일 엔진** manifest만 체인 노드로 모은다(혼재 저장소에서 다른
+/// 엔진의 체인과 섞이지 않게 — PITR의 mongo 필터와 대칭).
+async fn collect_file_nodes(
+    storage: &dyn Storage,
+) -> Result<Vec<crate::manifest::chain::ChainNode>> {
+    let ids = crate::pipeline::verify::collect_manifest_ids(storage).await?;
+    let store = ManifestStore::new(storage);
+    let mut nodes = Vec::new();
+    for id in &ids {
+        match store.read(id).await {
+            Ok(m) => {
+                let fmt = m.tool_versions.archive_format.as_deref();
+                if fmt == Some(crate::engine::file::FORMAT_ID)
+                    || fmt == Some(crate::engine::file::INCR_FORMAT_ID)
+                {
+                    nodes.push(crate::manifest::chain::ChainNode::from_manifest(&m));
+                }
+            }
+            Err(e) => tracing::debug!(id = %id, "manifest 읽기 실패(체인 노드 제외): {e}"),
+        }
+    }
+    Ok(nodes)
 }
 
 /// 네이티브 아카이브를 드라이버로 직접 복원한다(외부 mongorestore 불필요).
@@ -845,6 +995,7 @@ mod tests {
     }
 
     /// 가짜 mongorestore 스크립트 — stdin을 sink 파일로 복사하고 exit 0.
+    #[cfg(feature = "legacy-mongodump")]
     fn fake_mongorestore_sink(sink_path: &str) -> tempfile::TempPath {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
@@ -869,6 +1020,7 @@ mod tests {
     /// 평문 풀 복구 스트리밍 E2E(가짜 mongorestore): storage data.bin → identity 역스택
     /// → mongorestore stdin으로 바이트가 손실 없이 전달되는지 확인한다. DB·실제 도구
     /// 없이 파이프라인 합성·스폰·stdin copy·exit 판정 전 구간을 검증한다.
+    #[cfg(feature = "legacy-mongodump")]
     #[tokio::test]
     async fn plaintext_restore_streams_data_to_mongorestore_stdin() {
         let dir = tempfile::tempdir().unwrap();
@@ -910,7 +1062,305 @@ mod tests {
         );
     }
 
+    /// 파일 엔진 E2E(파이프라인 경유): 트리 → run_file_full_backup(스토리지 저장) →
+    /// run_restore(archive_format 디스패치) → 다른 디렉터리에 내용 복원. DB·외부 도구 0.
+    #[tokio::test]
+    async fn file_backup_restore_round_trip_through_pipeline() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let fs = LocalFs::new(store_dir.path()).unwrap();
+
+        // 소스 트리.
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir(src.path().join("d")).unwrap();
+        std::fs::write(src.path().join("d/x.txt"), b"file-engine").unwrap();
+
+        let outcome = crate::pipeline::backup::run_file_full_backup(
+            src.path().to_path_buf(),
+            &fs,
+            crate::pipeline::stage::StageStack::new(),
+            crate::pipeline::backup::BackupMeta::none(),
+            None,
+        )
+        .await
+        .expect("파일 풀 백업 성공");
+        assert!(outcome.stored_size_bytes > 0);
+
+        // 복구 대상(빈 디렉터리 — 가드 충돌 없음).
+        let dst = tempfile::tempdir().unwrap();
+        let request = RestoreRequest {
+            target_uri: crate::config::secret::Secret::new(format!(
+                "file://{}",
+                dst.path().display()
+            )),
+            mongorestore_program: "/nonexistent/never-spawned".to_string(),
+            backup_id: Some(outcome.backup_id.clone()),
+            only: None,
+            force: false, // 빈 대상 → 충돌 없음 → 가드 미발동.
+            dry_run: false,
+            skip_precheck: false,
+            timeout_secs: None,
+            progress_counter: None,
+        };
+        run_restore(&request, &fs, false, |_| {
+            panic!("충돌 없음 — confirm 미호출")
+        })
+        .await
+        .expect("파일 복구 성공");
+        assert_eq!(
+            std::fs::read(dst.path().join("d/x.txt")).unwrap(),
+            b"file-engine"
+        );
+    }
+
+    /// 파일 증분 체인 E2E(P2-2): 풀 → 수정(변경/신규/삭제) → 증분 → 재수정 → 증분2
+    /// → `--id 증분2`로 체인 복구 → 최종 트리와 동일해야 한다(tombstone 삭제 포함).
+    #[tokio::test]
+    async fn file_incremental_chain_restore_round_trip() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let fs = LocalFs::new(store_dir.path()).unwrap();
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir(src.path().join("d")).unwrap();
+        std::fs::write(src.path().join("keep.txt"), b"keep").unwrap();
+        std::fs::write(src.path().join("d/gone.txt"), b"will-delete").unwrap();
+        std::fs::write(src.path().join("mod.txt"), b"v1").unwrap();
+
+        // 1) base 풀 백업.
+        crate::pipeline::backup::run_file_full_backup(
+            src.path().to_path_buf(),
+            &fs,
+            crate::pipeline::stage::StageStack::new(),
+            crate::pipeline::backup::BackupMeta::none(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // 2) 변경: mod.txt 수정 + new.txt 신규 → 증분 1.
+        std::fs::write(src.path().join("mod.txt"), b"v2-longer").unwrap();
+        std::fs::write(src.path().join("new.txt"), b"fresh").unwrap();
+        let incr1 = crate::pipeline::backup::run_file_incremental_backup(
+            src.path().to_path_buf(),
+            &fs,
+            crate::pipeline::stage::StageStack::new(),
+            crate::pipeline::backup::BackupMeta::none(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!incr1.promoted);
+        assert!(incr1.change_count >= 2, "mod+new: {}", incr1.change_count);
+
+        // 3) 변경: d/gone.txt 삭제 → 증분 2(tombstone).
+        std::fs::remove_file(src.path().join("d/gone.txt")).unwrap();
+        let incr2 = crate::pipeline::backup::run_file_incremental_backup(
+            src.path().to_path_buf(),
+            &fs,
+            crate::pipeline::stage::StageStack::new(),
+            crate::pipeline::backup::BackupMeta::none(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(incr2.change_count >= 1, "삭제 1건: {}", incr2.change_count);
+
+        // 4) 증분2 id로 체인 복구 → 최종 상태와 동일.
+        let dst = tempfile::tempdir().unwrap();
+        let request = RestoreRequest {
+            target_uri: crate::config::secret::Secret::new(format!(
+                "file://{}",
+                dst.path().display()
+            )),
+            mongorestore_program: "/nonexistent/never-spawned".to_string(),
+            backup_id: Some(incr2.backup_id.clone()),
+            only: None,
+            force: false,
+            dry_run: false,
+            skip_precheck: false,
+            timeout_secs: None,
+            progress_counter: None,
+        };
+        run_restore(&request, &fs, false, |_| panic!("빈 대상 — confirm 미호출"))
+            .await
+            .expect("체인 복구 성공");
+
+        assert_eq!(std::fs::read(dst.path().join("keep.txt")).unwrap(), b"keep");
+        assert_eq!(
+            std::fs::read(dst.path().join("mod.txt")).unwrap(),
+            b"v2-longer"
+        );
+        assert_eq!(std::fs::read(dst.path().join("new.txt")).unwrap(), b"fresh");
+        assert!(
+            !dst.path().join("d/gone.txt").exists(),
+            "tombstone 삭제 반영"
+        );
+    }
+
+    /// 파일 증분: 변경이 없으면 빈 슬라이스(count=0, data 없음)로 체인 좌표만 유지한다.
+    #[tokio::test]
+    async fn file_incremental_empty_slice_when_unchanged() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let fs = LocalFs::new(store_dir.path()).unwrap();
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a"), b"same").unwrap();
+
+        crate::pipeline::backup::run_file_full_backup(
+            src.path().to_path_buf(),
+            &fs,
+            crate::pipeline::stage::StageStack::new(),
+            crate::pipeline::backup::BackupMeta::none(),
+            None,
+        )
+        .await
+        .unwrap();
+        let incr = crate::pipeline::backup::run_file_incremental_backup(
+            src.path().to_path_buf(),
+            &fs,
+            crate::pipeline::stage::StageStack::new(),
+            crate::pipeline::backup::BackupMeta::none(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(incr.change_count, 0);
+        assert_eq!(incr.stored_size_bytes, 0);
+        // data.bin이 없어야 한다(manifest+인덱스만).
+        assert!(fs.get_stream(&data_path(&incr.backup_id)).await.is_err());
+    }
+
+    /// 파일 증분: base 풀백업이 없으면 사용법 오류(exit 2)로 풀 백업을 먼저 요구한다.
+    #[tokio::test]
+    async fn file_incremental_requires_base_full() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let fs = LocalFs::new(store_dir.path()).unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let err = crate::pipeline::backup::run_file_incremental_backup(
+            src.path().to_path_buf(),
+            &fs,
+            crate::pipeline::stage::StageStack::new(),
+            crate::pipeline::backup::BackupMeta::none(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    /// 파일 증분 gap: 체인 헤드의 인덱스 사이드카가 사라지면 풀 백업으로 승격한다.
+    #[tokio::test]
+    async fn file_incremental_promotes_on_missing_index() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let fs = LocalFs::new(store_dir.path()).unwrap();
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a"), b"x").unwrap();
+
+        let full = crate::pipeline::backup::run_file_full_backup(
+            src.path().to_path_buf(),
+            &fs,
+            crate::pipeline::stage::StageStack::new(),
+            crate::pipeline::backup::BackupMeta::none(),
+            None,
+        )
+        .await
+        .unwrap();
+        // 인덱스 사이드카를 지워 gap을 흉내 낸다.
+        fs.delete(&crate::manifest::store::file_index_path(&full.backup_id))
+            .await
+            .unwrap();
+
+        let incr = crate::pipeline::backup::run_file_incremental_backup(
+            src.path().to_path_buf(),
+            &fs,
+            crate::pipeline::stage::StageStack::new(),
+            crate::pipeline::backup::BackupMeta::none(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(incr.promoted, "인덱스 소실 → 풀 승격");
+        // 승격 결과는 풀 백업 manifest여야 한다.
+        let m = ManifestStore::new(&fs).read(&incr.backup_id).await.unwrap();
+        assert_eq!(m.backup_type, BackupType::Full);
+        assert!(m.promoted_from_gap);
+    }
+
+    /// 파일 복구 가드: 대상 디렉터리가 비어 있지 않으면 --force 없이(비-TTY) 거부한다.
+    #[tokio::test]
+    async fn file_restore_guards_non_empty_target() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let fs = LocalFs::new(store_dir.path()).unwrap();
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a"), b"1").unwrap();
+        let outcome = crate::pipeline::backup::run_file_full_backup(
+            src.path().to_path_buf(),
+            &fs,
+            crate::pipeline::stage::StageStack::new(),
+            crate::pipeline::backup::BackupMeta::none(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(dst.path().join("existing"), b"keep").unwrap();
+        let request = RestoreRequest {
+            target_uri: crate::config::secret::Secret::new(format!(
+                "file://{}",
+                dst.path().display()
+            )),
+            mongorestore_program: "/nonexistent/never-spawned".to_string(),
+            backup_id: Some(outcome.backup_id),
+            only: None,
+            force: false,
+            dry_run: false,
+            skip_precheck: false,
+            timeout_secs: None,
+            progress_counter: None,
+        };
+        let err = run_restore(&request, &fs, false, |_| false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 1, "비-TTY + 충돌 + --force 없음 → 거부");
+        // 기존 파일은 그대로다(복구 미시작).
+        assert_eq!(std::fs::read(dst.path().join("existing")).unwrap(), b"keep");
+    }
+
+    /// 미포함(기본) 빌드: mongodump 아카이브 포맷 백업의 복구는 명확한 안내와 함께
+    /// 실패(exit 1)한다 — legacy-mongodump 빌드 또는 native 재백업 유도(P0-2).
+    #[cfg(not(feature = "legacy-mongodump"))]
+    #[tokio::test]
+    async fn restore_rejects_mongodump_format_without_legacy_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = LocalFs::new(dir.path()).unwrap();
+        seed_backup(
+            &fs,
+            &full_manifest("bk-legacy", "2026-06-12T00:00:00Z", "7.0.35"),
+            b"x",
+        )
+        .await;
+
+        let request = RestoreRequest {
+            target_uri: crate::config::secret::Secret::new("mongodb://unused/db"),
+            mongorestore_program: "/nonexistent/never-spawned".to_string(),
+            backup_id: Some("bk-legacy".to_string()),
+            only: None,
+            force: true,
+            dry_run: false,
+            skip_precheck: true,
+            timeout_secs: None,
+            progress_counter: None,
+        };
+        let err = run_restore(&request, &fs, false, |_| true)
+            .await
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        assert!(
+            err.to_string().contains("legacy-mongodump"),
+            "feature 안내 누락: {err}"
+        );
+    }
+
     /// mongorestore가 비정상 종료(exit 1)하면 복구는 실패(exit 1)로 전파한다.
+    #[cfg(feature = "legacy-mongodump")]
     #[tokio::test]
     async fn restore_propagates_mongorestore_failure() {
         use std::io::Write;

@@ -23,10 +23,13 @@ use tokio::io::{AsyncRead, ReadBuf};
 use uuid::Uuid;
 
 use crate::engine::mongo::meta::ServerMeta;
-use crate::engine::mongo::{DumpProcess, DumpSpec, MongoMeta, UriConfigFile};
+use crate::engine::mongo::MongoMeta;
+#[cfg(feature = "legacy-mongodump")]
+use crate::engine::mongo::{DumpProcess, DumpSpec, UriConfigFile};
 use crate::error::{Result, XBackupError};
 use crate::manifest::schema::{
-    BackupManifest, BackupStatus, BackupType, OplogRange, ToolVersions, Topology, FORMAT_VERSION,
+    BackupManifest, BackupStatus, BackupType, OplogRange, OplogTimestamp, ToolVersions, Topology,
+    FORMAT_VERSION,
 };
 use crate::manifest::store::{data_path, manifest_path, manifest_sha_path, ManifestStore};
 use crate::pipeline::checksum::Sha256Reader;
@@ -105,12 +108,31 @@ pub enum Engine {
     Mongodump,
 }
 
+/// legacy-mongodump 미포함 빌드에서 mongodump 엔진 경로가 요구될 때의 설정 오류(exit 2).
+///
+/// 모든 진입점(parse)과 도달 불가 방어 분기가 같은 안내를 낸다.
+#[cfg(not(feature = "legacy-mongodump"))]
+fn legacy_engine_unavailable() -> XBackupError {
+    XBackupError::Config(
+        "이 빌드에는 mongodump 엔진이 포함되지 않았습니다(cargo feature `legacy-mongodump`) — \
+         engine = \"native\"를 사용하세요. 기존 mongodump 포맷 백업의 복구가 필요하면 \
+         legacy-mongodump feature를 켠 빌드를 사용해야 합니다"
+            .into(),
+    )
+}
+
 impl Engine {
     /// config 문자열(`native`|`mongodump`)에서 파싱한다. 그 외 값은 설정 오류.
+    ///
+    /// `mongodump`는 legacy-mongodump feature 빌드에서만 유효하다 — 미포함 빌드에서는
+    /// 여기서 설정 오류(exit 2)로 조기 거부해 하위 분기가 도달 불가가 되게 한다.
     pub fn parse(s: &str) -> Result<Self> {
         match s {
             "native" => Ok(Engine::Native),
+            #[cfg(feature = "legacy-mongodump")]
             "mongodump" => Ok(Engine::Mongodump),
+            #[cfg(not(feature = "legacy-mongodump"))]
+            "mongodump" => Err(legacy_engine_unavailable()),
             other => Err(XBackupError::Config(format!(
                 "알 수 없는 engine: '{other}'(native | mongodump만 지원)"
             ))),
@@ -133,12 +155,14 @@ impl Engine {
 enum DumpFinalizer {
     /// mongodump 자식 프로세스(+ 0600 임시 URI config 핸들 — 종료까지 유지).
     /// Box로 감싼다 — 변형 간 크기 격차 회피(`clippy::large_enum_variant`).
+    #[cfg(feature = "legacy-mongodump")]
     Mongodump(Box<MongodumpFinalizer>),
     /// 네이티브 덤프 task 핸들(EOF 후 결과 회수).
     Native(Option<crate::engine::native::backup::NativeDumpHandle>),
 }
 
 /// mongodump 종료 처리 페이로드 — 자식 프로세스 + 0600 임시 URI config 핸들.
+#[cfg(feature = "legacy-mongodump")]
 struct MongodumpFinalizer {
     proc: Option<DumpProcess>,
     _uri_config: UriConfigFile,
@@ -148,6 +172,7 @@ impl DumpFinalizer {
     /// 정상 경로 — 스트림 EOF 후 종료를 판정한다(mongodump exit code / native task 결과).
     async fn finish(&mut self) -> Result<()> {
         match self {
+            #[cfg(feature = "legacy-mongodump")]
             DumpFinalizer::Mongodump(m) => match m.proc.take() {
                 Some(p) => p.wait().await,
                 None => Ok(()),
@@ -162,6 +187,7 @@ impl DumpFinalizer {
     /// 실패 경로 — 자식/리더를 정리한다(좀비/누수 방지).
     async fn abort(&mut self) {
         match self {
+            #[cfg(feature = "legacy-mongodump")]
             DumpFinalizer::Mongodump(m) => {
                 if let Some(p) = m.proc.take() {
                     p.abort().await;
@@ -300,7 +326,11 @@ pub async fn run_full_backup_with_meta(
     // 2) dump 스트림 생성 — 엔진 분기. mongodump는 `--archive=-`(시점 일관 `--oplog`),
     //    native는 드라이버로 직접 아카이브 스트림을 만든다(외부 도구 불필요).
     let archive_format = request.engine.archive_format();
-    let (dump_stream, mut finalizer): (BoxAsyncRead, DumpFinalizer) = match request.engine {
+    let (dump_stream, finalizer): (BoxAsyncRead, DumpFinalizer) = match request.engine {
+        // parse가 조기 거부하므로 미포함 빌드에서 도달 불가(방어적).
+        #[cfg(not(feature = "legacy-mongodump"))]
+        Engine::Mongodump => return Err(legacy_engine_unavailable()),
+        #[cfg(feature = "legacy-mongodump")]
         Engine::Mongodump => {
             // URI를 0600 임시 config로 — argv 노출 금지(PRD §11). 핸들은 dump 종료까지 유지.
             let uri_config = UriConfigFile::create(&request.uri)?;
@@ -331,41 +361,17 @@ pub async fn run_full_backup_with_meta(
         }
     };
 
-    // 3) 파이프라인 합성: dump stream → (입력 바이트 카운터) → 단계(compress→encrypt) → sha256 tee.
-    //    입력 카운터는 *압축 전* 원본 바이트(original_size_bytes)를 세고, sha256 tee는
-    //    *저장 직전* 최종 바이트(stored, 압축·암호화 후)에 걸린다(설계 불변: 체크섬=저장 바이트).
-    let counted = CountingReader::new(dump_stream);
-    let original_size_handle = counted.handle();
-    let staged: BoxAsyncRead = stages.apply(Box::pin(counted));
-    let checksummed = Sha256Reader::new(staged);
-    let checksum_handle = checksummed.handle();
-    // 진행 카운터가 주입됐으면 저장 카운터의 backing Arc로 공유한다(진행 표시 폴링).
-    let stored_counted = match &request.progress_counter {
-        Some(counter) => CountingReader::with_counter(Box::pin(checksummed), Arc::clone(counter)),
-        None => CountingReader::new(Box::pin(checksummed)),
-    };
-    let stored_size_handle = stored_counted.handle();
+    // 3) 공통 코어: 합성(카운터→스테이지→sha256) → 저장 → 종료 판정 → 확정.
+    let stored = store_dump_stream(
+        storage,
+        dump_stream,
+        stages,
+        &request.progress_counter,
+        finalizer,
+    )
+    .await?;
 
-    // 4) data.bin 저장(업로드 먼저). put_stream이 바이트를 끝까지 소비한다.
-    let backup_id = Uuid::now_v7().to_string();
-    let data_rel = data_path(&backup_id);
-
-    let put_result = storage
-        .put_stream(&data_rel, Box::pin(stored_counted), None)
-        .await;
-
-    // 업로드 성공/실패와 무관하게 dump 종료를 판정해야 한다(좀비/누수 방지).
-    if let Err(put_err) = put_result {
-        finalizer.abort().await;
-        return Err(put_err);
-    }
-    // dump 종료 판정(mongodump exit code / native task 결과).
-    if let Err(dump_err) = finalizer.finish().await {
-        cleanup(storage, &backup_id).await;
-        return Err(dump_err);
-    }
-
-    // 5) dump 후 oplog ts 조회(구간 end).
+    // 4) dump 후 oplog ts 조회(구간 end).
     let oplog_end = if record_oplog {
         mongo.latest_oplog_ts().await?
     } else {
@@ -379,48 +385,34 @@ pub async fn run_full_backup_with_meta(
         _ => None,
     };
 
-    // 7) 체크섬·크기 확정. put_stream이 끝났으므로 EOF까지 누산 완료.
-    let checksum = checksum_handle
-        .finalize()
-        .ok_or_else(|| XBackupError::Failure("체크섬 확정 실패(이미 소비됨)".into()))?;
-    let stored_size = stored_size_handle.total();
-    // 원본(압축 전) 입력 바이트. 압축 단계가 없으면 stored와 같다(평문 경로).
-    let original_size = original_size_handle.total();
-
-    // 8) manifest 작성. 압축/암호화 메타는 meta에서, archive_format(엔진)도 기록한다 —
-    //    복구가 이 값을 보고 mongorestore/native 중 맞는 소비자를 고른다.
+    // 5) manifest 작성·기록. 압축/암호화 메타는 meta에서, archive_format(엔진)도 기록한다 —
+    //    복구가 이 값을 보고 native/레거시 중 맞는 소비자를 고른다.
     let manifest = build_manifest(
-        &backup_id,
+        &stored.backup_id,
         &server_meta,
         topology,
         selective,
-        original_size,
-        stored_size,
-        &checksum,
+        stored.original_size,
+        stored.stored_size,
+        &stored.checksum,
         oplog_range,
         archive_format,
         &meta,
     );
-
-    // 9) manifest → 사이드카 기록(data 다음, pitfall 7-1). 실패 시 전체 정리.
-    let store = ManifestStore::new(storage);
-    if let Err(write_err) = store.write(&manifest).await {
-        cleanup(storage, &backup_id).await;
-        return Err(write_err);
-    }
+    write_manifest_or_cleanup(storage, &manifest).await?;
 
     tracing::info!(
-        backup_id = %backup_id,
-        bytes = stored_size,
-        checksum = %checksum,
+        backup_id = %stored.backup_id,
+        bytes = stored.stored_size,
+        checksum = %stored.checksum,
         "풀 백업 완료"
     );
 
     Ok(BackupOutcome {
-        backup_id,
-        stored_size_bytes: stored_size,
-        original_size_bytes: original_size,
-        checksum_sha256: checksum,
+        backup_id: stored.backup_id,
+        stored_size_bytes: stored.stored_size,
+        original_size_bytes: stored.original_size,
+        checksum_sha256: stored.checksum,
         topology,
         compression: meta.compression.clone(),
         encryption: meta.encryption.clone(),
@@ -483,6 +475,8 @@ async fn cleanup(storage: &dyn Storage, backup_id: &str) {
         data_path(backup_id),
         manifest_path(backup_id),
         manifest_sha_path(backup_id),
+        // 파일 엔진 인덱스 사이드카(P2-2) — 다른 엔진은 없어서 무해.
+        crate::manifest::store::file_index_path(backup_id),
     ] {
         if let Err(e) = storage.delete(&path).await {
             tracing::debug!(path = %path, "정리 중 삭제 실패(무시): {e}");
@@ -490,9 +484,142 @@ async fn cleanup(storage: &dyn Storage, backup_id: &str) {
     }
 }
 
+/// dump 스트림 종료 판정 훅 — 엔진 공통 저장 코어([`store_dump_stream`])가 성공/실패
+/// 경로에서 호출한다(Phase 1 슬라이스 B). `Output`은 dump 측이 종료 시 넘겨주는 엔진
+/// 메타다(MySQL=스냅샷 binlog 좌표, Mongo/PG=없음).
+trait DumpTermination {
+    type Output;
+    /// 정상 경로 — put_stream EOF 후 dump 종료를 판정하고 결과를 회수한다.
+    async fn finish(self) -> Result<Self::Output>;
+    /// 실패 경로 — 자식 프로세스/task를 정리한다(좀비/누수 방지).
+    async fn abort(self);
+}
+
+impl DumpTermination for DumpFinalizer {
+    type Output = ();
+    async fn finish(mut self) -> Result<()> {
+        DumpFinalizer::finish(&mut self).await
+    }
+    async fn abort(mut self) {
+        DumpFinalizer::abort(&mut self).await;
+    }
+}
+
+impl DumpTermination for crate::engine::postgres::backup::PgDumpHandle {
+    type Output = ();
+    async fn finish(self) -> Result<()> {
+        crate::engine::postgres::backup::PgDumpHandle::finish(self).await
+    }
+    // COPY task는 리더 drop으로 끝난다 — 결과만 흡수(종전 put 실패 경로와 동일).
+    async fn abort(self) {
+        let _ = crate::engine::postgres::backup::PgDumpHandle::finish(self).await;
+    }
+}
+
+impl DumpTermination for crate::engine::mysql::backup::MysqlDumpHandle {
+    type Output = Option<crate::manifest::schema::MysqlBinlogCoords>;
+    async fn finish(self) -> Result<Self::Output> {
+        crate::engine::mysql::backup::MysqlDumpHandle::finish(self).await
+    }
+    async fn abort(self) {
+        let _ = crate::engine::mysql::backup::MysqlDumpHandle::finish(self).await;
+    }
+}
+
+impl DumpTermination for crate::engine::file::backup::FileDumpHandle {
+    type Output = ();
+    async fn finish(self) -> Result<()> {
+        crate::engine::file::backup::FileDumpHandle::finish(self).await
+    }
+    // tar 직렬화 task는 리더 drop으로 BrokenPipe 종료된다 — 결과만 흡수.
+    async fn abort(self) {
+        let _ = crate::engine::file::backup::FileDumpHandle::finish(self).await;
+    }
+}
+
+/// 공통 저장 산출물 — 코어가 확정한 ID·크기·체크섬과 종료 훅의 엔진 메타.
+struct StoredDump<T> {
+    backup_id: String,
+    stored_size: u64,
+    original_size: u64,
+    checksum: String,
+    dump_output: T,
+}
+
+/// 엔진 공통 스트리밍 저장 코어(Phase 1 슬라이스 B) — 세 풀 백업 경로가 각자 들고 있던
+/// "합성 → 저장 → 종료 판정 → 확정" 골격의 단일 구현.
+///
+/// dump 스트림 → 원본 카운터 → 스테이지(compress→encrypt) → sha256 tee → 저장 카운터
+/// → put_stream. put 실패면 종료 훅 abort 후 전파, dump 종료 실패면 저장 산출물
+/// 정리([`cleanup`]) 후 전파. 새 엔진은 dump 스트림과 [`DumpTermination`] 구현만 만들면
+/// 이 코어에 그대로 접속한다(manifest 조립은 엔진별로 남는다 — 필드 의미가 다르다).
+async fn store_dump_stream<T: DumpTermination>(
+    storage: &dyn Storage,
+    dump_stream: BoxAsyncRead,
+    stages: StageStack,
+    progress_counter: &Option<Arc<AtomicU64>>,
+    termination: T,
+) -> Result<StoredDump<T::Output>> {
+    // 입력 카운터는 *압축 전* 원본 바이트를 세고, sha256 tee는 *저장 직전* 최종 바이트에
+    // 걸린다(설계 불변: 체크섬=저장 바이트). 진행 카운터가 주입됐으면 저장 카운터의
+    // backing Arc로 공유한다(진행 표시 폴링).
+    let counted = CountingReader::new(dump_stream);
+    let original_size_handle = counted.handle();
+    let staged: BoxAsyncRead = stages.apply(Box::pin(counted));
+    let checksummed = Sha256Reader::new(staged);
+    let checksum_handle = checksummed.handle();
+    let stored_counted = match progress_counter {
+        Some(counter) => CountingReader::with_counter(Box::pin(checksummed), Arc::clone(counter)),
+        None => CountingReader::new(Box::pin(checksummed)),
+    };
+    let stored_size_handle = stored_counted.handle();
+
+    // data.bin 저장(업로드 먼저). put_stream이 바이트를 끝까지 소비한다.
+    let backup_id = Uuid::now_v7().to_string();
+    let put_result = storage
+        .put_stream(&data_path(&backup_id), Box::pin(stored_counted), None)
+        .await;
+
+    // 업로드 성공/실패와 무관하게 dump 종료를 판정해야 한다(좀비/누수 방지).
+    if let Err(put_err) = put_result {
+        termination.abort().await;
+        return Err(put_err);
+    }
+    let dump_output = match termination.finish().await {
+        Ok(out) => out,
+        Err(dump_err) => {
+            cleanup(storage, &backup_id).await;
+            return Err(dump_err);
+        }
+    };
+
+    // put_stream이 끝났으므로 EOF까지 누산 완료 — 체크섬·크기 확정.
+    let checksum = checksum_handle
+        .finalize()
+        .ok_or_else(|| XBackupError::Failure("체크섬 확정 실패(이미 소비됨)".into()))?;
+    Ok(StoredDump {
+        stored_size: stored_size_handle.total(),
+        original_size: original_size_handle.total(),
+        backup_id,
+        checksum,
+        dump_output,
+    })
+}
+
+/// manifest를 기록하고, 실패 시 저장 산출물을 정리한다(data 다음 manifest, pitfall 7-1).
+async fn write_manifest_or_cleanup(storage: &dyn Storage, manifest: &BackupManifest) -> Result<()> {
+    let store = ManifestStore::new(storage);
+    if let Err(write_err) = store.write(manifest).await {
+        cleanup(storage, &manifest.id).await;
+        return Err(write_err);
+    }
+    Ok(())
+}
+
 /// PostgreSQL 풀 백업 — 드라이버 COPY 아카이브(`xb-pg-v1`)를 압축→암호화→저장 파이프라인에
 /// 흘린다. Mongo 경로와 달리 oplog/토폴로지가 없다(topology=Standalone로 기록). 복구는
-/// manifest.archive_format로 PG 엔진을 고른다. 파이프라인 합성·체크섬·정리는 Mongo와 동형.
+/// manifest.archive_format로 PG 엔진을 고른다. 파이프라인 합성·체크섬·정리는 Mongo와 동형
+/// (공통 코어 [`store_dump_stream`] 사용).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_pg_full_backup(
     uri: &crate::config::secret::Secret,
@@ -539,43 +666,20 @@ pub async fn run_pg_full_backup(
         .unwrap_or_else(|| "postgresql".to_string());
     let dump = dumper.dump_stream(db, collection);
     let dump_handle = dump.handle();
-    let dump_stream: BoxAsyncRead = Box::pin(dump);
 
-    // 파이프라인 합성(Mongo 경로와 동일): 입력 카운터 → 단계 → sha256 tee → 저장 카운터.
-    let counted = CountingReader::new(dump_stream);
-    let original_size_handle = counted.handle();
-    let staged: BoxAsyncRead = stages.apply(Box::pin(counted));
-    let checksummed = Sha256Reader::new(staged);
-    let checksum_handle = checksummed.handle();
-    let stored_counted = match &progress_counter {
-        Some(counter) => CountingReader::with_counter(Box::pin(checksummed), Arc::clone(counter)),
-        None => CountingReader::new(Box::pin(checksummed)),
-    };
-    let stored_size_handle = stored_counted.handle();
-
-    let backup_id = Uuid::now_v7().to_string();
-    let data_rel = data_path(&backup_id);
-    let put_result = storage
-        .put_stream(&data_rel, Box::pin(stored_counted), None)
-        .await;
-    if let Err(put_err) = put_result {
-        let _ = dump_handle.finish().await;
-        return Err(put_err);
-    }
-    if let Err(dump_err) = dump_handle.finish().await {
-        cleanup(storage, &backup_id).await;
-        return Err(dump_err);
-    }
-
-    let checksum = checksum_handle
-        .finalize()
-        .ok_or_else(|| XBackupError::Failure("체크섬 확정 실패(이미 소비됨)".into()))?;
-    let stored_size = stored_size_handle.total();
-    let original_size = original_size_handle.total();
+    // 공통 코어: 합성 → 저장 → 종료 판정 → 확정(Mongo 경로와 동일 골격).
+    let stored = store_dump_stream(
+        storage,
+        Box::pin(dump),
+        stages,
+        &progress_counter,
+        dump_handle,
+    )
+    .await?;
 
     let manifest = BackupManifest {
         format_version: FORMAT_VERSION,
-        id: backup_id.clone(),
+        id: stored.backup_id.clone(),
         created_at: Utc::now().to_rfc3339(),
         backup_type: BackupType::Full,
         base_id: None,
@@ -586,29 +690,25 @@ pub async fn run_pg_full_backup(
             archive_format: Some(pg_archive::FORMAT_ID.to_string()),
         },
         selective,
-        original_size_bytes: original_size,
-        stored_size_bytes: stored_size,
+        original_size_bytes: stored.original_size,
+        stored_size_bytes: stored.stored_size,
         compression: meta.compression.clone(),
         encryption: meta.encryption.clone(),
-        checksum_sha256: checksum.clone(),
+        checksum_sha256: stored.checksum.clone(),
         oplog_range: None,
         oplog_count: None,
         promoted_from_gap: false,
         mysql_binlog: None,
         status: BackupStatus::Complete,
     };
-    let store = ManifestStore::new(storage);
-    if let Err(write_err) = store.write(&manifest).await {
-        cleanup(storage, &backup_id).await;
-        return Err(write_err);
-    }
+    write_manifest_or_cleanup(storage, &manifest).await?;
 
-    tracing::info!(backup_id = %backup_id, bytes = stored_size, checksum = %checksum, "PG 풀 백업 완료");
+    tracing::info!(backup_id = %stored.backup_id, bytes = stored.stored_size, checksum = %stored.checksum, "PG 풀 백업 완료");
     Ok(BackupOutcome {
-        backup_id,
-        stored_size_bytes: stored_size,
-        original_size_bytes: original_size,
-        checksum_sha256: checksum,
+        backup_id: stored.backup_id,
+        stored_size_bytes: stored.stored_size,
+        original_size_bytes: stored.original_size,
+        checksum_sha256: stored.checksum,
         topology: Topology::Standalone,
         compression: meta.compression.clone(),
         encryption: meta.encryption.clone(),
@@ -644,46 +744,22 @@ pub async fn run_mysql_full_backup(
         .unwrap_or_else(|| "mysql".to_string());
     let dump = dumper.dump_stream(table_filter);
     let dump_handle = dump.handle();
-    let dump_stream: BoxAsyncRead = Box::pin(dump);
 
-    let counted = CountingReader::new(dump_stream);
-    let original_size_handle = counted.handle();
-    let staged: BoxAsyncRead = stages.apply(Box::pin(counted));
-    let checksummed = Sha256Reader::new(staged);
-    let checksum_handle = checksummed.handle();
-    let stored_counted = match &progress_counter {
-        Some(counter) => CountingReader::with_counter(Box::pin(checksummed), Arc::clone(counter)),
-        None => CountingReader::new(Box::pin(checksummed)),
-    };
-    let stored_size_handle = stored_counted.handle();
-
-    let backup_id = Uuid::now_v7().to_string();
-    let data_rel = data_path(&backup_id);
-    let put_result = storage
-        .put_stream(&data_rel, Box::pin(stored_counted), None)
-        .await;
-    if let Err(put_err) = put_result {
-        let _ = dump_handle.finish().await;
-        return Err(put_err);
-    }
-    // finish는 백업 task 오류 전파 + 스냅샷 binlog 좌표(증분 base) 반환.
-    let mysql_binlog = match dump_handle.finish().await {
-        Ok(coords) => coords,
-        Err(dump_err) => {
-            cleanup(storage, &backup_id).await;
-            return Err(dump_err);
-        }
-    };
-
-    let checksum = checksum_handle
-        .finalize()
-        .ok_or_else(|| XBackupError::Failure("체크섬 확정 실패(이미 소비됨)".into()))?;
-    let stored_size = stored_size_handle.total();
-    let original_size = original_size_handle.total();
+    // 공통 코어: 합성 → 저장 → 종료 판정 → 확정. dump_output이 스냅샷 binlog 좌표
+    // (증분 base — MysqlDumpHandle::finish의 반환값)다.
+    let stored = store_dump_stream(
+        storage,
+        Box::pin(dump),
+        stages,
+        &progress_counter,
+        dump_handle,
+    )
+    .await?;
+    let mysql_binlog = stored.dump_output;
 
     let manifest = BackupManifest {
         format_version: FORMAT_VERSION,
-        id: backup_id.clone(),
+        id: stored.backup_id.clone(),
         created_at: Utc::now().to_rfc3339(),
         backup_type: BackupType::Full,
         base_id: None,
@@ -694,33 +770,399 @@ pub async fn run_mysql_full_backup(
             archive_format: Some(my_archive::FORMAT_ID.to_string()),
         },
         selective,
-        original_size_bytes: original_size,
-        stored_size_bytes: stored_size,
+        original_size_bytes: stored.original_size,
+        stored_size_bytes: stored.stored_size,
         compression: meta.compression.clone(),
         encryption: meta.encryption.clone(),
-        checksum_sha256: checksum.clone(),
+        checksum_sha256: stored.checksum.clone(),
         oplog_range: None,
         oplog_count: None,
         promoted_from_gap,
         mysql_binlog,
         status: BackupStatus::Complete,
     };
-    let store = ManifestStore::new(storage);
-    if let Err(write_err) = store.write(&manifest).await {
-        cleanup(storage, &backup_id).await;
-        return Err(write_err);
-    }
+    write_manifest_or_cleanup(storage, &manifest).await?;
 
-    tracing::info!(backup_id = %backup_id, bytes = stored_size, checksum = %checksum, "MySQL 풀 백업 완료");
+    tracing::info!(backup_id = %stored.backup_id, bytes = stored.stored_size, checksum = %stored.checksum, "MySQL 풀 백업 완료");
     Ok(BackupOutcome {
-        backup_id,
-        stored_size_bytes: stored_size,
-        original_size_bytes: original_size,
-        checksum_sha256: checksum,
+        backup_id: stored.backup_id,
+        stored_size_bytes: stored.stored_size,
+        original_size_bytes: stored.original_size,
+        checksum_sha256: stored.checksum,
         topology: Topology::Standalone,
         compression: meta.compression.clone(),
         encryption: meta.encryption.clone(),
         oplog_range: None,
+    })
+}
+
+/// 파일 체인의 풀 백업 세대 좌표 — 모든 파일 풀 백업은 `(1,0)`에서 체인을 시작한다.
+///
+/// 파일 엔진은 oplog ts 대신 **세대 카운터**를 [`OplogRange`]에 일반화해 담는다(P2-2) —
+/// 기존 체인 계약([`crate::manifest::chain`])·`verify --chain`·prune 체인 안전성을 그대로
+/// 재사용하기 위함이다. 좌표는 체인(base_id) 안에서만 의미가 있으므로 풀 백업끼리 같은
+/// 좌표여도 무방하다.
+const FILE_CHAIN_START: OplogTimestamp = OplogTimestamp { t: 1, i: 0 };
+
+/// 파일 인덱스에 예약 경로(`.xb`)가 있으면 거부한다 — 복구가 삭제 지시로 해석하는
+/// 네임스페이스라 사용자 데이터와 충돌한다.
+fn reject_reserved_paths(index: &crate::engine::file::index::FileIndex) -> Result<()> {
+    let reserved = index
+        .entries
+        .keys()
+        .any(|p| p == ".xb" || p.starts_with(".xb/"));
+    if reserved {
+        return Err(XBackupError::Usage(
+            "백업 소스에 예약 경로 '.xb'가 있습니다 — 파일 엔진이 내부 메타(tombstone)에 \
+             쓰는 이름이라 백업할 수 없습니다"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// 인덱스 사이드카(`<id>/index.json.zst`)를 기록한다. 실패 시 산출물 정리 후 전파.
+async fn write_file_index_or_cleanup(
+    storage: &dyn Storage,
+    backup_id: &str,
+    index: &crate::engine::file::index::FileIndex,
+) -> Result<()> {
+    let bytes = index.encode().await?;
+    let reader: BoxAsyncRead = Box::pin(std::io::Cursor::new(bytes));
+    if let Err(e) = storage
+        .put_stream(
+            &crate::manifest::store::file_index_path(backup_id),
+            reader,
+            None,
+        )
+        .await
+    {
+        cleanup(storage, backup_id).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// 파일 증분 백업 결과.
+#[derive(Debug)]
+pub struct FileIncrementalOutcome {
+    pub backup_id: String,
+    pub base_id: Option<String>,
+    /// 변경 엔트리 수(변경/신규 + 삭제; 0이면 빈 슬라이스).
+    pub change_count: u64,
+    pub stored_size_bytes: u64,
+    /// diff 기준(체인 헤드 인덱스) 소실로 풀 백업으로 승격됐는지(exit 4 신호).
+    pub promoted: bool,
+}
+
+/// 파일 증분 백업(P2-2) — 체인 헤드의 스냅샷 인덱스와 현재 트리를 대조해 변경/신규
+/// 파일 + 삭제 tombstone만 담는 슬라이스(`xb-file-incr-v1`)를 저장한다.
+///
+/// - base(최신 파일 풀백업)가 없으면 사용법 오류 — 풀 백업을 먼저 요구한다.
+/// - 체인 헤드의 인덱스 사이드카를 읽지 못하면(**gap** — prune 오조작·버전 불일치 등)
+///   풀 백업으로 승격한다(promoted=true, 핸들러가 exit 4로 신호 — DB 엔진들과 동일 계약).
+/// - 변경이 없으면 빈 슬라이스(data.bin 없이 manifest+인덱스만)로 체인 좌표를 유지한다.
+pub async fn run_file_incremental_backup(
+    source_path: std::path::PathBuf,
+    storage: &dyn Storage,
+    stages: StageStack,
+    meta: BackupMeta,
+    progress_counter: Option<Arc<AtomicU64>>,
+) -> Result<FileIncrementalOutcome> {
+    use crate::engine::file::index::FileIndex;
+
+    // 1) 체인 수집: 최신 파일 풀백업(base) + 그 증분들 → 헤드(다음 diff 기준) 결정.
+    let Some(chain) = collect_file_chain(storage).await? else {
+        return Err(XBackupError::Usage(
+            "파일 증분(--type incr)에는 base 풀 백업이 필요합니다 — 먼저 \
+             `backup --type full`을 수행하세요."
+                .into(),
+        ));
+    };
+
+    // 2) 헤드 인덱스 로드 — 실패는 gap: diff 기준이 없으므로 풀로 승격한다.
+    let prev_index = match read_file_index(storage, &chain.head_id).await {
+        Ok(idx) => idx,
+        Err(e) => {
+            tracing::warn!(
+                head = %chain.head_id,
+                "파일 증분 gap(체인 헤드 인덱스 읽기 실패: {e}) — 풀 백업으로 승격"
+            );
+            let outcome = run_file_full_backup_inner(
+                source_path,
+                storage,
+                stages,
+                meta,
+                progress_counter,
+                /* promoted_from_gap */ true,
+            )
+            .await?;
+            return Ok(FileIncrementalOutcome {
+                backup_id: outcome.backup_id,
+                base_id: None,
+                change_count: 0,
+                stored_size_bytes: outcome.stored_size_bytes,
+                promoted: true,
+            });
+        }
+    };
+
+    // 3) 현재 인덱스 + diff.
+    let cur_index = FileIndex::build(&source_path)?;
+    reject_reserved_paths(&cur_index)?;
+    let diff = cur_index.diff_from(&prev_index);
+
+    let start = OplogTimestamp::new(chain.head_gen, 0);
+    let (backup_id, stored_size, original_size, checksum, end) = if diff.is_empty() {
+        // 4a) 빈 슬라이스 — data 없이 인덱스+manifest만(mongo 증분과 동일 계약:
+        //     start==end, oplog_count=0). 체인 헤드가 이 백업으로 전진한다.
+        (
+            Uuid::now_v7().to_string(),
+            0u64,
+            0u64,
+            crate::pipeline::incremental::empty_sha256(),
+            start,
+        )
+    } else {
+        // 4b) 변경 슬라이스 — 변경/신규 tar + tombstone을 공통 코어로 저장.
+        let dumper = crate::engine::file::backup::FileDumper::open(source_path)?;
+        let dump = dumper.dump_incremental_stream(diff.changed.clone(), diff.deleted.clone());
+        let dump_handle = dump.handle();
+        let stored = store_dump_stream(
+            storage,
+            Box::pin(dump),
+            stages,
+            &progress_counter,
+            dump_handle,
+        )
+        .await?;
+        (
+            stored.backup_id,
+            stored.stored_size,
+            stored.original_size,
+            stored.checksum,
+            OplogTimestamp::new(chain.head_gen + 1, 0),
+        )
+    };
+
+    // 5) 인덱스 사이드카 → manifest(마지막이 manifest — 존재가 완결성의 신호).
+    write_file_index_or_cleanup(storage, &backup_id, &cur_index).await?;
+    let manifest = BackupManifest {
+        format_version: FORMAT_VERSION,
+        id: backup_id.clone(),
+        created_at: Utc::now().to_rfc3339(),
+        backup_type: BackupType::Incremental,
+        base_id: Some(chain.base_id.clone()),
+        topology: Topology::Standalone,
+        server_version: "-".to_string(),
+        tool_versions: ToolVersions {
+            mongodump: None,
+            archive_format: Some(crate::engine::file::INCR_FORMAT_ID.to_string()),
+        },
+        selective: false,
+        original_size_bytes: original_size,
+        stored_size_bytes: stored_size,
+        compression: meta.compression.clone(),
+        encryption: meta.encryption.clone(),
+        checksum_sha256: checksum,
+        oplog_range: Some(OplogRange {
+            start_ts: start,
+            end_ts: end,
+        }),
+        oplog_count: Some(diff.count()),
+        promoted_from_gap: false,
+        mysql_binlog: None,
+        status: BackupStatus::Complete,
+    };
+    write_manifest_or_cleanup(storage, &manifest).await?;
+
+    tracing::info!(
+        backup_id = %backup_id,
+        base_id = %chain.base_id,
+        changes = diff.count(),
+        bytes = stored_size,
+        "파일 증분 백업 완료"
+    );
+    Ok(FileIncrementalOutcome {
+        backup_id,
+        base_id: Some(chain.base_id),
+        change_count: diff.count(),
+        stored_size_bytes: stored_size,
+        promoted: false,
+    })
+}
+
+/// 파일 체인 현황 — base 풀백업과 diff 기준이 되는 헤드.
+pub(crate) struct FileChain {
+    /// 최신 파일 풀백업 ID(체인 base).
+    pub(crate) base_id: String,
+    /// 체인 헤드 백업 ID(base 또는 마지막 증분) — 이 백업의 인덱스가 diff 기준.
+    pub(crate) head_id: String,
+    /// 헤드의 세대(end.t) — 다음 슬라이스는 (head_gen, 0)에서 시작한다.
+    pub(crate) head_gen: u32,
+}
+
+/// destination에서 최신 파일 풀백업과 그 체인 헤드를 찾는다. 파일 풀백업이 없으면 None.
+pub(crate) async fn collect_file_chain(storage: &dyn Storage) -> Result<Option<FileChain>> {
+    let ids = crate::pipeline::verify::collect_manifest_ids(storage).await?;
+    let store = ManifestStore::new(storage);
+
+    let mut base: Option<BackupManifest> = None;
+    let mut manifests = Vec::new();
+    for id in &ids {
+        let Ok(m) = store.read(id).await else {
+            continue;
+        };
+        let is_file_full = m.backup_type == BackupType::Full
+            && m.status == BackupStatus::Complete
+            && m.tool_versions.archive_format.as_deref() == Some(crate::engine::file::FORMAT_ID);
+        if is_file_full {
+            // UUID v7 = 시간 정렬 — id 사전순 최대가 최신.
+            let newer = base.as_ref().map(|b| m.id > b.id).unwrap_or(true);
+            if newer {
+                base = Some(m.clone());
+            }
+        }
+        manifests.push(m);
+    }
+    let Some(base) = base else { return Ok(None) };
+
+    // base의 증분들 중 헤드(최대 end.t; 동률이면 id 최신 — 빈 슬라이스 연속 대응).
+    let mut head_id = base.id.clone();
+    let mut head_gen = FILE_CHAIN_START.t;
+    for m in &manifests {
+        let in_chain = m.backup_type == BackupType::Incremental
+            && m.status == BackupStatus::Complete
+            && m.base_id.as_deref() == Some(base.id.as_str())
+            && m.tool_versions.archive_format.as_deref()
+                == Some(crate::engine::file::INCR_FORMAT_ID);
+        if !in_chain {
+            continue;
+        }
+        let Some(range) = m.oplog_range else { continue };
+        let gen = range.end_ts.t;
+        if gen > head_gen || (gen == head_gen && m.id > head_id) {
+            head_gen = gen;
+            head_id = m.id.clone();
+        }
+    }
+    Ok(Some(FileChain {
+        base_id: base.id,
+        head_id,
+        head_gen,
+    }))
+}
+
+/// 백업의 인덱스 사이드카를 읽어 디코드한다.
+async fn read_file_index(
+    storage: &dyn Storage,
+    backup_id: &str,
+) -> Result<crate::engine::file::index::FileIndex> {
+    use tokio::io::AsyncReadExt;
+    let mut stream = storage
+        .get_stream(&crate::manifest::store::file_index_path(backup_id))
+        .await?;
+    let mut bytes = Vec::new();
+    stream
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|e| XBackupError::Failure(format!("인덱스 사이드카 읽기 실패: {e}")))?;
+    crate::engine::file::index::FileIndex::decode(&bytes).await
+}
+
+/// 파일/디렉터리 풀 백업 — 로컬 경로의 tar 스트림(`xb-file-tar-v1`)을 압축→암호화→저장
+/// 파이프라인에 흘린다(P2-1). DB 메타(oplog/topology/서버 버전)가 없어 manifest는
+/// Standalone·버전 `-`로 기록한다. 복구는 manifest.archive_format으로 파일 엔진을 고른다.
+pub async fn run_file_full_backup(
+    source_path: std::path::PathBuf,
+    storage: &dyn Storage,
+    stages: StageStack,
+    meta: BackupMeta,
+    progress_counter: Option<Arc<AtomicU64>>,
+) -> Result<BackupOutcome> {
+    run_file_full_backup_inner(
+        source_path,
+        storage,
+        stages,
+        meta,
+        progress_counter,
+        /* promoted_from_gap */ false,
+    )
+    .await
+}
+
+/// 풀 백업 본체 — 증분의 gap 승격 경로가 `promoted_from_gap=true`로 재사용한다(P2-2).
+/// 증분 diff의 기준이 될 스냅샷 인덱스를 사이드카로 함께 기록하고, 체인 시작 좌표
+/// ([`FILE_CHAIN_START`])를 manifest에 담는다.
+async fn run_file_full_backup_inner(
+    source_path: std::path::PathBuf,
+    storage: &dyn Storage,
+    stages: StageStack,
+    meta: BackupMeta,
+    progress_counter: Option<Arc<AtomicU64>>,
+    promoted_from_gap: bool,
+) -> Result<BackupOutcome> {
+    // 인덱스를 dump보다 먼저 뜬다 — dump 도중 변한 파일은 인덱스보다 새 내용이 담기고,
+    // 다음 증분이 (더 새로운 mtime을 보고) 다시 담는다: 누락이 아닌 중복 방향의 안전.
+    let index = crate::engine::file::index::FileIndex::build(&source_path)?;
+    reject_reserved_paths(&index)?;
+
+    let dump = crate::engine::file::backup::FileDumper::open(source_path)?.dump_stream();
+    let dump_handle = dump.handle();
+
+    // 공통 코어: 합성 → 저장 → 종료 판정 → 확정(DB 엔진들과 동일 골격).
+    let stored = store_dump_stream(
+        storage,
+        Box::pin(dump),
+        stages,
+        &progress_counter,
+        dump_handle,
+    )
+    .await?;
+
+    // 인덱스 사이드카 → manifest 순서(마지막이 manifest — 존재가 완결성의 신호).
+    write_file_index_or_cleanup(storage, &stored.backup_id, &index).await?;
+
+    let oplog_range = Some(OplogRange {
+        start_ts: FILE_CHAIN_START,
+        end_ts: FILE_CHAIN_START,
+    });
+    let manifest = BackupManifest {
+        format_version: FORMAT_VERSION,
+        id: stored.backup_id.clone(),
+        created_at: Utc::now().to_rfc3339(),
+        backup_type: BackupType::Full,
+        base_id: None,
+        topology: Topology::Standalone,
+        server_version: "-".to_string(),
+        tool_versions: ToolVersions {
+            mongodump: None,
+            archive_format: Some(crate::engine::file::FORMAT_ID.to_string()),
+        },
+        selective: false,
+        original_size_bytes: stored.original_size,
+        stored_size_bytes: stored.stored_size,
+        compression: meta.compression.clone(),
+        encryption: meta.encryption.clone(),
+        checksum_sha256: stored.checksum.clone(),
+        oplog_range,
+        oplog_count: None,
+        promoted_from_gap,
+        mysql_binlog: None,
+        status: BackupStatus::Complete,
+    };
+    write_manifest_or_cleanup(storage, &manifest).await?;
+
+    tracing::info!(backup_id = %stored.backup_id, bytes = stored.stored_size, checksum = %stored.checksum, "파일 풀 백업 완료");
+    Ok(BackupOutcome {
+        backup_id: stored.backup_id,
+        stored_size_bytes: stored.stored_size,
+        original_size_bytes: stored.original_size,
+        checksum_sha256: stored.checksum,
+        topology: Topology::Standalone,
+        compression: meta.compression.clone(),
+        encryption: meta.encryption.clone(),
+        oplog_range,
     })
 }
 
@@ -1143,6 +1585,31 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::AsyncReadExt;
 
+    // ── Engine::parse — legacy-mongodump feature 게이트(P0-2) ──
+
+    #[test]
+    fn engine_parse_native_always_ok() {
+        assert_eq!(Engine::parse("native").unwrap(), Engine::Native);
+        assert_eq!(Engine::parse("bogus").unwrap_err().exit_code(), 2);
+    }
+
+    #[cfg(feature = "legacy-mongodump")]
+    #[test]
+    fn engine_parse_mongodump_ok_with_legacy_feature() {
+        assert_eq!(Engine::parse("mongodump").unwrap(), Engine::Mongodump);
+    }
+
+    #[cfg(not(feature = "legacy-mongodump"))]
+    #[test]
+    fn engine_parse_mongodump_rejected_without_legacy_feature() {
+        let err = Engine::parse("mongodump").unwrap_err();
+        assert_eq!(err.exit_code(), 2, "설정 오류(exit 2)여야 함");
+        assert!(
+            err.to_string().contains("legacy-mongodump"),
+            "feature 안내 누락: {err}"
+        );
+    }
+
     // 이 모듈의 단위 테스트는 드라이버·서브프로세스를 제외한 *저장 측* 합성 로직에
     // 집중한다(메타 질의·dump 스폰은 각 모듈 테스트와 통합 테스트가 담당). 여기서는
     // sha256 tee + put_stream + cleanup 호출 규약을 MockStorage로 검증한다.
@@ -1170,11 +1637,12 @@ mod tests {
 
     /// cleanup은 data/manifest/사이드카 3종 모두에 delete를 시도해야 한다.
     #[tokio::test]
-    async fn cleanup_deletes_all_three_artifacts() {
+    async fn cleanup_deletes_all_known_artifacts() {
         let mut mock = MockStorage::new();
         let deleted = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let d = Arc::clone(&deleted);
-        mock.expect_delete().times(3).returning(move |p| {
+        // data + manifest + 사이드카 + 파일 인덱스(P2-2) = 4개.
+        mock.expect_delete().times(4).returning(move |p| {
             d.lock().unwrap().push(p.to_string());
             Ok(())
         });
