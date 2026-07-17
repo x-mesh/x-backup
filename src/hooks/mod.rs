@@ -390,6 +390,23 @@ mod tests {
         set(cfg).run_observe(HookEvent::PostBackup, &ctx()).await;
     }
 
+    /// --no-hooks(enabled=false)면 관측 훅도 실행하지 않는다(부수효과 없음).
+    #[tokio::test]
+    async fn disabled_observe_does_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let cfg = HooksConfig {
+            post_backup: Some(format!("touch '{}'", marker.display())),
+            ..Default::default()
+        };
+        let hs = HookSet::new(cfg, false, vec![]);
+        hs.run_observe(HookEvent::PostBackup, &ctx()).await;
+        assert!(
+            !marker.exists(),
+            "--no-hooks면 관측 훅이 실행되지 않아야 함"
+        );
+    }
+
     #[tokio::test]
     async fn gate_times_out() {
         let cfg = HooksConfig {

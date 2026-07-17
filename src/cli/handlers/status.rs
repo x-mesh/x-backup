@@ -459,7 +459,13 @@ async fn recoverable_item(
             .with_value(lang.sel("access failed", "접근 실패"))
         }
     };
-    match latest_manifest_any(storage.as_ref()).await {
+    // 복구 가능 base는 실제 복원 가능한 것만 — Complete만 본다(Incomplete 최신이 복구 시점을
+    // 낙관 과대보고하는 것을 막는다; 실제 restore base 선택기와 동일 기준).
+    match latest_manifest_where(storage.as_ref(), |m| {
+        m.status == crate::manifest::schema::BackupStatus::Complete
+    })
+    .await
+    {
         Some(m) => match recoverable_until_rfc3339(&m) {
             Some(until) => {
                 let gap = format_age_rfc3339(&until, lang);
@@ -590,8 +596,19 @@ async fn destination_item(
     }
 }
 
-/// destination의 모든 백업 중 **created_at 최신** manifest를 고른다(타입 무관). 없으면 None.
+/// destination의 모든 백업 중 **created_at 최신** manifest를 고른다(타입·상태 무관). 없으면 None.
 async fn latest_manifest_any(storage: &dyn Storage) -> Option<BackupManifest> {
+    latest_manifest_where(storage, |_| true).await
+}
+
+/// `pred`를 만족하는 백업 중 **created_at 최신** manifest를 고른다. 없으면 None.
+///
+/// recoverable은 실제 복원 가능한 base만 봐야 하므로 `status == Complete` 필터로 쓴다(Incomplete
+/// 최신이 복구 시점을 낙관 과대보고하는 것을 막는다). last-backup 표시는 `|_| true`로 쓴다.
+async fn latest_manifest_where<P>(storage: &dyn Storage, pred: P) -> Option<BackupManifest>
+where
+    P: Fn(&BackupManifest) -> bool,
+{
     let store = ManifestStore::new(storage);
     let entries = storage.list("").await.ok()?;
     let suffix = "/manifest.json";
@@ -610,6 +627,9 @@ async fn latest_manifest_any(storage: &dyn Storage) -> Option<BackupManifest> {
     let mut best: Option<BackupManifest> = None;
     for id in ids {
         if let Ok(m) = store.read(&id).await {
+            if !pred(&m) {
+                continue;
+            }
             // created_at은 RFC3339(UTC, 동일 오프셋)라 문자열 비교가 시간순과 일치한다.
             let newer = best
                 .as_ref()
@@ -1603,6 +1623,43 @@ mod tests {
             recoverable_until_rfc3339(&m).as_deref(),
             Some("2026-06-12T13:00:00+00:00")
         );
+    }
+
+    /// F2 회귀: recoverable은 Complete만 골라야 한다 — 더 최신인 Incomplete가 있어도
+    /// 복구 시점으로 오보하지 않는다(latest_manifest_where(Complete)).
+    #[tokio::test]
+    async fn recoverable_where_skips_newer_incomplete() {
+        fn manifest(id: &str, created: &str, status: &str) -> BackupManifest {
+            let v = serde_json::json!({
+                "format_version": 1, "id": id, "created_at": created,
+                "backup_type": "full", "topology": "replica_set", "server_version": "7.0.0",
+                "selective": false, "original_size_bytes": 0, "stored_size_bytes": 0,
+                "checksum_sha256": "abc", "status": status
+            });
+            serde_json::from_value(v).unwrap()
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fs = crate::storage::LocalFs::new(dir.path()).unwrap();
+        let store = crate::manifest::store::ManifestStore::new(&fs);
+        // Complete는 과거(10:00), Incomplete는 더 최신(12:00).
+        store
+            .write(&manifest("c1", "2026-06-12T10:00:00+00:00", "complete"))
+            .await
+            .unwrap();
+        store
+            .write(&manifest("i1", "2026-06-12T12:00:00+00:00", "incomplete"))
+            .await
+            .unwrap();
+
+        // Complete 필터: 더 최신 Incomplete를 건너뛰고 Complete(c1)를 고른다.
+        let complete = latest_manifest_where(&fs, |m| {
+            m.status == crate::manifest::schema::BackupStatus::Complete
+        })
+        .await
+        .unwrap();
+        assert_eq!(complete.id, "c1");
+        // 무필터(last-backup 표시용)는 최신 Incomplete(i1)를 고른다 — 기존 동작 유지.
+        assert_eq!(latest_manifest_any(&fs).await.unwrap().id, "i1");
     }
 
     #[test]

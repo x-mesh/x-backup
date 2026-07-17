@@ -57,24 +57,7 @@ pub async fn handle(
     // 2) 백업 읽기 소스 URI 확보(PRD-05). 우선순위: CLI --read-source > config read_uri(복제본)
     //    > 주 소스(uri). 복제본에서 읽으면 primary 부하를 분리한다. build_stages가 &resolved를
     //    쓰므로 clone으로 꺼내 부분 이동을 피한다(Secret은 Clone).
-    let uri = if let Some(rs) = args.read_source.as_deref().filter(|s| !s.is_empty()) {
-        tracing::info!("--read-source 지정 — 복제본에서 백업을 읽습니다(primary 부하 분리)");
-        Secret::new(rs.to_string())
-    } else {
-        let from_replica = resolved.resolved_read_uri.is_some();
-        let u = resolved.effective_read_uri().cloned().ok_or_else(|| {
-            XBackupError::Config(format!(
-                "프로파일 '{}'에 source.uri_env/uri가 없거나 해석되지 않았습니다",
-                resolved.profile_name
-            ))
-        })?;
-        if from_replica {
-            tracing::info!(
-                "source.read_uri 지정 — 복제본에서 백업을 읽습니다(primary 부하 분리)"
-            );
-        }
-        u
-    };
+    let uri = select_read_uri(args.read_source.as_deref(), &resolved)?;
     // 접속 타임아웃(초) — config source.connect_timeout_secs(미설정이면 None → 기본 5초).
     let timeout_secs = resolved.profile.source.connect_timeout_secs;
 
@@ -277,47 +260,84 @@ pub async fn handle(
     .await;
 
     // 결과에 따라 관측 훅(post_backup / on_error)을 실행한다(작업 판정은 바꾸지 않음).
+    // 성공(exit 0)·경고 동반 성공(exit 4, gap 승격 등)은 백업이 이뤄진 것 → post_backup.
+    let event = post_hook_event(&result);
     hook_ctx.ended_at = Some(chrono::Utc::now().to_rfc3339());
-    match &result {
-        // 성공(exit 0)·경고 동반 성공(exit 4, gap 승격 등)은 백업이 이뤄진 것 → post_backup.
-        Ok(_) => {
-            hook_ctx.status = Some("ok".to_string());
-            hook_ctx.exit_code = Some(0);
-            hooks.run_observe(HookEvent::PostBackup, &hook_ctx).await;
+    hook_ctx.status = Some(
+        if event == HookEvent::PostBackup {
+            "ok"
+        } else {
+            "failed"
         }
-        Err(e) if e.is_warning() => {
-            hook_ctx.status = Some("ok".to_string());
-            hook_ctx.exit_code = Some(i32::from(e.exit_code()));
-            hook_ctx.error = Some(e.to_string());
-            hooks.run_observe(HookEvent::PostBackup, &hook_ctx).await;
-        }
-        Err(e) => {
-            hook_ctx.status = Some("failed".to_string());
-            hook_ctx.exit_code = Some(i32::from(e.exit_code()));
-            hook_ctx.error = Some(e.to_string());
-            hooks.run_observe(HookEvent::OnError, &hook_ctx).await;
-        }
+        .to_string(),
+    );
+    if let Err(e) = &result {
+        hook_ctx.exit_code = Some(i32::from(e.exit_code()));
+        hook_ctx.error = Some(e.to_string());
+    } else {
+        hook_ctx.exit_code = Some(0);
     }
+    hooks.run_observe(event, &hook_ctx).await;
     result
 }
 
+/// 백업 결과를 관측 훅 이벤트로 매핑한다. 성공(exit 0)과 경고 동반 성공(exit 4 —
+/// gap 승격·보조 복제 실패 등 산출물은 존재)은 `post_backup`, 실제 실패는 `on_error`.
+fn post_hook_event(result: &Result<()>) -> HookEvent {
+    match result {
+        Ok(_) => HookEvent::PostBackup,
+        Err(e) if e.is_warning() => HookEvent::PostBackup,
+        Err(_) => HookEvent::OnError,
+    }
+}
+
+/// 백업 읽기 소스 URI를 우선순위로 고른다(PRD-05): `--read-source` > config `read_uri`(복제본)
+/// > 주 소스(`uri`). 복제본에서 읽으면 primary 부하를 분리한다. 아무 소스도 없으면 Config 에러.
+fn select_read_uri(read_source: Option<&str>, resolved: &ResolvedConfig) -> Result<Secret> {
+    if let Some(rs) = read_source.filter(|s| !s.is_empty()) {
+        tracing::info!("--read-source 지정 — 복제본에서 백업을 읽습니다(primary 부하 분리)");
+        return Ok(Secret::new(rs.to_string()));
+    }
+    let from_replica = resolved.resolved_read_uri.is_some();
+    let uri = resolved.effective_read_uri().cloned().ok_or_else(|| {
+        XBackupError::Config(format!(
+            "프로파일 '{}'에 source.uri_env/uri가 없거나 해석되지 않았습니다",
+            resolved.profile_name
+        ))
+    })?;
+    if from_replica {
+        tracing::info!("source.read_uri 지정 — 복제본에서 백업을 읽습니다(primary 부하 분리)");
+    }
+    Ok(uri)
+}
+
 /// 프로파일 훅 설정 + 시크릿 env 목록으로 [`HookSet`]을 만든다(`--no-hooks`면 비활성).
-///
-/// 시크릿 env(NFR-2)로 제거할 이름: source `uri_env` + 각 destination S3 `credentials_env`.
-/// AES 키(env)는 [`HookSet`]이 상수로 함께 제거한다.
 fn build_hookset(resolved: &ResolvedConfig, no_hooks: bool) -> HookSet {
+    let secret_env = collect_secret_env_names(&resolved.profile);
+    HookSet::new(resolved.profile.hooks.clone(), !no_hooks, secret_env)
+}
+
+/// 훅 env에서 제거할 시크릿 env 변수 이름을 모은다(NFR-2).
+///
+/// source `uri_env`(주 소스) + `read_uri_env`(복제본 — 대개 같은 자격증명) + 각 destination
+/// S3 `credentials_env`. AES 키(env)는 [`HookSet`]이 상수로 함께 제거하므로 여기 포함하지 않는다.
+fn collect_secret_env_names(profile: &crate::config::file::Profile) -> Vec<String> {
     let mut secret_env = Vec::new();
-    if let Some(name) = &resolved.profile.source.uri_env {
+    if let Some(name) = &profile.source.uri_env {
         secret_env.push(name.clone());
     }
-    for dest in resolved.profile.effective_destinations() {
+    // read_uri_env(복제본 자격증명)도 반드시 제거한다 — 누락되면 복제본 비밀번호가 훅으로 샌다.
+    if let Some(name) = &profile.source.read_uri_env {
+        secret_env.push(name.clone());
+    }
+    for dest in profile.effective_destinations() {
         if let Some(s3) = &dest.s3 {
             if let Some(creds) = &s3.credentials_env {
                 secret_env.push(creds.clone());
             }
         }
     }
-    HookSet::new(resolved.profile.hooks.clone(), !no_hooks, secret_env)
+    secret_env
 }
 
 /// DB 종류를 훅 컨텍스트용 엔진 라벨(`XB_ENGINE`)로 — mongodb/postgresql/mysql.
@@ -1518,5 +1538,81 @@ mod tests {
             Err(e) => e.exit_code(),
         };
         assert_eq!(code, 2);
+    }
+
+    /// F1 회귀: 훅 시크릿 스크럽 목록이 uri_env + read_uri_env + s3 credentials_env를 모두 포함.
+    #[test]
+    fn collect_secret_env_includes_read_uri_env() {
+        let mut profile = Profile::default();
+        profile.source.uri_env = Some("MAIN_URI".to_string());
+        profile.source.read_uri_env = Some("REPLICA_URI".to_string());
+        profile.destination.r#type = Some("s3".to_string());
+        profile.destination.s3 = Some(crate::config::file::S3Config {
+            credentials_env: Some("S3_CREDS".to_string()),
+            ..Default::default()
+        });
+        let names = collect_secret_env_names(&profile);
+        assert!(names.contains(&"MAIN_URI".to_string()));
+        assert!(
+            names.contains(&"REPLICA_URI".to_string()),
+            "read_uri_env(복제본 자격증명)가 스크럽 목록에 있어야 함(NFR-2): {names:?}"
+        );
+        assert!(names.contains(&"S3_CREDS".to_string()));
+    }
+
+    /// select_read_uri: --read-source(CLI)가 config read_uri보다 우선한다.
+    #[test]
+    fn read_source_cli_beats_config() {
+        let profile = Profile::default();
+        let mut resolved = resolved_with(profile);
+        resolved.resolved_read_uri = Some(Secret::new("mongodb://replica/db".to_string()));
+        resolved.resolved_uri = Some(Secret::new("mongodb://primary/db".to_string()));
+        let uri = select_read_uri(Some("mongodb://cli/db"), &resolved).unwrap();
+        assert_eq!(uri.expose(), "mongodb://cli/db");
+    }
+
+    /// select_read_uri: CLI 없으면 config read_uri(복제본)를 쓴다.
+    #[test]
+    fn read_source_uses_config_read_uri() {
+        let mut resolved = resolved_with(Profile::default());
+        resolved.resolved_read_uri = Some(Secret::new("mongodb://replica/db".to_string()));
+        resolved.resolved_uri = Some(Secret::new("mongodb://primary/db".to_string()));
+        assert_eq!(
+            select_read_uri(None, &resolved).unwrap().expose(),
+            "mongodb://replica/db"
+        );
+    }
+
+    /// select_read_uri: read 소스가 없으면 주 소스로 폴백한다.
+    #[test]
+    fn read_source_falls_back_to_primary() {
+        let mut resolved = resolved_with(Profile::default());
+        resolved.resolved_uri = Some(Secret::new("mongodb://primary/db".to_string()));
+        assert_eq!(
+            select_read_uri(None, &resolved).unwrap().expose(),
+            "mongodb://primary/db"
+        );
+    }
+
+    /// select_read_uri: 아무 소스도 없으면 Config 에러(exit 2).
+    #[test]
+    fn read_source_none_is_config_error() {
+        let resolved = resolved_with(Profile::default());
+        let err = select_read_uri(None, &resolved).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    /// post_hook_event: 성공(0)·경고 동반 성공(4)은 post_backup, 실패는 on_error.
+    #[test]
+    fn post_hook_event_maps_result_to_event() {
+        assert_eq!(post_hook_event(&Ok(())), HookEvent::PostBackup);
+        assert_eq!(
+            post_hook_event(&Err(XBackupError::Warning("gap 승격".into()))),
+            HookEvent::PostBackup
+        );
+        assert_eq!(
+            post_hook_event(&Err(XBackupError::Failure("업로드 실패".into()))),
+            HookEvent::OnError
+        );
     }
 }

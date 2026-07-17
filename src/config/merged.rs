@@ -105,11 +105,24 @@ impl ResolvedConfig {
         //    폴백한다. 둘 다 없으면 None(URI가 필요한 핸들러가 이후 명확히 거부).
         let resolved_uri = resolve_source_uri(&profile.source, &secret_lookup)?;
         // 백업 읽기 전용(복제본) URI — read_uri_env > read_uri. 둘 다 없으면 None(폴백).
-        let resolved_read_uri = resolve_uri_pair(
+        //
+        // read 소스는 **backup 전용·옵셔널**이므로 해석 실패를 하드 에러로 전파하지 않는다.
+        // 예: read_uri_env만 있고 그 env가 이 환경에 없으면, read 소스를 쓰지도 않는
+        // status/list/restore/prune까지 동반 실패한다. 실패는 None으로 강등하고 경고만 남긴다
+        // (backup은 effective_read_uri로 주 소스에 폴백; 운영자는 경고로 인지).
+        let resolved_read_uri = match resolve_uri_pair(
             profile.source.read_uri_env.as_deref(),
             profile.source.read_uri.as_deref(),
             &secret_lookup,
-        )?;
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    "read 소스 URI 해석 실패(backup 시에만 필요 — 주 소스로 폴백): {e}"
+                );
+                None
+            }
+        };
 
         Ok(Self {
             profile_name: effective_name,
