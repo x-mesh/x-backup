@@ -58,6 +58,42 @@ pub struct Profile {
     /// 없을 때). 비어 있으면 prune은 명시적 CLI 기준이 필요하다.
     #[serde(default)]
     pub retention: RetentionConfig,
+    /// 생명주기 훅 — `[profiles.<name>.hooks]`. 백업/복구/prune 전후에 사용자 셸 명령을
+    /// 실행한다(PRD-04). 모두 선택적이며 미지정이면 훅 없음.
+    #[serde(default)]
+    pub hooks: HooksConfig,
+}
+
+/// 생명주기 훅 설정 — `[profiles.<name>.hooks]`. 각 지점의 명령(셸 문자열)은 선택적이다.
+///
+/// `pre_*`는 게이트(비-0 종료면 작업 중단), `post_*`/`on_error`는 관측(실패해도 경고만).
+/// 실행·환경변수·마스킹은 [`crate::hooks`]가 담당한다.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HooksConfig {
+    /// 백업 시작 전(게이트).
+    #[serde(default)]
+    pub pre_backup: Option<String>,
+    /// 백업 성공 후(관측).
+    #[serde(default)]
+    pub post_backup: Option<String>,
+    /// 복구 시작 전(게이트).
+    #[serde(default)]
+    pub pre_restore: Option<String>,
+    /// 복구 성공 후(관측).
+    #[serde(default)]
+    pub post_restore: Option<String>,
+    /// prune 시작 전(게이트).
+    #[serde(default)]
+    pub pre_prune: Option<String>,
+    /// prune 성공 후(관측).
+    #[serde(default)]
+    pub post_prune: Option<String>,
+    /// 어느 단계든 실패 시(관측).
+    #[serde(default)]
+    pub on_error: Option<String>,
+    /// 각 훅의 타임아웃(초). 미지정/0이면 기본값(60초).
+    #[serde(default)]
+    pub hook_timeout_secs: Option<u64>,
 }
 
 /// 보존 정책 설정 — `[profiles.<name>.retention]`. prune이 CLI 플래그가 없을 때 기본값으로
@@ -492,5 +528,20 @@ path = \"/var/b2\"
         )
         .unwrap();
         assert!(!cfg3.profile("p").unwrap().is_endpoint_only());
+    }
+
+    /// v1 nested `[profiles.<name>.hooks]`가 파싱되어 Profile.hooks로 들어간다(PRD-04).
+    #[test]
+    fn parses_hooks_v1_nested() {
+        let toml = "[profiles.p.source]\nuri = \"mongodb://h/db\"\n\
+                    [profiles.p.hooks]\npre_backup = \"echo hi\"\non_error = \"pager.sh\"\n\
+                    hook_timeout_secs = 30\n";
+        let cfg = Config::from_toml_str(toml).unwrap();
+        let p = cfg.profile("p").unwrap();
+        assert_eq!(p.hooks.pre_backup.as_deref(), Some("echo hi"));
+        assert_eq!(p.hooks.on_error.as_deref(), Some("pager.sh"));
+        assert_eq!(p.hooks.hook_timeout_secs, Some(30));
+        // 미지정 훅은 None.
+        assert!(p.hooks.post_backup.is_none());
     }
 }

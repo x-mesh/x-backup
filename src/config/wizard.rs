@@ -310,6 +310,7 @@ pub fn run_wizard(prompt: &mut dyn Prompt) -> Result<Config> {
             },
         },
         retention: crate::config::file::RetentionConfig::default(),
+        hooks: crate::config::file::HooksConfig::default(),
     };
 
     let mut config = Config {

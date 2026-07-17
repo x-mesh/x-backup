@@ -168,6 +168,9 @@ pub struct BackupArgs {
     /// 백업 전 사전 점검(status)을 건너뛴다.
     #[arg(long)]
     pub skip_precheck: bool,
+    /// 생명주기 훅(pre/post/on_error)을 이번 실행에서 비활성화한다(PRD-04).
+    #[arg(long)]
+    pub no_hooks: bool,
 }
 
 /// `restore` — PRD §9 restore 플래그 전체.

@@ -19,6 +19,7 @@ use crate::config::ResolvedConfig;
 use crate::crypto::build_encrypt_stage;
 use crate::engine::mongo::status::{human_bytes, CheckStatus, StatusChecker};
 use crate::error::{Result, XBackupError};
+use crate::hooks::{HookContext, HookEvent, HookSet};
 use crate::i18n::Lang;
 use crate::manifest::schema::{CompressionMeta, EncryptionMeta, OplogRange, Topology};
 use crate::pipeline::backup::{run_full_backup_with_meta, BackupMeta, BackupRequest, Engine};
@@ -74,7 +75,6 @@ pub async fn handle(
         .cloned()
         .collect();
     let primary = from_config(&dests[0])?;
-    let secondaries = &dests[1..];
 
     // 출력 모드 결정(R15) — CLI(--json>--quiet>--progress) > config(mode.output) > TTY 자동.
     // 진행 표시·요약 출력 분기에 일관 사용한다.
@@ -91,6 +91,23 @@ pub async fn handle(
     // 실행 컨텍스트(프로파일·DB) 표시 — 다중 DB 툴이라 무엇을 백업하는지 항상 보인다.
     let db = crate::engine::DbKind::from_uri(uri.expose());
     crate::cli::output::print_run_context(&resolved.profile_name, Some(db), mode);
+
+    // PRD-04 생명주기 훅 — pre_backup 게이트(비-0이면 백업 미시작) → 백업 실행 →
+    //   결과에 따라 post_backup(성공·경고 동반 성공) 또는 on_error(실패) 관측 훅.
+    let hooks = build_hookset(&resolved, args.no_hooks);
+    let mut hook_ctx = HookContext {
+        profile: resolved.profile_name.clone(),
+        engine: Some(db_hook_label(db).to_string()),
+        backup_type: Some(backup_type_label(backup_type).to_string()),
+        started_at: Some(chrono::Utc::now().to_rfc3339()),
+        ..Default::default()
+    };
+    hooks.run_gate(HookEvent::PreBackup, &hook_ctx).await?;
+
+    // 실제 백업을 async 블록으로 감싸 한 Result로 모은다(pg/mysql/mongo·full/incr의
+    //   여러 early-return을 블록의 반환으로 수렴). uri 등은 여기서 소비된다.
+    let result: Result<()> = async move {
+    let secondaries = &dests[1..];
 
     // DB 종류 분기 — source URI 스킴이 postgres면 PostgreSQL 경로(드라이버 COPY, oplog/토폴로지
     //   개념 없음)로 빠진다. 그 외(mongodb)는 아래 Mongo 경로.
@@ -243,6 +260,68 @@ pub async fn handle(
         return Err(XBackupError::Warning(w));
     }
     Ok(())
+    }
+    .await;
+
+    // 결과에 따라 관측 훅(post_backup / on_error)을 실행한다(작업 판정은 바꾸지 않음).
+    hook_ctx.ended_at = Some(chrono::Utc::now().to_rfc3339());
+    match &result {
+        // 성공(exit 0)·경고 동반 성공(exit 4, gap 승격 등)은 백업이 이뤄진 것 → post_backup.
+        Ok(_) => {
+            hook_ctx.status = Some("ok".to_string());
+            hook_ctx.exit_code = Some(0);
+            hooks.run_observe(HookEvent::PostBackup, &hook_ctx).await;
+        }
+        Err(e) if e.is_warning() => {
+            hook_ctx.status = Some("ok".to_string());
+            hook_ctx.exit_code = Some(i32::from(e.exit_code()));
+            hook_ctx.error = Some(e.to_string());
+            hooks.run_observe(HookEvent::PostBackup, &hook_ctx).await;
+        }
+        Err(e) => {
+            hook_ctx.status = Some("failed".to_string());
+            hook_ctx.exit_code = Some(i32::from(e.exit_code()));
+            hook_ctx.error = Some(e.to_string());
+            hooks.run_observe(HookEvent::OnError, &hook_ctx).await;
+        }
+    }
+    result
+}
+
+/// 프로파일 훅 설정 + 시크릿 env 목록으로 [`HookSet`]을 만든다(`--no-hooks`면 비활성).
+///
+/// 시크릿 env(NFR-2)로 제거할 이름: source `uri_env` + 각 destination S3 `credentials_env`.
+/// AES 키(env)는 [`HookSet`]이 상수로 함께 제거한다.
+fn build_hookset(resolved: &ResolvedConfig, no_hooks: bool) -> HookSet {
+    let mut secret_env = Vec::new();
+    if let Some(name) = &resolved.profile.source.uri_env {
+        secret_env.push(name.clone());
+    }
+    for dest in resolved.profile.effective_destinations() {
+        if let Some(s3) = &dest.s3 {
+            if let Some(creds) = &s3.credentials_env {
+                secret_env.push(creds.clone());
+            }
+        }
+    }
+    HookSet::new(resolved.profile.hooks.clone(), !no_hooks, secret_env)
+}
+
+/// DB 종류를 훅 컨텍스트용 엔진 라벨(`XB_ENGINE`)로 — mongodb/postgresql/mysql.
+fn db_hook_label(db: crate::engine::DbKind) -> &'static str {
+    match db {
+        crate::engine::DbKind::Mongo => "mongodb",
+        crate::engine::DbKind::Postgres => "postgresql",
+        crate::engine::DbKind::Mysql => "mysql",
+    }
+}
+
+/// 백업 유형을 훅 컨텍스트용 라벨(`XB_BACKUP_TYPE`)로 — full/incremental.
+fn backup_type_label(bt: BackupType) -> &'static str {
+    match bt {
+        BackupType::Full => "full",
+        BackupType::Incr => "incremental",
+    }
 }
 
 /// 백업이 저장된 위치를 사람이 읽는 한 줄로 만든다(완료 요약 표시용).
@@ -1347,6 +1426,7 @@ mod tests {
             progress: false,
             json: false,
             skip_precheck: false,
+            no_hooks: false,
         }
     }
 

@@ -188,6 +188,7 @@ fn expand_profile(name: &str, flat: &Table) -> Result<Table> {
     let mut encryption = Table::new();
     let mut incremental = Table::new();
     let mut retention = Table::new();
+    let mut hooks = Table::new();
     let mut destinations: Option<Value> = None;
 
     for (k, v) in flat {
@@ -235,6 +236,15 @@ fn expand_profile(name: &str, flat: &Table) -> Result<Table> {
             "keep_full" => insert_into(&mut retention, "keep_full", v),
             "keep_days" => insert_into(&mut retention, "keep_days", v),
             "keep_last" => insert_into(&mut retention, "keep_last", v),
+            // ── hooks ── (flat `hook_*` → hooks.*)
+            "hook_pre_backup" => insert_into(&mut hooks, "pre_backup", v),
+            "hook_post_backup" => insert_into(&mut hooks, "post_backup", v),
+            "hook_pre_restore" => insert_into(&mut hooks, "pre_restore", v),
+            "hook_post_restore" => insert_into(&mut hooks, "post_restore", v),
+            "hook_pre_prune" => insert_into(&mut hooks, "pre_prune", v),
+            "hook_post_prune" => insert_into(&mut hooks, "post_prune", v),
+            "hook_on_error" => insert_into(&mut hooks, "on_error", v),
+            "hook_timeout_secs" => insert_into(&mut hooks, "hook_timeout_secs", v),
             "extends" => {} // 이미 소비됨
             other => {
                 return Err(cfg_err(format!(
@@ -277,6 +287,9 @@ fn expand_profile(name: &str, flat: &Table) -> Result<Table> {
     }
     if !retention.is_empty() {
         profile.insert("retention".to_string(), Value::Table(retention));
+    }
+    if !hooks.is_empty() {
+        profile.insert("hooks".to_string(), Value::Table(hooks));
     }
 
     Ok(profile)
@@ -1251,5 +1264,20 @@ mod tests {
             mk_target("postgres://xbackup@localhost:5433/db_restore"),
         );
         roundtrip(&cfg);
+    }
+
+    /// v2 flat `hook_*` 키가 hooks.* nested로 정규화되어 파싱된다(PRD-04). 미지의 키로
+    /// 거부되지 않아야 한다.
+    #[test]
+    fn v2_flat_hooks_map_to_nested() {
+        let toml = "[profile.p]\nuri = \"mongodb://h/db\"\n\
+                    hook_pre_backup = \"quiesce.sh\"\nhook_post_backup = \"notify.sh\"\n\
+                    hook_on_error = \"pager.sh\"\nhook_timeout_secs = 15\n";
+        let cfg = crate::config::file::Config::from_toml_str(toml).unwrap();
+        let p = cfg.profile("p").unwrap();
+        assert_eq!(p.hooks.pre_backup.as_deref(), Some("quiesce.sh"));
+        assert_eq!(p.hooks.post_backup.as_deref(), Some("notify.sh"));
+        assert_eq!(p.hooks.on_error.as_deref(), Some("pager.sh"));
+        assert_eq!(p.hooks.hook_timeout_secs, Some(15));
     }
 }
