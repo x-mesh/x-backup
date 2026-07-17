@@ -223,11 +223,18 @@ impl HookSet {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true); // 타임아웃으로 future가 drop되면 자식 프로세스도 종료.
+            .kill_on_drop(true); // 타임아웃으로 future가 drop되면 직계 자식(sh)을 종료.
+        // 자식을 **새 프로세스 그룹**의 리더로 만든다(pgid = 자식 pid). 타임아웃 시 그룹 전체에
+        // SIGKILL을 보내 `sh -c "a && b"`가 fork한 손자까지 정리한다(kill_on_drop은 직계만 잡음).
+        #[cfg(unix)]
+        command.process_group(0);
 
         let child = command
             .spawn()
             .map_err(|e| XBackupError::Failure(format!("훅 프로세스 시작 실패: {e}")))?;
+        // wait_with_output이 child를 소비하므로 pid(=pgid)를 미리 확보한다.
+        #[cfg(unix)]
+        let pgid = child.id();
 
         match timeout(self.timeout(), child.wait_with_output()).await {
             Ok(Ok(output)) => {
@@ -235,10 +242,22 @@ impl HookSet {
                 Ok(output.status)
             }
             Ok(Err(e)) => Err(XBackupError::Failure(format!("훅 실행 오류: {e}"))),
-            Err(_elapsed) => Err(XBackupError::Failure(format!(
-                "훅 타임아웃({}초 초과) — 프로세스를 종료했습니다",
-                self.timeout().as_secs()
-            ))),
+            Err(_elapsed) => {
+                // future drop → kill_on_drop이 직계 sh를 죽인다. 손자까지 확실히 정리하려고
+                // 프로세스 그룹 전체(-pgid)에 SIGKILL을 보낸다.
+                #[cfg(unix)]
+                if let Some(pid) = pgid {
+                    // SAFETY: 음수 인자 = 프로세스 그룹 전체. 위 process_group(0)로 우리가 만든
+                    // 그룹(pgid = 이 자식 pid)만 대상이며, 반환값(이미 종료 등)은 무시해도 안전하다.
+                    unsafe {
+                        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                    }
+                }
+                Err(XBackupError::Failure(format!(
+                    "훅 타임아웃({}초 초과) — 프로세스를 종료했습니다",
+                    self.timeout().as_secs()
+                )))
+            }
         }
     }
 }
@@ -260,7 +279,9 @@ fn log_hook_output(output: &std::process::Output) {
 /// 문자열에서 자격증명이 담긴 URI(`scheme://user:pass@host`)의 userinfo를 `***`로 마스킹한다.
 ///
 /// `postgresql://u:p@h/db` → `postgresql://***@h/db`. 정규식 의존 없이 스캔한다 — `"://"`를
-/// 찾고, 그 뒤 authority 경계(`/` · 공백 · 끝) 이전에 `@`가 있으면 사이를 지운다.
+/// 찾고, 그 뒤 authority 구간(공백·`?`·`#`·끝 이전)에서 **마지막 `@`**를 userinfo/host 경계로
+/// 본다. 경계에 `/`를 넣지 않으므로, percent-encoding 안 된 password 내 `/`(예: `u:pa/ss@h`)도
+/// 마스킹된다(F5). host에는 `@`가 올 수 없으므로 `@`가 있으면 곧 자격증명이다.
 pub fn mask_secrets(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let bytes = s.as_bytes();
@@ -269,14 +290,15 @@ pub fn mask_secrets(s: &str) -> String {
         if bytes[i..].starts_with(b"://") {
             out.push_str("://");
             i += 3;
-            // authority 끝 경계를 찾는다.
+            // authority 구간 끝 — 공백/쿼리(`?`)/프래그먼트(`#`)/끝. `/`는 경계가 아니다
+            // (password에 인코딩 안 된 `/`가 올 수 있으므로). 구간 내 마지막 `@`가 userinfo 끝.
             let start = i;
             let mut end = bytes.len();
             let mut at: Option<usize> = None;
             let mut j = start;
             while j < bytes.len() {
                 match bytes[j] {
-                    b'/' | b' ' | b'\t' | b'\n' | b'\r' => {
+                    b' ' | b'\t' | b'\n' | b'\r' | b'?' | b'#' => {
                         end = j;
                         break;
                     }
@@ -287,7 +309,7 @@ pub fn mask_secrets(s: &str) -> String {
             }
             match at.filter(|&a| a < end) {
                 Some(a) => {
-                    // userinfo(start..a) 마스킹, host(a..end)는 보존.
+                    // userinfo(start..a) 마스킹, host+경로(a..end)는 보존.
                     out.push_str("***");
                     out.push_str(&s[a..end]);
                 }
@@ -464,6 +486,20 @@ mod tests {
     fn mask_leaves_non_credential_uri() {
         assert_eq!(mask_secrets("https://host/path"), "https://host/path");
         assert_eq!(mask_secrets("no uri here"), "no uri here");
+    }
+
+    /// F5: password에 인코딩 안 된 `/`가 있어도 userinfo 전체가 마스킹된다(경계가 `/`가 아님).
+    #[test]
+    fn mask_handles_slash_in_password() {
+        assert_eq!(
+            mask_secrets("postgresql://user:pa/ss@host/db"),
+            "postgresql://***@host/db"
+        );
+        // 쿼리 스트링 경계도 유지(? 이전까지가 authority).
+        assert_eq!(
+            mask_secrets("mongodb://a:b@h/?replicaSet=rs0"),
+            "mongodb://***@h/?replicaSet=rs0"
+        );
     }
 
     #[test]

@@ -688,6 +688,43 @@ mod tests {
         assert_eq!(plan.targets[0].base_id, "c1");
     }
 
+    /// recovery-window(F8): base가 윈도우 밖이라도 **최근 증분**이 붙어 있으면 체인이 윈도우
+    /// 내부로 들어와 base+증분 전부 보존된다(newest_created 기준). 임의 시점 복구 보장의 핵심.
+    #[test]
+    fn recovery_window_keeps_chain_pulled_in_by_recent_increment() {
+        let mut all = Vec::new();
+        all.extend(chain("c-old", 10 * DAY, &[])); // 오래된 풀 체인(증분 없음).
+        all.extend(chain("c-mid", 20 * DAY, &[("i1", 95 * DAY)])); // base 오래됐지만 증분 최근.
+        let policy = RetentionPolicy {
+            recovery_window_days: Some(30), // now=100 → cutoff=70.
+            ..Default::default()
+        };
+        let plan = plan_prune(&all, &[], policy, 100 * DAY);
+        // c-mid: base(20)는 cutoff(70) 밖이지만 증분(95)이 윈도우 내부라 체인 전체 보존.
+        assert!(plan.kept_base_ids.contains(&"c-mid".to_string()), "{plan:?}");
+        // c-old(newest 10 < 70, 경계 base도 아님 — c-mid가 경계)는 삭제.
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].base_id, "c-old");
+        // 보존된 c-mid 삭제가 아니라, c-old만 삭제 — c-mid의 증분도 함께 살아있다(체인 단위).
+        let survivors: Vec<&String> = plan.kept_base_ids.iter().collect();
+        assert!(survivors.contains(&&"c-mid".to_string()));
+    }
+
+    /// min_redundancy가 존재 체인 수보다 크면 전부 보존한다(패닉 없이, idx<M 항상 참).
+    #[test]
+    fn min_redundancy_larger_than_chains_keeps_all() {
+        let mut all = Vec::new();
+        all.extend(chain("c1", 10 * DAY, &[]));
+        all.extend(chain("c2", 50 * DAY, &[]));
+        let policy = RetentionPolicy {
+            min_redundancy: Some(5), // 체인은 2개뿐.
+            ..Default::default()
+        };
+        let plan = plan_prune(&all, &[], policy, 100 * DAY);
+        assert!(plan.is_empty(), "{plan:?}");
+        assert_eq!(plan.kept_base_ids.len(), 2);
+    }
+
     /// 보존 기준 미지정이면 아무것도 삭제하지 않는다(안전).
     #[test]
     fn no_policy_deletes_nothing() {
