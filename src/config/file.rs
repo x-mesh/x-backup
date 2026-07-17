@@ -110,6 +110,14 @@ pub struct RetentionConfig {
     /// 최신 백업 N개 보존(체인 단위로 누적 — 예: 100이면 최신 체인부터 누적 100벌까지 유지).
     #[serde(default)]
     pub keep_last: Option<u32>,
+    /// 복구 보장 윈도우(일) — 지난 N일 임의 시점 복구를 보장한다(PRD-02). 윈도우 내부 체인
+    /// 전부 + 윈도우 경계를 커버하는 가장 최근의 경계 base 1개를 보존한다(keep_days와 달리
+    /// "생성 시각"이 아니라 "복구 가능"을 보장).
+    #[serde(default)]
+    pub recovery_window_days: Option<u32>,
+    /// 최소 이중화 — 어떤 규칙이든 최소 M개의 완결 풀 체인은 남긴다(단일 손상 대비).
+    #[serde(default)]
+    pub min_redundancy: Option<u32>,
 }
 
 impl Profile {

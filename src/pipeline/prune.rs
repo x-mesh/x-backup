@@ -46,12 +46,23 @@ pub struct RetentionPolicy {
     /// 최신 백업 N벌 보존 — 체인 단위로 누적(최신 체인부터 멤버 수를 더해 N에 도달할 때까지
     /// 유지). 체인을 쪼개지 않으므로 살아있는 증분의 base가 단독 삭제되지 않는다.
     pub keep_last: Option<u32>,
+    /// 복구 보장 윈도우(일, PRD-02 INV-1) — 지난 N일 임의 시점 복구를 보장한다. 윈도우
+    /// 내부 체인 전부 + 윈도우 경계를 커버하는 **가장 최근의 경계 base 1개**를 보존한다.
+    /// keep_days가 "생성 시각"으로 거르는 것과 달리, 경계 base까지 살려 경계 시점 복구를
+    /// 성립시킨다.
+    pub recovery_window_days: Option<u32>,
+    /// 최소 이중화(PRD-02 INV-3) — 어떤 규칙이든 최소 M개의 완결 풀 체인은 남긴다.
+    pub min_redundancy: Option<u32>,
 }
 
 impl RetentionPolicy {
     /// 보존 기준이 하나도 없으면 true(이 경우 아무것도 삭제하지 않는다).
     pub fn is_unspecified(&self) -> bool {
-        self.keep_full.is_none() && self.keep_days.is_none() && self.keep_last.is_none()
+        self.keep_full.is_none()
+            && self.keep_days.is_none()
+            && self.keep_last.is_none()
+            && self.recovery_window_days.is_none()
+            && self.min_redundancy.is_none()
     }
 }
 
@@ -184,6 +195,14 @@ pub fn plan_prune(
     let mut targets = Vec::new();
     let mut kept_base_ids = Vec::new();
     let keep_days_cutoff = policy.keep_days.map(|d| now_secs - (d as i64) * 86_400);
+    // recovery-window: 지난 N일 임의 시점 복구를 보장(INV-1). 윈도우 경계 시각.
+    let window_cutoff = policy
+        .recovery_window_days
+        .map(|d| now_secs - (d as i64) * 86_400);
+    // 경계 base(INV-1) — chains는 base 생성 시각 내림차순이므로, 경계 시각 이하로 시작한
+    // 가장 최근(첫) 체인이 경계 시점을 커버하는 base다. 이 하나를 반드시 보존한다.
+    let boundary_idx =
+        window_cutoff.and_then(|cut| chains.iter().position(|c| c.base_created <= cut));
     // keep-last: 최신 체인부터 멤버 수를 누적해 N벌에 도달할 때까지 보존(체인 단위).
     let mut members_before = 0usize;
 
@@ -203,7 +222,14 @@ pub fn plan_prune(
             .is_some_and(|n| members_before < n as usize);
         members_before += chain.member_ids.len();
 
-        if kept_by_full || kept_by_days || kept_by_last {
+        // recovery-window(INV-1): 윈도우 내부(최신 구성원이 경계 이후) 체인 전부 보존 +
+        //   경계 base 1개 보존(경계 시점 복구 성립).
+        let kept_by_window = window_cutoff.is_some_and(|cut| chain.newest_created >= cut)
+            || boundary_idx == Some(idx);
+        // min_redundancy(INV-3): 최신 M개 체인은 무조건 보존.
+        let kept_by_redundancy = policy.min_redundancy.is_some_and(|m| idx < m as usize);
+
+        if kept_by_full || kept_by_days || kept_by_last || kept_by_window || kept_by_redundancy {
             kept_base_ids.push(chain.base_id.clone());
         } else {
             let reason = prune_reason(policy, idx);
@@ -274,6 +300,12 @@ fn prune_reason(policy: RetentionPolicy, idx: usize) -> String {
     }
     if let Some(l) = policy.keep_last {
         parts.push(format!("keep-last {l}"));
+    }
+    if let Some(w) = policy.recovery_window_days {
+        parts.push(format!("recovery-window {w}d"));
+    }
+    if let Some(m) = policy.min_redundancy {
+        parts.push(format!("min-redundancy {m}"));
     }
     if parts.is_empty() {
         "no retention rule".to_string() // 도달하지 않음(is_unspecified 가드).
@@ -517,6 +549,7 @@ mod tests {
             keep_full: Some(1),
             keep_days: None,
             keep_last: None,
+            ..Default::default()
         };
         let plan = plan_prune(&all, &[], policy, 3_000 * DAY);
 
@@ -539,6 +572,7 @@ mod tests {
             keep_full: None,
             keep_days: Some(30),
             keep_last: None,
+            ..Default::default()
         };
         let plan = plan_prune(&all, &[], policy, 110 * DAY);
 
@@ -563,6 +597,7 @@ mod tests {
             keep_full: Some(0), // 0개 보존 → 모두 삭제.
             keep_days: None,
             keep_last: None,
+            ..Default::default()
         };
         let plan = plan_prune(&all, &[], policy, 100 * DAY);
         assert_eq!(plan.targets.len(), 1);
@@ -585,11 +620,70 @@ mod tests {
             keep_full: Some(1),  // c3만.
             keep_days: Some(10), // now=105 → cutoff=95 → c2(95)·c3(100) 보존.
             keep_last: None,
+            ..Default::default()
         };
         let plan = plan_prune(&all, &[], policy, 105 * DAY);
         // c2, c3 보존(합집합), c1만 삭제.
         assert!(plan.kept_base_ids.contains(&"c2".to_string()));
         assert!(plan.kept_base_ids.contains(&"c3".to_string()));
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].base_id, "c1");
+    }
+
+    /// recovery-window(INV-1): 윈도우 경계보다 오래된 base라도, 경계 시점을 커버하는 가장
+    /// 최근의 경계 base 1개는 반드시 보존한다(그게 없으면 경계 시점 복구 불가).
+    #[test]
+    fn recovery_window_keeps_boundary_base() {
+        // 풀 체인 3개: c1(10일), c2(50일), c3(90일). now=100일, window=30일 → cutoff=70일.
+        let mut all = Vec::new();
+        all.extend(chain("c1", 10 * DAY, &[]));
+        all.extend(chain("c2", 50 * DAY, &[]));
+        all.extend(chain("c3", 90 * DAY, &[]));
+        let policy = RetentionPolicy {
+            recovery_window_days: Some(30),
+            ..Default::default()
+        };
+        let plan = plan_prune(&all, &[], policy, 100 * DAY);
+        // c3(90≥70) 윈도우 내부 보존, c2(50)는 경계(70) 이하 최근 base라 경계 보존,
+        // c1(10)만 삭제.
+        assert!(plan.kept_base_ids.contains(&"c3".to_string()), "{plan:?}");
+        assert!(
+            plan.kept_base_ids.contains(&"c2".to_string()),
+            "경계 base c2가 보존돼야 함(경계 시점 복구): {plan:?}"
+        );
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].base_id, "c1");
+    }
+
+    /// recovery-window: 모든 체인이 윈도우 내부면 아무것도 삭제하지 않는다.
+    #[test]
+    fn recovery_window_all_inside_deletes_nothing() {
+        let mut all = Vec::new();
+        all.extend(chain("c1", 95 * DAY, &[]));
+        all.extend(chain("c2", 99 * DAY, &[]));
+        let policy = RetentionPolicy {
+            recovery_window_days: Some(30), // now=100 → cutoff=70, 둘 다 ≥70.
+            ..Default::default()
+        };
+        let plan = plan_prune(&all, &[], policy, 100 * DAY);
+        assert!(plan.is_empty(), "{plan:?}");
+    }
+
+    /// min_redundancy(INV-3): 다른 규칙이 없어도 최신 M개 완결 체인은 남긴다.
+    #[test]
+    fn min_redundancy_keeps_m_newest() {
+        let mut all = Vec::new();
+        all.extend(chain("c1", 10 * DAY, &[]));
+        all.extend(chain("c2", 50 * DAY, &[]));
+        all.extend(chain("c3", 90 * DAY, &[]));
+        let policy = RetentionPolicy {
+            min_redundancy: Some(2),
+            ..Default::default()
+        };
+        let plan = plan_prune(&all, &[], policy, 100 * DAY);
+        // 최신 2개(c3, c2) 보존, c1 삭제.
+        assert!(plan.kept_base_ids.contains(&"c3".to_string()));
+        assert!(plan.kept_base_ids.contains(&"c2".to_string()));
         assert_eq!(plan.targets.len(), 1);
         assert_eq!(plan.targets[0].base_id, "c1");
     }
@@ -611,6 +705,7 @@ mod tests {
             keep_full: Some(10), // base는 보존.
             keep_days: None,
             keep_last: None,
+            ..Default::default()
         };
         let plan = plan_prune(&all, &["ghost".to_string()], policy, 100 * DAY);
         // base는 보존, ghost는 orphan 타깃.
@@ -632,6 +727,7 @@ mod tests {
             keep_full: Some(10),
             keep_days: None,
             keep_last: None,
+            ..Default::default()
         };
         let plan = plan_prune(&[m], &[], policy, 100 * DAY);
         let t = plan.targets.iter().find(|t| t.base_id == "inc").unwrap();

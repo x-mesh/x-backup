@@ -236,6 +236,8 @@ fn expand_profile(name: &str, flat: &Table) -> Result<Table> {
             "keep_full" => insert_into(&mut retention, "keep_full", v),
             "keep_days" => insert_into(&mut retention, "keep_days", v),
             "keep_last" => insert_into(&mut retention, "keep_last", v),
+            "recovery_window_days" => insert_into(&mut retention, "recovery_window_days", v),
+            "min_redundancy" => insert_into(&mut retention, "min_redundancy", v),
             // ── hooks ── (flat `hook_*` → hooks.*)
             "hook_pre_backup" => insert_into(&mut hooks, "pre_backup", v),
             "hook_post_backup" => insert_into(&mut hooks, "post_backup", v),
@@ -1144,6 +1146,7 @@ mod tests {
                     keep_full: Some(3),
                     keep_days: Some(14),
                     keep_last: None,
+                    ..Default::default()
                 },
                 ..Profile::default()
             },

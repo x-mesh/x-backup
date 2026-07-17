@@ -296,6 +296,12 @@ pub struct PruneArgs {
     /// 최신 백업 N벌을 보존한다(체인 단위 누적). 미지정 시 config retention.keep_last.
     #[arg(long, value_name = "N")]
     pub keep_last: Option<u32>,
+    /// 복구 보장 윈도우(일) — 지난 N일 임의 시점 복구를 보장한다(경계 base까지 보존, PRD-02).
+    #[arg(long, value_name = "N")]
+    pub recovery_window_days: Option<u32>,
+    /// 최소 이중화 — 어떤 규칙이든 최소 M개 풀 체인은 남긴다(PRD-02).
+    #[arg(long, value_name = "M")]
+    pub min_redundancy: Option<u32>,
     /// 실제 삭제 없이 삭제 대상 목록만 출력한다.
     #[arg(long)]
     pub dry_run: bool,

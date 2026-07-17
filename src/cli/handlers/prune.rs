@@ -62,6 +62,10 @@ pub async fn handle(
         keep_full: args.keep_full.or(cfg_ret.keep_full),
         keep_days: args.keep_days.or(cfg_ret.keep_days),
         keep_last: args.keep_last.or(cfg_ret.keep_last),
+        recovery_window_days: args
+            .recovery_window_days
+            .or(cfg_ret.recovery_window_days),
+        min_redundancy: args.min_redundancy.or(cfg_ret.min_redundancy),
     };
 
     // manifest·orphan 수집 → 순수 판정.
