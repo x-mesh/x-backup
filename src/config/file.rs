@@ -58,6 +58,42 @@ pub struct Profile {
     /// 없을 때). 비어 있으면 prune은 명시적 CLI 기준이 필요하다.
     #[serde(default)]
     pub retention: RetentionConfig,
+    /// 생명주기 훅 — `[profiles.<name>.hooks]`. 백업/복구/prune 전후에 사용자 셸 명령을
+    /// 실행한다(PRD-04). 모두 선택적이며 미지정이면 훅 없음.
+    #[serde(default)]
+    pub hooks: HooksConfig,
+}
+
+/// 생명주기 훅 설정 — `[profiles.<name>.hooks]`. 각 지점의 명령(셸 문자열)은 선택적이다.
+///
+/// `pre_*`는 게이트(비-0 종료면 작업 중단), `post_*`/`on_error`는 관측(실패해도 경고만).
+/// 실행·환경변수·마스킹은 [`crate::hooks`]가 담당한다.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HooksConfig {
+    /// 백업 시작 전(게이트).
+    #[serde(default)]
+    pub pre_backup: Option<String>,
+    /// 백업 성공 후(관측).
+    #[serde(default)]
+    pub post_backup: Option<String>,
+    /// 복구 시작 전(게이트).
+    #[serde(default)]
+    pub pre_restore: Option<String>,
+    /// 복구 성공 후(관측).
+    #[serde(default)]
+    pub post_restore: Option<String>,
+    /// prune 시작 전(게이트).
+    #[serde(default)]
+    pub pre_prune: Option<String>,
+    /// prune 성공 후(관측).
+    #[serde(default)]
+    pub post_prune: Option<String>,
+    /// 어느 단계든 실패 시(관측).
+    #[serde(default)]
+    pub on_error: Option<String>,
+    /// 각 훅의 타임아웃(초). 미지정/0이면 기본값(60초).
+    #[serde(default)]
+    pub hook_timeout_secs: Option<u64>,
 }
 
 /// 보존 정책 설정 — `[profiles.<name>.retention]`. prune이 CLI 플래그가 없을 때 기본값으로
@@ -74,6 +110,14 @@ pub struct RetentionConfig {
     /// 최신 백업 N개 보존(체인 단위로 누적 — 예: 100이면 최신 체인부터 누적 100벌까지 유지).
     #[serde(default)]
     pub keep_last: Option<u32>,
+    /// 복구 보장 윈도우(일) — 지난 N일 임의 시점 복구를 보장한다(PRD-02). 윈도우 내부 체인
+    /// 전부 + 윈도우 경계를 커버하는 가장 최근의 경계 base 1개를 보존한다(keep_days와 달리
+    /// "생성 시각"이 아니라 "복구 가능"을 보장).
+    #[serde(default)]
+    pub recovery_window_days: Option<u32>,
+    /// 최소 이중화 — 어떤 규칙이든 최소 M개의 완결 풀 체인은 남긴다(단일 손상 대비).
+    #[serde(default)]
+    pub min_redundancy: Option<u32>,
 }
 
 impl Profile {
@@ -151,6 +195,15 @@ pub struct SourceConfig {
     /// 가능하면 secondary에서 백업할지 여부.
     #[serde(default)]
     pub prefer_secondary: bool,
+    /// **백업 읽기 전용** 소스 URI(복제본) — primary 부하 분리(PRD-05). 지정하면 backup은
+    /// 이 URI에서 읽고, `uri`/`uri_env`는 제어/메타용으로 남는다. 미지정이면 backup도
+    /// `uri`/`uri_env`를 쓴다. 비밀번호가 있으면 [`read_uri_env`](Self::read_uri_env)를 쓴다.
+    #[serde(default)]
+    pub read_uri: Option<String>,
+    /// 백업 읽기 전용 소스 URI가 담긴 **환경변수 이름**(시크릿 평문 저장 금지). `read_uri`보다
+    /// 우선한다(env가 설정돼 있으면 그 값, 비었으면 `read_uri` 리터럴로 폴백).
+    #[serde(default)]
+    pub read_uri_env: Option<String>,
     /// MongoDB 접속(server-selection/connect) 타임아웃(초). 미지정 시 기본 5초.
     ///
     /// 이 프로파일로 실행하는 모든 명령의 MongoDB 연결(source·`--target` 모두)에 적용된다.
@@ -472,10 +525,9 @@ path = \"/var/b2\"
     #[test]
     fn is_endpoint_only_detects_source_only_profile() {
         // source만 있는 프로파일 → endpoint 전용.
-        let cfg = Config::from_toml_str(
-            "[profiles.dr.source]\nuri = \"mongodb://localhost:27117/db\"\n",
-        )
-        .unwrap();
+        let cfg =
+            Config::from_toml_str("[profiles.dr.source]\nuri = \"mongodb://localhost:27117/db\"\n")
+                .unwrap();
         assert!(cfg.profile("dr").unwrap().is_endpoint_only());
 
         // destination이 있으면 endpoint 전용이 아니다(backup 잡).
@@ -492,5 +544,20 @@ path = \"/var/b2\"
         )
         .unwrap();
         assert!(!cfg3.profile("p").unwrap().is_endpoint_only());
+    }
+
+    /// v1 nested `[profiles.<name>.hooks]`가 파싱되어 Profile.hooks로 들어간다(PRD-04).
+    #[test]
+    fn parses_hooks_v1_nested() {
+        let toml = "[profiles.p.source]\nuri = \"mongodb://h/db\"\n\
+                    [profiles.p.hooks]\npre_backup = \"echo hi\"\non_error = \"pager.sh\"\n\
+                    hook_timeout_secs = 30\n";
+        let cfg = Config::from_toml_str(toml).unwrap();
+        let p = cfg.profile("p").unwrap();
+        assert_eq!(p.hooks.pre_backup.as_deref(), Some("echo hi"));
+        assert_eq!(p.hooks.on_error.as_deref(), Some("pager.sh"));
+        assert_eq!(p.hooks.hook_timeout_secs, Some(30));
+        // 미지정 훅은 None.
+        assert!(p.hooks.post_backup.is_none());
     }
 }

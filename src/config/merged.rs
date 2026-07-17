@@ -22,6 +22,19 @@ pub struct ResolvedConfig {
     pub profile: Profile,
     /// `uri_env`로 해석된 MongoDB URI 시크릿(있을 때만).
     pub resolved_uri: Option<Secret>,
+    /// 백업 읽기 전용 소스(복제본) URI 시크릿 — `read_uri_env`/`read_uri`로 해석(PRD-05).
+    /// 미지정이면 `None`(backup은 `resolved_uri`로 폴백).
+    pub resolved_read_uri: Option<Secret>,
+}
+
+impl ResolvedConfig {
+    /// backup이 읽을 실효 소스 — 복제본(`read_uri`)이 있으면 그것, 없으면 주 소스(`uri`).
+    /// restore/status/migrate 등 제어 경로는 `resolved_uri`(주 소스)를 계속 쓴다.
+    pub fn effective_read_uri(&self) -> Option<&Secret> {
+        self.resolved_read_uri
+            .as_ref()
+            .or(self.resolved_uri.as_ref())
+    }
 }
 
 /// 병합 입력. CLI 레이어는 호출자가 결과에 적용하므로 여기서는 file/ENV만 받는다.
@@ -91,11 +104,29 @@ impl ResolvedConfig {
         //    uri_env가 가리키는 env가 설정돼 있으면 그 값을, 비었거나 없으면 직접 uri로
         //    폴백한다. 둘 다 없으면 None(URI가 필요한 핸들러가 이후 명확히 거부).
         let resolved_uri = resolve_source_uri(&profile.source, &secret_lookup)?;
+        // 백업 읽기 전용(복제본) URI — read_uri_env > read_uri. 둘 다 없으면 None(폴백).
+        //
+        // read 소스는 **backup 전용·옵셔널**이므로 해석 실패를 하드 에러로 전파하지 않는다.
+        // 예: read_uri_env만 있고 그 env가 이 환경에 없으면, read 소스를 쓰지도 않는
+        // status/list/restore/prune까지 동반 실패한다. 실패는 None으로 강등하고 경고만 남긴다
+        // (backup은 effective_read_uri로 주 소스에 폴백; 운영자는 경고로 인지).
+        let resolved_read_uri = match resolve_uri_pair(
+            profile.source.read_uri_env.as_deref(),
+            profile.source.read_uri.as_deref(),
+            &secret_lookup,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("read 소스 URI 해석 실패(backup 시에만 필요 — 주 소스로 폴백): {e}");
+                None
+            }
+        };
 
         Ok(Self {
             profile_name: effective_name,
             profile,
             resolved_uri,
+            resolved_read_uri,
         })
     }
 }
@@ -110,23 +141,40 @@ fn resolve_source_uri<F>(source: &SourceConfig, lookup: &F) -> Result<Option<Sec
 where
     F: Fn(&str) -> Option<String>,
 {
-    if let Some(env_name) = source.uri_env.as_deref() {
+    resolve_uri_pair(source.uri_env.as_deref(), source.uri.as_deref(), lookup)
+}
+
+/// `env_name`(env 값) > `literal`(직접) 우선순위로 URI 시크릿을 해석한다.
+///
+/// - `env_name`이 가리키는 env가 설정·비어있지 않으면 그 값.
+/// - 그렇지 않고 `literal`이 있으면 그 값(env 미설정 폴백).
+/// - `env_name`만 있고 env도 `literal`도 없으면 명확한 설정 오류.
+/// - 둘 다 없으면 `None`. source `uri`/`uri_env`와 read 소스 `read_uri`/`read_uri_env`가
+///   공유한다.
+fn resolve_uri_pair<F>(
+    env_name: Option<&str>,
+    literal: Option<&str>,
+    lookup: &F,
+) -> Result<Option<Secret>>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(env_name) = env_name {
         match lookup(env_name) {
             Some(v) if !v.is_empty() => return Ok(Some(Secret::new(v))),
             _ => {
-                if let Some(uri) = source.uri.as_deref().filter(|s| !s.is_empty()) {
+                if let Some(uri) = literal.filter(|s| !s.is_empty()) {
                     return Ok(Some(Secret::new(uri.to_string())));
                 }
                 return Err(XBackupError::Config(format!(
-                    "시크릿 환경변수 '{env_name}'가 설정되지 않았습니다(또는 source.uri로 직접 지정)"
+                    "시크릿 환경변수 '{env_name}'가 설정되지 않았습니다(또는 직접 URI로 지정)"
                 )));
             }
         }
     }
-    Ok(source
-        .uri
-        .as_deref()
+    Ok(literal
         .filter(|s| !s.is_empty())
+        .map(str::to_string)
         .map(Secret::new))
 }
 
@@ -344,6 +392,72 @@ bucket = "db-backups"
         )
         .unwrap();
         assert_eq!(cfg.resolved_uri.unwrap().expose(), "mongodb://literal/db");
+    }
+
+    /// read_uri(복제본)가 해석되어 effective_read_uri가 그것을, 주 소스는 primary를 유지한다.
+    #[test]
+    fn read_uri_resolves_and_is_effective() {
+        let toml = "[profiles.p.source]\nuri = \"mongodb://primary/db\"\n\
+                    read_uri = \"mongodb://replica/db\"\n";
+        let cfg = ResolvedConfig::build_with(
+            MergeInput {
+                config_toml: Some(toml),
+                profile_name: "p",
+                overrides: &[],
+            },
+            lookup(&[]),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.resolved_read_uri.as_ref().unwrap().expose(),
+            "mongodb://replica/db"
+        );
+        assert_eq!(
+            cfg.effective_read_uri().unwrap().expose(),
+            "mongodb://replica/db"
+        );
+        // 제어 경로가 쓰는 주 소스는 그대로 primary.
+        assert_eq!(cfg.resolved_uri.unwrap().expose(), "mongodb://primary/db");
+    }
+
+    /// read_uri_env(env 값)가 read_uri 리터럴보다 우선한다.
+    #[test]
+    fn read_uri_env_beats_literal() {
+        let toml = "[profiles.p.source]\nuri = \"mongodb://primary/db\"\n\
+                    read_uri = \"mongodb://lit/db\"\nread_uri_env = \"READ_URI\"\n";
+        let cfg = ResolvedConfig::build_with(
+            MergeInput {
+                config_toml: Some(toml),
+                profile_name: "p",
+                overrides: &[],
+            },
+            lookup(&[("READ_URI", "mongodb://from-env/db")]),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.resolved_read_uri.unwrap().expose(),
+            "mongodb://from-env/db"
+        );
+    }
+
+    /// read_uri 미지정이면 effective_read_uri는 주 소스로 폴백한다(복제본 없음).
+    #[test]
+    fn no_read_uri_falls_back_to_source() {
+        let toml = "[profiles.p.source]\nuri = \"mongodb://primary/db\"\n";
+        let cfg = ResolvedConfig::build_with(
+            MergeInput {
+                config_toml: Some(toml),
+                profile_name: "p",
+                overrides: &[],
+            },
+            lookup(&[]),
+        )
+        .unwrap();
+        assert!(cfg.resolved_read_uri.is_none());
+        assert_eq!(
+            cfg.effective_read_uri().unwrap().expose(),
+            "mongodb://primary/db"
+        );
     }
 
     /// uri도 uri_env도 없으면 resolved_uri는 None(이후 핸들러가 거부).

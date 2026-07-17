@@ -295,6 +295,7 @@ pub fn run_wizard(prompt: &mut dyn Prompt) -> Result<Config> {
             uri_env,
             prefer_secondary,
             connect_timeout_secs: None,
+            ..Default::default()
         },
         destination,
         destinations: Vec::new(),
@@ -310,6 +311,7 @@ pub fn run_wizard(prompt: &mut dyn Prompt) -> Result<Config> {
             },
         },
         retention: crate::config::file::RetentionConfig::default(),
+        hooks: crate::config::file::HooksConfig::default(),
     };
 
     let mut config = Config {
@@ -494,10 +496,10 @@ mod tests {
     #[test]
     fn direct_uri_accepted_as_source_uri() {
         let answers = vec![
-            "prod",                                                   // 프로파일명
+            "prod",                                                  // 프로파일명
             "\"mongodb://admin:adminpassword@100.100.202.71:27017/", // 변수명 칸에 붙인 URI
-            "n",                                                      // prefer_secondary
-            "local",                                                  // dest
+            "n",                                                     // prefer_secondary
+            "local",                                                 // dest
             "/data",
             "10",
             "n", // 암호화 off
@@ -512,7 +514,10 @@ mod tests {
             Some("mongodb://admin:adminpassword@100.100.202.71:27017/"),
             "양끝 따옴표는 제거하되 URI(끝 `/` 포함)는 그대로 source.uri로 저장돼야 함"
         );
-        assert!(p.source.uri_env.is_none(), "직접 저장이면 uri_env는 없어야 함");
+        assert!(
+            p.source.uri_env.is_none(),
+            "직접 저장이면 uri_env는 없어야 함"
+        );
     }
 
     /// mongodb+srv URI도 직접 입력으로 인식해 source.uri에 저장한다.

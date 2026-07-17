@@ -168,6 +168,13 @@ pub struct BackupArgs {
     /// 백업 전 사전 점검(status)을 건너뛴다.
     #[arg(long)]
     pub skip_precheck: bool,
+    /// 생명주기 훅(pre/post/on_error)을 이번 실행에서 비활성화한다(PRD-04).
+    #[arg(long)]
+    pub no_hooks: bool,
+    /// 백업 읽기 소스(복제본) URI를 이번 실행에서 지정한다(config source.read_uri 오버라이드,
+    /// PRD-05). primary 부하 분리용. 미지정 시 config read_uri → 주 소스 순으로 폴백.
+    #[arg(long, value_name = "URI")]
+    pub read_source: Option<String>,
 }
 
 /// `restore` — PRD §9 restore 플래그 전체.
@@ -293,6 +300,12 @@ pub struct PruneArgs {
     /// 최신 백업 N벌을 보존한다(체인 단위 누적). 미지정 시 config retention.keep_last.
     #[arg(long, value_name = "N")]
     pub keep_last: Option<u32>,
+    /// 복구 보장 윈도우(일) — 지난 N일 임의 시점 복구를 보장한다(경계 base까지 보존, PRD-02).
+    #[arg(long, value_name = "N")]
+    pub recovery_window_days: Option<u32>,
+    /// 최소 이중화 — 어떤 규칙이든 최소 M개 풀 체인은 남긴다(PRD-02).
+    #[arg(long, value_name = "M")]
+    pub min_redundancy: Option<u32>,
     /// 실제 삭제 없이 삭제 대상 목록만 출력한다.
     #[arg(long)]
     pub dry_run: bool,

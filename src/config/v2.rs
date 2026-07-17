@@ -142,7 +142,8 @@ fn resolve_flat(
                     ))
                 })?;
             visiting.push(base_name.clone());
-            let base_flat = resolve_flat(&base_name, base_entity, defaults, bases, profiles, visiting)?;
+            let base_flat =
+                resolve_flat(&base_name, base_entity, defaults, bases, profiles, visiting)?;
             visiting.pop();
             for (k, v) in base_flat {
                 acc.insert(k, v); // base가 defaults를 덮음
@@ -168,7 +169,9 @@ fn extends_names(profile: &str, ext: &Value) -> Result<Vec<String>> {
             .iter()
             .map(|v| {
                 v.as_str().map(str::to_string).ok_or_else(|| {
-                    cfg_err(format!("[profile.{profile}] extends 배열 항목은 문자열이어야 합니다"))
+                    cfg_err(format!(
+                        "[profile.{profile}] extends 배열 항목은 문자열이어야 합니다"
+                    ))
                 })
             })
             .collect(),
@@ -188,6 +191,7 @@ fn expand_profile(name: &str, flat: &Table) -> Result<Table> {
     let mut encryption = Table::new();
     let mut incremental = Table::new();
     let mut retention = Table::new();
+    let mut hooks = Table::new();
     let mut destinations: Option<Value> = None;
 
     for (k, v) in flat {
@@ -195,6 +199,8 @@ fn expand_profile(name: &str, flat: &Table) -> Result<Table> {
             // ── source ──
             "uri" => insert_into(&mut source, "uri", v),
             "uri_env" => insert_into(&mut source, "uri_env", v),
+            "read_uri" => insert_into(&mut source, "read_uri", v),
+            "read_uri_env" => insert_into(&mut source, "read_uri_env", v),
             "prefer_secondary" => insert_into(&mut source, "prefer_secondary", v),
             "connect_timeout_secs" => insert_into(&mut source, "connect_timeout_secs", v),
             // ── mode ── (output_mode → mode.output: 루트 [output]와 혼동 방지)
@@ -235,6 +241,17 @@ fn expand_profile(name: &str, flat: &Table) -> Result<Table> {
             "keep_full" => insert_into(&mut retention, "keep_full", v),
             "keep_days" => insert_into(&mut retention, "keep_days", v),
             "keep_last" => insert_into(&mut retention, "keep_last", v),
+            "recovery_window_days" => insert_into(&mut retention, "recovery_window_days", v),
+            "min_redundancy" => insert_into(&mut retention, "min_redundancy", v),
+            // ── hooks ── (flat `hook_*` → hooks.*)
+            "hook_pre_backup" => insert_into(&mut hooks, "pre_backup", v),
+            "hook_post_backup" => insert_into(&mut hooks, "post_backup", v),
+            "hook_pre_restore" => insert_into(&mut hooks, "pre_restore", v),
+            "hook_post_restore" => insert_into(&mut hooks, "post_restore", v),
+            "hook_pre_prune" => insert_into(&mut hooks, "pre_prune", v),
+            "hook_post_prune" => insert_into(&mut hooks, "post_prune", v),
+            "hook_on_error" => insert_into(&mut hooks, "on_error", v),
+            "hook_timeout_secs" => insert_into(&mut hooks, "hook_timeout_secs", v),
             "extends" => {} // 이미 소비됨
             other => {
                 return Err(cfg_err(format!(
@@ -277,6 +294,9 @@ fn expand_profile(name: &str, flat: &Table) -> Result<Table> {
     }
     if !retention.is_empty() {
         profile.insert("retention".to_string(), Value::Table(retention));
+    }
+    if !hooks.is_empty() {
+        profile.insert("hooks".to_string(), Value::Table(hooks));
     }
 
     Ok(profile)
@@ -334,7 +354,9 @@ fn expand_dest_array(name: &str, arr: &[Value]) -> Result<Value> {
     let mut out = Vec::with_capacity(arr.len());
     for (i, elem) in arr.iter().enumerate() {
         let t = elem.as_table().ok_or_else(|| {
-            cfg_err(format!("[[profile.{name}.dest]] {i}번 항목이 테이블이 아닙니다"))
+            cfg_err(format!(
+                "[[profile.{name}.dest]] {i}번 항목이 테이블이 아닙니다"
+            ))
         })?;
         let mut d = Table::new();
         let mut s3 = Table::new();
@@ -342,7 +364,9 @@ fn expand_dest_array(name: &str, arr: &[Value]) -> Result<Value> {
             match k.as_str() {
                 "dest" => {
                     let s = v.as_str().ok_or_else(|| {
-                        cfg_err(format!("[[profile.{name}.dest]] {i}: dest는 문자열이어야 합니다"))
+                        cfg_err(format!(
+                            "[[profile.{name}.dest]] {i}: dest는 문자열이어야 합니다"
+                        ))
                     })?;
                     parse_dest_compact(name, s, &mut d, &mut s3)?;
                 }
@@ -768,7 +792,10 @@ mod tests {
         let cfg: crate::config::file::Config = v.try_into().unwrap();
         assert_eq!(cfg.default_profile.as_deref(), Some("mongo"));
         let p = cfg.profile("mongo").unwrap();
-        assert_eq!(p.source.uri.as_deref(), Some("mongodb://localhost:27017/db"));
+        assert_eq!(
+            p.source.uri.as_deref(),
+            Some("mongodb://localhost:27017/db")
+        );
         assert_eq!(p.destination.r#type.as_deref(), Some("local"));
         assert_eq!(p.destination.path.as_deref(), Some("/srv/store/mongo"));
         assert_eq!(p.features.compression.algorithm, "zstd");
@@ -831,7 +858,10 @@ mod tests {
         // target: encrypt=false 오버라이드 + destination 없음(endpoint 전용).
         let t = cfg.profile("target").unwrap();
         assert!(!t.features.encryption.enabled);
-        assert!(t.is_endpoint_only(), "target은 dest가 없어 endpoint 전용이어야 함");
+        assert!(
+            t.is_endpoint_only(),
+            "target은 dest가 없어 endpoint 전용이어야 함"
+        );
     }
 
     /// extends 체인(base) — base가 defaults를 덮고, 프로파일이 base를 덮는다.
@@ -852,7 +882,10 @@ mod tests {
         let cfg: crate::config::file::Config = v.try_into().unwrap();
         let p = cfg.profile("prod").unwrap();
         assert_eq!(p.destination.r#type.as_deref(), Some("s3"));
-        assert_eq!(p.features.compression.level, 9, "base가 defaults(3)를 덮어 9");
+        assert_eq!(
+            p.features.compression.level, 9,
+            "base가 defaults(3)를 덮어 9"
+        );
         assert_eq!(p.source.uri_env.as_deref(), Some("U"));
     }
 
@@ -895,7 +928,10 @@ mod tests {
         assert_eq!(dests.len(), 2);
         assert_eq!(dests[0].name.as_deref(), Some("primary"));
         assert_eq!(dests[0].r#type.as_deref(), Some("s3"));
-        assert_eq!(dests[0].s3.as_ref().unwrap().bucket.as_deref(), Some("bucket"));
+        assert_eq!(
+            dests[0].s3.as_ref().unwrap().bucket.as_deref(),
+            Some("bucket")
+        );
         assert_eq!(dests[1].name.as_deref(), Some("offsite"));
         assert_eq!(dests[1].path.as_deref(), Some("/mnt/off"));
     }
@@ -1019,7 +1055,10 @@ mod tests {
                 .unwrap_or_else(|_| panic!("프로파일 {name} 누락\n{text}"));
             assert_profile_eq(p, q, name);
         }
-        assert_eq!(cfg.default_profile, parsed.default_profile, "default_profile");
+        assert_eq!(
+            cfg.default_profile, parsed.default_profile,
+            "default_profile"
+        );
         parsed
     }
 
@@ -1131,6 +1170,7 @@ mod tests {
                     keep_full: Some(3),
                     keep_days: Some(14),
                     keep_last: None,
+                    ..Default::default()
                 },
                 ..Profile::default()
             },
@@ -1166,7 +1206,10 @@ mod tests {
         );
         // 출력에 dest 키가 없어야 한다.
         let text = to_v2_string(&cfg).unwrap();
-        assert!(!text.contains("dest"), "endpoint 전용엔 dest가 없어야 함:\n{text}");
+        assert!(
+            !text.contains("dest"),
+            "endpoint 전용엔 dest가 없어야 함:\n{text}"
+        );
     }
 
     #[test]
@@ -1251,5 +1294,20 @@ mod tests {
             mk_target("postgres://xbackup@localhost:5433/db_restore"),
         );
         roundtrip(&cfg);
+    }
+
+    /// v2 flat `hook_*` 키가 hooks.* nested로 정규화되어 파싱된다(PRD-04). 미지의 키로
+    /// 거부되지 않아야 한다.
+    #[test]
+    fn v2_flat_hooks_map_to_nested() {
+        let toml = "[profile.p]\nuri = \"mongodb://h/db\"\n\
+                    hook_pre_backup = \"quiesce.sh\"\nhook_post_backup = \"notify.sh\"\n\
+                    hook_on_error = \"pager.sh\"\nhook_timeout_secs = 15\n";
+        let cfg = crate::config::file::Config::from_toml_str(toml).unwrap();
+        let p = cfg.profile("p").unwrap();
+        assert_eq!(p.hooks.pre_backup.as_deref(), Some("quiesce.sh"));
+        assert_eq!(p.hooks.post_backup.as_deref(), Some("notify.sh"));
+        assert_eq!(p.hooks.on_error.as_deref(), Some("pager.sh"));
+        assert_eq!(p.hooks.hook_timeout_secs, Some(15));
     }
 }

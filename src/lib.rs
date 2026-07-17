@@ -16,6 +16,7 @@ pub mod config;
 pub mod crypto;
 pub mod engine;
 pub mod error;
+pub mod hooks;
 pub mod i18n;
 pub mod lock;
 pub mod manifest;
