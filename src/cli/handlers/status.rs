@@ -1174,7 +1174,9 @@ impl Monitor {
             LiveConn::Mysql(my) => {
                 use crate::engine::mysql::{conn::MysqlClient, meta};
                 if my.is_none() {
-                    *my = MysqlClient::connect(&self.uri, self.timeout_secs).await.ok();
+                    *my = MysqlClient::connect(&self.uri, self.timeout_secs)
+                        .await
+                        .ok();
                 }
                 let c = match my {
                     Some(c) => c,

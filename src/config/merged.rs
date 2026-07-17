@@ -117,9 +117,7 @@ impl ResolvedConfig {
         ) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(
-                    "read 소스 URI 해석 실패(backup 시에만 필요 — 주 소스로 폴백): {e}"
-                );
+                tracing::warn!("read 소스 URI 해석 실패(backup 시에만 필요 — 주 소스로 폴백): {e}");
                 None
             }
         };
@@ -174,7 +172,10 @@ where
             }
         }
     }
-    Ok(literal.filter(|s| !s.is_empty()).map(str::to_string).map(Secret::new))
+    Ok(literal
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .map(Secret::new))
 }
 
 /// `root` 안에서 `[profiles.<name>]` 하위 테이블의 가변 참조를 얻는다(없으면 생성).

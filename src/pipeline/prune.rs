@@ -701,7 +701,10 @@ mod tests {
         };
         let plan = plan_prune(&all, &[], policy, 100 * DAY);
         // c-mid: base(20)는 cutoff(70) 밖이지만 증분(95)이 윈도우 내부라 체인 전체 보존.
-        assert!(plan.kept_base_ids.contains(&"c-mid".to_string()), "{plan:?}");
+        assert!(
+            plan.kept_base_ids.contains(&"c-mid".to_string()),
+            "{plan:?}"
+        );
         // c-old(newest 10 < 70, 경계 base도 아님 — c-mid가 경계)는 삭제.
         assert_eq!(plan.targets.len(), 1);
         assert_eq!(plan.targets[0].base_id, "c-old");

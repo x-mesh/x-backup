@@ -103,159 +103,159 @@ pub async fn handle(
     // 실제 백업을 async 블록으로 감싸 한 Result로 모은다(pg/mysql/mongo·full/incr의
     //   여러 early-return을 블록의 반환으로 수렴). uri 등은 여기서 소비된다.
     let result: Result<()> = async move {
-    let secondaries = &dests[1..];
+        let secondaries = &dests[1..];
 
-    // DB 종류 분기 — source URI 스킴이 postgres면 PostgreSQL 경로(드라이버 COPY, oplog/토폴로지
-    //   개념 없음)로 빠진다. 그 외(mongodb)는 아래 Mongo 경로.
-    if db == crate::engine::DbKind::Postgres {
-        return handle_pg_backup(
-            &resolved,
-            &args,
-            uri,
-            timeout_secs,
-            primary.as_ref(),
-            &dests[0],
-            secondaries,
-            dests.len(),
-            mode,
-            backup_type,
-            lang,
-        )
-        .await;
-    }
-    if db == crate::engine::DbKind::Mysql {
-        return handle_mysql_backup(
-            &resolved,
-            &args,
-            uri,
-            timeout_secs,
-            primary.as_ref(),
-            &dests[0],
-            secondaries,
-            dests.len(),
-            mode,
-            backup_type,
-            lang,
-        )
-        .await;
-    }
-
-    // backup 실행 전 status 핵심 점검(연결·권한·토폴로지·도구 존재)을 자동 선행한다(FR-8,
-    //   PRD §9). 전체 status보다 가벼운 서브셋([`StatusChecker::precheck_subset`])으로, 백업을
-    //   *막는* 결함(Fail)만 본다. 하나라도 Fail이면 PrecheckFailed(exit 3)로 백업을 미시작한다.
-    //   --skip-precheck면 우회한다(읽기 전용·무부작용).
-    // 엔진 결정(native | mongodump) — 사전 점검(도구 존재 여부)과 덤프 경로 양쪽이 쓴다.
-    let engine = Engine::parse(&resolved.profile.mode.engine)?;
-    let should_precheck = resolved.profile.mode.precheck && !args.skip_precheck;
-    if should_precheck {
-        run_precheck(&uri, &resolved.profile_name, timeout_secs, engine).await?;
-    } else if args.skip_precheck {
-        tracing::warn!("--skip-precheck 지정 — 백업 사전 점검을 건너뜁니다(FR-8 우회)");
-    } else {
-        tracing::warn!("config mode.precheck=false — 백업 사전 점검을 건너뜁니다");
-    }
-
-    // 증분(--type incr)은 드라이버 oplog 캡처 경로로 분기한다(t8). 선택적 백업
-    //   (--db/--collection)과는 병용 불가(증분은 항상 전체 oplog 슬라이스).
-    if matches!(backup_type, BackupType::Incr) {
-        if args.db.is_some() || args.collection.is_some() {
-            return Err(XBackupError::Usage(
-                "증분 백업(--type incr)은 선택적 백업(--db/--collection)과 병용할 수 없습니다 \
-                 — 증분은 전체 oplog 슬라이스를 캡처합니다(FR-1/FR-2)."
-                    .into(),
-            ));
+        // DB 종류 분기 — source URI 스킴이 postgres면 PostgreSQL 경로(드라이버 COPY, oplog/토폴로지
+        //   개념 없음)로 빠진다. 그 외(mongodb)는 아래 Mongo 경로.
+        if db == crate::engine::DbKind::Postgres {
+            return handle_pg_backup(
+                &resolved,
+                &args,
+                uri,
+                timeout_secs,
+                primary.as_ref(),
+                &dests[0],
+                secondaries,
+                dests.len(),
+                mode,
+                backup_type,
+                lang,
+            )
+            .await;
         }
-        return handle_incremental(
-            &resolved,
-            &args,
-            &uri,
-            primary.as_ref(),
-            &dests[0],
-            secondaries,
+        if db == crate::engine::DbKind::Mysql {
+            return handle_mysql_backup(
+                &resolved,
+                &args,
+                uri,
+                timeout_secs,
+                primary.as_ref(),
+                &dests[0],
+                secondaries,
+                dests.len(),
+                mode,
+                backup_type,
+                lang,
+            )
+            .await;
+        }
+
+        // backup 실행 전 status 핵심 점검(연결·권한·토폴로지·도구 존재)을 자동 선행한다(FR-8,
+        //   PRD §9). 전체 status보다 가벼운 서브셋([`StatusChecker::precheck_subset`])으로, 백업을
+        //   *막는* 결함(Fail)만 본다. 하나라도 Fail이면 PrecheckFailed(exit 3)로 백업을 미시작한다.
+        //   --skip-precheck면 우회한다(읽기 전용·무부작용).
+        // 엔진 결정(native | mongodump) — 사전 점검(도구 존재 여부)과 덤프 경로 양쪽이 쓴다.
+        let engine = Engine::parse(&resolved.profile.mode.engine)?;
+        let should_precheck = resolved.profile.mode.precheck && !args.skip_precheck;
+        if should_precheck {
+            run_precheck(&uri, &resolved.profile_name, timeout_secs, engine).await?;
+        } else if args.skip_precheck {
+            tracing::warn!("--skip-precheck 지정 — 백업 사전 점검을 건너뜁니다(FR-8 우회)");
+        } else {
+            tracing::warn!("config mode.precheck=false — 백업 사전 점검을 건너뜁니다");
+        }
+
+        // 증분(--type incr)은 드라이버 oplog 캡처 경로로 분기한다(t8). 선택적 백업
+        //   (--db/--collection)과는 병용 불가(증분은 항상 전체 oplog 슬라이스).
+        if matches!(backup_type, BackupType::Incr) {
+            if args.db.is_some() || args.collection.is_some() {
+                return Err(XBackupError::Usage(
+                    "증분 백업(--type incr)은 선택적 백업(--db/--collection)과 병용할 수 없습니다 \
+                 — 증분은 전체 oplog 슬라이스를 캡처합니다(FR-1/FR-2)."
+                        .into(),
+                ));
+            }
+            return handle_incremental(
+                &resolved,
+                &args,
+                &uri,
+                primary.as_ref(),
+                &dests[0],
+                secondaries,
+                mode,
+                lang,
+            )
+            .await;
+        }
+
+        // 4) 파이프라인 단계 구성(t6): compress → encrypt 고정 순서(PRD §8.4). 단계와
+        //    manifest 메타를 함께 만든다(아래 build_stages 참조). --no-encrypt면 암호화 생략.
+        //    진행 표시(R16): 공유 카운터를 만들어 BackupRequest에 주입하고, 백업은 dump 총량을
+        //    사전에 모르므로 부정형(spinner)로 처리 바이트·속도를 stderr에 표시한다(PRD §FR-9).
+        let progress_counter = new_counter();
+        let request = BackupRequest {
+            uri,
+            mongodump_program: "mongodump".to_string(),
+            db: args.db.clone(),
+            collection: args.collection.clone(),
+            timeout_secs,
+            engine,
+            progress_counter: Some(std::sync::Arc::clone(&progress_counter)),
+        };
+        let (stages, meta) = build_stages(&resolved, &args)?;
+
+        let reporter = ProgressReporter::start(
             mode,
-            lang,
+            ProgressKind::Indeterminate {
+                label: lang.sel("backup", "백업").into(),
+            },
+            progress_counter,
+        );
+        let result = run_full_backup_with_meta(&request, primary.as_ref(), stages, meta).await;
+        reporter.finish().await;
+        let outcome = result?;
+
+        // 4.5) 보조 destination으로 순차 복제(멀티 destination). primary는 성공했으므로,
+        //      복제 실패는 경고(exit 4)로만 보고한다("primary 필수 + 나머지 경고" 정책).
+        let replicate_warning = replicate_and_warn(
+            primary.as_ref(),
+            secondaries,
+            &outcome.backup_id,
+            outcome.stored_size_bytes > 0,
         )
         .await;
-    }
 
-    // 4) 파이프라인 단계 구성(t6): compress → encrypt 고정 순서(PRD §8.4). 단계와
-    //    manifest 메타를 함께 만든다(아래 build_stages 참조). --no-encrypt면 암호화 생략.
-    //    진행 표시(R16): 공유 카운터를 만들어 BackupRequest에 주입하고, 백업은 dump 총량을
-    //    사전에 모르므로 부정형(spinner)로 처리 바이트·속도를 stderr에 표시한다(PRD §FR-9).
-    let progress_counter = new_counter();
-    let request = BackupRequest {
-        uri,
-        mongodump_program: "mongodump".to_string(),
-        db: args.db.clone(),
-        collection: args.collection.clone(),
-        timeout_secs,
-        engine,
-        progress_counter: Some(std::sync::Arc::clone(&progress_counter)),
-    };
-    let (stages, meta) = build_stages(&resolved, &args)?;
+        // 5) 요약 출력(stdout — 결과 전용). 진행은 stderr, 결과/--json은 stdout으로 분리.
+        if mode.emits_json() {
+            let summary = serde_json::json!({
+                "backup_id": outcome.backup_id,
+                "stored_size_bytes": outcome.stored_size_bytes,
+                "checksum_sha256": outcome.checksum_sha256,
+                "topology": format!("{:?}", outcome.topology),
+                "destinations": dests.len(),
+            });
+            println!("{summary}");
+        } else if mode.shows_human_summary() {
+            let topo = match outcome.topology {
+                Topology::ReplicaSet => "replica_set",
+                Topology::Standalone => "standalone",
+            };
+            print_backup_summary(
+                &BackupSummary {
+                    kind: "full",
+                    detail: topo,
+                    backup_id: &outcome.backup_id,
+                    primary_dest: &dests[0],
+                    stored_size: outcome.stored_size_bytes,
+                    original_size: Some(outcome.original_size_bytes),
+                    compression: outcome.compression.as_ref(),
+                    encryption: outcome.encryption.as_ref(),
+                    checksum: Some(&outcome.checksum_sha256),
+                    dest_count: dests.len(),
+                    base_id: None,
+                    change: None,
+                    oplog_range: outcome.oplog_range.as_ref(),
+                    note: None,
+                },
+                lang,
+            );
+        }
 
-    let reporter = ProgressReporter::start(
-        mode,
-        ProgressKind::Indeterminate {
-            label: lang.sel("backup", "백업").into(),
-        },
-        progress_counter,
-    );
-    let result = run_full_backup_with_meta(&request, primary.as_ref(), stages, meta).await;
-    reporter.finish().await;
-    let outcome = result?;
-
-    // 4.5) 보조 destination으로 순차 복제(멀티 destination). primary는 성공했으므로,
-    //      복제 실패는 경고(exit 4)로만 보고한다("primary 필수 + 나머지 경고" 정책).
-    let replicate_warning = replicate_and_warn(
-        primary.as_ref(),
-        secondaries,
-        &outcome.backup_id,
-        outcome.stored_size_bytes > 0,
-    )
-    .await;
-
-    // 5) 요약 출력(stdout — 결과 전용). 진행은 stderr, 결과/--json은 stdout으로 분리.
-    if mode.emits_json() {
-        let summary = serde_json::json!({
-            "backup_id": outcome.backup_id,
-            "stored_size_bytes": outcome.stored_size_bytes,
-            "checksum_sha256": outcome.checksum_sha256,
-            "topology": format!("{:?}", outcome.topology),
-            "destinations": dests.len(),
-        });
-        println!("{summary}");
-    } else if mode.shows_human_summary() {
-        let topo = match outcome.topology {
-            Topology::ReplicaSet => "replica_set",
-            Topology::Standalone => "standalone",
-        };
-        print_backup_summary(
-            &BackupSummary {
-                kind: "full",
-                detail: topo,
-                backup_id: &outcome.backup_id,
-                primary_dest: &dests[0],
-                stored_size: outcome.stored_size_bytes,
-                original_size: Some(outcome.original_size_bytes),
-                compression: outcome.compression.as_ref(),
-                encryption: outcome.encryption.as_ref(),
-                checksum: Some(&outcome.checksum_sha256),
-                dest_count: dests.len(),
-                base_id: None,
-                change: None,
-                oplog_range: outcome.oplog_range.as_ref(),
-                note: None,
-            },
-            lang,
-        );
-    }
-
-    // 보조 복제 실패가 있으면 경고로 마감(exit 4) — primary 백업은 이미 성공.
-    if let Some(w) = replicate_warning {
-        return Err(XBackupError::Warning(w));
-    }
-    Ok(())
+        // 보조 복제 실패가 있으면 경고로 마감(exit 4) — primary 백업은 이미 성공.
+        if let Some(w) = replicate_warning {
+            return Err(XBackupError::Warning(w));
+        }
+        Ok(())
     }
     .await;
 

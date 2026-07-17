@@ -224,8 +224,8 @@ impl HookSet {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true); // 타임아웃으로 future가 drop되면 직계 자식(sh)을 종료.
-        // 자식을 **새 프로세스 그룹**의 리더로 만든다(pgid = 자식 pid). 타임아웃 시 그룹 전체에
-        // SIGKILL을 보내 `sh -c "a && b"`가 fork한 손자까지 정리한다(kill_on_drop은 직계만 잡음).
+                                 // 자식을 **새 프로세스 그룹**의 리더로 만든다(pgid = 자식 pid). 타임아웃 시 그룹 전체에
+                                 // SIGKILL을 보내 `sh -c "a && b"`가 fork한 손자까지 정리한다(kill_on_drop은 직계만 잡음).
         #[cfg(unix)]
         command.process_group(0);
 
@@ -364,7 +364,10 @@ mod tests {
             pre_backup: Some("true".into()),
             ..Default::default()
         };
-        set(cfg).run_gate(HookEvent::PreBackup, &ctx()).await.unwrap();
+        set(cfg)
+            .run_gate(HookEvent::PreBackup, &ctx())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -454,7 +457,10 @@ mod tests {
             ),
             ..Default::default()
         };
-        set(cfg).run_gate(HookEvent::PreBackup, &ctx()).await.unwrap();
+        set(cfg)
+            .run_gate(HookEvent::PreBackup, &ctx())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

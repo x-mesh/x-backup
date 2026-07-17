@@ -525,10 +525,9 @@ path = \"/var/b2\"
     #[test]
     fn is_endpoint_only_detects_source_only_profile() {
         // source만 있는 프로파일 → endpoint 전용.
-        let cfg = Config::from_toml_str(
-            "[profiles.dr.source]\nuri = \"mongodb://localhost:27117/db\"\n",
-        )
-        .unwrap();
+        let cfg =
+            Config::from_toml_str("[profiles.dr.source]\nuri = \"mongodb://localhost:27117/db\"\n")
+                .unwrap();
         assert!(cfg.profile("dr").unwrap().is_endpoint_only());
 
         // destination이 있으면 endpoint 전용이 아니다(backup 잡).
