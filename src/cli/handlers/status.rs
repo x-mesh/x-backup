@@ -323,6 +323,17 @@ async fn build_report(
         );
         items.push(
             CheckItem::ok(
+                "recoverable",
+                "PITR recoverable",
+                lang.sel(
+                    "n/a — endpoint-only profile",
+                    "해당 없음 — endpoint 전용 프로파일",
+                ),
+            )
+            .with_value(lang.sel("n/a", "해당없음")),
+        );
+        items.push(
+            CheckItem::ok(
                 "destination",
                 "destination",
                 lang.sel(
@@ -334,6 +345,7 @@ async fn build_report(
         );
     } else {
         items.push(last_backup_item(&resolved.profile, lang).await);
+        items.push(recoverable_item(&resolved.profile, lang).await);
         items.push(destination_item(&resolved.profile, lang).await);
     }
     Ok(StatusReport::new(name, items))
@@ -405,6 +417,96 @@ async fn last_backup_item(
         )
         .with_value(lang.sel("none", "없음")),
     }
+}
+
+/// 카탈로그(manifest)만으로 **현재 복구 가능한 최신 시점**과 **RPO 갭**을 보고한다(PRD-03 P1).
+///
+/// - `recoverable_until` = 최신 백업의 실효 복구 시점: oplog_range가 있으면 그 `end_ts`(정밀),
+///   없으면(PG/MySQL 풀 등) `created_at`으로 근사한다([`recoverable_until_rfc3339`]).
+/// - `rpo_gap` = now − recoverable_until. 값 컬럼(`--json`의 items[key=recoverable].value)에는
+///   RFC3339 시점을, 메시지에는 갭을 함께 담는다.
+///
+/// 서버 접속 없이 destination 카탈로그만 읽으므로 오프라인에서도 동작한다. base가 없으면
+/// "복구 불가"로 표시한다. 서버 대비 아카이빙 지연(archive_lag)·임계 경고는 P2다.
+async fn recoverable_item(
+    profile: &Profile,
+    lang: crate::i18n::Lang,
+) -> crate::engine::mongo::status::CheckItem {
+    use crate::engine::mongo::status::CheckItem;
+    let dests = profile.effective_destinations();
+    let dest = match dests.first() {
+        Some(d) => *d,
+        None => {
+            return CheckItem::warn(
+                "recoverable",
+                "PITR recoverable",
+                lang.sel("destination not configured", "destination 미설정"),
+            )
+            .with_value(lang.sel("not configured", "미설정"))
+        }
+    };
+    let storage = match from_config(dest) {
+        Ok(s) => s,
+        Err(e) => {
+            return CheckItem::warn(
+                "recoverable",
+                "PITR recoverable",
+                lang.sel(
+                    format!("destination access failed: {e}").as_str(),
+                    format!("destination 접근 실패: {e}").as_str(),
+                ),
+            )
+            .with_value(lang.sel("access failed", "접근 실패"))
+        }
+    };
+    match latest_manifest_any(storage.as_ref()).await {
+        Some(m) => match recoverable_until_rfc3339(&m) {
+            Some(until) => {
+                let gap = format_age_rfc3339(&until, lang);
+                CheckItem::ok(
+                    "recoverable",
+                    "PITR recoverable",
+                    lang.sel(
+                        format!("recoverable until {until} (RPO gap {gap})").as_str(),
+                        format!("복구가능 ~{until} (RPO 갭 {gap})").as_str(),
+                    ),
+                )
+                .with_value(until)
+            }
+            // manifest는 있으나 시점 산출 불가(잘린 데이터 등).
+            None => CheckItem::warn(
+                "recoverable",
+                "PITR recoverable",
+                lang.sel(
+                    "backup present but recovery point undetermined",
+                    "백업은 있으나 복구 시점을 산출할 수 없습니다",
+                ),
+            )
+            .with_value(lang.sel("unknown", "알수없음")),
+        },
+        None => CheckItem::warn(
+            "recoverable",
+            "PITR recoverable",
+            lang.sel(
+                "not recoverable — no backup base",
+                "복구 불가 — 백업 base가 없습니다",
+            ),
+        )
+        .with_value(lang.sel("none", "없음")),
+    }
+}
+
+/// manifest에서 복구 가능 시점(RFC3339 UTC)을 산출한다.
+///
+/// `oplog_range`가 있으면 그 `end_ts`(마지막으로 캡처한 변경 시각, unix 초)를 정밀 시점으로
+/// 쓰고, 없으면(PG/MySQL 풀 등 시간범위 미보유) `created_at`으로 근사한다. `end_ts` 변환이
+/// 실패하면 `None`.
+fn recoverable_until_rfc3339(m: &BackupManifest) -> Option<String> {
+    if let Some(range) = &m.oplog_range {
+        return chrono::DateTime::<chrono::Utc>::from_timestamp(i64::from(range.end_ts.t), 0)
+            .map(|dt| dt.to_rfc3339());
+    }
+    Some(m.created_at.clone())
 }
 
 /// destination 쓰기 가능 여부를 작은 객체 put→delete로 점검한다(+ local 여유 공간).
@@ -1457,6 +1559,51 @@ fn render_watch_all(
 mod tests {
     use super::*;
     use crate::engine::mongo::status::CheckItem;
+
+    /// 최소 필드 manifest를 serde로 구성한다(recoverable 시점 산출 테스트용).
+    fn manifest_with_oplog_end(oplog_end: Option<u32>) -> BackupManifest {
+        let mut v = serde_json::json!({
+            "format_version": 1,
+            "id": "0190-test",
+            "created_at": "2026-06-12T13:00:00+00:00",
+            "backup_type": "full",
+            "topology": "replica_set",
+            "server_version": "7.0.0",
+            "selective": false,
+            "original_size_bytes": 0,
+            "stored_size_bytes": 0,
+            "checksum_sha256": "abc",
+            "status": "complete"
+        });
+        if let Some(t) = oplog_end {
+            v["oplog_range"] = serde_json::json!({
+                "start_ts": { "t": t, "i": 1 },
+                "end_ts": { "t": t, "i": 5 }
+            });
+        }
+        serde_json::from_value(v).expect("manifest 역직렬화")
+    }
+
+    /// oplog_range가 있으면 end_ts(정밀 시점)를 복구 시점으로 쓴다.
+    #[test]
+    fn recoverable_uses_oplog_end_when_present() {
+        let m = manifest_with_oplog_end(Some(1_781_272_133));
+        let got = recoverable_until_rfc3339(&m).unwrap();
+        let expected = chrono::DateTime::<chrono::Utc>::from_timestamp(1_781_272_133, 0)
+            .unwrap()
+            .to_rfc3339();
+        assert_eq!(got, expected);
+    }
+
+    /// oplog_range가 없으면(PG/MySQL 풀 등) created_at으로 근사한다.
+    #[test]
+    fn recoverable_falls_back_to_created_at() {
+        let m = manifest_with_oplog_end(None);
+        assert_eq!(
+            recoverable_until_rfc3339(&m).as_deref(),
+            Some("2026-06-12T13:00:00+00:00")
+        );
+    }
 
     #[test]
     fn ok_report_maps_to_ok_result() {
