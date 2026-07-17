@@ -171,6 +171,10 @@ pub struct BackupArgs {
     /// 생명주기 훅(pre/post/on_error)을 이번 실행에서 비활성화한다(PRD-04).
     #[arg(long)]
     pub no_hooks: bool,
+    /// 백업 읽기 소스(복제본) URI를 이번 실행에서 지정한다(config source.read_uri 오버라이드,
+    /// PRD-05). primary 부하 분리용. 미지정 시 config read_uri → 주 소스 순으로 폴백.
+    #[arg(long, value_name = "URI")]
+    pub read_source: Option<String>,
 }
 
 /// `restore` — PRD §9 restore 플래그 전체.

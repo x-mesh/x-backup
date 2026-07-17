@@ -196,6 +196,8 @@ fn expand_profile(name: &str, flat: &Table) -> Result<Table> {
             // ── source ──
             "uri" => insert_into(&mut source, "uri", v),
             "uri_env" => insert_into(&mut source, "uri_env", v),
+            "read_uri" => insert_into(&mut source, "read_uri", v),
+            "read_uri_env" => insert_into(&mut source, "read_uri_env", v),
             "prefer_secondary" => insert_into(&mut source, "prefer_secondary", v),
             "connect_timeout_secs" => insert_into(&mut source, "connect_timeout_secs", v),
             // ── mode ── (output_mode → mode.output: 루트 [output]와 혼동 방지)

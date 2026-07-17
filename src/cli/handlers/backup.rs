@@ -54,14 +54,27 @@ pub async fn handle(
         overrides: &overrides,
     })?;
 
-    // 2) URI 시크릿(uri_env로 해석된 값) 확보. 이후 build_stages가 &resolved를 쓰므로
-    //    clone으로 꺼내 부분 이동을 피한다(Secret은 Clone).
-    let uri = resolved.resolved_uri.clone().ok_or_else(|| {
-        XBackupError::Config(format!(
-            "프로파일 '{}'에 source.uri_env가 없거나 해석되지 않았습니다",
-            resolved.profile_name
-        ))
-    })?;
+    // 2) 백업 읽기 소스 URI 확보(PRD-05). 우선순위: CLI --read-source > config read_uri(복제본)
+    //    > 주 소스(uri). 복제본에서 읽으면 primary 부하를 분리한다. build_stages가 &resolved를
+    //    쓰므로 clone으로 꺼내 부분 이동을 피한다(Secret은 Clone).
+    let uri = if let Some(rs) = args.read_source.as_deref().filter(|s| !s.is_empty()) {
+        tracing::info!("--read-source 지정 — 복제본에서 백업을 읽습니다(primary 부하 분리)");
+        Secret::new(rs.to_string())
+    } else {
+        let from_replica = resolved.resolved_read_uri.is_some();
+        let u = resolved.effective_read_uri().cloned().ok_or_else(|| {
+            XBackupError::Config(format!(
+                "프로파일 '{}'에 source.uri_env/uri가 없거나 해석되지 않았습니다",
+                resolved.profile_name
+            ))
+        })?;
+        if from_replica {
+            tracing::info!(
+                "source.read_uri 지정 — 복제본에서 백업을 읽습니다(primary 부하 분리)"
+            );
+        }
+        u
+    };
     // 접속 타임아웃(초) — config source.connect_timeout_secs(미설정이면 None → 기본 5초).
     let timeout_secs = resolved.profile.source.connect_timeout_secs;
 
@@ -1410,6 +1423,7 @@ mod tests {
             profile_name: "test".to_string(),
             profile,
             resolved_uri: None,
+            resolved_read_uri: None,
         }
     }
 
@@ -1427,6 +1441,7 @@ mod tests {
             json: false,
             skip_precheck: false,
             no_hooks: false,
+            read_source: None,
         }
     }
 

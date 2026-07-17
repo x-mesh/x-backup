@@ -195,6 +195,15 @@ pub struct SourceConfig {
     /// 가능하면 secondary에서 백업할지 여부.
     #[serde(default)]
     pub prefer_secondary: bool,
+    /// **백업 읽기 전용** 소스 URI(복제본) — primary 부하 분리(PRD-05). 지정하면 backup은
+    /// 이 URI에서 읽고, `uri`/`uri_env`는 제어/메타용으로 남는다. 미지정이면 backup도
+    /// `uri`/`uri_env`를 쓴다. 비밀번호가 있으면 [`read_uri_env`](Self::read_uri_env)를 쓴다.
+    #[serde(default)]
+    pub read_uri: Option<String>,
+    /// 백업 읽기 전용 소스 URI가 담긴 **환경변수 이름**(시크릿 평문 저장 금지). `read_uri`보다
+    /// 우선한다(env가 설정돼 있으면 그 값, 비었으면 `read_uri` 리터럴로 폴백).
+    #[serde(default)]
+    pub read_uri_env: Option<String>,
     /// MongoDB 접속(server-selection/connect) 타임아웃(초). 미지정 시 기본 5초.
     ///
     /// 이 프로파일로 실행하는 모든 명령의 MongoDB 연결(source·`--target` 모두)에 적용된다.
