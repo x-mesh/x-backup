@@ -18,6 +18,49 @@ use crate::error::{Result, XBackupError};
 /// 사람용 출력에서 한 문서를 자를 최대 길이(긴 문서로 화면이 넘치지 않게).
 const MAX_DOC_CHARS: usize = 200;
 
+/// `peek --json` 출력 스키마 버전.
+///
+/// 필드 의미가 바뀌면 올린다 — 소비자(웹 콘솔)가 버전으로 파서를 고르고, 모르는 버전을
+/// 만나면 조용히 오파싱하는 대신 명확히 실패할 수 있게 하기 위함이다. Mongo/PG/MySQL의
+/// 출력 모양이 서로 달라도 버전은 `peek` 하나로 묶는다 — 소비자가 보는 명령이 하나라서다.
+const PEEK_JSON_SCHEMA: u32 = 1;
+
+/// `--ns` 없는 개요 문서(엔진 공통) — 네임스페이스별 건수 + 최신 1건.
+fn overview_json(items: Vec<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({
+        "schema": PEEK_JSON_SCHEMA,
+        "namespaces": items,
+    })
+}
+
+/// `--ns db.coll` 문서(Mongo) — 그 컬렉션의 최신 N건.
+fn documents_json(ns: &str, documents: Vec<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({
+        "schema": PEEK_JSON_SCHEMA,
+        "ns": ns,
+        "documents": documents,
+    })
+}
+
+/// `--ns db.table` 문서(PG/MySQL) — 그 테이블의 최신 N행.
+///
+/// Mongo의 `documents`와 키 이름을 일부러 다르게 둔다 — 행과 문서는 같은 것이 아니고,
+/// 이미 나간 계약이라 통일하면 기존 소비자가 깨진다.
+fn rows_json(ns: &str, rows: Vec<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({
+        "schema": PEEK_JSON_SCHEMA,
+        "ns": ns,
+        "rows": rows,
+    })
+}
+
+/// 드라이버가 돌려준 JSON 텍스트 행들을 값으로 파싱한다(깨진 행은 null로 자리를 지킨다).
+fn parse_row_texts(rows: &[String]) -> Vec<serde_json::Value> {
+    rows.iter()
+        .map(|r| serde_json::from_str::<serde_json::Value>(r).unwrap_or(serde_json::Value::Null))
+        .collect()
+}
+
 /// `peek` 핸들러 진입점.
 pub async fn handle(
     config_path: Option<PathBuf>,
@@ -84,18 +127,15 @@ async fn peek_pg(
     if let Some(ns) = &args.ns {
         let rows = meta::latest_rows(client, ns, args.limit.max(1)).await?;
         if args.json {
-            // 각 행은 이미 JSON 텍스트 — 배열로 합쳐 그대로 출력.
-            println!(
-                "{}",
-                serde_json::json!({ "ns": ns, "rows": rows.iter().map(|r| serde_json::from_str::<serde_json::Value>(r).unwrap_or(serde_json::Value::Null)).collect::<Vec<_>>() })
-            );
+            // 각 행은 이미 JSON 텍스트 — 값으로 되돌려 배열에 담는다.
+            println!("{}", rows_json(ns, parse_row_texts(&rows)));
             return Ok(());
         }
         println!(
             "{ns} — {} {}",
             style(lang.sel("latest", "최신"), Tone::Label),
             style(
-                &lang.sel(
+                lang.sel(
                     &format!("{} rows", rows.len()),
                     &format!("{}행", rows.len())
                 ),
@@ -125,7 +165,7 @@ async fn peek_pg(
                 "latest": latest.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
             }));
         }
-        println!("{}", serde_json::json!({ "namespaces": items }));
+        println!("{}", overview_json(items));
         return Ok(());
     }
     if counts.is_empty() {
@@ -173,17 +213,17 @@ async fn peek_mysql(
     if let Some(ns) = &args.ns {
         let rows = meta::latest_rows(my.conn_mut(), ns, args.limit.max(1)).await?;
         if args.json {
-            println!(
-                "{}",
-                serde_json::json!({ "ns": ns, "rows": rows.iter().map(|r| serde_json::from_str::<serde_json::Value>(r).unwrap_or(serde_json::Value::Null)).collect::<Vec<_>>() })
-            );
+            println!("{}", rows_json(ns, parse_row_texts(&rows)));
             return Ok(());
         }
         println!(
             "{ns} — {} {}",
             style(lang.sel("latest", "최신"), Tone::Label),
             style(
-                &lang.sel(&format!("{} rows", rows.len()), &format!("{}행", rows.len())),
+                lang.sel(
+                    &format!("{} rows", rows.len()),
+                    &format!("{}행", rows.len())
+                ),
                 Tone::Value,
             )
         );
@@ -213,7 +253,7 @@ async fn peek_mysql(
                 "latest": latest.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
             }));
         }
-        println!("{}", serde_json::json!({ "namespaces": items }));
+        println!("{}", overview_json(items));
         return Ok(());
     }
     if counts.is_empty() {
@@ -265,7 +305,7 @@ async fn peek_overview(mongo: &MongoMeta, json: bool, lang: crate::i18n::Lang) -
                 "latest": latest.map(doc_to_json),
             }));
         }
-        println!("{}", serde_json::json!({ "namespaces": items }));
+        println!("{}", overview_json(items));
         return Ok(());
     }
 
@@ -316,7 +356,7 @@ async fn peek_namespace(
 
     if json {
         let arr: Vec<serde_json::Value> = docs.iter().cloned().map(doc_to_json).collect();
-        println!("{}", serde_json::json!({ "ns": ns, "documents": arr }));
+        println!("{}", documents_json(ns, arr));
         return Ok(());
     }
 
@@ -324,7 +364,7 @@ async fn peek_namespace(
         "{ns} — {} {}",
         style(lang.sel("latest", "최신"), Tone::Label),
         style(
-            &lang.sel(
+            lang.sel(
                 &format!("{} documents", docs.len()),
                 &format!("{}건", docs.len())
             ),
@@ -390,6 +430,35 @@ mod tests {
         let out = truncate(&long, lang);
         assert!(out.ends_with("… (잘림)"));
         assert!(out.chars().count() < long.chars().count());
+    }
+
+    /// 세 출력 모양 모두 최상위에 스키마 버전을 단다 — 소비자가 파서를 고르는 근거다.
+    #[test]
+    fn every_top_level_document_carries_schema() {
+        let overview = overview_json(vec![serde_json::json!({ "ns": "db.c", "count": 1 })]);
+        assert_eq!(overview["schema"], PEEK_JSON_SCHEMA);
+        assert!(overview["namespaces"].is_array());
+        // 배열 원소는 독립 문서가 아니므로 버전을 갖지 않는다.
+        assert!(overview["namespaces"][0].get("schema").is_none());
+
+        let docs = documents_json("db.c", vec![serde_json::json!({ "_id": 1 })]);
+        assert_eq!(docs["schema"], PEEK_JSON_SCHEMA);
+        assert_eq!(docs["ns"], "db.c");
+        assert!(docs["documents"].is_array());
+
+        let rows = rows_json("public.t", vec![serde_json::json!({ "id": 1 })]);
+        assert_eq!(rows["schema"], PEEK_JSON_SCHEMA);
+        assert_eq!(rows["ns"], "public.t");
+        assert!(rows["rows"].is_array());
+    }
+
+    /// 드라이버 행 텍스트는 값으로 파싱하고, 깨진 행은 null로 자리를 지킨다.
+    #[test]
+    fn parse_row_texts_keeps_position_for_broken_rows() {
+        let parsed = parse_row_texts(&["{\"id\":1}".to_string(), "not json".to_string()]);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["id"], 1);
+        assert!(parsed[1].is_null());
     }
 
     #[test]

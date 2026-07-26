@@ -29,6 +29,91 @@ use crate::pipeline::incremental::{
 use crate::pipeline::stage::{StageStack, ENV_AES_KEY_HEX};
 use crate::storage::{from_config, replicate_artifact, Storage};
 
+/// `backup --json` 요약 스키마 버전.
+///
+/// 필드 의미가 바뀌면 올린다 — 소비자(웹 콘솔)가 버전으로 파서를 고르고, 모르는 버전을
+/// 만나면 조용히 오파싱하는 대신 명확히 실패할 수 있게 하기 위함이다.
+pub const BACKUP_JSON_SCHEMA: u32 = 1;
+
+/// `backup --json`이 내보내는 요약.
+///
+/// ## 왜 타입인가
+/// 이 요약은 원래 엔진·백업 유형별로 흩어진 8개의 `serde_json::json!` 리터럴이었다.
+/// 리터럴은 타입이 아니라서 필드 이름을 잘못 적거나 빠뜨려도 컴파일이 통과하고, 그 출력을
+/// 파싱하는 쪽만 조용히 깨진다. 하나의 타입으로 모으면 계약이 컴파일러의 관할로 들어온다.
+///
+/// ## 왜 Option이 많은가
+/// 변형마다 의미 있는 필드가 다르다(풀에는 체크섬, 증분에는 base·변경 건수). `None`은
+/// `skip_serializing_if`로 **키 자체가 생략**되므로, 리터럴 시절과 키 집합이 같다 —
+/// 없는 정보를 `null`로 채워 소비자에게 거짓 필드를 만들지 않는다.
+#[derive(Debug, serde::Serialize)]
+pub struct BackupJsonSummary<'a> {
+    /// 스키마 버전(항상 존재).
+    pub schema: u32,
+    /// "full" | "incremental". 풀 백업 경로 일부는 유형을 표기하지 않는다(기존 동작 유지).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_type: Option<&'a str>,
+    pub backup_id: &'a str,
+    /// 증분이 딛고 선 풀 백업 ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_id: Option<&'a str>,
+    /// MongoDB 증분이 캡처한 oplog 항목 수.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oplog_count: Option<u64>,
+    /// PostgreSQL·MySQL 증분이 캡처한 변경 건수.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_count: Option<u64>,
+    pub stored_size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checksum_sha256: Option<&'a str>,
+    /// oplog/binlog gap 때문에 증분이 풀로 승격됐는지(exit 4 경로).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promoted_from_gap: Option<bool>,
+    /// MongoDB 토폴로지 표기(replica set / standalone).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology: Option<String>,
+    /// "postgresql" | "mysql". MongoDB 경로는 기존대로 표기하지 않는다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database: Option<&'a str>,
+    /// 기록한 destination 개수(멀티 destination).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destinations: Option<usize>,
+    /// 승격 사유 등 사람이 읽는 부연.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'a str>,
+}
+
+impl Default for BackupJsonSummary<'_> {
+    fn default() -> Self {
+        Self {
+            schema: BACKUP_JSON_SCHEMA,
+            backup_type: None,
+            backup_id: "",
+            base_id: None,
+            oplog_count: None,
+            change_count: None,
+            stored_size_bytes: 0,
+            checksum_sha256: None,
+            promoted_from_gap: None,
+            topology: None,
+            database: None,
+            destinations: None,
+            reason: None,
+        }
+    }
+}
+
+impl BackupJsonSummary<'_> {
+    /// 요약을 stdout에 한 줄 JSON으로 내보낸다.
+    ///
+    /// 직렬화는 실패할 수 없는 형태(모든 필드가 원시 타입)라 실패 시 패닉이 정당하다 —
+    /// 조용히 빈 출력을 내보내면 소비자가 성공으로 오인한다.
+    fn emit(&self) {
+        let line = serde_json::to_string(self).expect("요약 직렬화는 실패할 수 없다");
+        println!("{line}");
+    }
+}
+
 /// `backup` 핸들러 진입점.
 pub async fn handle(
     config_path: Option<PathBuf>,
@@ -217,14 +302,15 @@ pub async fn handle(
 
         // 5) 요약 출력(stdout — 결과 전용). 진행은 stderr, 결과/--json은 stdout으로 분리.
         if mode.emits_json() {
-            let summary = serde_json::json!({
-                "backup_id": outcome.backup_id,
-                "stored_size_bytes": outcome.stored_size_bytes,
-                "checksum_sha256": outcome.checksum_sha256,
-                "topology": format!("{:?}", outcome.topology),
-                "destinations": dests.len(),
-            });
-            println!("{summary}");
+            BackupJsonSummary {
+                backup_id: &outcome.backup_id,
+                stored_size_bytes: outcome.stored_size_bytes,
+                checksum_sha256: Some(&outcome.checksum_sha256),
+                topology: Some(format!("{:?}", outcome.topology)),
+                destinations: Some(dests.len()),
+                ..Default::default()
+            }
+            .emit();
         } else if mode.shows_human_summary() {
             let topo = match outcome.topology {
                 Topology::ReplicaSet => "replica_set",
@@ -622,14 +708,15 @@ async fn handle_pg_backup(
     .await;
 
     if mode.emits_json() {
-        let summary = serde_json::json!({
-            "backup_id": outcome.backup_id,
-            "stored_size_bytes": outcome.stored_size_bytes,
-            "checksum_sha256": outcome.checksum_sha256,
-            "database": "postgresql",
-            "destinations": dest_count,
-        });
-        println!("{summary}");
+        BackupJsonSummary {
+            backup_id: &outcome.backup_id,
+            stored_size_bytes: outcome.stored_size_bytes,
+            checksum_sha256: Some(&outcome.checksum_sha256),
+            database: Some("postgresql"),
+            destinations: Some(dest_count),
+            ..Default::default()
+        }
+        .emit();
     } else if mode.shows_human_summary() {
         print_backup_summary(
             &BackupSummary {
@@ -748,14 +835,15 @@ async fn handle_mysql_backup(
     .await;
 
     if mode.emits_json() {
-        let summary = serde_json::json!({
-            "backup_id": outcome.backup_id,
-            "stored_size_bytes": outcome.stored_size_bytes,
-            "checksum_sha256": outcome.checksum_sha256,
-            "database": "mysql",
-            "destinations": dest_count,
-        });
-        println!("{summary}");
+        BackupJsonSummary {
+            backup_id: &outcome.backup_id,
+            stored_size_bytes: outcome.stored_size_bytes,
+            checksum_sha256: Some(&outcome.checksum_sha256),
+            database: Some("mysql"),
+            destinations: Some(dest_count),
+            ..Default::default()
+        }
+        .emit();
     } else if mode.shows_human_summary() {
         print_backup_summary(
             &BackupSummary {
@@ -835,17 +923,22 @@ async fn handle_mysql_incremental(
     .await;
 
     if mode.emits_json() {
-        let summary = serde_json::json!({
-            "backup_type": if outcome.promoted { "full" } else { "incremental" },
-            "backup_id": outcome.backup_id,
-            "base_id": outcome.base_id,
-            "change_count": outcome.change_count,
-            "stored_size_bytes": outcome.stored_size_bytes,
-            "promoted_from_gap": outcome.promoted,
-            "database": "mysql",
-            "destinations": dest_count,
-        });
-        println!("{summary}");
+        BackupJsonSummary {
+            backup_type: Some(if outcome.promoted {
+                "full"
+            } else {
+                "incremental"
+            }),
+            backup_id: &outcome.backup_id,
+            base_id: Some(&outcome.base_id),
+            change_count: Some(outcome.change_count as u64),
+            stored_size_bytes: outcome.stored_size_bytes,
+            promoted_from_gap: Some(outcome.promoted),
+            database: Some("mysql"),
+            destinations: Some(dest_count),
+            ..Default::default()
+        }
+        .emit();
     } else if mode.shows_human_summary() {
         let note = if outcome.promoted {
             Some(lang.sel(
@@ -975,16 +1068,17 @@ async fn handle_pg_incremental(
     .await;
 
     if mode.emits_json() {
-        let summary = serde_json::json!({
-            "backup_type": "incremental",
-            "backup_id": outcome.backup_id,
-            "base_id": outcome.base_id,
-            "change_count": outcome.change_count,
-            "stored_size_bytes": outcome.stored_size_bytes,
-            "database": "postgresql",
-            "destinations": dest_count,
-        });
-        println!("{summary}");
+        BackupJsonSummary {
+            backup_type: Some("incremental"),
+            backup_id: &outcome.backup_id,
+            base_id: Some(&outcome.base_id),
+            change_count: Some(outcome.change_count as u64),
+            stored_size_bytes: outcome.stored_size_bytes,
+            database: Some("postgresql"),
+            destinations: Some(dest_count),
+            ..Default::default()
+        }
+        .emit();
     } else if mode.shows_human_summary() {
         print_backup_summary(
             &BackupSummary {
@@ -1087,17 +1181,18 @@ async fn promote_pg_incremental_to_full(
         replicate_and_warn(primary, secondaries, &outcome.backup_id, true).await;
 
     if mode.emits_json() {
-        let summary = serde_json::json!({
-            "backup_type": "full",
-            "promoted_from_gap": true,
-            "backup_id": outcome.backup_id,
-            "stored_size_bytes": outcome.stored_size_bytes,
-            "checksum_sha256": outcome.checksum_sha256,
-            "database": "postgresql",
-            "destinations": dest_count,
-            "reason": reason,
-        });
-        println!("{summary}");
+        BackupJsonSummary {
+            backup_type: Some("full"),
+            promoted_from_gap: Some(true),
+            backup_id: &outcome.backup_id,
+            stored_size_bytes: outcome.stored_size_bytes,
+            checksum_sha256: Some(&outcome.checksum_sha256),
+            database: Some("postgresql"),
+            destinations: Some(dest_count),
+            reason: Some(reason),
+            ..Default::default()
+        }
+        .emit();
     } else if mode.shows_human_summary() {
         print_backup_summary(
             &BackupSummary {
@@ -1216,14 +1311,15 @@ async fn handle_incremental(
             let replicate_warning =
                 replicate_and_warn(primary, secondaries, &backup_id, stored_size_bytes > 0).await;
             if mode.emits_json() {
-                let summary = serde_json::json!({
-                    "backup_type": "incremental",
-                    "backup_id": backup_id,
-                    "base_id": base_id,
-                    "oplog_count": oplog_count,
-                    "stored_size_bytes": stored_size_bytes,
-                });
-                println!("{summary}");
+                BackupJsonSummary {
+                    backup_type: Some("incremental"),
+                    backup_id: &backup_id,
+                    base_id: Some(&base_id),
+                    oplog_count: Some(oplog_count),
+                    stored_size_bytes,
+                    ..Default::default()
+                }
+                .emit();
             } else if mode.shows_human_summary() {
                 print_backup_summary(
                     &BackupSummary {
@@ -1260,15 +1356,16 @@ async fn handle_incremental(
                 replicate_and_warn(primary, secondaries, &outcome.backup_id, true).await;
             // 승격은 데이터상 성공이지만 "증분이 아니라 풀이 됨"을 경고로 알린다(exit 4, SC2).
             if mode.emits_json() {
-                let summary = serde_json::json!({
-                    "backup_type": "full",
-                    "promoted_from_gap": true,
-                    "backup_id": outcome.backup_id,
-                    "stored_size_bytes": outcome.stored_size_bytes,
-                    "checksum_sha256": outcome.checksum_sha256,
-                    "reason": reason,
-                });
-                println!("{summary}");
+                BackupJsonSummary {
+                    backup_type: Some("full"),
+                    promoted_from_gap: Some(true),
+                    backup_id: &outcome.backup_id,
+                    stored_size_bytes: outcome.stored_size_bytes,
+                    checksum_sha256: Some(&outcome.checksum_sha256),
+                    reason: Some(&reason),
+                    ..Default::default()
+                }
+                .emit();
             } else if mode.shows_human_summary() {
                 let topo = match outcome.topology {
                     Topology::ReplicaSet => "replica_set",
@@ -1436,6 +1533,131 @@ mod tests {
     use crate::cli::args::BackupArgs;
     use crate::config::file::Profile;
     use crate::config::merged::ResolvedConfig;
+
+    /// 요약을 직렬화해 키 목록을 정렬해 돌려준다(값이 아니라 계약만 본다).
+    fn keys_of(s: &BackupJsonSummary<'_>) -> Vec<String> {
+        let v: serde_json::Value = serde_json::to_value(s).unwrap();
+        let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        k.sort();
+        k
+    }
+
+    /// None 필드는 키 자체가 생략된다 — 리터럴 시절과 키 집합을 같게 유지하는 근거다.
+    /// 없는 정보를 `null`로 채우면 소비자가 "값이 null인 필드가 있다"로 오독한다.
+    #[test]
+    fn json_omits_absent_fields_instead_of_nulling() {
+        let s = BackupJsonSummary {
+            backup_id: "b1",
+            stored_size_bytes: 10,
+            ..Default::default()
+        };
+        assert_eq!(
+            keys_of(&s),
+            vec!["backup_id", "schema", "stored_size_bytes"],
+            "설정하지 않은 필드는 출력에 나타나지 않아야 한다"
+        );
+    }
+
+    /// MongoDB 풀 백업 변형의 키 집합(리터럴 시절 필드 + schema).
+    #[test]
+    fn json_mongo_full_keys() {
+        let s = BackupJsonSummary {
+            backup_id: "b1",
+            stored_size_bytes: 10,
+            checksum_sha256: Some("abc"),
+            topology: Some("ReplicaSet".to_string()),
+            destinations: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(
+            keys_of(&s),
+            vec![
+                "backup_id",
+                "checksum_sha256",
+                "destinations",
+                "schema",
+                "stored_size_bytes",
+                "topology",
+            ]
+        );
+    }
+
+    /// PostgreSQL 증분 변형 — base_id·change_count가 붙고 checksum·topology는 빠진다.
+    #[test]
+    fn json_pg_incremental_keys() {
+        let s = BackupJsonSummary {
+            backup_type: Some("incremental"),
+            backup_id: "b2",
+            base_id: Some("b1"),
+            change_count: Some(7),
+            stored_size_bytes: 20,
+            database: Some("postgresql"),
+            destinations: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            keys_of(&s),
+            vec![
+                "backup_id",
+                "backup_type",
+                "base_id",
+                "change_count",
+                "database",
+                "destinations",
+                "schema",
+                "stored_size_bytes",
+            ]
+        );
+    }
+
+    /// MongoDB 증분은 change_count가 아니라 oplog_count를 쓴다 — 둘을 섞으면 소비자가 깨진다.
+    #[test]
+    fn json_mongo_incremental_uses_oplog_count() {
+        let s = BackupJsonSummary {
+            backup_type: Some("incremental"),
+            backup_id: "b2",
+            base_id: Some("b1"),
+            oplog_count: Some(42),
+            stored_size_bytes: 20,
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["oplog_count"], 42);
+        assert!(
+            v.get("change_count").is_none(),
+            "MongoDB 경로에 change_count가 새어 나오면 안 된다"
+        );
+        assert!(
+            v.get("destinations").is_none(),
+            "이 경로는 개수를 내지 않는다"
+        );
+    }
+
+    /// gap 승격(exit 4) 변형은 promoted_from_gap과 reason을 함께 낸다.
+    #[test]
+    fn json_gap_promotion_keys() {
+        let s = BackupJsonSummary {
+            backup_type: Some("full"),
+            promoted_from_gap: Some(true),
+            backup_id: "b3",
+            stored_size_bytes: 30,
+            checksum_sha256: Some("def"),
+            reason: Some("oplog gap"),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["promoted_from_gap"], true);
+        assert_eq!(v["reason"], "oplog gap");
+        assert_eq!(v["backup_type"], "full");
+    }
+
+    /// 스키마 버전은 항상 실린다 — 소비자가 파서를 고르는 근거다.
+    #[test]
+    fn json_always_carries_schema_version() {
+        let s = BackupJsonSummary::default();
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["schema"], BACKUP_JSON_SCHEMA);
+    }
 
     /// 테스트용 ResolvedConfig — 주어진 profile로 구성(URI는 비워 둠).
     fn resolved_with(profile: Profile) -> ResolvedConfig {

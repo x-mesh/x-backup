@@ -24,8 +24,20 @@ use crate::i18n::Lang;
 use crate::pipeline::mysql_pitr::{run_mysql_pitr, MysqlPitrPlan, MysqlPitrRequest};
 use crate::pipeline::pg_pitr::{run_pg_pitr, PgPitrPlan, PgPitrRequest};
 use crate::pipeline::pitr::{run_pitr, PitrPlan, PitrRequest};
-use crate::pipeline::restore::{export_to_dir, run_restore, RestorePlan, RestoreRequest};
+use crate::pipeline::restore::{
+    export_to_dir, run_restore, RestoreOutcome, RestorePlan, RestoreRequest,
+};
 use crate::storage::{from_config, Storage};
+
+/// `restore --json` 출력 스키마 버전.
+///
+/// 필드 의미가 바뀌면 올린다 — 소비자(웹 콘솔)가 버전으로 파서를 고르고, 모르는 버전을
+/// 만나면 조용히 오파싱하는 대신 명확히 실패할 수 있게 하기 위함이다.
+///
+/// 풀 복구와 PITR(Mongo/PG/MySQL), 계획과 완료 요약까지 여덟 가지 모양이 이 한 버전을
+/// 공유한다 — 소비자가 보는 명령이 `restore` 하나이므로, 모양은 `dry_run`·`database` 같은
+/// 필드로 구분하고 버전은 명령 단위로 올린다.
+const RESTORE_JSON_SCHEMA: u32 = 1;
 
 /// `restore` 핸들러 진입점.
 pub async fn handle(
@@ -160,13 +172,7 @@ pub async fn handle(
     if request.dry_run {
         print_plan(&outcome.plan, mode.emits_json(), &destination, lang);
     } else if mode.emits_json() {
-        let summary = serde_json::json!({
-            "backup_id": outcome.backup_id,
-            "stored_size_bytes": outcome.stored_size_bytes,
-            "destination": destination,
-            "restored": true,
-        });
-        println!("{summary}");
+        println!("{}", build_restore_summary_json(&outcome, &destination));
     } else if mode.shows_human_summary() {
         const W: usize = 15;
         println!(
@@ -267,7 +273,7 @@ async fn handle_export(
         eprintln!(
             "{}",
             style_stderr(
-                &lang.sel(
+                lang.sel(
                     &format!(
                         "⚠ output dir is not empty — same-named files will be overwritten: {}",
                         to_dir.display()
@@ -350,7 +356,7 @@ async fn handle_export(
         println!(
             "{}",
             style(
-                &lang.sel(
+                lang.sel(
                     &format!(
                         "→ restore with:  mongorestore {}",
                         outcome.out_dir.display()
@@ -393,23 +399,39 @@ async fn resolve_backup_id(
     }
 }
 
+/// 풀 복구 dry-run 계획 JSON 값을 만든다(순수 — 출력 부작용 없음).
+fn build_plan_json(plan: &RestorePlan, destination: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": RESTORE_JSON_SCHEMA,
+        "dry_run": true,
+        "backup_id": plan.backup_id,
+        "backup_type": format!("{:?}", plan.backup_type),
+        "destination": destination,
+        "source_server_version": plan.source_server_version,
+        "target_server_version": plan.target_server_version,
+        "stored_size_bytes": plan.stored_size_bytes,
+        "ns_include": plan.ns_include,
+        "conflicting_namespaces": plan.conflicting_namespaces,
+        "version_warning": plan.version_warning,
+    })
+}
+
+/// 풀 복구 완료 요약 JSON 값을 만든다(순수 — 출력 부작용 없음).
+fn build_restore_summary_json(outcome: &RestoreOutcome, destination: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": RESTORE_JSON_SCHEMA,
+        "backup_id": outcome.backup_id,
+        "stored_size_bytes": outcome.stored_size_bytes,
+        "destination": destination,
+        "restored": true,
+    })
+}
+
 /// dry-run 계획을 출력한다(체인·대상·예상 크기·충돌 — PRD §FR-3). 시크릿은 출력하지 않는다.
 /// `destination`은 [`redact_uri`](crate::cli::output::redact_uri)로 가린 복구 대상 host다.
 fn print_plan(plan: &RestorePlan, json: bool, destination: &str, lang: Lang) {
     if json {
-        let summary = serde_json::json!({
-            "dry_run": true,
-            "backup_id": plan.backup_id,
-            "backup_type": format!("{:?}", plan.backup_type),
-            "destination": destination,
-            "source_server_version": plan.source_server_version,
-            "target_server_version": plan.target_server_version,
-            "stored_size_bytes": plan.stored_size_bytes,
-            "ns_include": plan.ns_include,
-            "conflicting_namespaces": plan.conflicting_namespaces,
-            "version_warning": plan.version_warning,
-        });
-        println!("{summary}");
+        println!("{}", build_plan_json(plan, destination));
         return;
     }
 
@@ -586,13 +608,29 @@ async fn handle_pitr(
 
     // PostgreSQL 대상은 logical decoding 기반 PITR로 분기한다(base 풀 복원 + 증분 DML 재생).
     if crate::engine::DbKind::from_uri(target_uri.expose()) == crate::engine::DbKind::Postgres {
-        return handle_pg_pitr(target_uri, storage, timeout_secs, target_origin, args, at, lang)
-            .await;
+        return handle_pg_pitr(
+            target_uri,
+            storage,
+            timeout_secs,
+            target_origin,
+            args,
+            at,
+            lang,
+        )
+        .await;
     }
     // MySQL 대상은 binlog 기반 PITR로 분기한다(base 풀 복원 + 증분 ROW 재생).
     if crate::engine::DbKind::from_uri(target_uri.expose()) == crate::engine::DbKind::Mysql {
-        return handle_mysql_pitr(target_uri, storage, timeout_secs, target_origin, args, at, lang)
-            .await;
+        return handle_mysql_pitr(
+            target_uri,
+            storage,
+            timeout_secs,
+            target_origin,
+            args,
+            at,
+            lang,
+        )
+        .await;
     }
 
     // 여기까지 왔으면 Mongo PITR. 실행 컨텍스트 + 복구 대상(host) 표시.
@@ -620,16 +658,7 @@ async fn handle_pitr(
     if request.dry_run {
         print_pitr_plan(&outcome.plan, args.json, &destination, lang);
     } else if args.json {
-        let summary = serde_json::json!({
-            "base_id": outcome.plan.base_id,
-            "incremental_ids": outcome.plan.incremental_ids,
-            "decided_ts": { "t": outcome.plan.decided_ts.t, "i": outcome.plan.decided_ts.i },
-            "decided_wall_clock": outcome.plan.decided_wall_clock,
-            "replayed_slices": outcome.replayed_slices,
-            "destination": destination,
-            "restored": true,
-        });
-        println!("{summary}");
+        println!("{}", build_pitr_summary_json(&outcome, &destination));
     } else if !args.quiet {
         const W: usize = 20;
         println!(
@@ -695,7 +724,11 @@ async fn handle_pg_pitr(
     }
 
     let mode = crate::cli::output::context_mode(args.json);
-    crate::cli::output::print_run_context(&args.profile, Some(crate::engine::DbKind::Postgres), mode);
+    crate::cli::output::print_run_context(
+        &args.profile,
+        Some(crate::engine::DbKind::Postgres),
+        mode,
+    );
     crate::cli::output::print_restore_target(&target_uri, &target_origin, mode, lang);
     let destination = crate::cli::output::redact_uri(target_uri.expose());
 
@@ -717,17 +750,7 @@ async fn handle_pg_pitr(
     if request.dry_run {
         print_pg_pitr_plan(&outcome.plan, args.json, &destination, lang);
     } else if args.json {
-        let summary = serde_json::json!({
-            "base_id": outcome.plan.base_id,
-            "incremental_ids": outcome.plan.incremental_ids,
-            "target": outcome.plan.target_label,
-            "destination": destination,
-            "replayed_slices": outcome.replayed_slices,
-            "applied_changes": outcome.applied_changes,
-            "database": "postgresql",
-            "restored": true,
-        });
-        println!("{summary}");
+        println!("{}", build_pg_pitr_summary_json(&outcome, &destination));
     } else if !args.quiet {
         const W: usize = 20;
         println!(
@@ -814,17 +837,7 @@ async fn handle_mysql_pitr(
     if request.dry_run {
         print_mysql_pitr_plan(&outcome.plan, args.json, &destination, lang);
     } else if args.json {
-        let summary = serde_json::json!({
-            "base_id": outcome.plan.base_id,
-            "incremental_ids": outcome.plan.incremental_ids,
-            "target": outcome.plan.target_label,
-            "destination": destination,
-            "replayed_slices": outcome.replayed_slices,
-            "applied_changes": outcome.applied_changes,
-            "database": "mysql",
-            "restored": true,
-        });
-        println!("{summary}");
+        println!("{}", build_mysql_pitr_summary_json(&outcome, &destination));
     } else if !args.quiet {
         const W: usize = 20;
         println!(
@@ -869,19 +882,42 @@ async fn handle_mysql_pitr(
     Ok(())
 }
 
+/// MySQL PITR dry-run 계획 JSON 값을 만든다(순수 — 출력 부작용 없음).
+fn build_mysql_pitr_plan_json(plan: &MysqlPitrPlan, destination: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": RESTORE_JSON_SCHEMA,
+        "dry_run": true,
+        "base_id": plan.base_id,
+        "destination": destination,
+        "incremental_ids": plan.incremental_ids,
+        "target": plan.target_label,
+        "conflicting_tables": plan.conflicting_tables,
+        "database": "mysql",
+    })
+}
+
+/// MySQL PITR 완료 요약 JSON 값을 만든다(순수 — 출력 부작용 없음).
+fn build_mysql_pitr_summary_json(
+    outcome: &crate::pipeline::mysql_pitr::MysqlPitrOutcome,
+    destination: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema": RESTORE_JSON_SCHEMA,
+        "base_id": outcome.plan.base_id,
+        "incremental_ids": outcome.plan.incremental_ids,
+        "target": outcome.plan.target_label,
+        "destination": destination,
+        "replayed_slices": outcome.replayed_slices,
+        "applied_changes": outcome.applied_changes,
+        "database": "mysql",
+        "restored": true,
+    })
+}
+
 /// MySQL PITR dry-run 계획을 출력한다(PG와 동일 형식).
 fn print_mysql_pitr_plan(plan: &MysqlPitrPlan, json: bool, destination: &str, lang: Lang) {
     if json {
-        let summary = serde_json::json!({
-            "dry_run": true,
-            "base_id": plan.base_id,
-            "destination": destination,
-            "incremental_ids": plan.incremental_ids,
-            "target": plan.target_label,
-            "conflicting_tables": plan.conflicting_tables,
-            "database": "mysql",
-        });
-        println!("{summary}");
+        println!("{}", build_mysql_pitr_plan_json(plan, destination));
         return;
     }
     const W: usize = 22;
@@ -1006,20 +1042,43 @@ fn prompt_confirm_pg(conflicts: &[String], lang: Lang) -> bool {
     matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+/// PG PITR dry-run 계획 JSON 값을 만든다(순수 — 출력 부작용 없음).
+fn build_pg_pitr_plan_json(plan: &PgPitrPlan, destination: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": RESTORE_JSON_SCHEMA,
+        "dry_run": true,
+        "base_id": plan.base_id,
+        "destination": destination,
+        "incremental_ids": plan.incremental_ids,
+        "target": plan.target_label,
+        "conflicting_tables": plan.conflicting_tables,
+        "database": "postgresql",
+    })
+}
+
+/// PG PITR 완료 요약 JSON 값을 만든다(순수 — 출력 부작용 없음).
+fn build_pg_pitr_summary_json(
+    outcome: &crate::pipeline::pg_pitr::PgPitrOutcome,
+    destination: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema": RESTORE_JSON_SCHEMA,
+        "base_id": outcome.plan.base_id,
+        "incremental_ids": outcome.plan.incremental_ids,
+        "target": outcome.plan.target_label,
+        "destination": destination,
+        "replayed_slices": outcome.replayed_slices,
+        "applied_changes": outcome.applied_changes,
+        "database": "postgresql",
+        "restored": true,
+    })
+}
+
 /// PG PITR dry-run 계획 출력. 시크릿 미출력.
 /// `destination`은 [`redact_uri`](crate::cli::output::redact_uri)로 가린 복구 대상 host다.
 fn print_pg_pitr_plan(plan: &PgPitrPlan, json: bool, destination: &str, lang: Lang) {
     if json {
-        let summary = serde_json::json!({
-            "dry_run": true,
-            "base_id": plan.base_id,
-            "destination": destination,
-            "incremental_ids": plan.incremental_ids,
-            "target": plan.target_label,
-            "conflicting_tables": plan.conflicting_tables,
-            "database": "postgresql",
-        });
-        println!("{summary}");
+        println!("{}", build_pg_pitr_plan_json(plan, destination));
         return;
     }
     const W: usize = 22;
@@ -1256,22 +1315,44 @@ fn store_location_label(dest: &DestinationConfig) -> String {
     }
 }
 
+/// Mongo PITR dry-run 계획 JSON 값을 만든다(순수 — 출력 부작용 없음).
+fn build_pitr_plan_json(plan: &PitrPlan, destination: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": RESTORE_JSON_SCHEMA,
+        "dry_run": true,
+        "base_id": plan.base_id,
+        "destination": destination,
+        "incremental_ids": plan.incremental_ids,
+        "target_unix": plan.target_unix,
+        "decided_ts": { "t": plan.decided_ts.t, "i": plan.decided_ts.i },
+        "decided_wall_clock": plan.decided_wall_clock,
+        "limit_slice_id": plan.limit_slice_id,
+        "estimated_bytes": plan.estimated_bytes,
+    })
+}
+
+/// Mongo PITR 완료 요약 JSON 값을 만든다(순수 — 출력 부작용 없음).
+fn build_pitr_summary_json(
+    outcome: &crate::pipeline::pitr::PitrOutcome,
+    destination: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema": RESTORE_JSON_SCHEMA,
+        "base_id": outcome.plan.base_id,
+        "incremental_ids": outcome.plan.incremental_ids,
+        "decided_ts": { "t": outcome.plan.decided_ts.t, "i": outcome.plan.decided_ts.i },
+        "decided_wall_clock": outcome.plan.decided_wall_clock,
+        "replayed_slices": outcome.replayed_slices,
+        "destination": destination,
+        "restored": true,
+    })
+}
+
 /// PITR dry-run 계획을 출력한다(base·증분 체인·결정 종료 ts·예상 크기 — 무변경). 시크릿 미출력.
 /// `destination`은 [`redact_uri`](crate::cli::output::redact_uri)로 가린 복구 대상 host다.
 fn print_pitr_plan(plan: &PitrPlan, json: bool, destination: &str, lang: Lang) {
     if json {
-        let summary = serde_json::json!({
-            "dry_run": true,
-            "base_id": plan.base_id,
-            "destination": destination,
-            "incremental_ids": plan.incremental_ids,
-            "target_unix": plan.target_unix,
-            "decided_ts": { "t": plan.decided_ts.t, "i": plan.decided_ts.i },
-            "decided_wall_clock": plan.decided_wall_clock,
-            "limit_slice_id": plan.limit_slice_id,
-            "estimated_bytes": plan.estimated_bytes,
-        });
-        println!("{summary}");
+        println!("{}", build_pitr_plan_json(plan, destination));
         return;
     }
 
@@ -1371,4 +1452,150 @@ fn print_pitr_plan(plan: &PitrPlan, json: bool, destination: &str, lang: Lang) {
             W,
         )
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::schema::{BackupType, OplogTimestamp};
+    use crate::pipeline::mysql_pitr::MysqlPitrOutcome;
+    use crate::pipeline::pg_pitr::PgPitrOutcome;
+    use crate::pipeline::pitr::{PitrOutcome, PitrPlan};
+
+    const DEST: &str = "mongodb://***@127.0.0.1:27017";
+
+    fn restore_plan() -> RestorePlan {
+        RestorePlan {
+            backup_id: "bk".into(),
+            backup_type: BackupType::Full,
+            source_server_version: "7.0.35".into(),
+            stored_size_bytes: 42,
+            ns_include: None,
+            conflicting_namespaces: Vec::new(),
+            target_server_version: Some("7.0.35".into()),
+            version_warning: None,
+        }
+    }
+
+    fn pitr_plan() -> PitrPlan {
+        PitrPlan {
+            base_id: "base".into(),
+            incremental_ids: vec!["i1".into()],
+            target_unix: 1_780_000_000,
+            decided_ts: OplogTimestamp::new(100, 1),
+            decided_wall_clock: "2026-06-12T00:00:00Z".into(),
+            limit_slice_id: Some("i1".into()),
+            estimated_bytes: 42,
+        }
+    }
+
+    fn pg_pitr_plan() -> PgPitrPlan {
+        PgPitrPlan {
+            base_id: "base".into(),
+            incremental_ids: vec!["i1".into()],
+            max_commit_micros: None,
+            target_label: "latest".into(),
+            conflicting_tables: Vec::new(),
+        }
+    }
+
+    fn mysql_pitr_plan() -> MysqlPitrPlan {
+        MysqlPitrPlan {
+            base_id: "base".into(),
+            incremental_ids: vec!["i1".into()],
+            max_commit_micros: None,
+            target_label: "latest".into(),
+            conflicting_tables: Vec::new(),
+        }
+    }
+
+    /// stdout에 통째로 나가는 여덟 문서 전부가 최상위에 스키마 버전을 단다.
+    ///
+    /// `restore`는 풀/PITR × Mongo/PG/MySQL × 계획/요약으로 출력 모양이 여러 개라, 한 곳만
+    /// 빠뜨려도 소비자는 그 경로에서만 조용히 버전을 잃는다. 여덟을 한 테스트로 묶어 둔다.
+    #[test]
+    fn every_top_level_document_carries_schema() {
+        let docs = vec![
+            ("풀 계획", build_plan_json(&restore_plan(), DEST)),
+            (
+                "풀 요약",
+                build_restore_summary_json(
+                    &RestoreOutcome {
+                        backup_id: "bk".into(),
+                        stored_size_bytes: 42,
+                        plan: restore_plan(),
+                    },
+                    DEST,
+                ),
+            ),
+            ("Mongo PITR 계획", build_pitr_plan_json(&pitr_plan(), DEST)),
+            (
+                "Mongo PITR 요약",
+                build_pitr_summary_json(
+                    &PitrOutcome {
+                        plan: pitr_plan(),
+                        replayed_slices: 1,
+                    },
+                    DEST,
+                ),
+            ),
+            (
+                "PG PITR 계획",
+                build_pg_pitr_plan_json(&pg_pitr_plan(), DEST),
+            ),
+            (
+                "PG PITR 요약",
+                build_pg_pitr_summary_json(
+                    &PgPitrOutcome {
+                        plan: pg_pitr_plan(),
+                        applied_changes: 3,
+                        replayed_slices: 1,
+                    },
+                    DEST,
+                ),
+            ),
+            (
+                "MySQL PITR 계획",
+                build_mysql_pitr_plan_json(&mysql_pitr_plan(), DEST),
+            ),
+            (
+                "MySQL PITR 요약",
+                build_mysql_pitr_summary_json(
+                    &MysqlPitrOutcome {
+                        plan: mysql_pitr_plan(),
+                        applied_changes: 3,
+                        replayed_slices: 1,
+                    },
+                    DEST,
+                ),
+            ),
+        ];
+        assert_eq!(docs.len(), 8, "출력 모양이 늘면 여기도 함께 늘어야 한다");
+        for (what, v) in &docs {
+            assert_eq!(
+                v["schema"], RESTORE_JSON_SCHEMA,
+                "{what}에 스키마 버전 누락"
+            );
+            assert_eq!(v["destination"], DEST, "{what}의 복구 대상 표기 누락");
+        }
+    }
+
+    /// 계획과 요약은 `dry_run`/`restored`로 갈린다 — 소비자가 둘을 헷갈리면 안 된다.
+    #[test]
+    fn plan_and_summary_are_distinguishable() {
+        let plan = build_plan_json(&restore_plan(), DEST);
+        assert_eq!(plan["dry_run"], true);
+        assert!(plan.get("restored").is_none());
+
+        let summary = build_restore_summary_json(
+            &RestoreOutcome {
+                backup_id: "bk".into(),
+                stored_size_bytes: 42,
+                plan: restore_plan(),
+            },
+            DEST,
+        );
+        assert_eq!(summary["restored"], true);
+        assert!(summary.get("dry_run").is_none());
+    }
 }

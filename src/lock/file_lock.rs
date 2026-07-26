@@ -299,7 +299,12 @@ fn conflict_error(path: &Path, holder: &Option<LockData>, extra: Option<String>)
 /// - `ESRCH`: 그런 프로세스 없음 → 죽음.
 ///
 /// `kill(.., 0)`은 시그널을 보내지 않고 권한/존재만 검사한다(POSIX). 따라서 안전하다.
-fn pid_alive(pid: u32) -> bool {
+///
+/// `pub(crate)`인 이유: [`crate::web::routes::lock`](t13)가 락을 잡거나 회수하지 않고
+/// **읽기 전용으로 생존만 재확인**하는 데 이 함수를 그대로 재사용한다. 판정 로직(이
+/// 함수)을 두 곳에 복제하면 한쪽만 고쳐졌을 때 조용히 어긋나므로, 로직은 여기 하나만
+/// 두고 가시성만 넓힌다 — 동작은 한 글자도 바뀌지 않는다.
+pub(crate) fn pid_alive(pid: u32) -> bool {
     // pid 0/1 등 경계: 0은 "프로세스 그룹 전체"라 오판 위험 → 살아있는 것으로 본다.
     if pid == 0 {
         return true;
@@ -335,7 +340,12 @@ fn lock_path(dir: &Path, profile: &str) -> PathBuf {
 }
 
 /// 기본 lock 디렉터리: `$XDG_RUNTIME_DIR/x-backup`, 없으면 `/tmp/x-backup`.
-fn lock_dir() -> PathBuf {
+///
+/// `pub(crate)`인 이유: [`crate::web::routes::lock`](t13)가 이 디렉터리를 스캔해 현재
+/// 잡힌 락을 **읽기 전용으로** 보여준다(락을 만들거나 지우지 않는다). 경로 계산 규칙이
+/// 두 곳에 있으면 한쪽만 바뀌었을 때 화면이 엉뚱한 디렉터리를 본다 — 그래서 계산은 여기
+/// 하나만 하고 결과만 빌려 쓴다.
+pub(crate) fn lock_dir() -> PathBuf {
     match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(rt) if !rt.is_empty() => PathBuf::from(rt).join("x-backup"),
         _ => std::env::temp_dir().join("x-backup"),
@@ -343,7 +353,13 @@ fn lock_dir() -> PathBuf {
 }
 
 /// 호스트명을 얻는다(실패 시 "unknown"). 다른 호스트 lock 회수 방지에 쓴다.
-fn hostname() -> String {
+///
+/// `pub(crate)`인 이유: [`crate::web::routes::lock`](t13)가 락 파일에 적힌 호스트명과
+/// **이 서버의** 호스트명을 비교해 "이 호스트에서 생존 여부를 판정할 수 있는가"를
+/// 가른다. 비교 기준이 여기와 다른 방식(예: env만 보고 uname 폴백을 빠뜨림)으로 새로
+/// 계산되면, 실제로는 같은 호스트인데 값을 얻는 경로가 달라 "다른 호스트"로 오판할 수
+/// 있다 — 그래서 값 산출은 이 함수 하나만 쓴다.
+pub(crate) fn hostname() -> String {
     // std에 hostname API가 없어 환경변수·uname 폴백을 쓴다. 정확한 호스트명이
     // 아니어도(같은 호스트에서 일관되기만 하면) 자동 회수 안전성에는 충분하다.
     if let Some(h) = std::env::var_os("HOSTNAME").filter(|h| !h.is_empty()) {
@@ -353,6 +369,20 @@ fn hostname() -> String {
 }
 
 /// `uname(2)`의 nodename(호스트명)을 읽는다.
+///
+/// ## `as u8`을 `allow`로 남기는 이유 — `c_char` 부호가 타깃마다 다르다
+/// `libc::c_char`는 x86_64 Linux와 macOS에서 `i8`, aarch64 Linux에서 `u8`이다. 그래서 이
+/// 캐스트는 **어느 타깃에서는 필요하고 어느 타깃에서는 불필요**하다: 지우면 i8 타깃에서
+/// `Vec<u8>`로 모을 수 없어 컴파일이 깨지고, 두면 u8 타깃에서 `unnecessary_cast`가 뜬다
+/// (aarch64 Linux 컨테이너로 실측 확인 — 우리가 배포하는 `aarch64-unknown-linux-musl`이
+/// 그 타깃이다).
+///
+/// `i8 as u8`은 비트 패턴을 그대로 두므로 ASCII 호스트명에서 값을 잃지 않고, 비 ASCII가
+/// 섞이면 아래 `from_utf8`이 거부한다.
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "c_char 부호가 타깃마다 달라 캐스트 유무를 한쪽으로 고정할 수 없다"
+)]
 fn read_uname_nodename() -> Option<String> {
     // SAFETY: uname은 호출자가 준 buf에 구조체를 채울 뿐 별도 부작용이 없다.
     unsafe {

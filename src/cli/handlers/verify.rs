@@ -26,6 +26,12 @@ use crate::manifest::chain::ChainReport;
 use crate::pipeline::verify::{verify_backup, verify_chain_for, VerifyReport};
 use crate::storage::{LocalFs, Storage};
 
+/// `verify --json` 출력 스키마 버전.
+///
+/// 필드 의미가 바뀌면 올린다 — 소비자(웹 콘솔)가 버전으로 파서를 고르고, 모르는 버전을
+/// 만나면 조용히 오파싱하는 대신 명확히 실패할 수 있게 하기 위함이다.
+const VERIFY_JSON_SCHEMA: u32 = 1;
+
 /// `verify` 핸들러 진입점.
 ///
 /// `--profile`이 없을 때 destination을 알아내기 위해 config가 필요하다. verify는 프로파일
@@ -245,6 +251,12 @@ fn print_human(report: &VerifyReport, chain: Option<&ChainReport>, lang: Lang) {
 
 /// 기계 판독 JSON 출력(stdout).
 fn print_json(report: &VerifyReport, chain: Option<&ChainReport>) {
+    let value = build_json(report, chain);
+    println!("{value}");
+}
+
+/// JSON 출력 값을 만든다(순수 — 출력 부작용 없음).
+fn build_json(report: &VerifyReport, chain: Option<&ChainReport>) -> serde_json::Value {
     let chain_json = chain.map(|c| {
         serde_json::json!({
             "base_id": c.base_id,
@@ -254,7 +266,8 @@ fn print_json(report: &VerifyReport, chain: Option<&ChainReport>) {
             "warnings": c.warnings.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
         })
     });
-    let value = serde_json::json!({
+    serde_json::json!({
+        "schema": VERIFY_JSON_SCHEMA,
         "backup_id": report.backup_id,
         "manifest_sidecar_ok": report.manifest_sidecar_ok,
         "data_checksum_ok": report.data_checksum_ok,
@@ -263,8 +276,7 @@ fn print_json(report: &VerifyReport, chain: Option<&ChainReport>) {
         "warnings": report.warnings,
         "ok": report.is_ok(),
         "chain": chain_json,
-    });
-    println!("{value}");
+    })
 }
 
 /// 불리언을 색 입힌 OK/FAIL 마크로(상태 토큰 — 항상 영문).
@@ -430,6 +442,43 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.exit_code(), 4, "broken chain은 exit 4: {err}");
+    }
+
+    fn report(id: &str) -> VerifyReport {
+        VerifyReport {
+            backup_id: id.to_string(),
+            manifest_sidecar_ok: true,
+            data_checksum_ok: true,
+            deep_decode_ok: None,
+            warnings: Vec::new(),
+            empty_slice: false,
+        }
+    }
+
+    /// 최상위 JSON 문서는 스키마 버전을 달고 나간다 — 소비자가 파서를 고르는 근거다.
+    #[test]
+    fn build_json_stamps_schema_at_top_level() {
+        let v = build_json(&report("bk"), None);
+        assert_eq!(v["schema"], VERIFY_JSON_SCHEMA);
+        assert_eq!(v["backup_id"], "bk");
+        assert!(v["chain"].is_null(), "--chain 없으면 chain은 null");
+    }
+
+    /// `--chain`이 붙어도 schema는 최상위에만 있다(중첩 객체는 버전을 갖지 않는다).
+    #[test]
+    fn build_json_schema_is_not_nested_into_chain() {
+        let chain = ChainReport {
+            base_id: "base".into(),
+            incremental_ids: vec!["i1".into()],
+            breaks: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let v = build_json(&report("i1"), Some(&chain));
+        assert_eq!(v["schema"], VERIFY_JSON_SCHEMA);
+        assert!(
+            v["chain"].get("schema").is_none(),
+            "중첩 객체는 독립 문서가 아니므로 버전을 갖지 않는다"
+        );
     }
 
     /// default_profile_name은 config의 default_profile을 읽는다.

@@ -1,0 +1,819 @@
+/* x-backup 웹 콘솔 스타일시트 — 손으로 쓴 단일 파일(R40: node 툴체인 미도입).
+ *
+ * 이 파일은 컴파일 타임에 `include_str!`로 바이너리에 박힌다(R41). 그래서 런타임에
+ * 파일을 찾지 않고, 릴리스 절차(4플랫폼 정적 바이너리)도 변하지 않는다.
+ *
+ * ==========================================================================
+ * 이 파일의 계약 — "값은 바뀐다, 이름과 구조는 안 바뀐다"
+ * ==========================================================================
+ * 비주얼 아이덴티티는 **"터미널 미학"(시안 C)으로 확정됐다**(PRD Q1 해소). ANSI 16색을
+ * 그대로 쓰고, 인 화면 느낌의 녹빛 검정 위에 전부 등폭·모서리 0·그림자 0으로 간다.
+ * 라이트 모드는 의도적으로 없다 — 근거는 아래 "1층 [토큰]" 블록 주석.
+ *
+ * 확정됐어도 두 층 분리는 유지한다. 이 분리가 없으면 앞으로 붙는 20여 개 화면이 색·간격
+ * 리터럴을 각자 들고 흩어지고, 그때는 아이덴티티를 손보는 일이 파일 전체를 훑는 작업이 된다:
+ *
+ *   1층 [토큰]  `:root`의 `--*` 변수. **아이덴티티가 바뀌면 여기만 바뀐다.**
+ *   2층 [구조]  선택자와 레이아웃 규칙. 아이덴티티와 무관하게 유지된다.
+ *   3층 [부속]  파일 끝. 선택된 안이 요구하는 덧칠(스캔라인·프롬프트 캐럿 등)만.
+ *
+ * 2층은 1층을 경유해서만 색·간격·서체를 얻는다. 리터럴 색상값이 2층에 한 번이라도
+ * 등장하면 이 분리가 무너진다. **새 규칙을 2층에 넣고 싶어지면 먼저 1층에 토큰이 있는지
+ * 보라** — 없으면 토큰을 만드는 것이 맞고, 안별 예외라면 3층으로 간다.
+ *
+ * 변수 *이름*은 계약이다 — 이름을 바꾸면 `view/components.rs`의 `data-level` 계약과 함께
+ * 화면 전체가 흔들린다.
+ *
+ * 시안 3안 원본과 심사 근거는 scratchpad `identity/`에 남아 있다(`variant-{a,b,c}.html`,
+ * `README.md`). 아이덴티티를 다시 논의하게 되면 그 비교표부터 읽으면 된다.
+ *
+ * ## 상태색을 `data-level` 하나로 모으는 이유
+ * 상태(ok/warn/fail/error)를 색으로 바꾸는 규칙은 이 파일에 **정확히 한 군데**뿐이다
+ * ("레벨 → 색" 절). 마크업은 `data-level="warn"`만 싣고 색을 모른다
+ * (`src/web/view/components.rs` 헤더 참고). 새 컴포넌트는 `var(--level)`만 읽으면 되고,
+ * 아이덴티티가 바뀌어도 상태 표현이 컴포넌트마다 어긋날 수 없다.
+ */
+
+/* ==========================================================================
+ * 1층 [토큰] — 아이덴티티 "터미널 미학"(시안 C). PRD Q1 확정.
+ *
+ * 전제는 "이 도구의 진짜 얼굴은 CLI이고, 웹은 그 얼굴을 부인하지 않는다"다.
+ * 색을 임의로 고르지 않고 **ANSI 16색을 그대로** 가져온다 — 터미널에서 이미 의미를 갖는
+ * 색이라 운영자가 새로 배울 것이 없다. 이게 이 안을 고른 결정적 이유다(미학이 아니라
+ * 학습 비용 0).
+ *
+ * 라이트 모드는 **의도적으로 없다.** 밝게 뒤집으면 이 안에 남는 것이 없고, 남는 것은
+ * 사용자가 명시적으로 거부한 무채색 SaaS 대시보드다. 그래서 `prefers-color-scheme`
+ * 분기를 두지 않는다 — OS 설정이 정체성을 지우지 못하게 하는 것이 여기서는 기능이다.
+ * ========================================================================== */
+
+:root {
+  /* 간격 스케일 — 중립 기본값보다 조여져 있다. 이 콘솔의 화면은 대부분 식별자·숫자·
+   * 타임스탬프이고, 카탈로그는 수백 행을 훑는 자리다. 여백보다 행 수가 이득이다. */
+  --s-1: 0.2rem;
+  --s-2: 0.4rem;
+  --s-3: 0.6rem;
+  --s-4: 0.9rem;
+  --s-6: 1.3rem;
+  --s-8: 1.8rem;
+
+  /* 타이포 — UI 서체까지 등폭이다. 화면의 대부분이 식별자·크기·타임스탬프인데 본문만
+   * sans로 두면 한 표 안에서 두 서체가 계속 부딪힌다.
+   *
+   * 한글 시스템 서체를 스택 끝에 명시한다 — doctor 출력에는 한국어가 실제로 섞여 나오고
+   * (`설정 오류: 시크릿 환경변수 …`), 등폭 스택에는 한글이 없어 브라우저 기본 폴백에
+   * 맡기면 서체가 제어를 벗어난다. 웹폰트는 여전히 0이다(R40: 단일 정적 바이너리).
+   *
+   * 남는 한계: 영문 등폭과 한글 비등폭이 한 줄에 섞이는 시각적 이음선은 지워지지 않는다.
+   * 등폭을 포기하면 사라지지만 그러면 이 안의 정체성도 함께 사라진다 — 감수한 손실이다. */
+  --f-ui: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace,
+    "Apple SD Gothic Neo", "Noto Sans KR";
+  --f-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace,
+    "Apple SD Gothic Neo", "Noto Sans KR";
+  --f-size: 14px;
+  /* 표·배지처럼 밀도가 높은 자리의 크기. rem이 아니라 em이면 중첩 시 계속 줄어든다. */
+  --f-size-sm: 12.5px;
+  --f-line: 1.5;
+  /* 데이터 표의 행 높이 — 본문보다 좁혀 한 화면에 더 많은 행이 들어가게 한다. */
+  --f-line-dense: 1.3;
+
+  /* 색 — 인 화면(phosphor) 느낌의 녹빛 검정. 순수 #000은 대비가 너무 세서 눈이 빨리
+   * 지친다(장시간 응시하는 운영 콘솔이다). */
+  --c-bg: #07100a;
+  --c-surface: #0c170f;
+  --c-border: #1f3a27;
+  --c-text: #c6d8c6;
+  --c-muted: #6f8c74;
+  /* ANSI bright yellow — 프롬프트·링크 색으로 터미널에서 가장 익숙한 자리. */
+  --c-accent: #ffd75f;
+
+  /* 상태색 — ANSI green / yellow / red / magenta. exit code 0~5를 화면에서 구분하는
+   * 데 쓴다(R10). 의미가 이미 정해져 있는 네 색이라 임의 선택이 아니다. */
+  --c-ok: #00d75f;
+  --c-warn: #d7af00;
+  --c-fail: #ff5f5f;
+  /* error = "점검 자체를 못 했다". fail("설정이 잘못됐다")과 색을 나눈다 — 운영자가
+   * 취해야 할 행동이 정반대이므로 같은 빨강으로 뭉개면 멀쩡한 config를 뒤지게 된다
+   * (`view/components.rs::Level` 문서 참고). ANSI magenta 자리다. */
+  --c-error: #d787ff;
+
+  /* 모서리와 깊이를 완전히 버린다 — 터미널에는 둘 다 없다. */
+  --radius: 0px;
+  --radius-sm: 0px;
+  --elev: none;
+  --rule: 1px;
+  /* 전환 애니메이션 없음. 터미널은 상태가 즉시 바뀐다. */
+  --motion: 0ms;
+}
+
+/* 사용자가 OS에서 모션을 줄였으면 무조건 따른다 — 아이덴티티보다 우선한다. */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion: 0ms;
+  }
+}
+
+/* ==========================================================================
+ * 2층 [구조] — 아이덴티티와 무관. 토큰만 경유한다.
+ * ========================================================================== */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--c-bg);
+  color: var(--c-text);
+  font-family: var(--f-ui);
+  font-size: var(--f-size);
+  line-height: var(--f-line);
+}
+
+code,
+kbd,
+samp,
+.mono {
+  font-family: var(--f-mono);
+  font-size: 0.92em;
+}
+
+a {
+  color: var(--c-accent);
+}
+
+/* 껍데기 — 헤더 한 줄 + 본문. */
+.shell {
+  max-width: 72rem;
+  margin: 0 auto;
+  padding: var(--s-6) var(--s-4);
+}
+
+.shell-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-3);
+  padding-bottom: var(--s-3);
+  margin-bottom: var(--s-6);
+  border-bottom: var(--rule) solid var(--c-border);
+  /* 화면이 늘어나면 내비게이션이 길어진다 — 좁은 창에서 제품명을 밀어내지 않고 줄바꿈. */
+  flex-wrap: wrap;
+}
+
+.shell-head h1 {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.shell-head .ver {
+  color: var(--c-muted);
+  font-family: var(--f-mono);
+  font-size: 0.82rem;
+}
+
+/* 내비게이션은 오른쪽으로 밀어 제품명과 시각적으로 분리한다. */
+.shell-nav {
+  margin-left: auto;
+  display: flex;
+  gap: var(--s-4);
+  font-size: var(--f-size-sm);
+}
+
+.shell-nav a {
+  text-decoration: none;
+  color: var(--c-muted);
+  transition: color var(--motion) linear;
+}
+
+.shell-nav a:hover {
+  color: var(--c-text);
+}
+
+/* 현재 화면은 색 + 밑줄 두 가지로 표시한다 — 색 하나만 쓰면 색각 이상에서 사라진다. */
+.shell-nav a[aria-current="page"] {
+  color: var(--c-text);
+  font-weight: 600;
+  border-bottom: 2px solid var(--c-accent);
+}
+
+.card,
+.panel {
+  background: var(--c-surface);
+  border: var(--rule) solid var(--c-border);
+  border-radius: var(--radius);
+  box-shadow: var(--elev);
+}
+
+.card {
+  padding: var(--s-4);
+}
+
+.muted {
+  color: var(--c-muted);
+}
+
+/* -- 화면 제목 ----------------------------------------------------------- */
+
+.page-head {
+  margin-bottom: var(--s-4);
+}
+
+.page-title {
+  margin: 0;
+  font-size: 1.35rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.page-sub {
+  margin: var(--s-1) 0 0;
+  color: var(--c-muted);
+  font-size: var(--f-size-sm);
+}
+
+/* -- 레벨 → 색: 이 파일에서 상태를 색으로 바꾸는 유일한 자리 -------------- */
+
+[data-level="ok"] {
+  --level: var(--c-ok);
+}
+
+[data-level="warn"] {
+  --level: var(--c-warn);
+}
+
+[data-level="fail"] {
+  --level: var(--c-fail);
+}
+
+[data-level="error"] {
+  --level: var(--c-error);
+}
+
+/* 레벨 색의 옅은 틴트. `color-mix`는 레벨 색이 무엇으로 바뀌어도 자동으로 따라오므로
+ * 레벨×테마마다 배경 토큰을 따로 두지 않아도 된다(토큰 8개가 0개로 줄어든다).
+ * 앞줄의 불투명 배경이 `color-mix`를 모르는 브라우저의 폴백이다.
+ *
+ * 주의: 이 계산은 표면색이 무채색일 때만 옳다. 현재 아이덴티티(터미널 미학)의 표면은
+ * 녹빛이라 빨강을 섞으면 갈색이 되므로, 3층 "아이덴티티 부속 규칙"이 네 레벨의 틴트를
+ * 고정값으로 덮어쓴다. 여기를 지우지 말 것 — 표면이 무채색인 안으로 돌아가면 이 규칙이
+ * 다시 유일한 틴트 공급자가 된다. */
+[data-level] {
+  --level-tint: var(--c-surface);
+  --level-tint: color-mix(in oklab, var(--level) 10%, var(--c-surface));
+}
+
+/* -- 판정 배너 ----------------------------------------------------------- */
+
+.verdict {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s-3);
+  padding: var(--s-3) var(--s-4);
+  margin-bottom: var(--s-4);
+  border: var(--rule) solid var(--level);
+  /* 왼쪽 굵은 띠 — 색을 못 보는 경우에도 "여기가 상태 블록"이라는 신호가 남는다. */
+  border-left-width: 4px;
+  border-radius: var(--radius);
+  background: var(--level-tint);
+}
+
+.verdict__badge {
+  flex: none;
+  font-family: var(--f-mono);
+  font-size: var(--f-size-sm);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--level);
+  /* 배지 폭을 고정해 여러 화면을 오갈 때 헤드라인 시작 위치가 흔들리지 않게 한다. */
+  min-width: 4.5em;
+}
+
+.verdict__text {
+  min-width: 0;
+}
+
+.verdict__headline {
+  margin: 0;
+  font-weight: 600;
+}
+
+.verdict__detail {
+  margin: var(--s-1) 0 0;
+  color: var(--c-muted);
+  font-size: var(--f-size-sm);
+}
+
+/* -- 메타 목록(라벨:값) --------------------------------------------------- */
+
+.meta {
+  display: grid;
+  /* 라벨 열은 내용에 맞추고 값 열이 남는 폭을 갖는다 — 라벨 폭을 px로 고정하면
+   * 한국어/영어 라벨 길이 차이에서 어긋난다. */
+  grid-template-columns: auto 1fr;
+  gap: var(--s-1) var(--s-3);
+  margin: 0 0 var(--s-4);
+  font-size: var(--f-size-sm);
+}
+
+.meta__k {
+  color: var(--c-muted);
+  font-family: var(--f-mono);
+}
+
+.meta__v {
+  margin: 0;
+  font-family: var(--f-mono);
+  /* 숫자 폭을 고정해 값 여러 개를 위아래로 비교할 수 있게 한다. */
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+/* -- 카드 ---------------------------------------------------------------- */
+
+.panel {
+  margin-bottom: var(--s-4);
+  overflow: hidden;
+}
+
+.panel__head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  flex-wrap: wrap;
+  padding: var(--s-3) var(--s-4);
+  border-bottom: var(--rule) solid var(--c-border);
+}
+
+.panel__title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 650;
+}
+
+/* 카드 제목줄의 배지는 오른쪽 끝으로 — 카드를 여러 장 훑을 때 상태가 한 열에 정렬된다. */
+.panel__head .badge {
+  margin-left: auto;
+}
+
+.panel__body {
+  /* 표가 카드 테두리에 붙어야 밀도가 산다 — 본문 패딩은 표 자체가 관리한다. */
+  padding: 0;
+}
+
+/* 엔진 같은 분류 꼬리표. 상태가 아니므로 레벨 색을 쓰지 않는다. */
+.tag {
+  font-family: var(--f-mono);
+  font-size: var(--f-size-sm);
+  color: var(--c-muted);
+  border: var(--rule) solid var(--c-border);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--s-2);
+}
+
+.counts {
+  color: var(--c-muted);
+  font-size: var(--f-size-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+/* -- 상태 배지 ----------------------------------------------------------- */
+
+.badge {
+  display: inline-block;
+  font-family: var(--f-mono);
+  font-size: var(--f-size-sm);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1.6;
+  padding: 0 var(--s-2);
+  border: var(--rule) solid var(--level);
+  border-radius: var(--radius-sm);
+  color: var(--level);
+  background: var(--level-tint);
+  /* 배지는 표의 첫 열이다 — 폭이 흔들리면 그 오른쪽 열 전체가 들쭉날쭉해진다. */
+  min-width: 4.5em;
+  text-align: center;
+  white-space: nowrap;
+}
+
+/* -- 데이터 표 ----------------------------------------------------------- */
+
+/* 표만 따로 스크롤한다 — 긴 메시지 하나가 페이지 전체를 좌우로 흔드는 것을 막는다. */
+.dtable-scroll {
+  overflow-x: auto;
+}
+
+.dtable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--f-size-sm);
+  line-height: var(--f-line-dense);
+}
+
+.dtable th,
+.dtable td {
+  text-align: left;
+  vertical-align: top;
+  padding: var(--s-2) var(--s-4);
+  border-bottom: var(--rule) solid var(--c-border);
+}
+
+.dtable thead th {
+  color: var(--c-muted);
+  font-weight: 600;
+  font-size: var(--f-size-sm);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+/* 상태 열은 배지 폭에 딱 맞춘다. `width: 1px`은 "가능한 만큼 좁혀라"라는 뜻이고
+ * (`table-layout: auto`에서 관용적인 표현), 배지의 `min-width`가 실제 폭을 정한다.
+ * 이게 없으면 표마다 상태 열 폭이 제각각이라, 카드를 위아래로 훑을 때 그 오른쪽 열
+ * 전체가 카드마다 다른 위치에서 시작한다 — 실제 데이터로 렌더해 보고 발견한 결함이다. */
+.dtable th:first-child,
+.dtable td:first-child {
+  width: 1px;
+  white-space: nowrap;
+}
+
+/* 행의 "키" 열(무슨 점검인가 / 무슨 필드인가).
+ *
+ * `min-width`가 아니라 `width`인 이유: `table-layout: auto`는 남는 폭을 각 열의 내용
+ * 길이에 비례해 나눠준다. 그래서 `min-width`만 주면 **메시지가 긴 카드일수록 키 열이
+ * 좁아져** 카드마다 설명 열의 시작 x가 어긋난다(실제 데이터로 렌더해 확인했다).
+ * `width`를 주면 그 폭이 기준선이 되고, 내용이 넘칠 때만 늘어난다. 등폭 서체의 라벨은
+ * 길어도 12자 정도라 9rem을 넘지 않는다. */
+.dtable .key {
+  width: 9rem;
+  white-space: nowrap;
+}
+
+/* 마지막 행의 밑줄은 카드 테두리와 겹친다. */
+.dtable tbody tr:last-child th,
+.dtable tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+/* 상태가 있는 행에 옅은 틴트 — 배지 하나만으로는 행이 20개를 넘어갈 때 눈이 상태를
+ * 잃는다. ok 행은 틴트를 지운다(대부분이 ok라 전부 칠하면 신호가 사라진다). */
+.dtable tbody tr[data-level] {
+  background: var(--level-tint);
+}
+
+.dtable tbody tr[data-level="ok"] {
+  background: transparent;
+}
+
+/* 숫자 열 — 우측 정렬 + 등폭 숫자. 자릿수를 눈으로 비교할 수 있게 한다. */
+.dtable .num {
+  text-align: right;
+  font-family: var(--f-mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 설명 열 — 자식 프로세스가 만든 임의 길이 텍스트가 온다. 공백 없는 초장문(토큰·해시)이
+ * 표를 밖으로 밀지 않도록 어디서든 끊는다. */
+.dtable .msg {
+  overflow-wrap: anywhere;
+  min-width: 18rem;
+}
+
+/* 경과 시간 표시 — 값 자체가 상태를 담으므로 레벨 색을 따른다. */
+.age {
+  font-family: var(--f-mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* -- 라이브 모니터 델타 --------------------------------------------------- */
+
+/* 값 옆에 붙는 변화량. 본체 숫자보다 작게 — 눈이 먼저 가야 하는 것은 현재 값이고, 델타는
+ * "무엇이 움직였나"를 훑을 때 보는 보조 정보다. */
+.monitor-delta {
+  font-size: 0.85em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  color: var(--delta, var(--c-muted));
+}
+
+/* **움직인 것만 눈에 남긴다.** 증가·감소를 서로 다른 색으로 나누지 않는 이유는, 어느 쪽이
+ * 좋은 일인지 화면이 알 수 없기 때문이다 — 문서가 늘어난 것은 백업 중이면 정상이고 유휴
+ * 시간에 급증했다면 사고다. 방향은 이미 값 앞의 `+`/`-` 부호가 말하므로, 색은 "여기가
+ * 움직였다"만 말하고 해석은 사람 몫으로 남긴다. */
+[data-delta="up"],
+[data-delta="down"] {
+  --delta: var(--c-text);
+}
+
+/* 변화 없음과 **아직 모름**은 뜻이 정반대지만(`view/monitor.rs` 헤더) 둘 다 "볼 것 없음"
+ * 이라 똑같이 물러난다. 구분은 색이 아니라 값이 한다 — `none`은 숫자 대신 대시(—)다. */
+[data-delta="same"],
+[data-delta="none"] {
+  --delta: var(--c-muted);
+}
+
+/* -- 알림 블록 ----------------------------------------------------------- */
+
+.notice {
+  padding: var(--s-3) var(--s-4);
+  margin-bottom: var(--s-4);
+  border: var(--rule) solid var(--level);
+  border-left-width: 4px;
+  border-radius: var(--radius);
+  background: var(--level-tint);
+}
+
+.notice__title {
+  margin: 0 0 var(--s-2);
+  font-weight: 600;
+  color: var(--level);
+}
+
+.notice__body {
+  font-size: var(--f-size-sm);
+}
+
+.notice__body p {
+  margin: 0 0 var(--s-2);
+}
+
+.notice__body p:last-child {
+  margin-bottom: 0;
+}
+
+/* 자식 프로세스 출력 덤프 — 줄바꿈을 보존하되 가로 스크롤은 자기 안에서 처리한다. */
+.logdump {
+  margin: 0;
+  padding: var(--s-3);
+  background: var(--c-bg);
+  border: var(--rule) solid var(--c-border);
+  border-radius: var(--radius-sm);
+  font-family: var(--f-mono);
+  font-size: var(--f-size-sm);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  /* 자식 stderr는 길다 — 오류 화면이 스크롤 지옥이 되지 않게 높이를 묶는다. */
+  max-height: 18rem;
+  overflow-y: auto;
+}
+
+/* 키보드 포커스 링은 지운다는 선택지 자체를 두지 않는다 — 운영 콘솔에서 파괴적 버튼을
+ * 키보드로 짚을 수 있어야 한다. */
+:focus-visible {
+  outline: 2px solid var(--c-accent);
+  outline-offset: 2px;
+}
+
+/* -- 폼 컨트롤 ------------------------------------------------------------ */
+
+/* 브라우저 기본 컨트롤은 자기 서체·자기 모서리를 들고 온다. 그대로 두면 화면 하나에
+ * 두 개의 시각 언어가 섞인다 — 특히 등폭 아이덴티티에서 입력칸만 sans로 튄다. */
+input,
+select,
+textarea,
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: var(--c-text);
+  background: var(--c-bg);
+  border: var(--rule) solid var(--c-border);
+  border-radius: var(--radius-sm);
+  padding: var(--s-1) var(--s-2);
+}
+
+/* 체크박스·라디오는 크기가 곧 의미다(누를 수 있는 표적). 위 규칙의 padding·배경이
+ * 오히려 표적을 흐트리므로 브라우저 기본 렌더링으로 되돌린다. */
+input[type="checkbox"],
+input[type="radio"] {
+  padding: 0;
+  background: none;
+  border: none;
+}
+
+button {
+  cursor: pointer;
+  background: var(--c-surface);
+}
+
+button:hover {
+  border-color: var(--c-accent);
+}
+
+/* 조작 묶음(제출·취소·삭제)은 한 줄에 모은다. 화면마다 다른 자리에 흩어지면 운영자가
+ * 매번 찾아야 한다. */
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-3);
+  align-items: center;
+  margin-top: var(--s-4);
+}
+
+/* -- config 편집 폼 ------------------------------------------------------- */
+
+.cfg-form {
+  display: grid;
+  gap: var(--s-3);
+}
+
+/* 필드 하나는 4칸 그리드다: 키 · 출처 · 현재 실효값 · 입력.
+ * 키를 고정폭으로 못박아 필드를 위아래로 훑을 때 눈이 흔들리지 않게 한다(카드마다 열이
+ * 다른 자리에서 시작하는 문제를 doctor 화면에서 이미 겪었다). */
+.field {
+  display: grid;
+  grid-template-columns: 14rem 10rem minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--s-2) var(--s-3);
+  align-items: baseline;
+  padding: var(--s-2) 0;
+  border-bottom: var(--rule) solid var(--c-border);
+}
+
+/* 힌트·경고·clear 체크박스는 4칸을 가로질러 아래에 붙는다 — 필드 그리드를 망가뜨리지
+ * 않으면서 그 필드에 속한다는 것이 보이게. */
+.field__hint,
+.field__warn,
+.field__clear {
+  grid-column: 1 / -1;
+  font-size: var(--f-size-sm);
+}
+
+.field__label {
+  color: var(--c-text);
+}
+
+.field__value {
+  color: var(--c-muted);
+  overflow-wrap: anywhere;
+}
+
+.field__hint {
+  color: var(--c-muted);
+}
+
+/* 경고는 상태가 아니라 주의 환기다 — `data-level`을 쓰지 않고 경고색만 직접 참조한다.
+ * (`data-level`을 붙이면 배지·틴트까지 따라와 필드 한 줄이 판정처럼 보인다.) */
+.field__warn {
+  color: var(--c-warn);
+}
+
+/* 출처 뱃지 — 이 값이 어디서 왔는지.
+ *
+ * ## 왜 `data-level`이 아니라 별도 축인가
+ * 출처는 상태가 아니다. `direct`는 "좋음"이 아니고 `inherited`는 "경고"가 아니다 —
+ * 둘 다 정상이다. 상태색(ok/warn/fail/error)을 빌려 쓰면 운영자가 상속을 문제로 읽는다.
+ * 그래서 색이 아니라 **강조 대비**로 가른다: 이 프로파일에서 직접 적은 값만 본문색으로
+ * 세우고, 다른 곳에서 온 값은 muted로 물러앉힌다.
+ *
+ * 글자 라벨(`extends: s3prod`)이 이미 마크업에 있으므로 CSS가 없어도 뜻이 읽힌다 —
+ * 이 규칙은 스캔 속도를 올리는 것이고 의미를 나르지 않는다(t26의 `data-origin` 설계). */
+.field__origin {
+  font-size: var(--f-size-sm);
+  color: var(--c-muted);
+  overflow-wrap: anywhere;
+}
+
+.field__origin[data-origin="direct"] {
+  color: var(--c-text);
+}
+
+/* 상속된 필드는 입력칸이 비어 있는 것이 정상이다(비운 채 제출하면 상속 유지).
+ * 그 "비어 있음"이 실수처럼 보이지 않게 placeholder 대비를 낮춘다. */
+.field[data-origin="defaults"] .field__label,
+.field[data-origin="inherited"] .field__label,
+.field[data-origin="builtin"] .field__label {
+  color: var(--c-muted);
+}
+
+/* config 문법 배너(v1/v2) — 판정 배너 골격을 그대로 쓰면서, 문법은 성공/실패가 아니므로
+ * 레벨 색을 쓰지 않는다. v1이든 v2든 정상이고, 알려야 할 것은 "저장이 이 문법을
+ * 유지한다"는 사실 하나뿐이다. */
+.verdict[data-syntax] {
+  border-color: var(--c-border);
+}
+
+.verdict[data-syntax] .verdict__badge {
+  color: var(--c-accent);
+  border-color: var(--c-accent);
+}
+
+/* 프로파일 카드 제목줄의 "6 direct · 10 inherited · 1 dest" 요약. */
+.counts {
+  color: var(--c-muted);
+  font-size: var(--f-size-sm);
+}
+
+/* 표 제목(`<caption>`)은 기본이 가운데 정렬이라 표 머리글과 축이 어긋난다. */
+table caption {
+  text-align: left;
+  color: var(--c-muted);
+  font-size: var(--f-size-sm);
+  padding-bottom: var(--s-1);
+}
+
+/* 좁은 화면에서는 4칸 그리드가 무너진다 — 한 칸으로 접고 라벨만 위에 남긴다. */
+@media (max-width: 60rem) {
+  .field {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ==========================================================================
+ * 아이덴티티 부속 규칙 — 터미널 미학(시안 C)이 요구하는 최소 규칙.
+ *
+ * 전부 2층을 건드리지 않는 **덧칠**이다. 2층 규칙을 고쳐야 했다면 1층 토큰이 부족하다는
+ * 신호이므로(파일 헤더 "아이덴티티 승격 절차" 3번) 그 경우엔 토큰을 늘렸다.
+ * ========================================================================== */
+
+/* 상태 틴트를 표면색과 **섞지 않고 고정값으로 박는다.**
+ *
+ * 2층의 기본 규칙은 `color-mix(in oklab, var(--level) 10%, var(--c-surface))`로 틴트를
+ * 계산한다 — 레벨색이 바뀌어도 자동으로 따라오는 영리한 방식이고, 표면이 무채색인 안에서는
+ * 정확히 옳다. 그런데 이 안의 표면은 **녹빛**(#0c170f)이다. 여기에 빨강 10%를 섞으면
+ * 초록+빨강이 되어 **탁한 갈색**이 나온다. 실제 데이터로 렌더해 확인한 결함이고, FAIL 행이
+ * 가장 눈에 띄어야 하는 자리에서 가장 흐려지므로 판독성 손실이 직접적이다.
+ *
+ * 그래서 네 레벨의 틴트를 표면과 무관한 고정값으로 준다. 대가는 "레벨색을 바꾸면 틴트를
+ * 손으로 따라 바꿔야 한다"는 것 — ANSI 팔레트는 정의상 고정이라 이 대가가 발생하지 않는다.
+ * `color-mix` 미지원 브라우저에서도 이 값이 그대로 쓰이므로 폴백 분기가 필요 없어진다. */
+[data-level="ok"] {
+  --level-tint: #0d1f13;
+}
+
+[data-level="warn"] {
+  --level-tint: #1c1a0c;
+}
+
+[data-level="fail"] {
+  --level-tint: #201011;
+}
+
+[data-level="error"] {
+  --level-tint: #1a1020;
+}
+
+/* 스캔라인: 화면 전체에 고정된 1px 격자. `pointer-events:none`으로 클릭을 막지 않고,
+ * 투명도를 아주 낮게 둬서 글자 대비를 깎지 않는다(여기서 욕심을 내면 판독성이 죽는다). */
+html::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9999;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0.18) 0px,
+    rgba(0, 0, 0, 0.18) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+}
+
+/* 배지 발광은 **글자에서 빼고 테두리에만** 남긴다.
+ *
+ * 시안은 `.badge`에 `text-shadow`로 CRT 번짐을 흉내냈는데, 12.5px 배지 글자에서 그
+ * 번짐이 윤곽을 무르게 만든다(`OK`/`WARN`/`FAIL`은 한 화면에 수십 개가 깔리는 글자다).
+ * `box-shadow`로 옮기면 배지 덩어리 주위가 발광해 CRT 느낌은 남고 글자는 선명해진다 —
+ * 개성을 거의 잃지 않으면서 판독성 손실만 제거하는 교환이다. */
+.badge,
+.verdict__badge {
+  box-shadow: 0 0 6px -1px var(--level);
+}
+
+/* 표 머리글은 터미널 헤더처럼 반전시킨다. */
+.dtable thead th {
+  background: var(--c-border);
+  color: var(--c-text);
+}
+
+/* 프롬프트 기호 — 화면 제목 앞에 붙는 이 안의 서명. */
+.page-title::before {
+  content: "$ ";
+  color: var(--c-accent);
+}
+
+/* 깜빡이는 캐럿. 모션을 줄인 사용자에게는 멈춘 블록으로 남는다(사라지지 않는다 — 커서가
+ * 있던 자리가 비면 제목이 잘린 것처럼 보인다). */
+.page-title::after {
+  content: "\2588";
+  color: var(--c-accent);
+  margin-left: 0.15em;
+  animation: caret 1.1s step-end infinite;
+}
+
+@keyframes caret {
+  50% {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .page-title::after {
+    animation: none;
+  }
+}

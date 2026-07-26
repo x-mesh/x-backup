@@ -220,6 +220,8 @@ mod tests {
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
+        // Linux 전용 `ETXTBSY` 경합을 피한다 — 근거는 그 함수 문서.
+        crate::testutil::wait_until_executable(&path);
         path
     }
 
@@ -298,6 +300,8 @@ mod tests {
         let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&script_path, perms).unwrap();
+        // Linux 전용 `ETXTBSY` 경합을 피한다 — 근거는 그 함수 문서.
+        crate::testutil::wait_until_executable(&script_path);
 
         // 시크릿 URI를 담은 0600 config 파일을 만들어 --config로 전달.
         let secret = crate::config::secret::Secret::new(

@@ -31,6 +31,8 @@ struct ProfileReport {
     db: Option<DbKind>,
     items: Vec<Item>,
 }
+/// `doctor --json` 출력 스키마 버전. 필드 의미가 바뀌면 올린다.
+pub const DOCTOR_JSON_SCHEMA: u32 = 1;
 
 fn rank(s: CheckStatus) -> u8 {
     match s {
@@ -464,6 +466,9 @@ fn render_json(reports: &[ProfileReport], overall: CheckStatus) {
     println!(
         "{}",
         serde_json::json!({
+            // 스키마 버전 — 소비자(웹 콘솔)가 버전으로 파서를 고르고, 모르는 버전에서
+            // 조용히 오파싱하는 대신 명확히 실패하게 한다.
+            "schema": DOCTOR_JSON_SCHEMA,
             "overall": format!("{overall:?}").to_lowercase(),
             "profiles": profiles,
         })

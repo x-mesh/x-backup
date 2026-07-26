@@ -22,12 +22,14 @@ use crate::config::merged::MergeInput;
 use crate::config::ResolvedConfig;
 use crate::engine::mongo::status::human_bytes;
 use crate::error::{Result, XBackupError};
-use crate::manifest::chain::verify_chain;
+use crate::manifest::chain::ChainVerifier;
 use crate::manifest::schema::{BackupStatus, BackupType};
 use crate::manifest::store::{ManifestStore, DATA_FILE, MANIFEST_FILE};
 use crate::manifest::ChainNode;
 use crate::pipeline::verify::collect_manifest_ids;
 use crate::storage::{LocalFs, Storage, StorageEntry};
+/// `list --json` 출력 스키마 버전. 필드 의미가 바뀌면 올린다.
+pub const LIST_JSON_SCHEMA: u32 = 1;
 
 /// 카탈로그 한 행(백업 또는 orphan).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,7 +162,9 @@ fn normalize_engine_filter(f: Option<&str>) -> Result<Option<String>> {
 }
 
 /// destination(store) 위치를 사람용 문자열로 — 표시용(local 경로 또는 s3).
-fn store_location(config_toml: Option<&str>, profile: &str) -> String {
+///
+/// `prune --json`도 같은 표기를 쓰므로 크레이트 내부에 공개한다(표기 이원화 방지).
+pub(crate) fn store_location(config_toml: Option<&str>, profile: &str) -> String {
     ResolvedConfig::build(MergeInput {
         config_toml,
         profile_name: profile,
@@ -211,6 +215,12 @@ pub async fn build_catalog(storage: &dyn Storage) -> Result<Vec<CatalogRow>> {
     let nodes: Vec<ChainNode> = manifests.iter().map(ChainNode::from_manifest).collect();
 
     // 2) 각 백업의 행을 만든다.
+    //
+    // 체인 판정은 `verify_chain`을 백업마다 부르지 않고 [`ChainVerifier`]를 한 번 만들어
+    // 재사용한다. 그 함수는 호출마다 노드 전체를 훑으므로 여기서 반복하면 O(n^2)가 되고,
+    // 실측으로 백업 4,000개에 336ms(release)였다 — 그 타입의 doc에 곡선이 있다.
+    let mut chains = ChainVerifier::new(&nodes);
+
     let mut rows = Vec::new();
     for m in &manifests {
         let kind = match m.backup_type {
@@ -220,9 +230,9 @@ pub async fn build_catalog(storage: &dyn Storage) -> Result<Vec<CatalogRow>> {
         let chain_status = if matches!(m.status, BackupStatus::Incomplete) {
             "incomplete".to_string()
         } else {
-            // 체인 연속성으로 ok/broken 판정.
-            let report = verify_chain(&nodes, &m.id);
-            if report.is_continuous() {
+            // 체인 연속성으로 ok/broken 판정. 불리언만 필요하므로 보고서를 복제하지
+            // 않는 `is_continuous`를 쓴다(`ChainVerifier::is_continuous` doc 참조).
+            if chains.is_continuous(&m.id) {
                 "ok".to_string()
             } else {
                 "broken".to_string()
@@ -547,7 +557,13 @@ fn print_json(rows: &[CatalogRow], store_loc: &str) {
             })
         })
         .collect();
-    let value = serde_json::json!({ "store": store_loc, "backups": items });
+    // 스키마 버전 — 소비자(웹 콘솔)가 버전으로 파서를 고르고, 모르는 버전에서 조용히
+    // 오파싱하는 대신 명확히 실패하게 한다.
+    let value = serde_json::json!({
+        "schema": LIST_JSON_SCHEMA,
+        "store": store_loc,
+        "backups": items,
+    });
     println!("{value}");
 }
 
