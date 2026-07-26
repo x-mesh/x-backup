@@ -97,7 +97,12 @@ pub async fn write_post<W: AsyncWrite + Unpin>(
     name: &str,
     sql: &str,
 ) -> Result<()> {
-    write_doc_frame(w, TAG_POST, &bson::doc! { "kind": kind, "name": name, "sql": sql }).await
+    write_doc_frame(
+        w,
+        TAG_POST,
+        &bson::doc! { "kind": kind, "name": name, "sql": sql },
+    )
+    .await
 }
 
 /// 테이블 메타 프레임에 담을 정보.

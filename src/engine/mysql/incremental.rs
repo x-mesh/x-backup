@@ -293,7 +293,10 @@ pub async fn capture(
 }
 
 /// binlog 한 행(이미지)을 SQL 리터럴 벡터로 렌더링한다(위치 순서, 컬럼 타입 반영). None이면 빈 벡터.
-fn render_binlog_row(row: Option<BinlogRow>, col_types: &[Option<ColumnType>]) -> Result<Vec<String>> {
+fn render_binlog_row(
+    row: Option<BinlogRow>,
+    col_types: &[Option<ColumnType>],
+) -> Result<Vec<String>> {
     let Some(br) = row else { return Ok(Vec::new()) };
     let r: Row = br
         .try_into()
@@ -445,7 +448,9 @@ fn build_dml(c: &Change, cols: &[ColInfo]) -> Option<String> {
                 .collect::<Vec<_>>()
                 .join(", ");
             if upd.is_empty() {
-                Some(format!("INSERT IGNORE INTO {q} ({collist}) VALUES ({vals})"))
+                Some(format!(
+                    "INSERT IGNORE INTO {q} ({collist}) VALUES ({vals})"
+                ))
             } else {
                 Some(format!(
                     "INSERT INTO {q} ({collist}) VALUES ({vals}) ON DUPLICATE KEY UPDATE {upd}"
@@ -591,8 +596,11 @@ async fn read_doc<R: AsyncRead + Unpin>(r: &mut R) -> Result<Document> {
 }
 
 fn change_to_doc(c: &Change) -> Document {
-    let strs =
-        |v: &[String]| v.iter().map(|s| Bson::String(s.clone())).collect::<Vec<_>>();
+    let strs = |v: &[String]| {
+        v.iter()
+            .map(|s| Bson::String(s.clone()))
+            .collect::<Vec<_>>()
+    };
     let op = match c.op {
         Op::Insert => "I",
         Op::Update => "U",
@@ -611,7 +619,11 @@ fn change_to_doc(c: &Change) -> Document {
 fn doc_to_change(d: &Document) -> Result<Change> {
     let strs = |arr: &str| -> Vec<String> {
         d.get_array(arr)
-            .map(|a| a.iter().filter_map(|b| b.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|b| b.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let op = match d.get_str("op").unwrap_or("") {
@@ -673,7 +685,10 @@ mod tests {
     fn update_by_pk() {
         // PK 컬럼도 SET에 포함된다(PK 변경 UPDATE를 대상에 반영하기 위함).
         let sql = build_dml(&ch(Op::Update), &cols()).unwrap();
-        assert_eq!(sql, "UPDATE `t` SET `id` = 7, `name` = 'new' WHERE `id` = 7");
+        assert_eq!(
+            sql,
+            "UPDATE `t` SET `id` = 7, `name` = 'new' WHERE `id` = 7"
+        );
     }
 
     #[test]
@@ -683,7 +698,10 @@ mod tests {
         c.before = vec!["5".into(), "'old'".into()];
         c.after = vec!["6".into(), "'new'".into()];
         let sql = build_dml(&c, &cols()).unwrap();
-        assert_eq!(sql, "UPDATE `t` SET `id` = 6, `name` = 'new' WHERE `id` = 5");
+        assert_eq!(
+            sql,
+            "UPDATE `t` SET `id` = 6, `name` = 'new' WHERE `id` = 5"
+        );
     }
 
     #[test]
@@ -750,7 +768,10 @@ mod tests {
         write_end(&mut buf);
 
         let mut r = std::io::Cursor::new(buf);
-        assert!(matches!(read_frame(&mut r).await.unwrap(), IncrFrame::Header(_)));
+        assert!(matches!(
+            read_frame(&mut r).await.unwrap(),
+            IncrFrame::Header(_)
+        ));
         match read_frame(&mut r).await.unwrap() {
             IncrFrame::Change(c) => {
                 assert_eq!(c.op, Op::Insert);
@@ -758,7 +779,10 @@ mod tests {
             }
             f => panic!("change 기대, {f:?}"),
         }
-        assert!(matches!(read_frame(&mut r).await.unwrap(), IncrFrame::Change(_)));
+        assert!(matches!(
+            read_frame(&mut r).await.unwrap(),
+            IncrFrame::Change(_)
+        ));
         assert!(matches!(read_frame(&mut r).await.unwrap(), IncrFrame::End));
     }
 
