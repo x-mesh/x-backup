@@ -719,6 +719,8 @@ The docs are written in Korean.
 | Document | Contents |
 |------|------|
 | [docs/mysql.md](docs/mysql.md) | MySQL engine deep-dive (schema fidelity, binlog internals, PITR, dev/CI) |
+| [docs/web-console.ko.md](docs/web-console.ko.md) | Running the web console (`serve`) — systemd unit, binding, auth, age key permissions, audit log, TLS via reverse proxy |
+| [docs/control-server.ko.md](docs/control-server.ko.md) | Central control-server operations (multi-DB backup/restore/migrate) — example: [examples/control-server.toml](examples/control-server.toml) |
 | [docs/PRD.md](docs/PRD.md) | Product requirements (FR-1–12, incremental design, encryption design) |
 | [docs/test-scenario.md](docs/test-scenario.md) | E2E scenario definition |
 | [docs/acceptance-report.md](docs/acceptance-report.md) | Acceptance criteria 10/10, with measured evidence |
