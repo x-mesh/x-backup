@@ -14,7 +14,9 @@ name: CI
 #                     기동 후 PG E2E(풀→증분(pgoutput)→PITR) 시나리오(make scenario-pg).
 #   - musl          : 모든 PR/push. cross 0.2.5로 정적 musl 릴리스 빌드 + artifact.
 #
-# Rust 버전 핀: 리포에 rust-toolchain.toml이 없으므로 워크플로에서 핀한다.
+# Rust 버전 핀: 리포의 `rust-toolchain.toml`이 1.93.0을 핀한다(로컬·CI 동일 컴파일러).
+# 아래 워크플로의 toolchain 지정은 그 값을 **다시 적은 것**이며, 둘이 갈라지면 로컬에서
+# green인 코드가 CI에서 다르게 판정된다 — 바꿀 때 두 곳을 함께 고쳐라.
 # - MSRV(최소 지원 버전)는 Cargo.toml `rust-version = "1.88"`(mongodb v3.7 요구)이다.
 # - 그러나 CI 검증 토큰체인은 **1.93.0**으로 핀한다(docs/acceptance-report.md §1 실측 환경).
 #   이유: clippy의 `uninlined_format_args` 등 일부 린트는 버전마다 적용 범위가 달라,
@@ -22,6 +24,11 @@ name: CI
 #   거짓 실패한다(1.88 clippy가 1.93에는 없는 방식으로 플래그). "1.88+" 요건을 만족하면서
 #   실측 green 상태와 일치시키기 위해 검증은 1.93.0으로 한다. MSRV 회귀는 별도 msrv 잡
 #   (toolchain 1.88.0, `cargo check`만 — clippy 제외)으로 감시한다.
+#
+# **msrv 잡은 `rust-toolchain.toml`을 명시적으로 우회해야 한다.** 그 파일은 rustup 기본값을
+# 이기므로, 맨 `cargo check`를 쓰면 1.88이 아니라 1.93이 돌고 MSRV 검사가 조용히 무력화된다
+# — 통과는 계속 하므로 아무도 눈치채지 못한다. 그래서 그 잡은 `RUSTUP_TOOLCHAIN`을 걸고,
+# 실제로 1.88이 돌고 있는지를 스텝 하나로 확인한다.
 
 on:
   push:
@@ -43,8 +50,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # 검증 토큰체인 핀(acceptance-report §1 실측 환경 = 1.93.0). MSRV는 1.88(Cargo.toml).
+  # 검증 툴체인 핀(acceptance-report §1 실측 환경 = 1.93.0). `rust-toolchain.toml`과
+  # **같은 값이어야 한다** — 갈라지면 로컬과 CI의 판정이 달라진다.
   RUST_TOOLCHAIN: "1.93.0"
+  # MSRV(Cargo.toml `rust-version`). msrv 잡이 `RUSTUP_TOOLCHAIN`으로 이 값을 강제한다.
+  RUST_MSRV: "1.88.0"
   # mongodb-database-tools 정확 버전(spike §2 / acceptance-report §1 실측).
   MONGO_TOOLS_VERSION: "100.16.1"
 
@@ -98,14 +108,30 @@ jobs:
       - name: Install Rust toolchain (MSRV 1.88.0)
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88.0"
+          toolchain: ${{ env.RUST_MSRV }}
 
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
         with:
           key: msrv
 
+      # `rust-toolchain.toml`(1.93.0)이 rustup 기본값을 이기므로, 이 잡은 env로 우회한다.
+      # 아래 확인 스텝이 없으면 우회가 깨져도 잡은 계속 green이고 MSRV 주장은 검증되지 않는다.
+      - name: Verify the MSRV toolchain is actually in use
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.RUST_MSRV }}
+        run: |
+          set -euo pipefail
+          actual="$(cargo --version)"
+          echo "cargo: $actual"
+          case "$actual" in
+            *"$RUST_MSRV"*) echo "✓ MSRV 툴체인 확인" ;;
+            *) echo "✗ MSRV가 아니라 다른 툴체인이 돈다 — rust-toolchain.toml이 우회되지 않았다"; exit 1 ;;
+          esac
+
       - name: cargo check (all features, all targets, MSRV)
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.RUST_MSRV }}
         run: cargo check --all-features --all-targets
 
   # ── 2) 통합 테스트: replica set + mongodb-database-tools (push main + nightly) ─

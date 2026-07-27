@@ -96,9 +96,9 @@ async fn write_archive(
         "SET NAMES utf8mb4",
         "SET SESSION time_zone = '+00:00'",
     ] {
-        conn.query_drop(stmt)
-            .await
-            .map_err(|e| XBackupError::Failure(format!("스냅샷 트랜잭션 설정 실패({stmt}): {e}")))?;
+        conn.query_drop(stmt).await.map_err(|e| {
+            XBackupError::Failure(format!("스냅샷 트랜잭션 설정 실패({stmt}): {e}"))
+        })?;
     }
 
     // 스냅샷↔binlog 좌표 **원자성**(mysqldump --single-transaction --master-data 방식):
@@ -136,7 +136,8 @@ async fn write_archive_in_snapshot(
         .flatten()
         .ok_or_else(|| {
             XBackupError::Usage(
-                "MySQL 백업은 URI에 데이터베이스가 지정되어야 합니다(mysql://user@host/<db>)".into(),
+                "MySQL 백업은 URI에 데이터베이스가 지정되어야 합니다(mysql://user@host/<db>)"
+                    .into(),
             )
         })?;
 
@@ -186,7 +187,12 @@ async fn write_archive_in_snapshot(
 }
 
 /// 한 테이블을 introspection해 DDL + 행 데이터를 쓴다.
-async fn dump_table(conn: &mut Conn, writer: &mut DuplexStream, db: &str, table: &str) -> Result<()> {
+async fn dump_table(
+    conn: &mut Conn,
+    writer: &mut DuplexStream,
+    db: &str,
+    table: &str,
+) -> Result<()> {
     // 소스 질의는 db로 정규화(현재 USE db와 무관히 정확). 아카이브에는 **bare** 테이블명을 담아
     // 복구가 대상 연결의 현재 DB로 들어가게 한다(mysqldump와 동일 — 교차 DB 복구 가능).
     let quoted_src = quote_qualified(db, table);

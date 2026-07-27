@@ -17,7 +17,14 @@ use crate::config::merged::MergeInput;
 use crate::config::secret::Secret;
 use crate::config::ResolvedConfig;
 use crate::error::{Result, XBackupError};
-use crate::pipeline::migrate::{run_migrate, MigratePlan, MigrateRequest};
+use crate::pipeline::migrate::{run_migrate, MigrateOutcome, MigratePlan, MigrateRequest};
+
+/// `migrate --json` 출력 스키마 버전.
+///
+/// 필드 의미가 바뀌면 올린다 — 소비자(웹 콘솔)가 버전으로 파서를 고르고, 모르는 버전을
+/// 만나면 조용히 오파싱하는 대신 명확히 실패할 수 있게 하기 위함이다. dry-run 계획과 완료
+/// 요약은 모양이 다르지만 `dry_run` 필드로 구분되는 같은 명령의 출력이라 버전은 하나다.
+const MIGRATE_JSON_SCHEMA: u32 = 1;
 
 /// `migrate` 핸들러 진입점.
 pub async fn handle(
@@ -137,13 +144,7 @@ pub async fn handle(
         print_plan(&plan, mode.emits_json(), lang);
     } else if let Some(out) = outcome {
         if mode.emits_json() {
-            let summary = serde_json::json!({
-                "migrated": true,
-                "source_topology": out.source_topology,
-                "target_had_data": out.target_had_data,
-                "ns": plan.ns,
-            });
-            println!("{summary}");
+            println!("{}", build_completed_json(&out, &plan));
         } else if mode.shows_human_summary() {
             const W: usize = 12;
             println!(
@@ -191,6 +192,39 @@ pub async fn handle(
     Ok(())
 }
 
+/// 완료 요약 JSON 값을 만든다(순수 — 출력 부작용 없음).
+fn build_completed_json(out: &MigrateOutcome, plan: &MigratePlan) -> serde_json::Value {
+    serde_json::json!({
+        "schema": MIGRATE_JSON_SCHEMA,
+        "migrated": true,
+        "source_topology": out.source_topology,
+        "target_had_data": out.target_had_data,
+        "ns": plan.ns,
+    })
+}
+
+/// dry-run 계획 JSON 값을 만든다(순수 — 출력 부작용 없음).
+fn build_plan_json(plan: &MigratePlan) -> serde_json::Value {
+    let ns_items: Vec<serde_json::Value> = merge_ns_rows(plan)
+        .iter()
+        .map(|(ns, s, t)| serde_json::json!({ "ns": ns, "source": s, "target": t, "transfer": s }))
+        .collect();
+    serde_json::json!({
+        "schema": MIGRATE_JSON_SCHEMA,
+        "dry_run": true,
+        "source_server_version": plan.source_server_version,
+        "source_topology": plan.source_topology,
+        "target_server_version": plan.target_server_version,
+        "ns": plan.ns,
+        "conflicting_namespaces": plan.conflicting_namespaces,
+        "version_warning": plan.version_warning,
+        "namespaces": ns_items,
+        "source_total": plan.source_total(),
+        "target_total": plan.target_total(),
+        "transfer_total": plan.source_total(),
+    })
+}
+
 /// 네임스페이스별 source/target 문서 수를 합쳐 (ns, source, target) 행으로 만든다(정렬).
 fn merge_ns_rows(plan: &MigratePlan) -> Vec<(String, u64, u64)> {
     use std::collections::BTreeMap;
@@ -206,30 +240,11 @@ fn merge_ns_rows(plan: &MigratePlan) -> Vec<(String, u64, u64)> {
 
 /// dry-run 계획 출력(연결·버전·네임스페이스별 source vs target diff — 무변경). 시크릿 미출력.
 fn print_plan(plan: &MigratePlan, json: bool, lang: crate::i18n::Lang) {
-    let rows = merge_ns_rows(plan);
     if json {
-        let ns_items: Vec<serde_json::Value> = rows
-            .iter()
-            .map(|(ns, s, t)| {
-                serde_json::json!({ "ns": ns, "source": s, "target": t, "transfer": s })
-            })
-            .collect();
-        let summary = serde_json::json!({
-            "dry_run": true,
-            "source_server_version": plan.source_server_version,
-            "source_topology": plan.source_topology,
-            "target_server_version": plan.target_server_version,
-            "ns": plan.ns,
-            "conflicting_namespaces": plan.conflicting_namespaces,
-            "version_warning": plan.version_warning,
-            "namespaces": ns_items,
-            "source_total": plan.source_total(),
-            "target_total": plan.target_total(),
-            "transfer_total": plan.source_total(),
-        });
-        println!("{summary}");
+        println!("{}", build_plan_json(plan));
         return;
     }
+    let rows = merge_ns_rows(plan);
     println!(
         "{}",
         style(
@@ -405,4 +420,46 @@ fn prompt_confirm(plan: &MigratePlan, lang: crate::i18n::Lang) -> bool {
         return false;
     }
     matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan() -> MigratePlan {
+        MigratePlan {
+            source_server_version: "7.0.35".into(),
+            source_topology: "replica_set".into(),
+            target_server_version: "7.0.35".into(),
+            ns: Some("app".into()),
+            conflicting_namespaces: vec!["app.users".into()],
+            version_warning: None,
+            source_counts: vec![("app.users".into(), 3)],
+            target_counts: vec![("app.users".into(), 1)],
+        }
+    }
+
+    /// dry-run 계획 문서는 최상위에 스키마 버전을 단다 — 소비자가 파서를 고르는 근거다.
+    #[test]
+    fn build_plan_json_stamps_schema_at_top_level() {
+        let v = build_plan_json(&plan());
+        assert_eq!(v["schema"], MIGRATE_JSON_SCHEMA);
+        assert_eq!(v["dry_run"], true);
+        // 배열 원소는 독립 문서가 아니므로 버전을 갖지 않는다.
+        assert!(v["namespaces"][0].get("schema").is_none());
+        assert_eq!(v["namespaces"][0]["ns"], "app.users");
+    }
+
+    /// 완료 요약 문서도 같은 버전을 단다(계획과 요약은 `dry_run` 유무로 구분한다).
+    #[test]
+    fn build_completed_json_stamps_schema_at_top_level() {
+        let out = MigrateOutcome {
+            source_topology: "replica_set".into(),
+            target_had_data: true,
+        };
+        let v = build_completed_json(&out, &plan());
+        assert_eq!(v["schema"], MIGRATE_JSON_SCHEMA);
+        assert_eq!(v["migrated"], true);
+        assert!(v.get("dry_run").is_none(), "완료 요약에는 dry_run이 없다");
+    }
 }

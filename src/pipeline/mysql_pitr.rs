@@ -16,7 +16,9 @@
 use chrono::{DateTime, Utc};
 
 use crate::config::secret::Secret;
-use crate::engine::mysql::{conn::MysqlClient, incremental, meta as my_meta, restore as my_restore};
+use crate::engine::mysql::{
+    conn::MysqlClient, incremental, meta as my_meta, restore as my_restore,
+};
 use crate::error::{Result, XBackupError};
 use crate::manifest::schema::{BackupManifest, BackupStatus, BackupType, MysqlBinlogCoords};
 use crate::manifest::store::{data_path, ManifestStore};

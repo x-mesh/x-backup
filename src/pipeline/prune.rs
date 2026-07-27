@@ -28,7 +28,7 @@
 //! 스토리지 연동(수집·실삭제)은 [`load_backups`]·[`execute_prune`]가 담당한다.
 
 use crate::error::{Result, XBackupError};
-use crate::manifest::chain::{verify_chain, ChainNode};
+use crate::manifest::chain::{ChainNode, ChainVerifier};
 use crate::manifest::schema::{BackupManifest, BackupStatus, BackupType};
 use crate::manifest::store::{
     data_path, manifest_path, manifest_sha_path, ManifestStore, DATA_FILE, MANIFEST_FILE,
@@ -155,6 +155,7 @@ pub fn plan_prune(
     // 1) 체인 그룹핑 — base별로 (base + 그 base를 가리키는 증분) 묶음을 만든다.
     //    incomplete가 아닌 풀백업을 base 후보로 삼는다.
     let mut chains: Vec<ChainGroup> = Vec::new();
+    let mut verifier = ChainVerifier::new(&nodes);
     for m in manifests {
         if m.backup_type != BackupType::Full {
             continue; // 증분은 자기 base 그룹에 흡수된다(아래).
@@ -162,8 +163,10 @@ pub fn plan_prune(
         if m.status == BackupStatus::Incomplete {
             continue; // incomplete 풀은 체인 base 부적격 → 잔재로 따로 처리.
         }
-        // verify_chain으로 이 base에 연결된 증분(complete만 의미 있음)을 모은다.
-        let report = verify_chain(&nodes, &m.id);
+        // 이 base에 연결된 증분(complete만 의미 있음)을 모은다. `verify_chain`을 풀백업마다
+        // 부르면 그때마다 노드 전체를 훑으므로, 인덱스를 한 번만 만드는 `ChainVerifier`를
+        // 재사용한다(그 타입 doc 참조).
+        let report = verifier.verify(&m.id);
         let mut members = vec![m.id.clone()];
         // report.incremental_ids는 같은 base를 가리키는 증분(정렬됨). incomplete 증분도
         // 체인 멤버로 포함해야 한다 — 그래야 base 삭제 시 함께 정리되어 잔재가 안 남는다.

@@ -51,6 +51,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # 체크섬 (PRD §FR-7 sha256, 스캐폴드 단계에서는 미사용이나 stack 기준에 포함)
 sha2 = "0.10"
+# 웹 콘솔 세션 ID용 CSPRNG. OS 엔트로피만 쓰는 얇은 크레이트라 PRNG 상태·시딩을 우리가
+# 들고 다니지 않는다. 이 버전은 이미 빌드 트리에 전이 의존성으로 있어 컴파일이 늘지 않는다.
+getrandom = "0.3"
 # 추상 스토리지 백엔드 (PRD §10 Storage trait). LocalFileSystem은 기본 feature(fs)로 포함되며,
 # aws feature는 S3 호환 백엔드(t7)가 AmazonS3Builder(with_endpoint+path-style)로 멀티파트
 # 업로드/abort를 구현하는 데 필요하다. reqwest→rustls→ring 체인으로 musl 정적 빌드와 호환된다.
@@ -131,6 +134,18 @@ webpki-roots = "1"
 # binlog 파서(TableMapEvent/WriteRows/UpdateRows/DeleteRows 디코드)를 켠다.
 mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring", "binlog"] }
 
+# --- 웹 운영 콘솔(serve) ---
+# HTTP 서버 — hyper·hyper-util·http·tower가 이미 트리에 있어(reqwest/object_store 경유)
+# 추가 무게가 작다. default-features를 끄고 실제로 쓰는 것만 켠다:
+#   http1 — HTTP/1.1. TLS·HTTP/2 종단은 앞단 리버스 프록시 책임이므로 h2는 켜지 않는다.
+#   tokio — axum::serve + TcpListener 통합.
+# json/form/query/macros는 그 기능을 실제로 쓰는 태스크가 켠다(쓰지 않는 코드 생성 회피).
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
+# 서버 사이드 HTML — `html!` 매크로가 컴파일 타임에 Rust 코드로 펼쳐지므로 런타임 템플릿
+# 파일이 없다(단일 정적 바이너리 원칙 유지). 보간값을 기본 HTML 이스케이프해 XSS 표면을
+# 좁힌다. axum feature가 Markup→Response(IntoResponse) 변환을 제공한다.
+maud = { version = "0.27", features = ["axum"] }
+
 [dev-dependencies]
 # Storage trait mock 자동 생성(단위 테스트에서 파이프라인 로직 주입).
 mockall = "0.14"
@@ -138,3 +153,12 @@ mockall = "0.14"
 # Docker·DB 없이 동작하는 시나리오(설정 오류=2, PITR+--only=2, 점검 실패=3, 잠금 충돌=5)만 다룬다.
 assert_cmd = "2"
 predicates = "3"
+# axum 라우터를 실제 포트 없이 직접 호출한다(`ServiceExt::oneshot`) — 웹 라우팅 테스트가
+# 포트 점유·방화벽·타이밍에 흔들리지 않게 한다. tower는 이미 트리에 있고 util feature만 켠다.
+tower = { version = "0.5", features = ["util"] }
+# oneshot 응답 본문(http_body::Body)을 바이트로 모으는 테스트 유틸.
+http-body-util = "0.1"
+# 가상 시계(`#[tokio::test(start_paused = true)]`). tokio의 "full"에는 들어 있지 않다 —
+# 런타임 기능이 아니라 테스트 전용이라 별도 feature다. 라이브 모니터의 grace 종료
+# (`web::routes::monitor`)처럼 "몇 초 뒤에 일어나는 일"을 실제로 기다리지 않고 고정한다.
+tokio = { version = "1.47", features = ["test-util"] }
