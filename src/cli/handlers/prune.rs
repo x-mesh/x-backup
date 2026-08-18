@@ -129,7 +129,7 @@ pub async fn handle(
     println!(
         "{}",
         style(
-            &lang.sel(
+            lang.sel(
                 &format!(
                     "prune done — deleted {} chains, {} backups",
                     outcome.deleted_chains, outcome.deleted_backups
@@ -196,7 +196,7 @@ fn prompt_confirm(plan: &PrunePlan, lang: Lang) -> bool {
     eprint!(
         "{}",
         style_stderr(
-            &lang.sel(
+            lang.sel(
                 &format!("Delete the {chain_count} chains above? [y/N] "),
                 &format!("위 {chain_count}개 체인을 삭제하시겠습니까? [y/N] ")
             ),

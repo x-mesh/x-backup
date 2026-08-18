@@ -235,7 +235,7 @@ mod tests {
             "local".into(),
             "/data".into(),
             "10".into(),
-            "y".into(),   // 암호화 on
+            "y".into(), // 암호화 on
             "age".into(),
             pub_path.into(), // recipient(미존재)
             "15m".into(),
@@ -262,7 +262,9 @@ mod tests {
         let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "개인키는 0600이어야 함");
         // 생성된 공개키 경로로 암호화 단계가 실제로 만들어진다(유효한 recipient).
-        assert!(crate::crypto::AgeEncryptStage::from_recipient_file(pub_path.to_str().unwrap()).is_ok());
+        assert!(
+            crate::crypto::AgeEncryptStage::from_recipient_file(pub_path.to_str().unwrap()).is_ok()
+        );
     }
 
     /// 거부(n) 시 키를 만들지 않는다(공개키 파일 없음 유지).
@@ -280,7 +282,15 @@ mod tests {
     #[test]
     fn ensure_age_key_noop_when_encryption_disabled() {
         let answers = vec![
-            "prod", "MONGO_URI", "n", "local", "/data", "10", "n", "15m", "progress",
+            "prod",
+            "MONGO_URI",
+            "n",
+            "local",
+            "/data",
+            "10",
+            "n",
+            "15m",
+            "progress",
         ];
         let cfg = run_wizard(&mut VecPrompt::new(answers)).unwrap();
         // 빈 프롬프트 — 무언가 물으면 입력 부족으로 에러가 났을 것.

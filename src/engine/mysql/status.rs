@@ -43,7 +43,10 @@ pub async fn full_report(
     .with_value("OK")];
 
     // 현재 데이터베이스.
-    match conn.query_first::<Option<String>, _>("SELECT DATABASE()").await {
+    match conn
+        .query_first::<Option<String>, _>("SELECT DATABASE()")
+        .await
+    {
         Ok(db) => {
             let db = db.flatten().unwrap_or_default();
             if db.is_empty() {
@@ -92,7 +95,8 @@ pub async fn full_report(
                 .with_value(v.clone()),
                 _ => {
                     let label = if is_maria { "MariaDB" } else { "MySQL" };
-                    CheckItem::ok("version", "version", format!("{label} {v}")).with_value(v.clone())
+                    CheckItem::ok("version", "version", format!("{label} {v}"))
+                        .with_value(v.clone())
                 }
             };
             items.push(item);
@@ -113,7 +117,10 @@ pub async fn full_report(
     }
 
     // 권한 — 백업은 사용자 테이블 read가 필요. SHOW GRANTS에서 SELECT/ALL 존재 여부 best-effort 확인.
-    match conn.query::<String, _>("SHOW GRANTS FOR CURRENT_USER()").await {
+    match conn
+        .query::<String, _>("SHOW GRANTS FOR CURRENT_USER()")
+        .await
+    {
         Ok(grants) => {
             let has_select = grants.iter().any(|g| {
                 let u = g.to_ascii_uppercase();

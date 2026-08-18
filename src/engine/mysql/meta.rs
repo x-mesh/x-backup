@@ -172,7 +172,9 @@ fn row_to_json(row: &Row, names: &[String], cats: &[ColCategory]) -> String {
                 }
                 _ => serde_json::Value::String(String::from_utf8_lossy(b).into_owned()),
             },
-            other => serde_json::Value::String(super::value::render_value(other, ColCategory::Text)),
+            other => {
+                serde_json::Value::String(super::value::render_value(other, ColCategory::Text))
+            }
         };
         map.insert(name.clone(), jv);
     }

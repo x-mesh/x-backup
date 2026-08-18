@@ -248,11 +248,11 @@ mod tests {
 
     #[test]
     fn renders_typed_float_roundtrip() {
-        assert_eq!(render_value(&Value::Double(1.5), ColCategory::Numeric), "1.5");
         assert_eq!(
-            render_value(&Value::Int(-42), ColCategory::Numeric),
-            "-42"
+            render_value(&Value::Double(1.5), ColCategory::Numeric),
+            "1.5"
         );
+        assert_eq!(render_value(&Value::Int(-42), ColCategory::Numeric), "-42");
     }
 
     #[test]
@@ -289,7 +289,10 @@ mod tests {
         );
         // zero timestamp 특수값.
         assert_eq!(
-            render_binlog_value(&Value::Bytes(b"0".to_vec()), Some(ColumnType::MYSQL_TYPE_TIMESTAMP2)),
+            render_binlog_value(
+                &Value::Bytes(b"0".to_vec()),
+                Some(ColumnType::MYSQL_TYPE_TIMESTAMP2)
+            ),
             "'0000-00-00 00:00:00'"
         );
     }
@@ -303,10 +306,16 @@ mod tests {
         );
         // 텍스트는 따옴표.
         assert_eq!(
-            render_binlog_value(&Value::Bytes(b"hi".to_vec()), Some(ColumnType::MYSQL_TYPE_VARCHAR)),
+            render_binlog_value(
+                &Value::Bytes(b"hi".to_vec()),
+                Some(ColumnType::MYSQL_TYPE_VARCHAR)
+            ),
             "'hi'"
         );
         // NULL.
-        assert_eq!(render_binlog_value(&Value::NULL, Some(ColumnType::MYSQL_TYPE_BIT)), "NULL");
+        assert_eq!(
+            render_binlog_value(&Value::NULL, Some(ColumnType::MYSQL_TYPE_BIT)),
+            "NULL"
+        );
     }
 }

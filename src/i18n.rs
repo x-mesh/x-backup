@@ -6,7 +6,7 @@
 //! (`--lang`/env는 clap에서 한 플래그로 합쳐지므로 여기서는 flag·config·기본만 본다).
 //!
 //! 사용 패턴: 라벨은 영문 리터럴 그대로 두고, 설명만 [`Lang::sel`]로 고른다.
-//! ```ignore
+//! ```text
 //! println!("  checksum:  sha256:{cs}");              // 라벨: 항상 영문
 //! println!("{}", lang.sel("Backup complete", "백업 완료"));  // 설명: 토글
 //! ```
