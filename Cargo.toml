@@ -1,6 +1,6 @@
 [package]
 name = "x-backup"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 # rust-version: mongodb v3.7 요구사항(1.88+)을 고려해 MSRV를 1.88로 고정한다.
 rust-version = "1.88"
