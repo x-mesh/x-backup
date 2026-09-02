@@ -46,7 +46,11 @@ scripts/release.sh --skip-tap      # GitHub 릴리스만, tap 갱신 생략
 
 - `cargo`, `cross`(linux musl 빌드), **실행 중인 `docker`**(cross 백엔드)
 - `gh` 인증(`gh auth status`) — 릴리스 게시 + tap clone/push 권한
-- `shasum`, `tar`, `ruby`(formula 문법 검증)
+- `shasum`, `tar`, `ruby`(formula 문법 검증), `rustup`
+- **macOS arm64**: cross가 컨테이너에 마운트할 linux 툴체인이 필요하다. 한 번만:
+  `rustup toolchain install stable-x86_64-unknown-linux-gnu --force-non-host --profile minimal`
+  (없으면 스크립트가 이 명령을 알려주고 중단한다). cross 이미지는 amd64 전용이라
+  linux 빌드는 에뮬레이션으로 돌아 느리다 — 스크립트가 자동 설정한다.
 - private 저장소 단계: 다운로드 검증 시 `HOMEBREW_GITHUB_API_TOKEN=$(gh auth token)`
 
 ## 스크립트가 하는 일(단계별)
@@ -89,6 +93,9 @@ brew update && brew upgrade x-mesh/tap/x-backup
   갱신 누락). 스크립트는 패키징 직후 한 번에 생성하므로 항상 일치한다.
 - **brew가 옛 버전 설치** → `brew update`로 tap을 먼저 최신화해야 새 formula가 보인다.
   `update`의 brew 위임(`brew upgrade`)도 tap이 최신이어야 동작.
+- **`scripts/release.sh`를 파이프로 넘기지 않는다** → `| tee`를 붙이면 파이프라인
+  종료 코드가 `tee`의 것이 되어 `set -e` 실패가 exit 0으로 보인다. 로그가 필요하면
+  `scripts/release.sh > release.log 2>&1`처럼 리다이렉트한다.
 - **macOS `sed -i`** → BSD sed는 `-i` 뒤 백업 접미사가 필수다(`-i.bak`). 스크립트는
   이를 지킨다.
 - **GitHub API contents 캐시** → push 직후 `contents` API가 옛 내용을 줄 수 있다.
