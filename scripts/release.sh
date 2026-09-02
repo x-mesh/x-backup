@@ -59,8 +59,30 @@ need() { command -v "$1" >/dev/null 2>&1 || die "필요한 도구 없음: $1"; }
 say "릴리스 대상: $REPO $TAG  (dry-run=$DRY_RUN, skip-tap=$SKIP_TAP)"
 
 # ── 0) 사전 점검 ─────────────────────────────────────────────────────────────
-need cargo; need cross; need gh; need tar; need shasum; need git; need ruby
+need cargo; need cross; need gh; need tar; need shasum; need git; need ruby; need rustup
 docker info >/dev/null 2>&1 || die "docker 데몬 미실행(cross 빌드에 필요)"
+
+# cross 0.2.5 환경 보정 — v0.3.0 릴리스에서 실제로 관측한 세 가지 실패를 막는다.
+# (a) 기본 이미지가 Ubuntu 16.04(glibc 2.23)라 rustc 1.98 빌드 스크립트가
+#     `libc.so.6: version GLIBC_2.28 not found`로 죽는다 → main 태그(Ubuntu 24.04).
+#     main은 움직이는 태그다. 고정이 필요하면 이 env를 미리 설정해 덮어쓴다.
+: "${CROSS_TARGET_X86_64_UNKNOWN_LINUX_MUSL_IMAGE:=ghcr.io/cross-rs/x86_64-unknown-linux-musl:main}"
+: "${CROSS_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_IMAGE:=ghcr.io/cross-rs/aarch64-unknown-linux-musl:main}"
+export CROSS_TARGET_X86_64_UNKNOWN_LINUX_MUSL_IMAGE CROSS_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_IMAGE
+
+# (b) ghcr.io/cross-rs 이미지는 amd64 전용이라 arm64 호스트에서 docker가
+#     `no matching manifest for linux/arm64/v8`로 거부한다 → 플랫폼 고정(에뮬레이션).
+case "$(uname -m)" in
+  arm64|aarch64)
+    : "${DOCKER_DEFAULT_PLATFORM:=linux/amd64}"; export DOCKER_DEFAULT_PLATFORM
+    say "arm64 호스트 — cross 컨테이너를 $DOCKER_DEFAULT_PLATFORM 에뮬레이션으로 실행합니다(빌드가 느립니다)."
+    ;;
+esac
+
+# (c) cross는 호스트 rustup의 x86_64-unknown-linux-gnu 툴체인을 컨테이너에 마운트한다.
+#     Apple Silicon rustup은 non-host 툴체인 설치를 거부하므로 미리 깔려 있어야 한다.
+rustup toolchain list 2>/dev/null | grep -q 'x86_64-unknown-linux-gnu' || \
+  die "cross가 마운트할 툴체인 없음 — 먼저: rustup toolchain install stable-x86_64-unknown-linux-gnu --force-non-host --profile minimal"
 
 # clean 트리·원격 태그는 실제 게시에만 필요(dry-run은 빌드·패키징만 검증).
 if [ "$DRY_RUN" = 0 ]; then
