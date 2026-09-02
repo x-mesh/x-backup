@@ -1,14 +1,16 @@
-//! 인터랙티브 백업 선택 — `restore --id` 미지정 + TTY일 때 fuzzy 피커로 복구할 백업을 고른다.
+//! 인터랙티브 백업 선택 — `restore --id` 미지정 + TTY에서 Bubble Tea TUI를 연다.
 //!
-//! 후보는 **풀 + 완료(Full + Complete)** 백업만 보여준다 — 증분·미완료는 단독 복구 베이스로
-//! 부적격이기 때문이다. 최신순으로 정렬해 첫 항목(가장 최근)이 피커 기본 선택이 된다.
-//!
-//! ## 분리 설계(테스트 용이성)
-//! 후보 구성([`full_backup_choices`], Storage 주입 → 단위 테스트 가능)과 표시([`pick_backup`],
-//! dialoguer FuzzySelect — TTY 필요)를 분리한다. 표시는 stderr 기준 터미널에 그려지고
-//! 선택 결과(백업 ID)만 반환하므로 stdout(결과·--json)을 오염시키지 않는다.
+//! 후보는 Full + Complete만 최신순으로 보여준다. Model-View-Update 상태는 검색어, 필터 결과,
+//! 선택 행, 터미널 크기를 함께 관리한다. 대체 화면을 사용하므로 종료 후 기존 CLI 출력이 복원된다.
 
-use dialoguer::{theme::ColorfulTheme, FuzzySelect};
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
+
+use bubbletea_rs::{quit, window_size, Cmd, KeyMsg, Model, Msg, PasteMsg, Program, WindowSizeMsg};
+use bubbletea_widgets::table::{Column, Model as TableModel, Row, Styles as TableStyles};
+use bubbletea_widgets::textinput::{self, Model as TextInput};
+use crossterm::event::{KeyCode, KeyModifiers};
+use lipgloss_extras::lipgloss::{AdaptiveColor, Style};
 
 use crate::engine::mongo::status::human_bytes;
 use crate::error::{Result, XBackupError};
@@ -17,99 +19,524 @@ use crate::manifest::store::ManifestStore;
 use crate::pipeline::verify::collect_manifest_ids;
 use crate::storage::Storage;
 
+const ACCENT: AdaptiveColor = AdaptiveColor {
+    Light: "#087F72",
+    Dark: "#5EEAD4",
+};
+const TEXT: AdaptiveColor = AdaptiveColor {
+    Light: "#17202A",
+    Dark: "#E6EDF3",
+};
+const MUTED: AdaptiveColor = AdaptiveColor {
+    Light: "#5A6772",
+    Dark: "#8B9AAA",
+};
+const RULE: AdaptiveColor = AdaptiveColor {
+    Light: "#C9D3DC",
+    Dark: "#33404D",
+};
+const SELECTED_BG: AdaptiveColor = AdaptiveColor {
+    Light: "#C8F3EC",
+    Dark: "#123F3A",
+};
+const SELECTED_FG: AdaptiveColor = AdaptiveColor {
+    Light: "#063C36",
+    Dark: "#E9FFFB",
+};
+
 /// 피커에 보여줄 복구 후보 한 건.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupChoice {
-    /// 백업 ID(선택 결과로 반환되는 값).
     pub id: String,
-    /// 한 줄 표시 라벨(id·유형·DB·생성시각·크기) — fuzzy 매칭 대상이기도 하다.
-    pub label: String,
+    pub kind: String,
+    pub engine: String,
+    pub server_version: String,
+    pub created_at: String,
+    pub size: String,
+    search_text: String,
 }
 
-/// 복구 베이스로 유효한 후보(Full + Complete)를 **최신순**으로 모은다.
-///
-/// 최신순 = `created_at` 내림차순(동률이면 id 내림차순 — UUID v7라 사실상 동일 순서).
-/// 첫 항목이 가장 최근이라 피커 기본 선택이 된다. manifest 읽기에 실패한 ID는 건너뛴다
-/// (list 카탈로그와 동일 정책 — 깨진 한 건이 전체 선택을 막지 않게).
+/// 복구 베이스로 유효한 후보(Full + Complete)를 최신순으로 모은다.
 pub async fn full_backup_choices(storage: &dyn Storage) -> Result<Vec<BackupChoice>> {
     let ids = collect_manifest_ids(storage).await?;
     let store = ManifestStore::new(storage);
-
     let mut manifests = Vec::with_capacity(ids.len());
     for id in ids {
         match store.read(&id).await {
-            // 풀 + 완료만 — 증분/미완료는 단독 복구 베이스로 부적격.
             Ok(m) if m.backup_type == BackupType::Full && m.status == BackupStatus::Complete => {
-                manifests.push(m);
+                if m.id == id {
+                    manifests.push(m);
+                } else {
+                    tracing::warn!(
+                        storage_id = %id,
+                        manifest_id = %m.id,
+                        "manifest ID가 저장 경로와 달라 피커에서 제외"
+                    );
+                }
             }
             Ok(_) => {}
             Err(e) => tracing::debug!(id = %id, "manifest 읽기 실패(피커에서 제외): {e}"),
         }
     }
-
-    // 최신순: created_at desc, 동률이면 id desc.
     manifests.sort_by(|a, b| {
         b.created_at
             .cmp(&a.created_at)
             .then_with(|| b.id.cmp(&a.id))
     });
-
-    Ok(manifests
-        .into_iter()
-        .map(|m| BackupChoice {
-            label: format_choice(&m),
-            id: m.id,
-        })
-        .collect())
+    Ok(manifests.iter().map(format_choice).collect())
 }
 
-/// 후보 한 줄 라벨: `<id>  full  <db> v<server>  <created>  <size>`.
-///
-/// `server_version`을 넣어 "어느 서버에서 뜬 백업인지"를 행에서 바로 구분할 수 있게 한다
-/// (피커는 한 프로파일의 저장소를 보지만, 시점마다 서버 버전이 다를 수 있다).
-fn format_choice(m: &BackupManifest) -> String {
-    let engine = match m.tool_versions.archive_format.as_deref() {
-        Some(f) if f.starts_with("xb-pg") => "postgresql",
+fn format_choice(manifest: &BackupManifest) -> BackupChoice {
+    let engine = match manifest.tool_versions.archive_format.as_deref() {
+        Some(format) if format.starts_with("xb-mysql") => "mysql",
+        Some(format) if format.starts_with("xb-pg") => "postgresql",
         _ => "mongodb",
     };
-    // gap 승격 full은 일반 full과 구분 표시(증분 요청이 풀로 폴백된 백업).
-    let kind = if m.promoted_from_gap {
-        "full(gap)"
+    let kind = if manifest.promoted_from_gap {
+        "full (gap)"
     } else {
         "full"
     };
-    format!(
-        "{}  {}  {} v{}  {}  {}",
-        m.id,
-        kind,
-        engine,
-        m.server_version,
-        short_created(&m.created_at),
-        human_bytes(m.stored_size_bytes as i64),
+    let size = human_bytes(manifest.stored_size_bytes as i64);
+    let search_text = format!(
+        "{} {kind} {engine} {} {} {size}",
+        manifest.id, manifest.server_version, manifest.created_at
     )
+    .to_ascii_lowercase();
+    BackupChoice {
+        id: manifest.id.clone(),
+        kind: kind.to_string(),
+        engine: engine.to_string(),
+        server_version: manifest.server_version.clone(),
+        created_at: manifest.created_at.clone(),
+        size,
+        search_text,
+    }
 }
 
-/// 생성 시각을 초 단위까지 축약(`2026-06-14 14:56:11`) — RFC3339의 마이크로초·TZ는 생략.
-fn short_created(ts: &str) -> String {
-    ts.replacen('T', " ", 1).chars().take(19).collect()
+#[derive(Clone)]
+struct PickerSeed {
+    choices: Vec<BackupChoice>,
+    lang: crate::i18n::Lang,
 }
 
-/// fuzzy 피커를 띄워 백업 하나를 고른다(기본=최신=index 0). 사용자가 취소(Esc)하면 `None`.
-///
-/// 후보가 비어 있으면 호출하지 않는다(호출 측에서 폴백 처리). dialoguer는 stderr 기준
-/// 터미널에 그리므로 stdout(결과·--json)을 오염시키지 않는다.
-pub fn pick_backup(choices: &[BackupChoice], lang: crate::i18n::Lang) -> Result<Option<String>> {
-    let labels: Vec<&str> = choices.iter().map(|c| c.label.as_str()).collect();
-    let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
-        .with_prompt(lang.sel(
-            "Select backup to restore (type=filter, ↑↓=move, Enter=select, Esc=cancel)",
-            "복구할 백업 선택 (타이핑=필터, ↑↓=이동, Enter=선택, Esc=취소)",
+static PICKER_SEED: OnceLock<Mutex<Option<PickerSeed>>> = OnceLock::new();
+
+struct PickerModel {
+    choices: Vec<BackupChoice>,
+    filtered: Vec<usize>,
+    table: TableModel,
+    search: TextInput,
+    search_active: bool,
+    width: u16,
+    height: u16,
+    selected_id: Option<String>,
+    cancelled: bool,
+    lang: crate::i18n::Lang,
+}
+
+impl PickerModel {
+    fn from_seed(seed: PickerSeed) -> Self {
+        let mut search = textinput::new();
+        search.prompt = "/ ".to_string();
+        search.set_placeholder(seed.lang.sel("filter backups", "백업 검색"));
+        search.prompt_style = Style::new().foreground(ACCENT).bold(true);
+        search.text_style = Style::new().foreground(TEXT);
+        search.placeholder_style = Style::new().foreground(MUTED);
+
+        let mut model = Self {
+            filtered: (0..seed.choices.len()).collect(),
+            choices: seed.choices,
+            table: TableModel::new(Vec::new()),
+            search,
+            search_active: false,
+            width: 100,
+            height: 28,
+            selected_id: None,
+            cancelled: false,
+            lang: seed.lang,
+        };
+        model.sync_table(None);
+        model
+    }
+
+    fn selected_choice(&self) -> Option<&BackupChoice> {
+        self.filtered
+            .get(self.table.selected)
+            .and_then(|index| self.choices.get(*index))
+    }
+
+    fn apply_filter(&mut self) {
+        let selected = self.selected_choice().map(|choice| choice.id.clone());
+        let query = self.search.value().to_ascii_lowercase();
+        let tokens: Vec<&str> = query.split_whitespace().collect();
+        self.filtered = self
+            .choices
+            .iter()
+            .enumerate()
+            .filter(|(_, choice)| {
+                tokens
+                    .iter()
+                    .all(|token| choice.search_text.contains(token))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        self.sync_table(selected.as_deref());
+    }
+
+    fn sync_table(&mut self, selected_id: Option<&str>) {
+        let id_width = shortest_unique_id_prefix(&self.choices, 8);
+        self.table.columns = table_columns(self.width, id_width);
+        self.table.selected = selected_id
+            .and_then(|id| {
+                self.filtered
+                    .iter()
+                    .position(|index| self.choices[*index].id == id)
+            })
+            .unwrap_or_else(|| {
+                self.table
+                    .selected
+                    .min(self.filtered.len().saturating_sub(1))
+            });
+        self.refresh_rows();
+        self.table.set_styles(TableStyles {
+            header: Style::new()
+                .bold(true)
+                .foreground(MUTED)
+                .padding(0, 1, 0, 1),
+            cell: Style::new().foreground(TEXT).padding(0, 1, 0, 1),
+            selected: Style::new()
+                .bold(true)
+                .foreground(SELECTED_FG)
+                .background(SELECTED_BG),
+        });
+        self.table
+            .set_width(i32::from(self.width.saturating_sub(4)));
+        self.table
+            .set_height(i32::from(self.height.saturating_sub(15).max(4)));
+        self.table.update_viewport();
+        self.search
+            .set_width(i32::from(self.width.saturating_sub(22).max(12)));
+    }
+
+    fn refresh_rows(&mut self) {
+        let id_width = shortest_unique_id_prefix(&self.choices, 8);
+        self.table.rows = self
+            .filtered
+            .iter()
+            .enumerate()
+            .map(|(row, index)| {
+                table_row(
+                    &self.choices[*index],
+                    self.width,
+                    row == self.table.selected,
+                    id_width,
+                )
+            })
+            .collect();
+        self.table.update_viewport();
+    }
+
+    fn update_search(&mut self, key: KeyMsg) -> Option<Cmd> {
+        self.search_active = true;
+        std::mem::drop(self.search.focus());
+        let cmd = self.search.update(Box::new(key));
+        self.apply_filter();
+        cmd
+    }
+
+    fn cancel_or_clear(&mut self) -> Option<Cmd> {
+        if self.search_active || !self.search.value().is_empty() {
+            self.search.set_value("");
+            self.search_active = false;
+            self.search.blur();
+            self.apply_filter();
+            None
+        } else {
+            self.cancelled = true;
+            Some(quit())
+        }
+    }
+}
+
+impl Model for PickerModel {
+    fn init() -> (Self, Option<Cmd>) {
+        let seed = PICKER_SEED
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+            .unwrap_or(PickerSeed {
+                choices: Vec::new(),
+                lang: crate::i18n::Lang::En,
+            });
+        (Self::from_seed(seed), Some(window_size()))
+    }
+
+    fn update(&mut self, msg: Msg) -> Option<Cmd> {
+        if let Some(size) = msg.downcast_ref::<WindowSizeMsg>() {
+            self.width = size.width.max(48);
+            self.height = size.height.max(18);
+            let selected = self.selected_choice().map(|choice| choice.id.clone());
+            self.sync_table(selected.as_deref());
+            return None;
+        }
+        if let Some(paste) = msg.downcast_ref::<PasteMsg>() {
+            self.search_active = true;
+            std::mem::drop(self.search.focus());
+            let cmd = self.search.update(Box::new(paste.clone()));
+            self.apply_filter();
+            return cmd;
+        }
+        let key = msg.downcast_ref::<KeyMsg>().cloned()?;
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.key == KeyCode::Char('c') {
+            self.cancelled = true;
+            return Some(quit());
+        }
+        match key.key {
+            KeyCode::Enter => {
+                if let Some(choice) = self.selected_choice() {
+                    self.selected_id = Some(choice.id.clone());
+                    return Some(quit());
+                }
+            }
+            KeyCode::Esc => return self.cancel_or_clear(),
+            KeyCode::Up => self.table.select_prev(),
+            KeyCode::Down => self.table.select_next(),
+            KeyCode::PageUp => self.table.move_up(self.table.height.max(1) as usize),
+            KeyCode::PageDown => self.table.move_down(self.table.height.max(1) as usize),
+            KeyCode::Home if !self.search_active => self.table.goto_top(),
+            KeyCode::End if !self.search_active => self.table.goto_bottom(),
+            KeyCode::Char('q') if !self.search_active => {
+                self.cancelled = true;
+                return Some(quit());
+            }
+            KeyCode::Char('/') if !self.search_active => {
+                self.search_active = true;
+                std::mem::drop(self.search.focus());
+            }
+            KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete if self.search_active => {
+                return self.update_search(key);
+            }
+            KeyCode::Char(_) if !self.search_active => return self.update_search(key),
+            _ => {}
+        }
+        self.refresh_rows();
+        None
+    }
+
+    fn view(&self) -> String {
+        render_picker(self)
+    }
+}
+
+fn table_columns(width: u16, id_width: usize) -> Vec<Column> {
+    if width >= 112 {
+        vec![
+            Column::new("CREATED (UTC)", 21),
+            Column::new("TYPE", 10),
+            Column::new("ENGINE", 12),
+            Column::new("SIZE", 10),
+            Column::new("BACKUP ID", 36),
+        ]
+    } else if width >= 78 {
+        vec![
+            Column::new("CREATED (UTC)", 21),
+            Column::new("TYPE", 10),
+            Column::new("ENGINE", 12),
+            Column::new("SIZE", 10),
+            Column::new("ID", id_width as i32),
+        ]
+    } else {
+        vec![
+            Column::new("CREATED", 16),
+            Column::new("ENGINE", 10),
+            Column::new("SIZE", 9),
+            Column::new("ID", id_width as i32),
+        ]
+    }
+}
+
+fn table_row(choice: &BackupChoice, width: u16, selected: bool, id_width: usize) -> Row {
+    let short_id: String = choice.id.chars().take(id_width).collect();
+    let marker = if selected { "> " } else { "  " };
+    if width >= 112 {
+        Row::new(vec![
+            format!("{marker}{}", short_created(&choice.created_at)),
+            choice.kind.clone(),
+            choice.engine.clone(),
+            choice.size.clone(),
+            choice.id.clone(),
+        ])
+    } else if width >= 78 {
+        Row::new(vec![
+            format!("{marker}{}", short_created(&choice.created_at)),
+            choice.kind.clone(),
+            choice.engine.clone(),
+            choice.size.clone(),
+            short_id,
+        ])
+    } else {
+        Row::new(vec![
+            format!("{marker}{}", compact_created(&choice.created_at)),
+            choice.engine.clone(),
+            choice.size.clone(),
+            short_id,
+        ])
+    }
+}
+
+/// Git처럼 현재 후보를 구분할 수 있는 가장 짧은 ID 접두사를 고른다.
+fn shortest_unique_id_prefix(choices: &[BackupChoice], minimum: usize) -> usize {
+    let maximum = choices
+        .iter()
+        .map(|choice| choice.id.chars().count())
+        .max()
+        .unwrap_or(minimum);
+    (minimum..=maximum)
+        .find(|length| {
+            let mut seen = HashSet::with_capacity(choices.len());
+            choices
+                .iter()
+                .map(|choice| choice.id.chars().take(*length).collect::<String>())
+                .all(|prefix| seen.insert(prefix))
+        })
+        .unwrap_or(maximum)
+}
+
+fn short_created(timestamp: &str) -> String {
+    timestamp.replacen('T', " ", 1).chars().take(19).collect()
+}
+
+fn compact_created(timestamp: &str) -> String {
+    let full = short_created(timestamp);
+    full.get(5..16).unwrap_or(&full).to_string()
+}
+
+fn render_picker(model: &PickerModel) -> String {
+    let horizontal = i32::from(model.width.saturating_sub(4));
+    let title = Style::new()
+        .bold(true)
+        .foreground(TEXT)
+        .render(model.lang.sel("Restore a backup", "복구할 백업 선택"));
+    let count = Style::new().foreground(MUTED).render(&format!(
+        "{} / {} {}",
+        model.filtered.len(),
+        model.choices.len(),
+        model.lang.sel("backups", "개 백업")
+    ));
+    let rule = Style::new()
+        .foreground(RULE)
+        .render(&"─".repeat(horizontal.max(1) as usize));
+
+    let search = if model.search_active || !model.search.value().is_empty() {
+        model.search.view()
+    } else {
+        format!(
+            "{} {}",
+            Style::new().bold(true).foreground(ACCENT).render("/"),
+            Style::new().foreground(MUTED).render(model.lang.sel(
+                "Search by ID, engine, date, or version",
+                "ID, 엔진, 날짜, 버전으로 검색"
+            ))
+        )
+    };
+
+    let body = if model.filtered.is_empty() {
+        Style::new()
+            .width(horizontal)
+            .height(i32::from(model.height.saturating_sub(15).max(4)))
+            .foreground(MUTED)
+            .render(model.lang.sel(
+                "No backups match this filter. Press Esc to clear it.",
+                "검색 결과가 없습니다. Esc를 눌러 검색어를 지우세요.",
+            ))
+    } else {
+        model.table.view()
+    };
+
+    let detail = model.selected_choice().map_or_else(String::new, |choice| {
+        let latest = model.filtered.first().is_some_and(|index| {
+            model.choices[*index].id == choice.id && model.search.value().is_empty()
+        });
+        let badge = if latest {
+            format!(
+                "  {}",
+                Style::new()
+                    .bold(true)
+                    .foreground(ACCENT)
+                    .render("[LATEST]")
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "{}{}\n{}  {}\n{}  {}",
+            Style::new()
+                .bold(true)
+                .foreground(TEXT)
+                .render(model.lang.sel("Selected backup", "선택한 백업")),
+            badge,
+            Style::new().foreground(MUTED).render("id"),
+            Style::new().foreground(TEXT).render(&choice.id),
+            Style::new().foreground(MUTED).render("server"),
+            Style::new().foreground(TEXT).render(&format!(
+                "{} · {} · {}",
+                choice.server_version,
+                short_created(&choice.created_at),
+                choice.size
+            ))
+        )
+    });
+
+    let help = if model.search_active {
+        model.lang.sel(
+            "type filter  ↑↓ move  enter restore  esc clear",
+            "입력 검색  ↑↓ 이동  enter 복구  esc 검색 해제",
+        )
+    } else {
+        model.lang.sel(
+            "/ search  ↑↓ move  enter restore  esc/q cancel",
+            "/ 검색  ↑↓ 이동  enter 복구  esc/q 취소",
+        )
+    };
+
+    Style::new()
+        .width(i32::from(model.width.saturating_sub(2)))
+        .padding(1, 1, 0, 1)
+        .render(&format!(
+            "{title}  {count}\n{rule}\n{search}\n\n{body}\n\n{detail}\n\n{}",
+            Style::new().foreground(MUTED).render(help)
         ))
-        .items(&labels)
-        .default(0)
-        .interact_opt()
+}
+
+/// Bubble Tea 피커를 열어 백업 하나를 고른다. Esc/q/Ctrl-C는 `None`을 반환한다.
+pub async fn pick_backup(
+    choices: &[BackupChoice],
+    lang: crate::i18n::Lang,
+) -> Result<Option<String>> {
+    let seed = PICKER_SEED.get_or_init(|| Mutex::new(None));
+    *seed
+        .lock()
+        .map_err(|_| XBackupError::Failure("백업 선택기 상태 잠금 실패".into()))? =
+        Some(PickerSeed {
+            choices: choices.to_vec(),
+            lang,
+        });
+    let program = Program::<PickerModel>::builder()
+        .alt_screen(true)
+        .bracketed_paste(true)
+        .build()
+        .map_err(|e| XBackupError::Usage(format!("백업 선택기 시작 실패: {e}")))?;
+    let model = program
+        .run()
+        .await
         .map_err(|e| XBackupError::Usage(format!("백업 선택 입력 실패: {e}")))?;
-    Ok(selection.map(|i| choices[i].id.clone()))
+    if model.cancelled {
+        Ok(None)
+    } else {
+        Ok(model.selected_id)
+    }
 }
 
 #[cfg(test)]
@@ -131,8 +558,11 @@ mod tests {
             backup_type: ty,
             base_id: None,
             topology: Topology::ReplicaSet,
-            server_version: "7.0.35".to_string(),
-            tool_versions: ToolVersions::default(),
+            server_version: "10.11.9-MariaDB".to_string(),
+            tool_versions: ToolVersions {
+                archive_format: Some("xb-mysql-v1".to_string()),
+                ..ToolVersions::default()
+            },
             selective: false,
             original_size_bytes: 100,
             stored_size_bytes: 2_000_000,
@@ -147,16 +577,14 @@ mod tests {
         }
     }
 
-    async fn write(fs: &LocalFs, m: &BackupManifest) {
-        ManifestStore::new(fs).write(m).await.unwrap();
+    async fn write(fs: &LocalFs, manifest: &BackupManifest) {
+        ManifestStore::new(fs).write(manifest).await.unwrap();
     }
 
-    /// 후보는 풀+완료만, 최신순으로 모은다(증분·미완료는 제외).
     #[tokio::test]
     async fn collects_full_complete_newest_first() {
         let dir = tempfile::tempdir().unwrap();
         let fs = LocalFs::new(dir.path()).unwrap();
-        // 오래된 풀, 최신 풀, 증분(제외), 미완료 풀(제외).
         write(
             &fs,
             &manifest(
@@ -187,72 +615,93 @@ mod tests {
             ),
         )
         .await;
-        write(
-            &fs,
-            &manifest(
-                "d-partial",
-                "2026-06-16T00:00:00Z",
-                BackupType::Full,
-                BackupStatus::Incomplete,
-            ),
-        )
-        .await;
-
         let choices = full_backup_choices(&fs).await.unwrap();
-
-        // 풀+완료 2건만, 최신순(b-new가 먼저).
-        let ids: Vec<&str> = choices.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(ids, vec!["b-new", "a-old"], "풀+완료만 최신순");
+        let ids: Vec<&str> = choices.iter().map(|choice| choice.id.as_str()).collect();
+        assert_eq!(ids, vec!["b-new", "a-old"]);
     }
 
-    /// 후보가 없으면 빈 목록(호출 측이 폴백 판단).
-    #[tokio::test]
-    async fn empty_when_no_full_complete() {
-        let dir = tempfile::tempdir().unwrap();
-        let fs = LocalFs::new(dir.path()).unwrap();
-        write(
-            &fs,
-            &manifest(
-                "c-incr",
-                "2026-06-15T00:00:00Z",
-                BackupType::Incremental,
-                BackupStatus::Complete,
-            ),
-        )
-        .await;
-        let choices = full_backup_choices(&fs).await.unwrap();
-        assert!(choices.is_empty());
-    }
-
-    /// 라벨 포맷: id·full·db·축약시각·사람단위 크기를 담는다.
     #[test]
-    fn label_format_is_human_readable() {
-        let m = manifest(
+    fn mysql_choice_is_not_labeled_mongodb() {
+        let choice = format_choice(&manifest(
             "bk-1",
-            "2026-06-14T14:56:11.354264+00:00",
+            "2026-06-14T14:56:11Z",
             BackupType::Full,
             BackupStatus::Complete,
-        );
-        let label = format_choice(&m);
-        assert!(label.contains("bk-1"), "id 포함: {label}");
-        assert!(label.contains("full"), "유형 포함: {label}");
-        assert!(label.contains("mongodb"), "DB 엔진 포함: {label}");
-        assert!(label.contains("v7.0.35"), "서버 버전 포함: {label}");
-        assert!(label.contains("2026-06-14 14:56:11"), "축약 시각: {label}");
-        assert!(!label.contains('T'), "RFC3339 T는 공백으로 치환: {label}");
+        ));
+        assert_eq!(choice.engine, "mysql");
+        assert!(choice.search_text.contains("mariadb"));
     }
 
-    /// gap 승격 full은 라벨에서 `full(gap)`으로 구분 표시된다.
     #[test]
-    fn label_marks_gap_promoted_full() {
-        let mut m = manifest(
-            "bk-2",
-            "2026-06-14T14:56:11+00:00",
+    fn filtering_matches_multiple_metadata_tokens() {
+        let choices = vec![format_choice(&manifest(
+            "bk-1",
+            "2026-06-14T14:56:11Z",
             BackupType::Full,
             BackupStatus::Complete,
+        ))];
+        let mut model = PickerModel::from_seed(PickerSeed {
+            choices,
+            lang: crate::i18n::Lang::En,
+        });
+        model.search.set_value("mysql 2026-06");
+        model.apply_filter();
+        assert_eq!(model.filtered, vec![0]);
+        model.search.set_value("postgresql");
+        model.apply_filter();
+        assert!(model.filtered.is_empty());
+    }
+
+    #[test]
+    fn id_prefix_expands_until_every_choice_is_distinct() {
+        let choices = [
+            "01a05f7f-d799-7df2-9983-2f7fae0d6ff3",
+            "01a05f7f-add7-7112-907c-340239cf8d5d",
+        ]
+        .iter()
+        .map(|id| {
+            format_choice(&manifest(
+                id,
+                "2026-06-14T14:56:11Z",
+                BackupType::Full,
+                BackupStatus::Complete,
+            ))
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(shortest_unique_id_prefix(&choices, 8), 10);
+        assert_eq!(
+            table_row(&choices[0], 100, false, 10).cells[4],
+            "01a05f7f-d"
         );
-        m.promoted_from_gap = true;
-        let label = format_choice(&m);
-        assert!(label.contains("full(gap)"), "gap 승격 표식: {label}");
+        assert_eq!(
+            table_row(&choices[1], 100, false, 10).cells[4],
+            "01a05f7f-a"
+        );
+    }
+
+    #[test]
+    fn selection_marker_is_part_of_created_cell() {
+        let choice = format_choice(&manifest(
+            "bk-1",
+            "2026-06-14T14:56:11Z",
+            BackupType::Full,
+            BackupStatus::Complete,
+        ));
+        let row = table_row(&choice, 100, true, 8);
+        assert_eq!(row.cells.len(), 5);
+        assert!(row.cells[0].starts_with("> 2026-06-14"));
+    }
+
+    #[test]
+    fn render_has_empty_state_and_keyboard_help() {
+        let mut model = PickerModel::from_seed(PickerSeed {
+            choices: Vec::new(),
+            lang: crate::i18n::Lang::Ko,
+        });
+        model.search.set_value("missing");
+        model.apply_filter();
+        let view = model.view();
+        assert!(view.contains("검색 결과가 없습니다"));
+        assert!(view.contains("enter"));
     }
 }

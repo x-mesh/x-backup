@@ -137,8 +137,8 @@ pub struct InitArgs {
 /// `backup` — PRD §9 backup 플래그 전체.
 #[derive(Debug, Args)]
 pub struct BackupArgs {
-    /// 사용할 프로파일 이름.
-    #[arg(long, value_name = "NAME", env = "XB_PROFILE")]
+    /// 사용할 프로파일 이름. 생략하면 config의 `default_profile`을 사용한다.
+    #[arg(long, value_name = "NAME", env = "XB_PROFILE", default_value = "")]
     pub profile: String,
     /// 백업 유형(full/incr). 미지정 시 config의 기본값을 따른다.
     #[arg(long = "type", value_enum)]
@@ -416,6 +416,16 @@ mod tests {
                 assert!(args.no_encrypt);
                 assert!(args.quiet);
             }
+            other => panic!("backup이 아님: {other:?}"),
+        }
+    }
+
+    /// backup은 --profile 없이 파싱하며 config의 default_profile 해석을 핸들러에 맡긴다.
+    #[test]
+    fn backup_allows_default_profile() {
+        let cli = Cli::try_parse_from(["x-backup", "backup"]).expect("파싱 실패");
+        match cli.command {
+            Command::Backup(args) => assert!(args.profile.is_empty()),
             other => panic!("backup이 아님: {other:?}"),
         }
     }

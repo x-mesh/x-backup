@@ -35,9 +35,13 @@ pub async fn handle(
     lang_flag: Option<crate::i18n::Lang>,
     args: BackupArgs,
 ) -> Result<()> {
-    // 동시 실행 잠금(FR-12) — 같은 프로파일의 backup/restore/prune과 직렬화한다.
-    // 가드(_lock)를 함수 끝까지 유지해 작업 동안 lock을 잡는다(충돌 시 exit 5).
-    let _lock = crate::lock::acquire(&args.profile)?;
+    // 명시 profile은 config·secret 해석 전에 잠근다. 다른 실행이 이미 작업 중이면 URI 설정
+    // 오류보다 lock 충돌을 먼저 보고한다. profile 생략 시에는 default_profile 해석 뒤 잠근다.
+    let explicit_lock = if args.profile.is_empty() {
+        None
+    } else {
+        Some(crate::lock::acquire(&args.profile)?)
+    };
 
     // 1) config 로드 + 레이어 병합(file + ENV; CLI는 아래에서 직접 반영).
     let config_toml = match &config_path {
@@ -53,6 +57,13 @@ pub async fn handle(
         profile_name: &args.profile,
         overrides: &overrides,
     })?;
+
+    // 동시 실행 잠금(FR-12) — default_profile까지 해석한 실효 이름으로 같은 프로파일의
+    // backup/restore/prune을 직렬화한다. 가드는 함수 끝까지 유지한다(충돌 시 exit 5).
+    let _lock = match explicit_lock {
+        Some(lock) => lock,
+        None => crate::lock::acquire(&resolved.profile_name)?,
+    };
 
     // 2) 백업 읽기 소스 URI 확보(PRD-05). 우선순위: CLI --read-source > config read_uri(복제본)
     //    > 주 소스(uri). 복제본에서 읽으면 primary 부하를 분리한다. build_stages가 &resolved를

@@ -147,12 +147,23 @@ async fn write_archive_in_snapshot(
         .ok()
         .flatten()
         .unwrap_or_default();
+    let (database_charset, database_collation): (String, String) = conn
+        .exec_first(
+            "SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME \
+             FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?",
+            (&db,),
+        )
+        .await
+        .map_err(|e| XBackupError::Failure(format!("데이터베이스 문자셋 조회 실패: {e}")))?
+        .ok_or_else(|| XBackupError::Failure(format!("데이터베이스 '{db}' metadata가 없습니다")))?;
 
     archive::write_header(
         writer,
         &HeaderFrame {
             created_at: &chrono::Utc::now().to_rfc3339(),
             mysql_version: &version,
+            database_charset: &database_charset,
+            database_collation: &database_collation,
             binlog_file: &coords.file,
             binlog_pos: coords.position,
             gtid_executed: &coords.gtid_executed,
@@ -324,7 +335,19 @@ async fn write_views(conn: &mut Conn, writer: &mut DuplexStream, db: &str) -> Re
             .map_err(|e| XBackupError::Failure(format!("{name} SHOW CREATE VIEW 실패: {e}")))?
         {
             if let Some(ddl) = row.take::<String, _>(1) {
-                archive::write_post(writer, "view", name, &strip_definer(&ddl)).await?;
+                let charset = row.take::<String, _>(2);
+                let collation = row.take::<String, _>(3);
+                archive::write_post(
+                    writer,
+                    "view",
+                    name,
+                    &strip_definer(&ddl),
+                    None,
+                    charset.as_deref(),
+                    collation.as_deref(),
+                    None,
+                )
+                .await?;
             }
         }
     }
@@ -350,7 +373,20 @@ async fn write_triggers(conn: &mut Conn, writer: &mut DuplexStream, db: &str) ->
             .map_err(|e| XBackupError::Failure(format!("{name} SHOW CREATE TRIGGER 실패: {e}")))?
         {
             if let Some(ddl) = row.take::<String, _>(2) {
-                archive::write_post(writer, "trigger", name, &strip_definer(&ddl)).await?;
+                let sql_mode = row.take::<String, _>(1);
+                let charset = row.take::<String, _>(3);
+                let collation = row.take::<String, _>(4);
+                archive::write_post(
+                    writer,
+                    "trigger",
+                    name,
+                    &strip_definer(&ddl),
+                    sql_mode.as_deref(),
+                    charset.as_deref(),
+                    collation.as_deref(),
+                    None,
+                )
+                .await?;
             }
         }
     }
@@ -379,7 +415,20 @@ async fn write_routines(conn: &mut Conn, writer: &mut DuplexStream, db: &str) ->
             .map_err(|e| XBackupError::Failure(format!("{name} SHOW CREATE {kw} 실패: {e}")))?
         {
             if let Some(ddl) = row.take::<Option<String>, _>(2).flatten() {
-                archive::write_post(writer, kind, name, &strip_definer(&ddl)).await?;
+                let sql_mode = row.take::<String, _>(1);
+                let charset = row.take::<String, _>(3);
+                let collation = row.take::<String, _>(4);
+                archive::write_post(
+                    writer,
+                    kind,
+                    name,
+                    &strip_definer(&ddl),
+                    sql_mode.as_deref(),
+                    charset.as_deref(),
+                    collation.as_deref(),
+                    None,
+                )
+                .await?;
             }
         }
     }
@@ -404,7 +453,21 @@ async fn write_events(conn: &mut Conn, writer: &mut DuplexStream, db: &str) -> R
             .map_err(|e| XBackupError::Failure(format!("{name} SHOW CREATE EVENT 실패: {e}")))?
         {
             if let Some(ddl) = row.take::<Option<String>, _>(3).flatten() {
-                archive::write_post(writer, "event", name, &strip_definer(&ddl)).await?;
+                let sql_mode = row.take::<String, _>(1);
+                let time_zone = row.take::<String, _>(2);
+                let charset = row.take::<String, _>(4);
+                let collation = row.take::<String, _>(5);
+                archive::write_post(
+                    writer,
+                    "event",
+                    name,
+                    &strip_definer(&ddl),
+                    sql_mode.as_deref(),
+                    charset.as_deref(),
+                    collation.as_deref(),
+                    time_zone.as_deref(),
+                )
+                .await?;
             }
         }
     }

@@ -240,16 +240,19 @@ where
         plan.conflicting_namespaces = existing;
     }
     if is_mysql && !request.skip_precheck {
-        let mut my = crate::engine::mysql::conn::MysqlClient::connect(
+        let my = crate::engine::mysql::conn::MysqlClient::connect_restore_target(
             &request.target_uri,
             request.timeout_secs,
+            !request.dry_run,
         )
         .await
         .map_err(|e| XBackupError::PrecheckFailed(format!("복구 대상(MySQL) 연결 실패: {e}")))?;
-        let existing = crate::engine::mysql::meta::list_qualified(my.conn_mut())
-            .await
-            .map_err(|e| XBackupError::PrecheckFailed(format!("기존 테이블 조회 실패: {e}")))?;
-        plan.conflicting_namespaces = existing;
+        if let Some(mut my) = my {
+            let existing = crate::engine::mysql::meta::list_qualified(my.conn_mut())
+                .await
+                .map_err(|e| XBackupError::PrecheckFailed(format!("기존 테이블 조회 실패: {e}")))?;
+            plan.conflicting_namespaces = existing;
+        }
     }
 
     // 버전 호환 경고는 진행 전 항상 알린다(차단하지 않음 — PRD: 경고).

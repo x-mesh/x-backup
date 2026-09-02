@@ -105,7 +105,11 @@ pub async fn handle(
 
     // TTY 여부 — 대화형 선택/확인 가능 여부. stdin/stderr 모두 터미널일 때만 인터랙션한다
     //   (선택·확인 입력은 stdin, 표시는 stderr; stdout은 결과 전용).
-    let is_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    // Bubble Tea는 대체 화면을 stdout에 그린다. 세 표준 스트림이 모두 TTY일 때만 열어
+    // stdout 파이프의 기계 출력 계약을 지킨다.
+    let is_tty = std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && std::io::stderr().is_terminal();
 
     // 복구할 백업 결정: --id 있으면 그대로, 없고 대화형(TTY·비-json·비-quiet)이면 fuzzy
     //   피커로 고르게 한다(최신이 기본). 비대화형/기계출력은 최신 풀백업 자동선택으로 폴백.
@@ -226,7 +230,9 @@ async fn handle_export(
     );
     crate::cli::output::print_run_context(&args.profile, None, mode);
 
-    let is_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let is_tty = std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && std::io::stderr().is_terminal();
     let backup_id = resolve_backup_id(args, storage.as_ref(), is_tty, lang).await?;
 
     // dry-run: 무엇을 어디로 추출할지만 알리고 무변경(피커는 위에서 이미 선택값 반영).
@@ -387,7 +393,7 @@ async fn resolve_backup_id(
     if choices.is_empty() {
         return Ok(None);
     }
-    match crate::cli::picker::pick_backup(&choices, lang)? {
+    match crate::cli::picker::pick_backup(&choices, lang).await? {
         Some(id) => Ok(Some(id)),
         None => Err(XBackupError::Failure("백업 선택을 취소했습니다".into())),
     }

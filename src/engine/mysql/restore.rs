@@ -34,7 +34,11 @@ pub async fn mysql_restore<R: AsyncRead + Unpin>(
     timeout_secs: Option<u64>,
     drop: bool,
 ) -> Result<u64> {
-    let mut client = MysqlClient::connect(target_uri, timeout_secs).await?;
+    let mut client = MysqlClient::connect_restore_target(target_uri, timeout_secs, true)
+        .await?
+        .ok_or_else(|| {
+            XBackupError::Failure("MySQL 복구 대상 데이터베이스를 준비하지 못했습니다".into())
+        })?;
     restore_into(reader, client.conn_mut(), drop).await
 }
 
@@ -43,6 +47,10 @@ struct PostObj {
     kind: String,
     name: String,
     sql: String,
+    sql_mode: Option<String>,
+    character_set_client: Option<String>,
+    collation_connection: Option<String>,
+    time_zone: Option<String>,
 }
 
 /// 이미 연결된 conn으로 복원한다(migrate 등에서 재사용).
@@ -74,6 +82,7 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
                     archive::FORMAT_ID
                 )));
             }
+            apply_database_defaults(conn, &h).await?;
             warn_on_major_mismatch(conn, h.get_str("mysql_version").unwrap_or("")).await;
         }
         other => {
@@ -109,6 +118,10 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
                             XBackupError::Failure("후행 DDL 프레임에 sql이 없습니다".into())
                         })?
                         .to_string(),
+                    sql_mode: optional_str(&d, "sql_mode"),
+                    character_set_client: optional_str(&d, "character_set_client"),
+                    collation_connection: optional_str(&d, "collation_connection"),
+                    time_zone: optional_str(&d, "time_zone"),
                 });
             }
             Frame::Table(meta) => {
@@ -232,7 +245,7 @@ async fn apply_post(conn: &mut Conn, post: &[PostObj], drop: bool) -> Result<()>
         let mut still: Vec<&PostObj> = Vec::new();
         let mut last_err: Option<String> = None;
         for obj in &pending {
-            match run_ignore_exists(conn, &obj.sql).await {
+            match apply_post_object(conn, obj).await {
                 Ok(()) => {}
                 Err(e) => {
                     last_err = Some(format!("{e}\n  SQL: {}", obj.sql));
@@ -249,6 +262,66 @@ async fn apply_post(conn: &mut Conn, post: &[PostObj], drop: bool) -> Result<()>
         pending = still;
     }
     Ok(())
+}
+
+fn optional_str(doc: &bson::Document, key: &str) -> Option<String> {
+    doc.get_str(key)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// 새 아카이브는 소스 DB 기본값을 보존한다. 기존 아카이브에는 필드가 없으므로 건너뛴다.
+async fn apply_database_defaults(conn: &mut Conn, header: &bson::Document) -> Result<()> {
+    let (Ok(charset), Ok(collation)) = (
+        header.get_str("database_charset"),
+        header.get_str("database_collation"),
+    ) else {
+        return Ok(());
+    };
+    let database: Option<String> = conn
+        .query_first("SELECT DATABASE()")
+        .await
+        .map_err(|e| XBackupError::Failure(format!("복구 대상 데이터베이스 조회 실패: {e}")))?;
+    let database = database.ok_or_else(|| {
+        XBackupError::Usage("MySQL 복구 대상 URI에 데이터베이스가 필요합니다".into())
+    })?;
+    conn.query_drop(format!(
+        "ALTER DATABASE {} CHARACTER SET {} COLLATE {}",
+        quote_ident(&database),
+        quote_ident(charset),
+        quote_ident(collation)
+    ))
+    .await
+    .map_err(|e| {
+        XBackupError::Failure(format!(
+            "복구 대상 데이터베이스 기본 문자셋 적용 실패({charset}/{collation}): {e}"
+        ))
+    })
+}
+
+/// 객체 생성 당시의 session metadata를 복원한 뒤 DDL을 실행한다.
+async fn apply_post_object(conn: &mut Conn, obj: &PostObj) -> Result<()> {
+    if let Some(sql_mode) = &obj.sql_mode {
+        conn.exec_drop("SET SESSION sql_mode = ?", (sql_mode,))
+            .await
+            .map_err(|e| XBackupError::Failure(format!("sql_mode 복원 실패: {e}")))?;
+    }
+    if let Some(time_zone) = &obj.time_zone {
+        conn.exec_drop("SET SESSION time_zone = ?", (time_zone,))
+            .await
+            .map_err(|e| XBackupError::Failure(format!("time_zone 복원 실패: {e}")))?;
+    }
+    if let Some(charset) = &obj.character_set_client {
+        let mut sql = format!("SET NAMES {}", quote_ident(charset));
+        if let Some(collation) = &obj.collation_connection {
+            sql.push_str(&format!(" COLLATE {}", quote_ident(collation)));
+        }
+        conn.query_drop(sql)
+            .await
+            .map_err(|e| XBackupError::Failure(format!("객체 생성 문자셋 복원 실패: {e}")))?;
+    }
+    run_ignore_exists(conn, &obj.sql).await
 }
 
 /// 객체 kind → DROP 키워드.

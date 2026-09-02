@@ -110,8 +110,13 @@ async fn full_backup_restore_round_trip_preserves_data() {
     .await
     .expect("MySQL 풀 백업 성공");
 
-    // 빈 대상 DB로 복구.
-    recreate_database(&server_uri(&src_uri), "xb_rt_target").await;
+    // 대상 DB가 없으면 복구가 자동 생성한다.
+    let mut admin = connect(&server_uri(&src_uri)).await;
+    admin
+        .query_drop("DROP DATABASE IF EXISTS `xb_rt_target`")
+        .await
+        .unwrap();
+    drop(admin);
     let tgt_uri = swap_db(&src_uri, "xb_rt_target");
     let req = RestoreRequest {
         target_uri: Secret::new(tgt_uri.clone()),

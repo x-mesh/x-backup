@@ -39,6 +39,94 @@ impl MysqlClient {
         Ok(Self { conn })
     }
 
+    /// 복구 대상에 연결한다. 대상 데이터베이스가 없고 `create_missing`이 참이면 생성 후 연결한다.
+    ///
+    /// `create_missing`이 거짓이면 데이터베이스가 없을 때 `None`을 반환한다. `--dry-run`은 이
+    /// 경로로 상태를 바꾸지 않고 빈 대상으로 계획할 수 있다. 데이터베이스 생성 권한이 없으면
+    /// 원래 서버 오류를 포함한 명확한 실패를 반환한다.
+    pub async fn connect_restore_target(
+        uri: &Secret,
+        timeout_secs: Option<u64>,
+        create_missing: bool,
+    ) -> Result<Option<Self>> {
+        let dur = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
+        let opts = build_opts(uri.expose())?;
+        let db_name = opts
+            .db_name()
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                XBackupError::Usage(
+                    "복구 대상 MySQL URI에 데이터베이스가 필요합니다(mysql://.../<db>)".into(),
+                )
+            })?;
+
+        match tokio::time::timeout(dur, Conn::new(opts.clone())).await {
+            Ok(Ok(conn)) => return Ok(Some(Self { conn })),
+            Ok(Err(err)) if is_unknown_database(&err) => {}
+            Ok(Err(err)) => {
+                return Err(XBackupError::Failure(format!(
+                    "MySQL 연결 실패: {}",
+                    describe(&err)
+                )))
+            }
+            Err(_) => {
+                return Err(XBackupError::Failure(format!(
+                    "MySQL 연결 타임아웃({}s)",
+                    dur.as_secs()
+                )))
+            }
+        }
+
+        if !create_missing {
+            return Ok(None);
+        }
+
+        let server_opts: Opts = OptsBuilder::from_opts(opts.clone())
+            .db_name(None::<String>)
+            .into();
+        let mut server = tokio::time::timeout(dur, Conn::new(server_opts))
+            .await
+            .map_err(|_| {
+                XBackupError::Failure(format!("MySQL 서버 연결 타임아웃({}s)", dur.as_secs()))
+            })?
+            .map_err(|e| {
+                XBackupError::Failure(format!(
+                    "MySQL 서버 연결 실패(대상 데이터베이스 생성 준비): {}",
+                    describe(&e)
+                ))
+            })?;
+
+        let quoted = super::util::quote_ident(&db_name);
+        server
+            .query_drop(format!("CREATE DATABASE IF NOT EXISTS {quoted}"))
+            .await
+            .map_err(|e| {
+                XBackupError::Failure(format!(
+                    "MySQL 대상 데이터베이스 '{db_name}' 생성 실패: {}. 이 계정에는 CREATE DATABASE 권한이 필요합니다",
+                    describe(&e)
+                ))
+            })?;
+        let _ = server.disconnect().await;
+
+        let conn = tokio::time::timeout(dur, Conn::new(opts))
+            .await
+            .map_err(|_| {
+                XBackupError::Failure(format!(
+                    "생성한 MySQL 데이터베이스 '{db_name}' 연결 타임아웃({}s)",
+                    dur.as_secs()
+                ))
+            })?
+            .map_err(|e| {
+                XBackupError::Failure(format!(
+                    "생성한 MySQL 데이터베이스 '{db_name}' 연결 실패: {}",
+                    describe(&e)
+                ))
+            })?;
+        tracing::info!(database = %db_name, "MySQL 복구 대상 데이터베이스 생성 완료");
+        Ok(Some(Self { conn }))
+    }
+
     /// 내부 드라이버 연결의 가변 참조(쿼리 실행용).
     pub fn conn_mut(&mut self) -> &mut Conn {
         &mut self.conn
@@ -134,6 +222,11 @@ fn describe(e: &mysql_async::Error) -> String {
     msg
 }
 
+/// MySQL ER_BAD_DB_ERROR. 다른 인증·네트워크 오류에는 자동 생성을 시도하지 않는다.
+fn is_unknown_database(error: &mysql_async::Error) -> bool {
+    matches!(error, mysql_async::Error::Server(server) if server.code == 1049)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +258,21 @@ mod tests {
         assert!(ssl_opts_for(Some("DISABLED")).is_none());
         assert!(ssl_opts_for(Some("REQUIRED")).is_some());
         assert!(ssl_opts_for(Some("VERIFY_IDENTITY")).is_some());
+    }
+
+    #[test]
+    fn detects_only_unknown_database_error() {
+        let unknown = mysql_async::Error::Server(mysql_async::ServerError {
+            code: 1049,
+            message: "Unknown database 'missing'".into(),
+            state: "42000".into(),
+        });
+        let denied = mysql_async::Error::Server(mysql_async::ServerError {
+            code: 1045,
+            message: "Access denied".into(),
+            state: "28000".into(),
+        });
+        assert!(is_unknown_database(&unknown));
+        assert!(!is_unknown_database(&denied));
     }
 }

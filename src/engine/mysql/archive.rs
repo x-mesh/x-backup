@@ -61,6 +61,8 @@ pub enum Frame {
 pub struct HeaderFrame<'a> {
     pub created_at: &'a str,
     pub mysql_version: &'a str,
+    pub database_charset: &'a str,
+    pub database_collation: &'a str,
     /// 스냅샷 시점 binlog 파일명(없으면 빈 문자열).
     pub binlog_file: &'a str,
     /// 스냅샷 시점 binlog 위치.
@@ -75,6 +77,8 @@ pub async fn write_header<W: AsyncWrite + Unpin>(w: &mut W, h: &HeaderFrame<'_>)
         "format": FORMAT_ID,
         "created_at": h.created_at,
         "mysql_version": h.mysql_version,
+        "database_charset": h.database_charset,
+        "database_collation": h.database_collation,
         "binlog_file": h.binlog_file,
         "binlog_pos": h.binlog_pos as i64,
         "gtid_executed": h.gtid_executed,
@@ -91,16 +95,29 @@ pub async fn write_pre<W: AsyncWrite + Unpin>(w: &mut W, sql: &str) -> Result<()
 ///
 /// `kind`(view|trigger|procedure|function|event)와 `name`은 복구가 `drop=true`일 때
 /// `DROP <kind> IF EXISTS <name>`을 먼저 실행해 멱등 재생성을 가능하게 한다.
+#[allow(clippy::too_many_arguments)]
 pub async fn write_post<W: AsyncWrite + Unpin>(
     w: &mut W,
     kind: &str,
     name: &str,
     sql: &str,
+    sql_mode: Option<&str>,
+    character_set_client: Option<&str>,
+    collation_connection: Option<&str>,
+    time_zone: Option<&str>,
 ) -> Result<()> {
     write_doc_frame(
         w,
         TAG_POST,
-        &bson::doc! { "kind": kind, "name": name, "sql": sql },
+        &bson::doc! {
+            "kind": kind,
+            "name": name,
+            "sql": sql,
+            "sql_mode": sql_mode,
+            "character_set_client": character_set_client,
+            "collation_connection": collation_connection,
+            "time_zone": time_zone,
+        },
     )
     .await
 }
@@ -262,6 +279,8 @@ mod tests {
             &HeaderFrame {
                 created_at: "2026-06-14T00:00:00Z",
                 mysql_version: "8.0.39",
+                database_charset: "utf8mb4",
+                database_collation: "utf8mb4_0900_ai_ci",
                 binlog_file: "binlog.000003",
                 binlog_pos: 4567,
                 gtid_executed: "uuid:1-10",
@@ -283,9 +302,18 @@ mod tests {
         write_row(&mut buf, b"(1,'a')").await.unwrap();
         write_row(&mut buf, b"(2,0x00FF)").await.unwrap();
         write_table_end(&mut buf).await.unwrap();
-        write_post(&mut buf, "view", "v", "CREATE VIEW `v` AS SELECT 1")
-            .await
-            .unwrap();
+        write_post(
+            &mut buf,
+            "view",
+            "v",
+            "CREATE VIEW `v` AS SELECT 1",
+            None,
+            Some("utf8"),
+            Some("utf8_general_ci"),
+            None,
+        )
+        .await
+        .unwrap();
         write_end(&mut buf).await.unwrap();
 
         let mut r = std::io::Cursor::new(buf);
@@ -293,6 +321,11 @@ mod tests {
             Frame::Header(h) => {
                 assert_eq!(h.get_str("format").unwrap(), FORMAT_ID);
                 assert_eq!(h.get_str("mysql_version").unwrap(), "8.0.39");
+                assert_eq!(h.get_str("database_charset").unwrap(), "utf8mb4");
+                assert_eq!(
+                    h.get_str("database_collation").unwrap(),
+                    "utf8mb4_0900_ai_ci"
+                );
                 assert_eq!(h.get_str("binlog_file").unwrap(), "binlog.000003");
                 assert_eq!(h.get_i64("binlog_pos").unwrap(), 4567);
                 assert_eq!(h.get_str("gtid_executed").unwrap(), "uuid:1-10");
@@ -317,7 +350,14 @@ mod tests {
         );
         assert_eq!(read_frame(&mut r).await.unwrap(), Frame::TableEnd);
         match read_frame(&mut r).await.unwrap() {
-            Frame::Post(p) => assert_eq!(p.get_str("sql").unwrap(), "CREATE VIEW `v` AS SELECT 1"),
+            Frame::Post(p) => {
+                assert_eq!(p.get_str("sql").unwrap(), "CREATE VIEW `v` AS SELECT 1");
+                assert_eq!(p.get_str("character_set_client").unwrap(), "utf8");
+                assert_eq!(
+                    p.get_str("collation_connection").unwrap(),
+                    "utf8_general_ci"
+                );
+            }
             f => panic!("후행 DDL 기대, {f:?}"),
         }
         assert_eq!(read_frame(&mut r).await.unwrap(), Frame::End);

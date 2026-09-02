@@ -100,10 +100,18 @@ where
     };
     let incremental_ids = collect_mysql_increments(storage, &base_id).await?;
 
-    let mut target = MysqlClient::connect(&request.target_uri, request.timeout_secs).await?;
-    let conflicting_tables = my_meta::list_qualified(target.conn_mut())
-        .await
-        .unwrap_or_default();
+    let mut target = MysqlClient::connect_restore_target(
+        &request.target_uri,
+        request.timeout_secs,
+        !request.dry_run,
+    )
+    .await?;
+    let conflicting_tables = match target.as_mut() {
+        Some(target) => my_meta::list_qualified(target.conn_mut())
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
 
     let plan = MysqlPitrPlan {
         base_id: base_id.clone(),
@@ -123,6 +131,9 @@ where
     }
 
     let drop_existing = decide_guard(&conflicting_tables, request.force, is_tty, confirm)?;
+    let mut target = target.ok_or_else(|| {
+        XBackupError::Failure("MySQL PITR 대상 데이터베이스를 준비하지 못했습니다".into())
+    })?;
 
     // base 풀 복원(reverse stack → mysql restore_into).
     let base_manifest = store.read(&base_id).await?;
