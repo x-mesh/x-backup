@@ -989,7 +989,13 @@ pub async fn run_pg_incremental_backup(
         if let Some(lsn) = &captured.last_lsn {
             // DML이 아닌 메시지만 있던 구간 — 다시 안 읽도록 전진.
             if let Err(e) = incremental::advance_slot(admin.client(), &slot, lsn).await {
-                tracing::warn!("빈 슬라이스 slot 전진 실패(다음에 재시도): {e}");
+                tracing::warn!(
+                    "{}",
+                    crate::tr!(
+                        "empty slice: could not advance the slot, retrying on the next increment: {e}",
+                        "빈 슬라이스라 slot을 전진시키지 못했습니다. 다음 증분에서 다시 시도합니다: {e}",
+                    )
+                );
             }
         }
         tracing::info!(backup_id = %backup_id, base_id = %base_id, "PG 증분 — 변경 없음(빈 슬라이스)");
@@ -1043,7 +1049,13 @@ pub async fn run_pg_incremental_backup(
     // 6) 저장·manifest가 끝났으니 slot 전진(여기 실패는 다음 증분이 겹쳐 캡처 — idempotent).
     if let Some(lsn) = &last_lsn {
         if let Err(e) = incremental::advance_slot(admin.client(), &slot, lsn).await {
-            tracing::warn!("slot 전진 실패(다음 증분이 겹쳐 캡처, 복구는 idempotent): {e}");
+            tracing::warn!(
+                "{}",
+                crate::tr!(
+                    "could not advance the slot; the next increment re-captures the overlap, and restore is idempotent, so the result is the same: {e}",
+                    "slot을 전진시키지 못했습니다. 다음 증분이 겹친 만큼 다시 잡지만 복구가 멱등이라 결과는 같습니다: {e}",
+                )
+            );
         }
     }
     let _ = BackupStatus::Complete; // (manifest 헬퍼가 이미 Complete로 기록)

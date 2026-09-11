@@ -41,7 +41,7 @@ pub async fn handle(
         })?),
         None => None,
     };
-    let lang = crate::i18n::resolve_from_toml(lang_flag, config_toml.as_deref());
+    let lang = crate::i18n::activate_from_toml(lang_flag, config_toml.as_deref());
     let storage = open_storage(&config_path).await?;
     run(storage.as_ref(), &args, lang).await
 }

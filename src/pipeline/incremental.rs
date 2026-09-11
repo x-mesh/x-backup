@@ -213,7 +213,13 @@ where
         Err(CaptureError::LateGap(msg)) => {
             cleanup(storage, &backup_id).await;
             let reason = format!("캡처 중 late gap — {msg}");
-            tracing::warn!("{reason} → 풀 백업으로 승격합니다.");
+            tracing::warn!(
+                "{}",
+                crate::tr!(
+                    "{reason} — promoting this run to a full backup",
+                    "{reason} → 이번 실행을 풀 백업으로 올립니다",
+                )
+            );
             return promote_to_full(request, storage, &stage_factory, reason).await;
         }
         Err(CaptureError::Other(e)) => {

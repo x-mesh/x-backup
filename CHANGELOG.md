@@ -12,6 +12,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `LICENSE` (MIT). `Cargo.toml` has declared `license = "MIT"` since its first commit,
   but the file itself was never there.
 - `Cargo.toml` metadata: `repository`, `homepage`, `readme`, `keywords`, `categories`.
+- Terminal demos in the README, recorded with [VHS](https://github.com/charmbracelet/vhs):
+  a full backup and the increment that follows it, the `status` preflight, and
+  `verify --deep --chain`. The tapes and their setup script live in `docs/assets/`, so
+  the recordings can be reproduced rather than only replaced.
+
+### Fixed
+
+- Output no longer mixes languages under `[output].language = "en"`. Two things leaked
+  Korean regardless of the setting: the error-kind prefix, which was baked into each
+  variant's `#[error("작업 실패: {0}")]` and therefore fixed at compile time, and fifteen
+  `tracing` log lines written as Korean literals. The prefix moved out of `Display` into
+  `XBackupError::kind_label(lang)`, which the printer in `main` applies, and the log lines
+  now go through a `tr!` macro that formats only the language in use. Error message
+  *bodies* are still Korean — that is the whole error surface and has not been touched.
 
 ### Changed
 

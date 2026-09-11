@@ -14,6 +14,8 @@
 
 use std::process::ExitCode;
 
+use crate::i18n::Lang;
+
 /// 종료 코드 상수. 매직 넘버를 코드 전반에 흩뿌리지 않기 위해 한곳에 모은다.
 pub mod exit_codes {
     /// 성공.
@@ -39,49 +41,70 @@ pub mod exit_codes {
 #[non_exhaustive]
 pub enum XBackupError {
     /// 작업 미완료 — 파이프라인/업로드/복구/IO/드라이버 등 일반 실행 실패. → exit 1
-    #[error("작업 실패: {0}")]
+    #[error("{0}")]
     Failure(String),
 
     /// 입출력 오류. → exit 1
-    #[error("IO 오류: {0}")]
+    #[error("{0}")]
     Io(#[from] std::io::Error),
 
     /// 스토리지 업로드(put) 실패 — 산출물 저장 중 오류. → exit 1
     ///
     /// 부분 산출물은 호출 경로(RAII 가드·멀티파트 abort)에서 정리한다(PRD §11 신뢰성).
-    #[error("스토리지 업로드 실패: {0}")]
+    #[error("{0}")]
     StorageUpload(String),
 
     /// 스토리지 다운로드(get)·조회(list)·삭제(delete) 실패 — 산출물 읽기/관리 중 오류. → exit 1
-    #[error("스토리지 다운로드 실패: {0}")]
+    #[error("{0}")]
     StorageDownload(String),
 
     /// 사용법·플래그 오류(잘못된 인자 조합 등). → exit 2
-    #[error("사용법 오류: {0}")]
+    #[error("{0}")]
     Usage(String),
 
     /// 설정 결함(config 파싱 실패, 필수 키 누락, 알 수 없는 프로파일 등). → exit 2
-    #[error("설정 오류: {0}")]
+    #[error("{0}")]
     Config(String),
 
     /// 사전 점검 실패 — 작업을 시작하지 않음(`status` 핵심 항목 실패). → exit 3
-    #[error("사전 점검 실패: {0}")]
+    #[error("{0}")]
     PrecheckFailed(String),
 
     /// oplog gap 감지로 증분→풀 승격 등, 경고를 동반한 성공. → exit 4
-    #[error("경고: {0}")]
+    #[error("{0}")]
     Warning(String),
 
     /// 무결성 검증에서 경고가 발생함(verify 경고). → exit 4
-    #[error("검증 경고: {0}")]
+    #[error("{0}")]
     VerifyWarning(String),
 
     /// 동일 프로파일의 다른 인스턴스가 실행 중 — 잠금 충돌(FR-12). → exit 5
-    #[error("잠금 충돌: {0}")]
+    #[error("{0}")]
     LockConflict(String),
 }
 
 impl XBackupError {
+    /// 에러 종류를 가리키는 짧은 라벨.
+    ///
+    /// 예전에는 이 라벨이 각 variant의 `#[error("작업 실패: {0}")]`에 박혀 있었다.
+    /// 그 포맷 문자열은 컴파일 시점에 고정되므로 `[output].language = "en"`으로 돌려도
+    /// 한국어 라벨이 영어 본문 앞에 붙었다. 라벨을 Display에서 떼어 내고 여기서 고르면
+    /// 출력 지점이 언어를 정할 수 있다 — 본문은 각 호출부가 이미 언어에 맞게 만든다.
+    pub fn kind_label(&self, lang: Lang) -> &'static str {
+        match self {
+            Self::Failure(_) => lang.sel("failed", "작업 실패"),
+            Self::Io(_) => lang.sel("I/O error", "IO 오류"),
+            Self::StorageUpload(_) => lang.sel("storage upload failed", "스토리지 업로드 실패"),
+            Self::StorageDownload(_) => lang.sel("storage read failed", "스토리지 읽기 실패"),
+            Self::Usage(_) => lang.sel("usage error", "사용법 오류"),
+            Self::Config(_) => lang.sel("config error", "설정 오류"),
+            Self::PrecheckFailed(_) => lang.sel("precheck failed", "사전 점검 실패"),
+            Self::Warning(_) => lang.sel("warning", "경고"),
+            Self::VerifyWarning(_) => lang.sel("verify warning", "검증 경고"),
+            Self::LockConflict(_) => lang.sel("lock conflict", "잠금 충돌"),
+        }
+    }
+
     /// PRD §9 규약에 따른 프로세스 종료 코드(`u8`)를 반환한다.
     ///
     /// 이 매핑이 종료 코드의 단일 진실 공급원이다 — `main`은 이 값만 신뢰한다.
@@ -168,6 +191,31 @@ mod tests {
                 "코드 {code} 범위 밖"
             );
         }
+    }
+
+    /// 종류 라벨은 언어를 따른다 — 예전에는 `#[error(...)]`에 한국어로 박혀 있어서
+    /// `language = "en"`으로도 바뀌지 않았다. 그 회귀를 막는다.
+    #[test]
+    fn kind_label_follows_language() {
+        let err = XBackupError::Warning("x".into());
+        assert_eq!(err.kind_label(Lang::En), "warning");
+        assert_eq!(err.kind_label(Lang::Ko), "경고");
+
+        let err = XBackupError::Usage("x".into());
+        assert_eq!(err.kind_label(Lang::En), "usage error");
+        assert_eq!(err.kind_label(Lang::Ko), "사용법 오류");
+    }
+
+    /// Display에는 종류 라벨이 들어가지 않는다 — 라벨은 출력 지점이 붙인다.
+    /// 라벨이 Display에 남아 있으면 중첩 에러에 접두사가 두 번 끼거나, 언어가
+    /// 뒤섞인 한 줄이 만들어진다.
+    #[test]
+    fn display_carries_only_the_message() {
+        assert_eq!(XBackupError::Failure("boom".into()).to_string(), "boom");
+        assert_eq!(
+            XBackupError::Warning("heads up".into()).to_string(),
+            "heads up"
+        );
     }
 
     /// 상수 값이 PRD §9 표의 숫자와 일치하는지 고정한다(회귀 방지).

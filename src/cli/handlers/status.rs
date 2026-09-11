@@ -44,7 +44,7 @@ pub async fn handle(
         })?),
         None => None,
     };
-    let lang = crate::i18n::resolve_from_toml(lang_flag, config_toml.as_deref());
+    let lang = crate::i18n::activate_from_toml(lang_flag, config_toml.as_deref());
 
     // 참조 중인 config 위치를 stderr에 한 줄 알린다(다중 DB 툴 + xbenv 자동 XB_CONFIG 환경에서
     // "지금 어느 config를 보는지"를 분명히). json은 기계 판독 오염 방지로 생략.
@@ -129,7 +129,7 @@ pub async fn handle(
     }
 
     // 신호등 → 종료 코드. fail이면 PrecheckFailed(exit 3), warn이면 Warning(exit 4), ok면 0.
-    report_to_result(&report)
+    report_to_result(&report, lang)
 }
 
 /// `--all` — config의 모든 프로파일을 점검한다. 사람용 출력은 **프로파일별 전체 상세**
@@ -235,7 +235,10 @@ async fn handle_all(
             CheckStatus::Fail => 2,
         })
         .unwrap_or(CheckStatus::Ok);
-    report_to_result(&StatusReport::new("(전체)", overall_placeholder(worst)))
+    report_to_result(
+        &StatusReport::new("(전체)", overall_placeholder(worst)),
+        lang,
+    )
 }
 
 /// 한 프로파일의 점검 보고서를 만든다(connect 실패도 보고서로 표현 — Err로 끊지 않음).
@@ -894,17 +897,26 @@ fn fmt_cell(text: &str, status: CheckStatus, differs: bool, width: usize, color:
 }
 
 /// 신호등 합산을 [`Result`]로 변환한다 — main의 exit code 매핑에 태운다.
-fn report_to_result(report: &StatusReport) -> Result<()> {
+///
+/// 이 메시지는 점검 표 바로 아래에 찍히므로 표와 같은 언어여야 한다. `lang`을 받는
+/// 이유가 그것이다 — 예전에는 한국어로 고정돼 있어서 `language = "en"` 설정에서도
+/// 영어 표 끝에 한국어 한 줄이 붙었다.
+fn report_to_result(report: &StatusReport, lang: Lang) -> Result<()> {
+    let profile = &report.profile;
     match report.overall {
         CheckStatus::Ok => Ok(()),
-        CheckStatus::Warn => Err(XBackupError::Warning(format!(
-            "프로파일 '{}' 점검에 경고가 있습니다(백업 가능하나 주의)",
-            report.profile
-        ))),
-        CheckStatus::Fail => Err(XBackupError::PrecheckFailed(format!(
-            "프로파일 '{}' 점검 실패 — 백업 불가 항목이 있습니다",
-            report.profile
-        ))),
+        CheckStatus::Warn => Err(XBackupError::Warning(match lang {
+            Lang::En => {
+                format!("profile '{profile}' — backup can run, but review the checks above")
+            }
+            Lang::Ko => {
+                format!("프로파일 '{profile}' — 백업은 가능하지만 위 점검 결과를 확인하세요")
+            }
+        })),
+        CheckStatus::Fail => Err(XBackupError::PrecheckFailed(match lang {
+            Lang::En => format!("profile '{profile}' failed its checks — backup cannot run"),
+            Lang::Ko => format!("프로파일 '{profile}' 점검 실패 — 백업 불가 항목이 있습니다"),
+        })),
     }
 }
 
@@ -1675,13 +1687,13 @@ mod tests {
     #[test]
     fn ok_report_maps_to_ok_result() {
         let report = StatusReport::new("p", vec![CheckItem::ok("a", "A", "")]);
-        assert!(report_to_result(&report).is_ok());
+        assert!(report_to_result(&report, Lang::En).is_ok());
     }
 
     #[test]
     fn warn_report_maps_to_exit_4() {
         let report = StatusReport::new("p", vec![CheckItem::warn("a", "A", "")]);
-        let err = report_to_result(&report).unwrap_err();
+        let err = report_to_result(&report, Lang::En).unwrap_err();
         assert_eq!(err.exit_code(), 4);
     }
 
@@ -1691,7 +1703,7 @@ mod tests {
             "p",
             vec![CheckItem::fail("topology", "토폴로지", "샤딩 감지")],
         );
-        let err = report_to_result(&report).unwrap_err();
+        let err = report_to_result(&report, Lang::En).unwrap_err();
         assert_eq!(err.exit_code(), 3);
     }
 

@@ -50,7 +50,7 @@ pub async fn handle(
         })?),
         None => None,
     };
-    let lang = crate::i18n::resolve_from_toml(lang_flag, config_toml.as_deref());
+    let lang = crate::i18n::activate_from_toml(lang_flag, config_toml.as_deref());
     let overrides = collect_overrides_from_process();
     let resolved = ResolvedConfig::build(MergeInput {
         config_toml: config_toml.as_deref(),
@@ -161,9 +161,21 @@ pub async fn handle(
         if should_precheck {
             run_precheck(&uri, &resolved.profile_name, timeout_secs, engine).await?;
         } else if args.skip_precheck {
-            tracing::warn!("--skip-precheck 지정 — 백업 사전 점검을 건너뜁니다(FR-8 우회)");
+            tracing::warn!(
+                "{}",
+                crate::tr!(
+                    "--skip-precheck given, so the pre-backup checks are skipped (FR-8 bypass)",
+                    "--skip-precheck가 있어 백업 전 점검을 건너뜁니다(FR-8 우회)",
+                )
+            );
         } else {
-            tracing::warn!("config mode.precheck=false — 백업 사전 점검을 건너뜁니다");
+            tracing::warn!(
+                "{}",
+                crate::tr!(
+                    "config sets mode.precheck=false, so the pre-backup checks are skipped",
+                    "config의 mode.precheck=false라 백업 전 점검을 건너뜁니다",
+                )
+            );
         }
 
         // 증분(--type incr)은 드라이버 oplog 캡처 경로로 분기한다(t8). 선택적 백업
@@ -306,7 +318,13 @@ fn post_hook_event(result: &Result<()>) -> HookEvent {
 /// > 주 소스(`uri`). 복제본에서 읽으면 primary 부하를 분리한다. 아무 소스도 없으면 Config 에러.
 fn select_read_uri(read_source: Option<&str>, resolved: &ResolvedConfig) -> Result<Secret> {
     if let Some(rs) = read_source.filter(|s| !s.is_empty()) {
-        tracing::info!("--read-source 지정 — 복제본에서 백업을 읽습니다(primary 부하 분리)");
+        tracing::info!(
+            "{}",
+            crate::tr!(
+                "--read-source given, so the backup reads from a replica and leaves the primary alone",
+                "--read-source가 있어 복제본에서 읽습니다. primary에는 부하를 주지 않습니다",
+            )
+        );
         return Ok(Secret::new(rs.to_string()));
     }
     let from_replica = resolved.resolved_read_uri.is_some();
@@ -317,7 +335,13 @@ fn select_read_uri(read_source: Option<&str>, resolved: &ResolvedConfig) -> Resu
         ))
     })?;
     if from_replica {
-        tracing::info!("source.read_uri 지정 — 복제본에서 백업을 읽습니다(primary 부하 분리)");
+        tracing::info!(
+            "{}",
+            crate::tr!(
+                "config sets source.read_uri, so the backup reads from a replica and leaves the primary alone",
+                "config의 source.read_uri를 따라 복제본에서 읽습니다. primary에는 부하를 주지 않습니다",
+            )
+        );
     }
     Ok(uri)
 }
@@ -561,9 +585,21 @@ async fn handle_pg_backup(
     if should_precheck {
         crate::engine::postgres::status::precheck(&uri, timeout_secs).await?;
     } else if args.skip_precheck {
-        tracing::warn!("--skip-precheck 지정 — PG 백업 사전 점검을 건너뜁니다(FR-8 우회)");
+        tracing::warn!(
+            "{}",
+            crate::tr!(
+                "--skip-precheck given, so the pre-backup checks are skipped (FR-8 bypass)",
+                "--skip-precheck가 있어 PostgreSQL 백업 전 점검을 건너뜁니다(FR-8 우회)",
+            )
+        );
     } else {
-        tracing::warn!("config mode.precheck=false — PG 백업 사전 점검을 건너뜁니다");
+        tracing::warn!(
+            "{}",
+            crate::tr!(
+                "config sets mode.precheck=false, so the pre-backup checks are skipped",
+                "config의 mode.precheck=false라 PostgreSQL 백업 전 점검을 건너뜁니다",
+            )
+        );
     }
 
     // 증분(--type incr)은 logical decoding 캡처 경로로 분기한다. pg_logical 미활성이면
@@ -692,7 +728,13 @@ async fn handle_mysql_backup(
     if should_precheck {
         crate::engine::mysql::status::precheck(&uri, timeout_secs).await?;
     } else if args.skip_precheck {
-        tracing::warn!("--skip-precheck 지정 — MySQL 백업 사전 점검을 건너뜁니다(FR-8 우회)");
+        tracing::warn!(
+            "{}",
+            crate::tr!(
+                "--skip-precheck given, so the pre-backup checks are skipped (FR-8 bypass)",
+                "--skip-precheck가 있어 MySQL 백업 전 점검을 건너뜁니다(FR-8 우회)",
+            )
+        );
     }
 
     // 증분(--type incr)은 binlog 캡처 경로로 분기한다. mysql_binlog 미활성이면 명확히 거부.
@@ -1064,7 +1106,13 @@ async fn promote_pg_incremental_to_full(
         ),
         SlotHealth::Active => lang.sel("ok", "정상"),
     };
-    tracing::warn!("PG 증분 gap 감지({reason}) — 풀 백업으로 승격합니다");
+    tracing::warn!(
+        "{}",
+        crate::tr!(
+            "PostgreSQL incremental gap detected ({reason}) — promoting this run to a full backup",
+            "PostgreSQL 증분에서 gap을 발견했습니다({reason}). 이번 실행을 풀 백업으로 올립니다",
+        )
+    );
 
     let (stages, meta) = build_stages(resolved, args)?;
     let progress_counter = new_counter();

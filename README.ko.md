@@ -12,6 +12,11 @@
 스트리밍(데이터 크기와 무관한 상수 메모리 — [실측 보고서](docs/memory-profile.md): 6 GiB 백업
 피크 RSS 54.6 MiB)으로 동작한다. DB 종류는 source URI 스킴(`mongodb://`·`postgresql://`·`mysql://`/`mariadb://`)으로 자동 선택된다.
 
+<img src="docs/assets/demo-backup.gif" alt="풀 백업, 이어지는 증분 백업, 그리고 x-backup list에 나타난 둘의 체인" width="100%">
+
+풀 백업 → 그 이후 변경만 담는 증분 백업 → 둘이 이루는 체인. 실제로 떠 있는 replica set을
+대상으로 녹화했고, [테이프 스크립트도 리포에 있다](docs/assets/).
+
 ## Features
 
 - ✅ **풀 백업** — 드라이버 네이티브 스트리밍 아카이브(데이터 + 인덱스 + 컬렉션 옵션), 외부 도구 불필요. `mongodump --archive --oplog`는 opt-in 엔진으로 선택 가능
@@ -86,6 +91,12 @@ x-backup migrate --profile prod --target mongodb://newcluster --force # 파일 �
 ```
 
 다중 DB 툴이라, 모든 명령은 실행 시 stderr에 활성 프로파일·DB를 한 줄로 보여준다(`▸ 프로파일 prod · DB postgresql`) — 지금 무엇을 건드리는지 항상 보이게(`--json`이면 생략). `--profile`은 `XB_PROFILE` 환경변수로도 줄 수 있다(`--config`/`XB_CONFIG`와 동일).
+
+가장 먼저 돌릴 것은 `status`다. "지금 이 서버를 백업해도 되는가"에 아무것도 쓰지 않고
+답한다 — 연결·토폴로지·권한·버전/FCV·시계 오차·oplog 윈도·데이터 형태·마지막 백업 경과
+시간, 그리고 destination이 쓰기 가능하고 여유 공간이 있는지까지.
+
+<img src="docs/assets/demo-status.gif" alt="x-backup status가 16개 사전 점검 항목을 OK/WARN으로 찍고 종합 판정과 종료 코드를 내놓는 화면" width="100%">
 
 ### Migrate (파일 없이 직접 복사)
 
@@ -598,6 +609,12 @@ x-backup prune --profile prod --force                     # config retention을 
 cron에서 4를 성공으로 다루려면: `x-backup backup ...; rc=$?; [ $rc -eq 4 ] && rc=0; exit $rc`
 
 ## 복구 의미론
+
+백업이 망가진 걸 가장 싸게 아는 방법은 *필요해지기 전에* 아는 것이다. `verify --deep`은
+아카이브를 복호화·디코드까지 해보고, `--chain`은 증분을 base까지 거슬러 올라간다. 복구를
+실제로 돌리지 않고도 복구가 될지 알 수 있다 — DB에는 아무것도 쓰지 않고, 저장소도 그대로다.
+
+<img src="docs/assets/demo-verify.gif" alt="x-backup verify가 manifest 무결성·데이터 체크섬·deep decode를 모두 OK로 보고하고, base까지 연속된 체인을 확인하는 화면" width="100%">
 
 - `restore`(--at 없음) = **base 풀백업 스냅샷만** 복원
 - `restore --at <시각>` = PITR — base 복원 후 증분 oplog를 해당 시각(이하 최대 ts)까지 재생.

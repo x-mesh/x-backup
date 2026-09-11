@@ -57,7 +57,7 @@ pub async fn handle(
     };
     // from_toml_str로 통일 — v2 표면도 여기서 정규화된다(inline toml::from_str 금지).
     let cfg: Config = Config::from_toml_str(&config_toml)?;
-    let lang = crate::i18n::resolve_from_toml(lang_flag, Some(config_toml.as_str()));
+    let lang = crate::i18n::activate_from_toml(lang_flag, Some(config_toml.as_str()));
 
     // 점검할 프로파일 — --profile 지정 시 그것만, 아니면 전체(이름순).
     let names: Vec<String> = match &args.profile {

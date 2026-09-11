@@ -13,7 +13,7 @@ const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
 pub async fn handle(lang_flag: Option<Lang>, args: UpdateArgs) -> Result<()> {
     // update는 config를 읽지 않으므로 언어는 CLI `--lang`/env `XB_LANG` 또는 기본 en으로만 정한다.
-    let lang = crate::i18n::resolve(lang_flag, None);
+    let lang = crate::i18n::activate(lang_flag, None);
 
     let exe = std::env::current_exe()
         .map_err(|e| XBackupError::Failure(format!("실행 파일 경로 확인 실패: {e}")))?;

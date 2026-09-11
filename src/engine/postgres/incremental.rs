@@ -341,7 +341,13 @@ pub async fn apply<R: AsyncRead + Unpin>(
     // 이대로 두면 복구 후 새 insert가 기존 행과 PK 충돌한다.
     for (schema, table) in meta_cache.keys() {
         if let Err(e) = resync_sequences(client, schema, table).await {
-            tracing::warn!("{schema}.{table} 시퀀스 재동기화 실패(무시): {e}");
+            tracing::warn!(
+                "{}",
+                crate::tr!(
+                    "could not resync the {schema}.{table} sequence, so it is left as is: {e}",
+                    "{schema}.{table} 시퀀스를 다시 맞추지 못해 그대로 둡니다: {e}",
+                )
+            );
         }
     }
     Ok(applied)

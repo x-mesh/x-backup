@@ -50,7 +50,7 @@ pub async fn handle(
         })?),
         None => None,
     };
-    let lang = crate::i18n::resolve_from_toml(lang_flag, config_toml.as_deref());
+    let lang = crate::i18n::activate_from_toml(lang_flag, config_toml.as_deref());
     let overrides = collect_overrides_from_process();
     let resolved = ResolvedConfig::build(MergeInput {
         config_toml: config_toml.as_deref(),
@@ -584,7 +584,7 @@ async fn handle_pitr(
         Some(path) => std::fs::read_to_string(path).ok(),
         None => None,
     };
-    let lang = crate::i18n::resolve_from_toml(lang_flag, config_toml.as_deref());
+    let lang = crate::i18n::activate_from_toml(lang_flag, config_toml.as_deref());
 
     // config·URI·storage·타임아웃·대상 출처 해석(풀 복구 경로와 동일 규칙).
     let (target_uri, storage, timeout_secs, target_origin) =

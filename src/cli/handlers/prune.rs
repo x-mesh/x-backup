@@ -45,7 +45,7 @@ pub async fn handle(
     let config_toml = config_path
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok());
-    let lang = crate::i18n::resolve_from_toml(lang_flag, config_toml.as_deref());
+    let lang = crate::i18n::activate_from_toml(lang_flag, config_toml.as_deref());
 
     let storage = open_storage(&config_path, &args).await?;
 

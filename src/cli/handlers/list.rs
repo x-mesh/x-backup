@@ -65,7 +65,7 @@ pub async fn handle(
     let config_toml = config_path
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok());
-    let lang = crate::i18n::resolve_from_toml(lang_flag, config_toml.as_deref());
+    let lang = crate::i18n::activate_from_toml(lang_flag, config_toml.as_deref());
     let profile = resolve_profile_name(args.profile.as_deref(), config_toml.as_deref());
     crate::cli::output::print_run_context(
         &profile,

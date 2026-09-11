@@ -29,7 +29,7 @@ pub async fn handle(
     args: InitArgs,
 ) -> Result<()> {
     // init은 config.toml을 새로 만드는 흐름이라 읽어들일 기존 config_toml이 없다 → flag/기본만 본다.
-    let lang = crate::i18n::resolve(lang_flag, None);
+    let lang = crate::i18n::activate(lang_flag, None);
 
     // 1) 비-TTY 가드 — 마법사는 대화형 전용. 표준입력이 터미널이 아니면 거부한다.
     if !std::io::stdin().is_terminal() {

@@ -269,10 +269,18 @@ fn log_hook_output(output: &std::process::Output) {
     let out = out.trim();
     let err = err.trim();
     if !out.is_empty() {
-        tracing::info!("훅 stdout: {}", mask_secrets(out));
+        let masked = mask_secrets(out);
+        tracing::info!(
+            "{}",
+            crate::tr!("hook stdout: {masked}", "훅 stdout: {masked}")
+        );
     }
     if !err.is_empty() {
-        tracing::info!("훅 stderr: {}", mask_secrets(err));
+        let masked = mask_secrets(err);
+        tracing::info!(
+            "{}",
+            crate::tr!("hook stderr: {masked}", "훅 stderr: {masked}")
+        );
     }
 }
 

@@ -117,7 +117,13 @@ impl ResolvedConfig {
         ) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!("read 소스 URI 해석 실패(backup 시에만 필요 — 주 소스로 폴백): {e}");
+                tracing::warn!(
+                    "{}",
+                    crate::tr!(
+                        "could not resolve the read source URI, so falling back to the primary source; only backup uses it: {e}",
+                        "read 소스 URI를 해석하지 못해 주 소스로 돌아갑니다. backup에서만 쓰는 값입니다: {e}",
+                    )
+                );
                 None
             }
         };

@@ -11,6 +11,8 @@
 //! println!("{}", lang.sel("Backup complete", "백업 완료"));  // 설명: 토글
 //! ```
 
+use std::sync::OnceLock;
+
 use clap::ValueEnum;
 
 use crate::config::file::Config;
@@ -62,6 +64,62 @@ pub fn resolve_from_toml(flag: Option<Lang>, config_toml: Option<&str>) -> Lang 
         .and_then(|c| c.output)
         .and_then(|o| o.language);
     resolve(None, cfg_lang.as_deref())
+}
+
+/// 프로세스 전역 출력 언어.
+///
+/// **왜 전역인가**: 언어를 인자로 넘길 수 없는 출력 지점이 두 부류 있다.
+/// 하나는 `main`의 최종 에러 출력이다 — 거기서는 config를 다시 읽지 않고
+/// [`crate::error::XBackupError`] 하나만 들고 있다. 다른 하나는 파이프라인 깊은 곳의
+/// `tracing::warn!` 호출이다 — 로그 한 줄을 위해 `lang`을 수십 단계 함수 시그니처에
+/// 끼워 넣는 것은 비용이 이득보다 크다. 그래서 서브커맨드가 시작할 때 언어를 한 번
+/// 정해 두고, 그 지점들이 여기서 읽어 간다.
+///
+/// [`OnceLock`]이라 한 번만 정해지고, 정해지기 전에 읽으면 기본값 `En`이다. 테스트는
+/// 프로세스를 공유하므로 [`active`]에 의존하는 단정을 쓰지 않는다 — 순수 함수인
+/// [`Lang::sel`]에 언어를 직접 넘겨 검증한다.
+static ACTIVE: OnceLock<Lang> = OnceLock::new();
+
+/// 전역 출력 언어를 정한다. 첫 호출만 반영되고 이후 호출은 조용히 무시된다.
+pub fn set_active(lang: Lang) {
+    let _ = ACTIVE.set(lang);
+}
+
+/// 전역 출력 언어. 아직 정해지지 않았으면 기본 `En`.
+pub fn active() -> Lang {
+    ACTIVE.get().copied().unwrap_or_default()
+}
+
+/// [`resolve`]에 [`set_active`]를 붙인 것. 서브커맨드 진입부에서 쓴다.
+pub fn activate(flag: Option<Lang>, config_language: Option<&str>) -> Lang {
+    let lang = resolve(flag, config_language);
+    set_active(lang);
+    lang
+}
+
+/// [`resolve_from_toml`]에 [`set_active`]를 붙인 것. 서브커맨드 진입부에서 쓴다.
+pub fn activate_from_toml(flag: Option<Lang>, config_toml: Option<&str>) -> Lang {
+    let lang = resolve_from_toml(flag, config_toml);
+    set_active(lang);
+    lang
+}
+
+/// 전역 언어에 맞는 쪽만 포맷해서 `String`으로 돌려준다.
+///
+/// [`Lang::sel`]은 이미 만들어진 두 문자열 중 하나를 고르므로, 값이 끼어드는 문구에 쓰면
+/// 양쪽을 다 `format!`해 놓고 하나를 버리게 된다. 이 매크로는 고른 쪽만 포맷한다.
+/// 인자는 인라인 캡처를 그대로 쓴다 — `tr!("failed: {e}", "실패: {e}")`.
+///
+/// 언어를 인자로 받을 수 있는 자리에서는 이걸 쓰지 말고 [`Lang::sel`]에 그 언어를
+/// 직접 넘긴다. 전역 상태에 기대는 범위를 좁게 유지하려는 것이다.
+#[macro_export]
+macro_rules! tr {
+    ($en:expr, $ko:expr $(,)?) => {
+        match $crate::i18n::active() {
+            $crate::i18n::Lang::En => format!($en),
+            $crate::i18n::Lang::Ko => format!($ko),
+        }
+    };
 }
 
 #[cfg(test)]

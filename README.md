@@ -8,6 +8,11 @@
 
 x-backup backs up a running MongoDB (standalone or replica set), PostgreSQL, or MySQL into an encrypted form you can verify and actually restore from. By default it talks to the database directly through the Rust driver — **no `mongodump`/`mongorestore`, `pg_dump`/`pg_restore`, or `mysqldump`/`mysql` required** — and streams every stage, so memory stays flat no matter how large the dataset is. A 6 GiB backup peaks at 54.6 MiB RSS ([measured](docs/memory-profile.md)). The database is chosen automatically from the source URI scheme (`mongodb://`, `postgresql://`, or `mysql://`/`mariadb://`).
 
+<img src="docs/assets/demo-backup.gif" alt="A full backup, then an incremental one, and the chain they form in x-backup list" width="100%">
+
+A full backup, an incremental one that captures only what changed since it, and the chain
+they form. Recorded against a live replica set; [the tape is in the repo](docs/assets/).
+
 ## Features
 
 - ✅ **Full backup** — driver-native streaming archive (data + indexes + collection options), no external tools; `mongodump --archive --oplog` available as an opt-in engine
@@ -83,6 +88,13 @@ Every command prints a one-line context to stderr — the active profile and DB 
 e.g. `▸ 프로파일 prod · DB postgresql` — so you always know what you're touching in a
 multi-DB config (skipped under `--json`). `--profile` can also come from the `XB_PROFILE`
 env var, and `--config` from `XB_CONFIG`.
+
+`status` is the one to run first. It answers "can this server be backed up right now?"
+without writing anything — connection, topology, privileges, version/FCV, clock skew,
+oplog window, data shape, how old the last backup is, and whether the destination is
+writable with room to spare:
+
+<img src="docs/assets/demo-status.gif" alt="x-backup status printing sixteen preflight checks, each marked OK or WARN, with an overall verdict and exit code" width="100%">
 
 ### Migrate (direct copy, no file)
 
@@ -621,6 +633,13 @@ deletes nothing and reports the error.
 To treat 4 as success in cron: `x-backup backup ...; rc=$?; [ $rc -eq 4 ] && rc=0; exit $rc`
 
 ## Restore semantics
+
+The cheapest way to find out a backup is broken is *before* you need it. `verify --deep`
+decrypts and decodes the archive, and `--chain` walks the increments back to their base,
+so you learn whether a restore would work without running one — nothing is written to a
+database, and nothing in the store is modified:
+
+<img src="docs/assets/demo-verify.gif" alt="x-backup verify reporting manifest integrity, data checksum and deep decode all OK, then a continuous chain back to its base backup" width="100%">
 
 - `restore` (no `--at`) restores the **base full backup snapshot only**.
 - `restore --at <time>|latest` is PITR: it restores the base, then replays increments up to that time — MongoDB oplog (the largest ts at or before it) or PostgreSQL logical-decoding changes; `latest` replays everything. It requires `verify --chain` to pass, and it cannot be combined with `--only` (selective restore).
