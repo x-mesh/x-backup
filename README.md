@@ -17,7 +17,7 @@ they form. Recorded against a live replica set; [the tape is in the repo](docs/a
 
 - ✅ **Full backup** — driver-native streaming archive (data + indexes + collection options), no external tools; `mongodump --archive --oplog` available as an opt-in engine
 - ✅ **Incremental backup** — captures the oplog directly; on a gap it promotes to a full backup automatically (exit 4)
-- ✅ **PITR** — restore to a moment with `--at <RFC3339>|latest` (base restore + replay of MongoDB oplog or PostgreSQL logical-decoding changes, gated on chain verification)
+- ✅ **PITR** — restore to a moment with `--at <RFC3339>`: the base is restored, then increments replay up to that time (MongoDB oplog, PostgreSQL logical-decoding changes, or MySQL binlog), gated on chain verification. On PostgreSQL and MySQL, `--at latest` replays everything instead
 - ✅ **Storage** — local disk or S3-compatible (MinIO, R2, OCI), streaming multipart upload with abort cleanup
 - ✅ **Encrypted by default** — `age` (X25519; only the public key lives on the backup host) or AES-256-GCM, compressed with zstd before encryption
 - ✅ **Integrity** — manifest + sha256, with `verify` (structural check, no key needed), `--deep`, and `--chain`
@@ -642,7 +642,7 @@ database, and nothing in the store is modified:
 <img src="docs/assets/demo-verify.gif" alt="x-backup verify reporting manifest integrity, data checksum and deep decode all OK, then a continuous chain back to its base backup" width="100%">
 
 - `restore` (no `--at`) restores the **base full backup snapshot only**.
-- `restore --at <time>|latest` is PITR: it restores the base, then replays increments up to that time — MongoDB oplog (the largest ts at or before it) or PostgreSQL logical-decoding changes; `latest` replays everything. It requires `verify --chain` to pass, and it cannot be combined with `--only` (selective restore).
+- `restore --at <RFC3339>` is PITR: it restores the base, then replays increments up to that time — MongoDB oplog (the largest ts at or before it), PostgreSQL logical-decoding changes, or MySQL binlog. PostgreSQL and MySQL also accept `--at latest`, which replays everything; MongoDB takes a timestamp only. It requires `verify --chain` to pass, and it cannot be combined with `--only` (selective restore).
 - `verify --deep` runs only on a host that holds the private key (key isolation, PRD §8.5). The backup host carries only the public key, so a compromised backup host still cannot decrypt past backups.
 
 ## Development

@@ -21,7 +21,7 @@
 
 - ✅ **풀 백업** — 드라이버 네이티브 스트리밍 아카이브(데이터 + 인덱스 + 컬렉션 옵션), 외부 도구 불필요. `mongodump --archive --oplog`는 opt-in 엔진으로 선택 가능
 - ✅ **증분 백업** — oplog 직접 캡처, gap 감지 시 풀 백업 자동 승격(exit 4)
-- ✅ **PITR** — `--at <RFC3339>|latest` 시점 복구 (base + replay, 체인 검증 전제). MongoDB(oplog)·PostgreSQL(logical decoding) 모두 지원
+- ✅ **PITR** — `--at <RFC3339>` 시점 복구(base 복원 후 증분 재생, 체인 검증 전제). MongoDB(oplog)·PostgreSQL(logical decoding)·MySQL(binlog) 지원. PostgreSQL·MySQL은 `--at latest`로 전체 재생도 된다
 - ✅ **스토리지** — 로컬 디스크 / S3 호환(MinIO·R2·OCI), 스트리밍 멀티파트 + abort
 - ✅ **암호화 기본** — `age`(X25519, 공개키만 백업 호스트에 배치) / AES-256-GCM 대안, zstd 압축 후 암호화
 - ✅ **무결성** — manifest + sha256, `verify`(키 불필요 구조 검증) / `--deep` / `--chain`
@@ -617,8 +617,10 @@ cron에서 4를 성공으로 다루려면: `x-backup backup ...; rc=$?; [ $rc -e
 <img src="docs/assets/demo-verify.gif" alt="x-backup verify가 manifest 무결성·데이터 체크섬·deep decode를 모두 OK로 보고하고, base까지 연속된 체인을 확인하는 화면" width="100%">
 
 - `restore`(--at 없음) = **base 풀백업 스냅샷만** 복원
-- `restore --at <시각>` = PITR — base 복원 후 증분 oplog를 해당 시각(이하 최대 ts)까지 재생.
-  `verify --chain` 통과가 전제이며, `--only`(선택 복구)와는 병용 불가(mongorestore 제약)
+- `restore --at <RFC3339>` = PITR — base 복원 후 증분을 해당 시각(이하 최대 ts)까지 재생.
+  MongoDB는 oplog, PostgreSQL은 logical decoding, MySQL은 binlog를 재생한다. PostgreSQL·MySQL은
+  `--at latest`로 전체 재생도 되지만 **MongoDB는 시각만 받는다**. `verify --chain` 통과가
+  전제이며, `--only`(선택 복구)와는 병용 불가(oplog 재생은 네임스페이스 필터와 함께 쓸 수 없다)
 - 복구 검증: `verify --deep`은 개인키 보유 호스트에서만 동작한다(§8.5 키 격리 — 백업
   호스트는 공개키만 가지므로 침해돼도 과거 백업을 복호화할 수 없다)
 
