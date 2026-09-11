@@ -684,10 +684,14 @@ fn free_space_bytes(path: &str) -> Option<u64> {
         return None;
     }
     // `f_bavail`의 너비는 플랫폼마다 다르다 — macOS는 u32, Linux glibc는 u64다.
-    // `as u64` 캐스트는 macOS에서 필수지만 Linux에서는 무의미해져 clippy의
-    // `unnecessary_cast`가 `-D warnings` CI를 깨뜨린다. `u64::from`은 양쪽 모두에서
-    // 컴파일되면서(`From<u64> for u64`가 있다) 캐스트가 아니라 린트에 걸리지 않는다.
-    Some(u64::from(st.f_bavail).saturating_mul(st.f_frsize))
+    // 그래서 어떤 변환을 써도 한쪽에서는 항등 변환이 되고, clippy가 그걸 문다:
+    // `as u64`는 Linux에서 `unnecessary_cast`, `u64::from`은 Linux에서
+    // `useless_conversion`이다. `-D warnings`로 도는 lint 잡은 Linux에서만 돌므로
+    // 둘 중 어느 쪽을 골라도 로컬(macOS)에서는 멀쩡한 코드가 CI에서만 깨진다.
+    // 잘림이 절대 없는 `u64::from`을 쓰고, 항등이 되는 플랫폼의 린트만 끈다.
+    #[allow(clippy::useless_conversion)]
+    let avail = u64::from(st.f_bavail);
+    Some(avail.saturating_mul(st.f_frsize))
 }
 
 /// 신호등 합산을 [`report_to_result`]에 태우기 위한 단일 항목 보고서(--all 종합용).
