@@ -17,6 +17,8 @@
 # OS·에디터
 .DS_Store
 *.swp
+# BSD sed -i.bak 등이 남기는 사본(한 번 실수로 커밋된 적 있음)
+*.bak
 
 # x-build 하네스 상태 (세션 로컬)
 .xm/
