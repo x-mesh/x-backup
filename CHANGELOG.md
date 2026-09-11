@@ -5,6 +5,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `LICENSE` (MIT). `Cargo.toml` has declared `license = "MIT"` since its first commit,
+  but the file itself was never there.
+- `Cargo.toml` metadata: `repository`, `homepage`, `readme`, `keywords`, `categories`.
+
+### Changed
+
+- The docs no longer assume a private repository. `README.md`, `README.ko.md`,
+  `install.sh`, the release skill, and the `x-backup update` doc comments all opened by
+  telling the reader to set a GitHub token, which no longer buys anything. `update`
+  still picks up a token when one is set, but only to dodge the rate limit on
+  unauthenticated GitHub API calls.
+- `install.sh` downloads straight from the public release URL. The `gh` and API-token
+  paths existed to reach assets in a private repo, so they are gone and the script is
+  half its former length.
+- CI pins `dtolnay/rust-toolchain` to a commit SHA rather than `@master`, which moves.
+- The README doc tables now link `docs/postgres.md` and `docs/prd/`. Both files were
+  already in the repo; nothing pointed at them.
+
+### Removed
+
+- `install`, a byte-identical copy of `install.sh` that nothing referenced. Use
+  `install.sh`.
+
 ## [0.3.0] - 2026-09-02
 
 ### Added

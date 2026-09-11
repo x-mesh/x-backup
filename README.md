@@ -31,21 +31,10 @@ Scope: MongoDB replica sets get full and incremental backups, standalone gets fu
 brew install x-mesh/tap/x-backup
 ```
 
-While the repository is private, downloading release assets needs a GitHub token:
-
-```bash
-export HOMEBREW_GITHUB_API_TOKEN=$(gh auth token)
-brew install x-mesh/tap/x-backup
-```
-
 ### curl (install.sh)
 
 ```bash
-# Once the repository is public:
 curl -fsSL https://raw.githubusercontent.com/x-mesh/x-backup/main/install.sh | sh
-
-# While private (reuses your gh auth):
-gh api repos/x-mesh/x-backup/contents/install.sh --jq '.content' | base64 -d | sh
 ```
 
 This installs to `~/.local/bin/x-backup`. Override with `XB_VERSION` or `XB_INSTALL_DIR`.
@@ -69,8 +58,6 @@ x-backup update --check   # check only, no install
 - **Homebrew install** → delegates to `brew upgrade x-mesh/tap/x-backup`
 - **install.sh install** → downloads the latest release, verifies sha256, and replaces itself atomically
 - **cargo install** → prints the upgrade command instead of overwriting
-
-While the repository is private, this needs `GITHUB_TOKEN` (or a prior `gh auth login`).
 
 ## Quick Start
 
@@ -718,8 +705,11 @@ The docs are written in Korean.
 
 | Document | Contents |
 |------|------|
+| [docs/postgres.md](docs/postgres.md) | PostgreSQL engine deep-dive (logical decoding, PITR, schema fidelity) |
 | [docs/mysql.md](docs/mysql.md) | MySQL engine deep-dive (schema fidelity, binlog internals, PITR, dev/CI) |
+| [docs/control-server.ko.md](docs/control-server.ko.md) | Central control-server operation (many DBs, one config) — see [examples/control-server.toml](examples/control-server.toml) |
 | [docs/PRD.md](docs/PRD.md) | Product requirements (FR-1–12, incremental design, encryption design) |
+| [docs/prd/](docs/prd/) | Per-feature PRDs (WAL physical PITR, recovery-window retention, RPO status, hooks, standby backup) |
 | [docs/test-scenario.md](docs/test-scenario.md) | E2E scenario definition |
 | [docs/acceptance-report.md](docs/acceptance-report.md) | Acceptance criteria 10/10, with measured evidence |
 | [docs/memory-profile.md](docs/memory-profile.md) | Memory ceiling measurement (constant RSS) |
@@ -730,3 +720,7 @@ The docs are written in Korean.
 
 GFS retention, Prometheus metrics, KMS/HSM key integration, live migration (oplog-tailing,
 near-zero-downtime cutover) — see [PRD §12](docs/PRD.md).
+
+## License
+
+MIT. Full text in [LICENSE](LICENSE).

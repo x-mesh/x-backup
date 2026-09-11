@@ -47,7 +47,6 @@ scripts/release.sh --skip-tap      # GitHub 릴리스만, tap 갱신 생략
 - `cargo`, `cross`(linux musl 빌드), **실행 중인 `docker`**(cross 백엔드)
 - `gh` 인증(`gh auth status`) — 릴리스 게시 + tap clone/push 권한
 - `shasum`, `tar`, `ruby`(formula 문법 검증)
-- private 저장소 단계: 다운로드 검증 시 `HOMEBREW_GITHUB_API_TOKEN=$(gh auth token)`
 
 ## 스크립트가 하는 일(단계별)
 
@@ -69,8 +68,7 @@ scripts/release.sh --skip-tap      # GitHub 릴리스만, tap 갱신 생략
 # manual 설치(~/.local/bin) — 다운로드+sha256+self-replace
 x-backup update
 
-# Homebrew 설치 — tap formula 경유(private면 토큰 필요)
-export HOMEBREW_GITHUB_API_TOKEN=$(gh auth token)
+# Homebrew 설치 — tap formula 경유
 brew update && brew upgrade x-mesh/tap/x-backup
 ```
 

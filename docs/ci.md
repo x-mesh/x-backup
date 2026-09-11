@@ -99,7 +99,10 @@ cross build --release --target x86_64-unknown-linux-musl
 ## 3. 캐시 / 토큰체인
 
 - 캐시: `Swatinem/rust-cache@v2`(잡별 `key`로 분리).
-- 토큰체인: `dtolnay/rust-toolchain@master`로 **1.93.0** 핀.
+- 토큰체인: `dtolnay/rust-toolchain`으로 **1.93.0** 핀. 액션 자체도 `@master`가 아니라
+  커밋 SHA(`d1031067…`, master @ 2026-09-03)로 박는다. `@master`는 움직이는 ref라
+  액션 저장소 쪽이 바뀌면 그 코드가 다음 CI 실행에 그대로 들어온다. public 저장소는
+  그 경로를 열어둘 이유가 없다. 액션을 올릴 때 SHA와 옆의 날짜 주석을 같이 고친다.
   - MSRV는 `Cargo.toml rust-version = "1.88"`(mongodb v3.7 요구).
   - 검증 토큰체인은 **1.93.0**(acceptance-report §1 실측). 정확히 1.88.0으로 돌리면
     clippy `uninlined_format_args` 등 버전별 린트 차이로 거짓 실패가 난다(아래 §4).

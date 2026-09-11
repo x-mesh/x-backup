@@ -6,9 +6,9 @@
 //! - **manual**(install.sh — `~/.local/bin` 등) → GitHub 릴리스 자산을 내려받아
 //!   `checksums.txt`로 sha256 검증 후 **원자적 rename**으로 자기 교체.
 //!
-//! private 저장소 단계에서는 GitHub API 호출·자산 다운로드에 토큰이 필요하다 —
-//! `GITHUB_TOKEN` > `GH_TOKEN` > `gh auth token`(설치돼 있으면) 순으로 찾는다.
-//! 저장소가 public이 되면 토큰 없이도 동작한다(있으면 rate-limit 완화용으로 사용).
+//! 토큰 없이 동작한다. 다만 토큰이 있으면 쓴다. 비인증 GitHub API는 IP당 시간 60회라
+//! CI처럼 자주 부르는 환경에서는 한도에 걸리기 때문이다. 탐색 순서는 `GITHUB_TOKEN` >
+//! `GH_TOKEN` > `gh auth token`(설치돼 있으면).
 
 use std::path::{Path, PathBuf};
 
@@ -116,8 +116,9 @@ pub struct Release {
     pub assets: Vec<Asset>,
 }
 
-/// 릴리스 자산 — private 저장소에서는 `url`(API asset endpoint)로 받아야 한다
-/// (`browser_download_url`은 토큰 인증으로 받을 수 없음).
+/// 릴리스 자산. 다운로드는 `browser_download_url`이 아니라 `url`(API asset endpoint)로
+/// 한다. `browser_download_url`은 Bearer 인증과 같이 못 쓰므로, 토큰이 있는 환경까지
+/// 한 경로로 덮으려면 이쪽이어야 한다.
 #[derive(Debug, Deserialize)]
 pub struct Asset {
     /// 자산 파일명.
@@ -164,7 +165,7 @@ fn auth_header(req: reqwest::RequestBuilder, token: &Option<String>) -> reqwest:
     }
 }
 
-/// 최신 릴리스를 조회한다. private + 토큰 부재(404)는 안내 메시지로 변환한다.
+/// 최신 릴리스를 조회한다. 404는 게시된 릴리스가 없는 경우라 안내 메시지로 바꾼다.
 pub async fn fetch_latest(token: &Option<String>) -> Result<Release> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
     let resp = auth_header(http_client()?.get(&url), token)
@@ -178,9 +179,9 @@ pub async fn fetch_latest(token: &Option<String>) -> Result<Release> {
             .json::<Release>()
             .await
             .map_err(|e| XBackupError::Failure(format!("릴리스 응답 파싱 실패: {e}"))),
-        404 if token.is_none() => Err(XBackupError::Config(format!(
-            "{REPO} 릴리스를 찾을 수 없습니다 — private 저장소면 GITHUB_TOKEN을 \
-             설정하거나 gh auth login 후 다시 실행하세요."
+        404 => Err(XBackupError::Config(format!(
+            "{REPO}에 게시된 릴리스가 없습니다 — \
+             https://github.com/{REPO}/releases 를 확인하세요."
         ))),
         s => Err(XBackupError::Failure(format!(
             "릴리스 조회 실패: HTTP {s} ({url})"
@@ -188,7 +189,7 @@ pub async fn fetch_latest(token: &Option<String>) -> Result<Release> {
     }
 }
 
-/// 자산을 API endpoint로 내려받는다(private 호환 — Accept: octet-stream).
+/// 자산을 API endpoint로 내려받는다(`Accept: application/octet-stream`).
 pub async fn download_asset(asset: &Asset, token: &Option<String>) -> Result<Vec<u8>> {
     let resp = auth_header(http_client()?.get(&asset.url), token)
         .header("Accept", "application/octet-stream")

@@ -35,21 +35,10 @@
 brew install x-mesh/tap/x-backup
 ```
 
-private 단계에서는 릴리스 자산 다운로드에 GitHub 토큰이 필요하다:
-
-```bash
-export HOMEBREW_GITHUB_API_TOKEN=$(gh auth token)
-brew install x-mesh/tap/x-backup
-```
-
 ### curl (install.sh)
 
 ```bash
-# 저장소 공개 후:
 curl -fsSL https://raw.githubusercontent.com/x-mesh/x-backup/main/install.sh | sh
-
-# private 단계(gh 인증 재사용):
-gh api repos/x-mesh/x-backup/contents/install.sh --jq '.content' | base64 -d | sh
 ```
 
 `~/.local/bin/x-backup`에 설치된다. `XB_VERSION`, `XB_INSTALL_DIR`로 조정.
@@ -75,8 +64,6 @@ x-backup update --check   # 확인만
 - **brew 설치** → `brew upgrade x-mesh/tap/x-backup`으로 위임
 - **install.sh 설치** → 최신 릴리스 다운로드 + sha256 검증 + 원자적 자기 교체
 - **cargo install** → 갱신 명령 안내만(덮어쓰지 않음)
-
-private 단계에서는 `GITHUB_TOKEN`(또는 `gh auth login`)이 필요하다.
 
 ## Quick Start
 
@@ -713,9 +700,11 @@ gap 가드가 동작하는 것이지 오류가 아니다. churn으로 데이터�
 
 | 문서 | 내용 |
 |------|------|
+| [docs/postgres.md](docs/postgres.md) | PostgreSQL 엔진 상세(logical decoding·PITR·스키마 충실도) |
 | [docs/mysql.md](docs/mysql.md) | MySQL 엔진 상세(스키마 충실도·binlog 내부 구조·PITR·개발/CI) |
 | [docs/control-server.ko.md](docs/control-server.ko.md) | 중앙 control 서버 운영(다중 DB 백업·복구·마이그레이션) — 예시: [examples/control-server.toml](examples/control-server.toml) |
 | [docs/PRD.md](docs/PRD.md) | 제품 요구사항(FR-1~12, 증분 설계, 암호화 설계) |
+| [docs/prd/](docs/prd/) | 기능별 PRD(WAL 물리 PITR·recovery window retention·RPO status·hooks·standby 백업) |
 | [docs/test-scenario.md](docs/test-scenario.md) | E2E 시나리오 정의 |
 | [docs/acceptance-report.md](docs/acceptance-report.md) | 수용 기준 10/10 실측 근거 |
 | [docs/memory-profile.md](docs/memory-profile.md) | 메모리 상한 실측(상수 RSS 입증) |
@@ -726,3 +715,7 @@ gap 가드가 동작하는 것이지 오류가 아니다. churn으로 데이터�
 
 GFS retention · Prometheus 메트릭 · KMS/HSM 키 연동 ·
 라이브 마이그레이션(oplog tailing 무중단 cutover) — [PRD §12](docs/PRD.md)
+
+## License
+
+MIT. 전문은 [LICENSE](LICENSE)에 있다.

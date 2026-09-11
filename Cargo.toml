@@ -6,6 +6,11 @@ edition = "2021"
 rust-version = "1.88"
 description = "MongoDB·PostgreSQL 백업·복구 CLI — 풀/증분(oplog·logical decoding)/PITR, 로컬/원격(S3 호환), 암호화, 외부 의존 없는 단일 정적 바이너리"
 license = "MIT"
+repository = "https://github.com/x-mesh/x-backup"
+homepage = "https://github.com/x-mesh/x-backup"
+readme = "README.md"
+keywords = ["backup", "mongodb", "postgresql", "mysql", "pitr"]
+categories = ["command-line-utilities", "database"]
 
 [features]
 # 통합 테스트 격리(환경에 mongodump/mongorestore + replica set 필요).
