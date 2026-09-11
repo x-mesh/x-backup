@@ -153,11 +153,8 @@ pub async fn write_row<W: AsyncWrite + Unpin>(w: &mut W, tuple: &[u8]) -> Result
     // read 측 상한(MAX_FRAME_BYTES)과 대칭 — 초과 행은 백업 시점에 실패시켜(복구 가능) 읽을 수
     // 없는 아카이브 생성을 막는다.
     if tuple.len() > MAX_FRAME_BYTES as usize {
-        return Err(XBackupError::Failure(format!(
-            "행 튜플이 프레임 상한({} MiB)을 초과합니다: {}바이트 — 거대 BLOB 행은 현재 미지원",
-            MAX_FRAME_BYTES / (1024 * 1024),
-            tuple.len()
-        )));
+        return Err(XBackupError::Failure(crate::tr!("the row tuple exceeds the frame limit ({} MiB): {} bytes — huge BLOB rows are not supported yet", "행 튜플이 프레임 상한({} MiB)을 초과합니다: {}바이트 — 거대 BLOB 행은 현재 미지원", MAX_FRAME_BYTES / (1024 * 1024),
+            tuple.len())));
     }
     let len = tuple.len() as u32;
     w.write_all(&[TAG_DATA])
@@ -189,8 +186,12 @@ pub async fn write_end<W: AsyncWrite + Unpin>(w: &mut W) -> Result<()> {
 /// BSON 문서 한 개를 태그와 함께 쓴다.
 async fn write_doc_frame<W: AsyncWrite + Unpin>(w: &mut W, tag: u8, doc: &Document) -> Result<()> {
     let mut buf = Vec::new();
-    doc.to_writer(&mut buf)
-        .map_err(|e| XBackupError::Failure(format!("MySQL 아카이브 프레임 직렬화 실패: {e}")))?;
+    doc.to_writer(&mut buf).map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to serialize a MySQL archive frame: {e}",
+            "MySQL 아카이브 프레임 직렬화 실패: {e}"
+        ))
+    })?;
     w.write_all(&[tag])
         .await
         .map_err(io_err("프레임 태그 쓰기"))?;
@@ -216,7 +217,8 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame> {
         TAG_POST => Ok(Frame::Post(read_doc(r).await?)),
         TAG_TABLE => Ok(Frame::Table(read_doc(r).await?)),
         TAG_DATA => Ok(Frame::Data(read_data(r).await?)),
-        other => Err(XBackupError::Failure(format!(
+        other => Err(XBackupError::Failure(crate::tr!(
+            "corrupt MySQL archive frame tag: 0x{other:02x}",
             "MySQL 아카이브 프레임 태그 손상: 0x{other:02x}"
         ))),
     }
@@ -230,7 +232,8 @@ async fn read_doc<R: AsyncRead + Unpin>(r: &mut R) -> Result<Document> {
         .map_err(io_err("프레임 길이 읽기"))?;
     let len = u32::from_le_bytes(len_buf);
     if !(5..=MAX_FRAME_BYTES).contains(&len) {
-        return Err(XBackupError::Failure(format!(
+        return Err(XBackupError::Failure(crate::tr!(
+            "invalid MySQL archive document length: {len} bytes",
             "MySQL 아카이브 문서 길이 비정상: {len}바이트"
         )));
     }
@@ -239,8 +242,12 @@ async fn read_doc<R: AsyncRead + Unpin>(r: &mut R) -> Result<Document> {
     r.read_exact(&mut buf[4..])
         .await
         .map_err(io_err("프레임 본문 읽기"))?;
-    Document::from_reader(&buf[..])
-        .map_err(|e| XBackupError::Failure(format!("MySQL 아카이브 프레임 파싱 실패: {e}")))
+    Document::from_reader(&buf[..]).map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to parse a MySQL archive frame: {e}",
+            "MySQL 아카이브 프레임 파싱 실패: {e}"
+        ))
+    })
 }
 
 /// 길이 프리픽스 데이터(행 튜플)를 읽는다.
@@ -251,7 +258,8 @@ async fn read_data<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
         .map_err(io_err("데이터 길이 읽기"))?;
     let len = u32::from_le_bytes(len_buf);
     if len == 0 || len > MAX_FRAME_BYTES {
-        return Err(XBackupError::Failure(format!(
+        return Err(XBackupError::Failure(crate::tr!(
+            "invalid MySQL archive data length: {len} bytes",
             "MySQL 아카이브 데이터 길이 비정상: {len}바이트"
         )));
     }
@@ -264,7 +272,12 @@ async fn read_data<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
 
 /// IO 에러를 XBackupError로 감싸는 헬퍼.
 fn io_err(ctx: &'static str) -> impl Fn(std::io::Error) -> XBackupError {
-    move |e| XBackupError::Failure(format!("MySQL 아카이브 {ctx} 실패: {e}"))
+    move |e| {
+        XBackupError::Failure(crate::tr!(
+            "MySQL archive {ctx} failed: {e}",
+            "MySQL 아카이브 {ctx} 실패: {e}"
+        ))
+    }
 }
 
 #[cfg(test)]

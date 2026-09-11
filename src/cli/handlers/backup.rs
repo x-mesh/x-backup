@@ -35,6 +35,12 @@ pub async fn handle(
     lang_flag: Option<crate::i18n::Lang>,
     args: BackupArgs,
 ) -> Result<()> {
+    // config를 읽기도 전에 lock 충돌·config 부재/읽기 실패로 끝날 수 있다. 그 경로들의
+    // 에러 라벨·본문이 --lang을 따르도록 config 병합보다 먼저 CLI flag만으로 언어를
+    // 잡아 둔다. config가 성공적으로 읽히면 아래에서 activate_from_toml이 그 안의
+    // [output].language까지 반영해 다시 정한다(Mutex라 재설정 가능).
+    crate::i18n::set_active(lang_flag.unwrap_or_default());
+
     // 명시 profile은 config·secret 해석 전에 잠근다. 다른 실행이 이미 작업 중이면 URI 설정
     // 오류보다 lock 충돌을 먼저 보고한다. profile 생략 시에는 default_profile 해석 뒤 잠근다.
     let explicit_lock = if args.profile.is_empty() {
@@ -46,7 +52,12 @@ pub async fn handle(
     // 1) config 로드 + 레이어 병합(file + ENV; CLI는 아래에서 직접 반영).
     let config_toml = match &config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
-            XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
+            XBackupError::Config(crate::tr_lang!(
+                lang_flag.unwrap_or_default(),
+                "failed to read the config file ({}): {e}",
+                "config 파일 읽기 실패({}): {e}",
+                path.display()
+            ))
         })?),
         None => None,
     };
@@ -182,11 +193,8 @@ pub async fn handle(
         //   (--db/--collection)과는 병용 불가(증분은 항상 전체 oplog 슬라이스).
         if matches!(backup_type, BackupType::Incr) {
             if args.db.is_some() || args.collection.is_some() {
-                return Err(XBackupError::Usage(
-                    "증분 백업(--type incr)은 선택적 백업(--db/--collection)과 병용할 수 없습니다 \
-                 — 증분은 전체 oplog 슬라이스를 캡처합니다(FR-1/FR-2)."
-                        .into(),
-                ));
+                return Err(XBackupError::Usage(crate::tr!("an incremental backup (--type incr) cannot be combined with a selective backup (--db/--collection) — an incremental captures the entire oplog slice (FR-1/FR-2).", "증분 백업(--type incr)은 선택적 백업(--db/--collection)과 병용할 수 없습니다 \
+                 — 증분은 전체 oplog 슬라이스를 캡처합니다(FR-1/FR-2).")));
             }
             return handle_incremental(
                 &resolved,
@@ -329,7 +337,8 @@ fn select_read_uri(read_source: Option<&str>, resolved: &ResolvedConfig) -> Resu
     }
     let from_replica = resolved.resolved_read_uri.is_some();
     let uri = resolved.effective_read_uri().cloned().ok_or_else(|| {
-        XBackupError::Config(format!(
+        XBackupError::Config(crate::tr!(
+            "profile '{}' has no source.uri_env/uri, or it did not resolve",
             "프로파일 '{}'에 source.uri_env/uri가 없거나 해석되지 않았습니다",
             resolved.profile_name
         ))
@@ -606,19 +615,13 @@ async fn handle_pg_backup(
     //   slot이 없어 캡처 불가하므로 명확히 안내하고 거부한다(선택적 백업과도 병용 불가).
     if matches!(backup_type, BackupType::Incr) {
         if !enable_incremental {
-            return Err(XBackupError::Usage(
-                "PG 증분(--type incr)은 features.incremental.pg_logical=true가 필요합니다 \
+            return Err(XBackupError::Usage(crate::tr!("PostgreSQL incremental (--type incr) requires features.incremental.pg_logical=true (a full backup must have created the replication slot first). Turn it on and run a full backup once before using incremental.", "PG 증분(--type incr)은 features.incremental.pg_logical=true가 필요합니다 \
                  (풀 백업이 replication slot을 만든 상태여야 캡처 가능). 설정을 켜고 풀 백업을 \
-                 한 번 수행한 뒤 증분을 사용하세요."
-                    .into(),
-            ));
+                 한 번 수행한 뒤 증분을 사용하세요.")));
         }
         if args.db.is_some() || args.collection.is_some() {
-            return Err(XBackupError::Usage(
-                "PG 증분(--type incr)은 선택적 백업(--db/--collection)과 병용할 수 없습니다 \
-                 — 증분은 전체 변경 슬라이스를 캡처합니다."
-                    .into(),
-            ));
+            return Err(XBackupError::Usage(crate::tr!("PostgreSQL incremental (--type incr) cannot be combined with a selective backup (--db/--collection) — an incremental captures the entire change slice.", "PG 증분(--type incr)은 선택적 백업(--db/--collection)과 병용할 수 없습니다 \
+                 — 증분은 전체 변경 슬라이스를 캡처합니다.")));
         }
         return handle_pg_incremental(
             resolved,
@@ -740,19 +743,13 @@ async fn handle_mysql_backup(
     // 증분(--type incr)은 binlog 캡처 경로로 분기한다. mysql_binlog 미활성이면 명확히 거부.
     if matches!(backup_type, BackupType::Incr) {
         if !resolved.profile.features.incremental.mysql_binlog {
-            return Err(XBackupError::Usage(
-                "MySQL 증분(--type incr)은 features.incremental.mysql_binlog=true가 필요합니다 \
+            return Err(XBackupError::Usage(crate::tr!("MySQL incremental (--type incr) requires features.incremental.mysql_binlog=true (the server needs log_bin=ON, binlog_format=ROW, binlog_row_image=FULL). Turn it on and run a full backup once before using incremental.", "MySQL 증분(--type incr)은 features.incremental.mysql_binlog=true가 필요합니다 \
                  (서버 log_bin=ON·binlog_format=ROW·binlog_row_image=FULL 전제). 설정을 켜고 \
-                 풀 백업을 한 번 수행한 뒤 증분을 사용하세요."
-                    .into(),
-            ));
+                 풀 백업을 한 번 수행한 뒤 증분을 사용하세요.")));
         }
         if args.collection.is_some() {
-            return Err(XBackupError::Usage(
-                "MySQL 증분(--type incr)은 선택적 백업(--collection)과 병용할 수 없습니다 \
-                 — 증분은 전체 변경 슬라이스를 캡처합니다."
-                    .into(),
-            ));
+            return Err(XBackupError::Usage(crate::tr!("MySQL incremental (--type incr) cannot be combined with a selective backup (--collection) — an incremental captures the entire change slice.", "MySQL 증분(--type incr)은 선택적 백업(--collection)과 병용할 수 없습니다 \
+                 — 증분은 전체 변경 슬라이스를 캡처합니다.")));
         }
         return handle_mysql_incremental(
             resolved,
@@ -1180,10 +1177,16 @@ async fn promote_pg_incremental_to_full(
     }
 
     // exit 4(경고 동반 성공) — main이 Warning을 exit 4로 매핑한다.
-    let mut msg = format!(
-        "PG 증분이 gap으로 풀 백업({})으로 승격되었습니다: {reason}",
-        outcome.backup_id
-    );
+    let mut msg = match lang {
+        Lang::En => format!(
+            "PostgreSQL incremental promoted to full backup ({}) due to a gap: {reason}",
+            outcome.backup_id
+        ),
+        Lang::Ko => format!(
+            "PG 증분이 gap으로 풀 백업({})으로 승격되었습니다: {reason}",
+            outcome.backup_id
+        ),
+    };
     if let Some(w) = replicate_warning {
         msg.push_str(" / ");
         msg.push_str(&w);
@@ -1223,7 +1226,9 @@ async fn replicate_and_warn(
     if failures.is_empty() {
         None
     } else {
-        Some(format!(
+        Some(crate::tr!(
+            "the primary backup succeeded, but replication to {} secondary destination(s) \
+             failed: {}",
             "primary 백업은 성공했으나 보조 destination {}곳 복제 실패: {}",
             failures.len(),
             failures.join(" / ")
@@ -1355,10 +1360,16 @@ async fn handle_incremental(
             }
             // exit 4(경고 동반 성공) — main이 Warning을 exit 4로 매핑한다.
             // 승격 경고에 보조 복제 실패가 있으면 함께 알린다(둘 다 exit 4).
-            let mut msg = format!(
-                "증분이 gap으로 풀 백업({})으로 승격되었습니다: {reason}",
-                outcome.backup_id
-            );
+            let mut msg = match lang {
+                Lang::En => format!(
+                    "incremental promoted to full backup ({}) due to a gap: {reason}",
+                    outcome.backup_id
+                ),
+                Lang::Ko => format!(
+                    "증분이 gap으로 풀 백업({})으로 승격되었습니다: {reason}",
+                    outcome.backup_id
+                ),
+            };
             if let Some(w) = replicate_warning {
                 msg.push_str(" / ");
                 msg.push_str(&w);
@@ -1376,7 +1387,8 @@ fn effective_backup_type(resolved: &ResolvedConfig, args: &BackupArgs) -> Result
     match resolved.profile.mode.backup_type.as_str() {
         "full" => Ok(BackupType::Full),
         "incr" => Ok(BackupType::Incr),
-        other => Err(XBackupError::Config(format!(
+        other => Err(XBackupError::Config(crate::tr!(
+            "unknown mode.backup_type: '{other}' (only full | incr are supported)",
             "알 수 없는 mode.backup_type: '{other}'(full | incr만 지원)"
         ))),
     }
@@ -1397,7 +1409,10 @@ async fn run_precheck(
         .await
         .map_err(|e| {
             // connect 준비 실패(URI 파싱 등)는 사전 점검 실패로 본다(백업 미시작).
-            XBackupError::PrecheckFailed(format!("사전 점검 연결 준비 실패: {e}"))
+            XBackupError::PrecheckFailed(crate::tr!(
+                "failed to prepare the precheck connection: {e}",
+                "사전 점검 연결 준비 실패: {e}"
+            ))
         })?;
     // 네이티브 엔진은 외부 도구 불필요 — mongodump 존재 점검을 생략한다.
     let tool = match engine {
@@ -1423,7 +1438,8 @@ async fn run_precheck(
             .filter(|i| i.status == CheckStatus::Fail)
             .map(|i| format!("{}: {}", i.label, i.message))
             .collect();
-        return Err(XBackupError::PrecheckFailed(format!(
+        return Err(XBackupError::PrecheckFailed(crate::tr!(
+            "backup precheck failed (bypass with --skip-precheck) — {}",
             "백업 사전 점검 실패(--skip-precheck로 우회 가능) — {}",
             failed.join(" / ")
         )));
@@ -1459,7 +1475,8 @@ fn build_stages(resolved: &ResolvedConfig, args: &BackupArgs) -> Result<(StageSt
         });
         stack.push(Box::new(stage));
     } else {
-        return Err(XBackupError::Config(format!(
+        return Err(XBackupError::Config(crate::tr!(
+            "unknown compression algorithm: '{}' (only zstd is supported)",
             "알 수 없는 압축 알고리즘: '{}'(zstd만 지원)",
             comp.algorithm
         )));
@@ -1666,11 +1683,17 @@ mod tests {
     fn post_hook_event_maps_result_to_event() {
         assert_eq!(post_hook_event(&Ok(())), HookEvent::PostBackup);
         assert_eq!(
-            post_hook_event(&Err(XBackupError::Warning("gap 승격".into()))),
+            post_hook_event(&Err(XBackupError::Warning(crate::tr!(
+                "gap promotion",
+                "gap 승격"
+            )))),
             HookEvent::PostBackup
         );
         assert_eq!(
-            post_hook_event(&Err(XBackupError::Failure("업로드 실패".into()))),
+            post_hook_event(&Err(XBackupError::Failure(crate::tr!(
+                "upload failed",
+                "업로드 실패"
+            )))),
             HookEvent::OnError
         );
     }

@@ -516,22 +516,31 @@ pub async fn pick_backup(
     lang: crate::i18n::Lang,
 ) -> Result<Option<String>> {
     let seed = PICKER_SEED.get_or_init(|| Mutex::new(None));
-    *seed
-        .lock()
-        .map_err(|_| XBackupError::Failure("백업 선택기 상태 잠금 실패".into()))? =
-        Some(PickerSeed {
-            choices: choices.to_vec(),
-            lang,
-        });
+    *seed.lock().map_err(|_| {
+        XBackupError::Failure(crate::tr!(
+            "failed to lock the backup picker state",
+            "백업 선택기 상태 잠금 실패"
+        ))
+    })? = Some(PickerSeed {
+        choices: choices.to_vec(),
+        lang,
+    });
     let program = Program::<PickerModel>::builder()
         .alt_screen(true)
         .bracketed_paste(true)
         .build()
-        .map_err(|e| XBackupError::Usage(format!("백업 선택기 시작 실패: {e}")))?;
-    let model = program
-        .run()
-        .await
-        .map_err(|e| XBackupError::Usage(format!("백업 선택 입력 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Usage(crate::tr!(
+                "failed to start the backup picker: {e}",
+                "백업 선택기 시작 실패: {e}"
+            ))
+        })?;
+    let model = program.run().await.map_err(|e| {
+        XBackupError::Usage(crate::tr!(
+            "failed to read the backup selection: {e}",
+            "백업 선택 입력 실패: {e}"
+        ))
+    })?;
     if model.cancelled {
         Ok(None)
     } else {

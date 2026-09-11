@@ -339,9 +339,12 @@ fn parse_major(v: &str) -> Option<u32> {
 /// 도중 실패하는 대신 빠르게 exit 3로 미시작한다(엔진 무관 FR-8 / PRD §323).
 pub async fn precheck(uri: &Secret, timeout_secs: Option<u64>) -> crate::error::Result<()> {
     use crate::error::XBackupError;
-    let pg = PgClient::connect(uri, timeout_secs)
-        .await
-        .map_err(|e| XBackupError::PrecheckFailed(format!("PG 연결 실패: {e}")))?;
+    let pg = PgClient::connect(uri, timeout_secs).await.map_err(|e| {
+        XBackupError::PrecheckFailed(crate::tr!(
+            "failed to connect to PostgreSQL: {e}",
+            "PG 연결 실패: {e}"
+        ))
+    })?;
     let c = pg.client();
     let perm_sql = format!(
         "SELECT count(*) FILTER (WHERE NOT has_table_privilege(c.oid, 'SELECT'))::bigint AS missing, \
@@ -349,17 +352,17 @@ pub async fn precheck(uri: &Secret, timeout_secs: Option<u64>) -> crate::error::
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
          WHERE c.relkind = 'r' AND n.nspname NOT IN ({SYSTEM_SCHEMAS})"
     );
-    let row = c
-        .query_one(perm_sql.as_str(), &[])
-        .await
-        .map_err(|e| XBackupError::PrecheckFailed(format!("권한 점검 질의 실패: {e}")))?;
+    let row = c.query_one(perm_sql.as_str(), &[]).await.map_err(|e| {
+        XBackupError::PrecheckFailed(crate::tr!(
+            "the privilege-check query failed: {e}",
+            "권한 점검 질의 실패: {e}"
+        ))
+    })?;
     let missing: i64 = row.get("missing");
     let total: i64 = row.get("total");
     if missing > 0 {
-        return Err(XBackupError::PrecheckFailed(format!(
-            "백업 사용자가 사용자 테이블 {missing}/{total}개에 SELECT 권한이 없습니다 — \
-             백업 대상 전체에 SELECT가 필요합니다(권한 부여 후 재시도하거나 --skip-precheck로 우회)."
-        )));
+        return Err(XBackupError::PrecheckFailed(crate::tr!("the backup user lacks SELECT on {missing}/{total} user table(s) — SELECT is required on everything being backed up (grant it and retry, or bypass with --skip-precheck).", "백업 사용자가 사용자 테이블 {missing}/{total}개에 SELECT 권한이 없습니다 — \
+             백업 대상 전체에 SELECT가 필요합니다(권한 부여 후 재시도하거나 --skip-precheck로 우회).")));
     }
     Ok(())
 }

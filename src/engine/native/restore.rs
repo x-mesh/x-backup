@@ -33,14 +33,16 @@ pub async fn native_restore<R: AsyncRead + Unpin>(
         Frame::Header(h) => {
             let fmt = h.get_str("format").unwrap_or("");
             if fmt != archive::FORMAT_ID {
-                return Err(XBackupError::Failure(format!(
+                return Err(XBackupError::Failure(crate::tr!(
+                    "native archive format mismatch: '{fmt}' (expected '{}')",
                     "네이티브 아카이브 포맷 불일치: '{fmt}'(기대 '{}')",
                     archive::FORMAT_ID
                 )));
             }
         }
         other => {
-            return Err(XBackupError::Failure(format!(
+            return Err(XBackupError::Failure(crate::tr!(
+                "native archive header missing (first frame: {other:?})",
                 "네이티브 아카이브 헤더 누락(첫 프레임: {other:?})"
             )))
         }
@@ -54,18 +56,27 @@ pub async fn native_restore<R: AsyncRead + Unpin>(
     loop {
         match archive::read_frame(reader).await? {
             Frame::Header(_) => {
-                return Err(XBackupError::Failure("아카이브에 헤더가 중복됩니다".into()))
+                return Err(XBackupError::Failure(crate::tr!(
+                    "duplicate archive header",
+                    "아카이브에 헤더가 중복됩니다"
+                )))
             }
             Frame::Collection(meta) => {
                 // 이전 컬렉션의 잔여 배치 flush.
                 inserted += flush_batch(client, &current, &mut batch).await?;
 
-                let ns = meta
-                    .get_str("ns")
-                    .map_err(|_| XBackupError::Failure("컬렉션 프레임에 ns가 없습니다".into()))?;
-                let (db_name, coll_name) = ns
-                    .split_once('.')
-                    .ok_or_else(|| XBackupError::Failure(format!("ns 형식 오류: '{ns}'")))?;
+                let ns = meta.get_str("ns").map_err(|_| {
+                    XBackupError::Failure(crate::tr!(
+                        "the collection frame has no ns",
+                        "컬렉션 프레임에 ns가 없습니다"
+                    ))
+                })?;
+                let (db_name, coll_name) = ns.split_once('.').ok_or_else(|| {
+                    XBackupError::Failure(crate::tr!(
+                        "malformed ns: '{ns}'",
+                        "ns 형식 오류: '{ns}'"
+                    ))
+                })?;
 
                 let skip = ns_include.is_some_and(|want| want != ns);
                 if skip {
@@ -132,7 +143,12 @@ async fn flush_batch(
         .collection::<Document>(coll)
         .insert_many(docs)
         .await
-        .map_err(|e| XBackupError::Failure(format!("{db}.{coll} insert_many 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "{db}.{coll}: insert_many failed: {e}",
+                "{db}.{coll} insert_many 실패: {e}"
+            ))
+        })?;
     Ok(n)
 }
 
@@ -166,7 +182,8 @@ async fn create_collection(
                 .and_then(|d| d.get_i32("code").ok())
                 == Some(48);
             if !already {
-                return Err(XBackupError::Failure(format!(
+                return Err(XBackupError::Failure(crate::tr!(
+                    "{db_name}.{coll}: failed to create the collection: {e}",
                     "{db_name}.{coll} 컬렉션 생성 실패: {e}"
                 )));
             }
@@ -179,7 +196,10 @@ async fn create_collection(
             "indexes": indexes.iter().cloned().map(bson::Bson::Document).collect::<Vec<_>>(),
         };
         db.run_command(cmd).await.map_err(|e| {
-            XBackupError::Failure(format!("{db_name}.{coll} 인덱스 복원 실패: {e}"))
+            XBackupError::Failure(crate::tr!(
+                "{db_name}.{coll}: failed to restore indexes: {e}",
+                "{db_name}.{coll} 인덱스 복원 실패: {e}"
+            ))
         })?;
     }
     Ok(())

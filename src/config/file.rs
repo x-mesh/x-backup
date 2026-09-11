@@ -381,27 +381,41 @@ impl Config {
     /// 트리로 정규화한 뒤 역직렬화한다 — 모든 raw-TOML→Config 진입점이 이 함수를 거치도록
     /// 통일해 v2가 일부 명령에서만 동작하는 split-brain을 방지한다.
     pub fn from_toml_str(s: &str) -> Result<Self> {
-        let value: toml::Value = toml::from_str(s)
-            .map_err(|e| XBackupError::Config(format!("config.toml 파싱 실패: {e}")))?;
+        let value: toml::Value = toml::from_str(s).map_err(|e| {
+            XBackupError::Config(crate::tr!(
+                "failed to parse config.toml: {e}",
+                "config.toml 파싱 실패: {e}"
+            ))
+        })?;
         let value = crate::config::v2::normalize_v2(value)?;
-        value
-            .try_into()
-            .map_err(|e| XBackupError::Config(format!("config.toml 파싱 실패: {e}")))
+        value.try_into().map_err(|e| {
+            XBackupError::Config(crate::tr!(
+                "failed to parse config.toml: {e}",
+                "config.toml 파싱 실패: {e}"
+            ))
+        })
     }
 
     /// 파일 경로에서 설정을 읽어 파싱한다.
     pub fn from_path(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path).map_err(|e| {
-            XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
+            XBackupError::Config(crate::tr!(
+                "failed to read the config file ({}): {e}",
+                "config 파일 읽기 실패({}): {e}",
+                path.display()
+            ))
         })?;
         Self::from_toml_str(&raw)
     }
 
     /// 이름으로 프로파일을 조회한다. 없으면 [`XBackupError::Config`](exit 2).
     pub fn profile(&self, name: &str) -> Result<&Profile> {
-        self.profiles
-            .get(name)
-            .ok_or_else(|| XBackupError::Config(format!("알 수 없는 프로파일: '{name}'")))
+        self.profiles.get(name).ok_or_else(|| {
+            XBackupError::Config(crate::tr!(
+                "unknown profile: '{name}'",
+                "알 수 없는 프로파일: '{name}'"
+            ))
+        })
     }
 }
 

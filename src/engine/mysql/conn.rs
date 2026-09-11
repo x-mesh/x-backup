@@ -34,8 +34,20 @@ impl MysqlClient {
         let opts = build_opts(uri.expose())?;
         let conn = tokio::time::timeout(dur, Conn::new(opts))
             .await
-            .map_err(|_| XBackupError::Failure(format!("MySQL 연결 타임아웃({}s)", dur.as_secs())))?
-            .map_err(|e| XBackupError::Failure(format!("MySQL 연결 실패: {}", describe(&e))))?;
+            .map_err(|_| {
+                XBackupError::Failure(crate::tr!(
+                    "MySQL connection timed out ({}s)",
+                    "MySQL 연결 타임아웃({}s)",
+                    dur.as_secs()
+                ))
+            })?
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "failed to connect to MySQL: {}",
+                    "MySQL 연결 실패: {}",
+                    describe(&e)
+                ))
+            })?;
         Ok(Self { conn })
     }
 
@@ -56,22 +68,25 @@ impl MysqlClient {
             .filter(|name| !name.is_empty())
             .map(str::to_string)
             .ok_or_else(|| {
-                XBackupError::Usage(
-                    "복구 대상 MySQL URI에 데이터베이스가 필요합니다(mysql://.../<db>)".into(),
-                )
+                XBackupError::Usage(crate::tr!(
+                    "the MySQL restore target URI must name a database (mysql://.../<db>)",
+                    "복구 대상 MySQL URI에 데이터베이스가 필요합니다(mysql://.../<db>)"
+                ))
             })?;
 
         match tokio::time::timeout(dur, Conn::new(opts.clone())).await {
             Ok(Ok(conn)) => return Ok(Some(Self { conn })),
             Ok(Err(err)) if is_unknown_database(&err) => {}
             Ok(Err(err)) => {
-                return Err(XBackupError::Failure(format!(
+                return Err(XBackupError::Failure(crate::tr!(
+                    "failed to connect to MySQL: {}",
                     "MySQL 연결 실패: {}",
                     describe(&err)
                 )))
             }
             Err(_) => {
-                return Err(XBackupError::Failure(format!(
+                return Err(XBackupError::Failure(crate::tr!(
+                    "MySQL connection timed out ({}s)",
                     "MySQL 연결 타임아웃({}s)",
                     dur.as_secs()
                 )))
@@ -88,13 +103,10 @@ impl MysqlClient {
         let mut server = tokio::time::timeout(dur, Conn::new(server_opts))
             .await
             .map_err(|_| {
-                XBackupError::Failure(format!("MySQL 서버 연결 타임아웃({}s)", dur.as_secs()))
+                XBackupError::Failure(crate::tr!("MySQL server connection timed out ({}s)", "MySQL 서버 연결 타임아웃({}s)", dur.as_secs()))
             })?
             .map_err(|e| {
-                XBackupError::Failure(format!(
-                    "MySQL 서버 연결 실패(대상 데이터베이스 생성 준비): {}",
-                    describe(&e)
-                ))
+                XBackupError::Failure(crate::tr!("failed to connect to the MySQL server (preparing to create the target database): {}", "MySQL 서버 연결 실패(대상 데이터베이스 생성 준비): {}", describe(&e)))
             })?;
 
         let quoted = super::util::quote_ident(&db_name);
@@ -102,23 +114,22 @@ impl MysqlClient {
             .query_drop(format!("CREATE DATABASE IF NOT EXISTS {quoted}"))
             .await
             .map_err(|e| {
-                XBackupError::Failure(format!(
-                    "MySQL 대상 데이터베이스 '{db_name}' 생성 실패: {}. 이 계정에는 CREATE DATABASE 권한이 필요합니다",
-                    describe(&e)
-                ))
+                XBackupError::Failure(crate::tr!("failed to create MySQL target database '{db_name}': {}. This account needs the CREATE DATABASE privilege", "MySQL 대상 데이터베이스 '{db_name}' 생성 실패: {}. 이 계정에는 CREATE DATABASE 권한이 필요합니다", describe(&e)))
             })?;
         let _ = server.disconnect().await;
 
         let conn = tokio::time::timeout(dur, Conn::new(opts))
             .await
             .map_err(|_| {
-                XBackupError::Failure(format!(
+                XBackupError::Failure(crate::tr!(
+                    "connection to the newly created MySQL database '{db_name}' timed out ({}s)",
                     "생성한 MySQL 데이터베이스 '{db_name}' 연결 타임아웃({}s)",
                     dur.as_secs()
                 ))
             })?
             .map_err(|e| {
-                XBackupError::Failure(format!(
+                XBackupError::Failure(crate::tr!(
+                    "failed to connect to the newly created MySQL database '{db_name}': {}",
                     "생성한 MySQL 데이터베이스 '{db_name}' 연결 실패: {}",
                     describe(&e)
                 ))
@@ -142,7 +153,13 @@ impl MysqlClient {
         self.conn
             .query_first::<String, _>("SELECT VERSION()")
             .await
-            .map_err(|e| XBackupError::Failure(format!("MySQL 버전 조회 실패: {}", describe(&e))))
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "failed to query the MySQL version: {}",
+                    "MySQL 버전 조회 실패: {}",
+                    describe(&e)
+                ))
+            })
     }
 }
 
@@ -153,8 +170,12 @@ fn build_opts(uri: &str) -> Result<Opts> {
         None => uri.to_string(),
     };
     let (clean_url, ssl_mode) = extract_ssl_mode(&normalized);
-    let base = Opts::from_url(&clean_url)
-        .map_err(|e| XBackupError::Config(format!("MySQL URI 파싱 실패: {e}")))?;
+    let base = Opts::from_url(&clean_url).map_err(|e| {
+        XBackupError::Config(crate::tr!(
+            "failed to parse the MySQL URI: {e}",
+            "MySQL URI 파싱 실패: {e}"
+        ))
+    })?;
     match ssl_opts_for(ssl_mode.as_deref()) {
         Some(ssl) => Ok(OptsBuilder::from_opts(base).ssl_opts(ssl).into()),
         None => Ok(base),

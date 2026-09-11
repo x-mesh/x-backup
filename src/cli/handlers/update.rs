@@ -15,8 +15,12 @@ pub async fn handle(lang_flag: Option<Lang>, args: UpdateArgs) -> Result<()> {
     // update는 config를 읽지 않으므로 언어는 CLI `--lang`/env `XB_LANG` 또는 기본 en으로만 정한다.
     let lang = crate::i18n::activate(lang_flag, None);
 
-    let exe = std::env::current_exe()
-        .map_err(|e| XBackupError::Failure(format!("실행 파일 경로 확인 실패: {e}")))?;
+    let exe = std::env::current_exe().map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to resolve the executable path: {e}",
+            "실행 파일 경로 확인 실패: {e}"
+        ))
+    })?;
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let source = detect_install(&exe, home.as_deref());
 
@@ -24,10 +28,18 @@ pub async fn handle(lang_flag: Option<Lang>, args: UpdateArgs) -> Result<()> {
     let token = update::github_token();
     let release = fetch_latest(&token).await?;
     let latest = parse_semver(&release.tag_name).ok_or_else(|| {
-        XBackupError::Failure(format!("릴리스 태그 파싱 실패: {}", release.tag_name))
+        XBackupError::Failure(crate::tr!(
+            "failed to parse the release tag: {}",
+            "릴리스 태그 파싱 실패: {}",
+            release.tag_name
+        ))
     })?;
-    let current = parse_semver(CURRENT)
-        .ok_or_else(|| XBackupError::Failure(format!("현재 버전 파싱 실패: {CURRENT}")))?;
+    let current = parse_semver(CURRENT).ok_or_else(|| {
+        XBackupError::Failure(crate::tr!(
+            "failed to parse the current version: {CURRENT}",
+            "현재 버전 파싱 실패: {CURRENT}"
+        ))
+    })?;
 
     // label(current/latest)은 항상 영문, 괄호 안 설치 소스 설명만 언어에 따라.
     println!(
@@ -97,11 +109,17 @@ pub async fn handle(lang_flag: Option<Lang>, args: UpdateArgs) -> Result<()> {
             let status = std::process::Command::new("brew")
                 .args(["upgrade", update::BREW_FORMULA])
                 .status()
-                .map_err(|e| XBackupError::Failure(format!("brew 실행 실패: {e}")))?;
+                .map_err(|e| {
+                    XBackupError::Failure(crate::tr!(
+                        "failed to run brew: {e}",
+                        "brew 실행 실패: {e}"
+                    ))
+                })?;
             if !status.success() {
-                return Err(XBackupError::Failure(
-                    "brew upgrade가 실패했습니다 — 위 brew 출력을 확인하세요".into(),
-                ));
+                return Err(XBackupError::Failure(crate::tr!(
+                    "brew upgrade failed — check the brew output above",
+                    "brew upgrade가 실패했습니다 — 위 brew 출력을 확인하세요"
+                )));
             }
             Ok(())
         }
@@ -136,7 +154,8 @@ pub async fn handle(lang_flag: Option<Lang>, args: UpdateArgs) -> Result<()> {
                 .iter()
                 .find(|a| a.name == asset_name)
                 .ok_or_else(|| {
-                    XBackupError::Failure(format!(
+                    XBackupError::Failure(crate::tr!(
+                        "release {} has no {asset_name} asset",
                         "릴리스 {}에 {asset_name} 자산이 없습니다",
                         release.tag_name
                     ))
@@ -145,7 +164,12 @@ pub async fn handle(lang_flag: Option<Lang>, args: UpdateArgs) -> Result<()> {
                 .assets
                 .iter()
                 .find(|a| a.name == "checksums.txt")
-                .ok_or_else(|| XBackupError::Failure("릴리스에 checksums.txt가 없습니다".into()))?;
+                .ok_or_else(|| {
+                    XBackupError::Failure(crate::tr!(
+                        "the release has no checksums.txt",
+                        "릴리스에 checksums.txt가 없습니다"
+                    ))
+                })?;
 
             println!(
                 "{}",
@@ -164,11 +188,15 @@ pub async fn handle(lang_flag: Option<Lang>, args: UpdateArgs) -> Result<()> {
                 String::from_utf8_lossy(&download_asset(sums_asset, &token).await?).into_owned();
 
             let expected = checksum_for(&sums, &asset_name).ok_or_else(|| {
-                XBackupError::Failure(format!("checksums.txt에 {asset_name} 항목이 없습니다"))
+                XBackupError::Failure(crate::tr!(
+                    "checksums.txt has no entry for {asset_name}",
+                    "checksums.txt에 {asset_name} 항목이 없습니다"
+                ))
             })?;
             let actual = sha256_hex(&targz);
             if expected != actual {
-                return Err(XBackupError::Failure(format!(
+                return Err(XBackupError::Failure(crate::tr!(
+                    "sha256 mismatch — expected {expected}, got {actual}. Aborting the update.",
                     "sha256 불일치 — 기대 {expected}, 실제 {actual}. 갱신을 중단합니다."
                 )));
             }

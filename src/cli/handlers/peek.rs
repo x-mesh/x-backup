@@ -24,9 +24,17 @@ pub async fn handle(
     lang_flag: Option<crate::i18n::Lang>,
     args: PeekArgs,
 ) -> Result<()> {
+    // config 부재/읽기 실패로 activate 전에 끝날 수 있는 경로들도 --lang을 따르도록
+    // 미리 잡아 둔다(§tr_lang! 주석 참고). config가 읽히면 아래에서 다시 정한다.
+    crate::i18n::set_active(lang_flag.unwrap_or_default());
     let config_toml = match &config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
-            XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
+            XBackupError::Config(crate::tr_lang!(
+                lang_flag.unwrap_or_default(),
+                "failed to read the config file ({}): {e}",
+                "config 파일 읽기 실패({}): {e}",
+                path.display()
+            ))
         })?),
         None => None,
     };
@@ -38,7 +46,8 @@ pub async fn handle(
         overrides: &overrides,
     })?;
     let uri = resolved.resolved_uri.clone().ok_or_else(|| {
-        XBackupError::Config(format!(
+        XBackupError::Config(crate::tr!(
+            "profile '{}' has no source.uri/uri_env",
             "프로파일 '{}'에 source.uri/uri_env가 없습니다",
             resolved.profile_name
         ))
@@ -313,7 +322,10 @@ async fn peek_namespace(
     lang: crate::i18n::Lang,
 ) -> Result<()> {
     let (db, coll) = ns.split_once('.').ok_or_else(|| {
-        XBackupError::Usage(format!("--ns는 db.collection 형식이어야 합니다: '{ns}'"))
+        XBackupError::Usage(crate::tr!(
+            "--ns must be db.collection: '{ns}'",
+            "--ns는 db.collection 형식이어야 합니다: '{ns}'"
+        ))
     })?;
     let docs = mongo.latest_documents(db, coll, limit.max(1)).await?;
 

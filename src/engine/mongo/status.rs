@@ -412,8 +412,12 @@ impl StatusChecker {
             },
         };
 
-        let client = Client::with_options(options)
-            .map_err(|e| XBackupError::Failure(format!("MongoDB 클라이언트 생성 실패: {e}")))?;
+        let client = Client::with_options(options).map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to create the MongoDB client: {e}",
+                "MongoDB 클라이언트 생성 실패: {e}"
+            ))
+        })?;
 
         Ok(Self { client, connection })
     }
@@ -534,7 +538,12 @@ impl StatusChecker {
             .database("admin")
             .run_command(command)
             .await
-            .map_err(|e| XBackupError::Failure(format!("명령 실행 실패: {e}")))
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "command execution failed: {e}",
+                    "명령 실행 실패: {e}"
+                ))
+            })
     }
 
     /// 1) 연결·인증 — admin.ping + 인증 메커니즘 표시(읽기 전용).
@@ -947,7 +956,10 @@ impl StatusChecker {
     /// 모두 돌려주므로, 크기·데이터 형상 항목을 추가 쿼리 없이 같은 합산에서 만든다.
     async fn db_stats_totals(&self) -> Result<DbTotals> {
         let db_names = self.client.list_database_names().await.map_err(|e| {
-            XBackupError::Failure(format!("DB 목록 조회 실패(권한 부족 가능): {e}"))
+            XBackupError::Failure(crate::tr!(
+                "failed to list databases (possibly insufficient privileges): {e}",
+                "DB 목록 조회 실패(권한 부족 가능): {e}"
+            ))
         })?;
         let mut t = DbTotals::default();
         for name in &db_names {

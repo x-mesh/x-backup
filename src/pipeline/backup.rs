@@ -111,7 +111,8 @@ impl Engine {
         match s {
             "native" => Ok(Engine::Native),
             "mongodump" => Ok(Engine::Mongodump),
-            other => Err(XBackupError::Config(format!(
+            other => Err(XBackupError::Config(crate::tr!(
+                "unknown engine: '{other}' (only native | mongodump are supported)",
                 "알 수 없는 engine: '{other}'(native | mongodump만 지원)"
             ))),
         }
@@ -380,9 +381,12 @@ pub async fn run_full_backup_with_meta(
     };
 
     // 7) 체크섬·크기 확정. put_stream이 끝났으므로 EOF까지 누산 완료.
-    let checksum = checksum_handle
-        .finalize()
-        .ok_or_else(|| XBackupError::Failure("체크섬 확정 실패(이미 소비됨)".into()))?;
+    let checksum = checksum_handle.finalize().ok_or_else(|| {
+        XBackupError::Failure(crate::tr!(
+            "failed to finalize the checksum (already consumed)",
+            "체크섬 확정 실패(이미 소비됨)"
+        ))
+    })?;
     let stored_size = stored_size_handle.total();
     // 원본(압축 전) 입력 바이트. 압축 단계가 없으면 stored와 같다(평문 경로).
     let original_size = original_size_handle.total();
@@ -567,9 +571,12 @@ pub async fn run_pg_full_backup(
         return Err(dump_err);
     }
 
-    let checksum = checksum_handle
-        .finalize()
-        .ok_or_else(|| XBackupError::Failure("체크섬 확정 실패(이미 소비됨)".into()))?;
+    let checksum = checksum_handle.finalize().ok_or_else(|| {
+        XBackupError::Failure(crate::tr!(
+            "failed to finalize the checksum (already consumed)",
+            "체크섬 확정 실패(이미 소비됨)"
+        ))
+    })?;
     let stored_size = stored_size_handle.total();
     let original_size = original_size_handle.total();
 
@@ -675,9 +682,12 @@ pub async fn run_mysql_full_backup(
         }
     };
 
-    let checksum = checksum_handle
-        .finalize()
-        .ok_or_else(|| XBackupError::Failure("체크섬 확정 실패(이미 소비됨)".into()))?;
+    let checksum = checksum_handle.finalize().ok_or_else(|| {
+        XBackupError::Failure(crate::tr!(
+            "failed to finalize the checksum (already consumed)",
+            "체크섬 확정 실패(이미 소비됨)"
+        ))
+    })?;
     let stored_size = stored_size_handle.total();
     let original_size = original_size_handle.total();
 
@@ -839,9 +849,12 @@ pub async fn run_mysql_incremental_backup(
         cleanup(storage, &backup_id).await;
         return Err(put_err);
     }
-    let checksum = checksum_handle
-        .finalize()
-        .ok_or_else(|| XBackupError::Failure("체크섬 확정 실패(이미 소비됨)".into()))?;
+    let checksum = checksum_handle.finalize().ok_or_else(|| {
+        XBackupError::Failure(crate::tr!(
+            "failed to finalize the checksum (already consumed)",
+            "체크섬 확정 실패(이미 소비됨)"
+        ))
+    })?;
     let stored_size = stored_size_handle.total();
 
     let manifest = mysql_incremental_manifest(
@@ -914,13 +927,16 @@ async fn ensure_wal_level_logical(client: &tokio_postgres::Client) -> Result<()>
         .query_one("SHOW wal_level", &[])
         .await
         .map(|r| r.get(0))
-        .map_err(|e| XBackupError::PrecheckFailed(format!("wal_level 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::PrecheckFailed(crate::tr!(
+                "failed to query wal_level: {e}",
+                "wal_level 조회 실패: {e}"
+            ))
+        })?;
     if level != "logical" {
-        return Err(XBackupError::PrecheckFailed(format!(
-            "PG 증분에는 wal_level=logical이 필요합니다(현재 '{level}'). \
+        return Err(XBackupError::PrecheckFailed(crate::tr!("PostgreSQL incremental requires wal_level=logical (currently '{level}'). Run `ALTER SYSTEM SET wal_level=logical;` on the server and restart it. If you don't need incremental, leave features.incremental.pg_logical=false.", "PG 증분에는 wal_level=logical이 필요합니다(현재 '{level}'). \
              서버에서 `ALTER SYSTEM SET wal_level=logical;` 후 재시작하세요. \
-             증분이 필요 없으면 features.incremental.pg_logical=false로 두세요."
-        )));
+             증분이 필요 없으면 features.incremental.pg_logical=false로 두세요.")));
     }
     Ok(())
 }
@@ -1025,9 +1041,12 @@ pub async fn run_pg_incremental_backup(
         cleanup(storage, &backup_id).await;
         return Err(put_err);
     }
-    let checksum = checksum_handle
-        .finalize()
-        .ok_or_else(|| XBackupError::Failure("체크섬 확정 실패(이미 소비됨)".into()))?;
+    let checksum = checksum_handle.finalize().ok_or_else(|| {
+        XBackupError::Failure(crate::tr!(
+            "failed to finalize the checksum (already consumed)",
+            "체크섬 확정 실패(이미 소비됨)"
+        ))
+    })?;
     let stored_size = stored_size_handle.total();
 
     // 5) manifest 기록(data 다음). 실패 시 정리(slot 미전진 → 다음에 재캡처).
@@ -1140,11 +1159,8 @@ async fn select_pg_full_base(storage: &dyn Storage) -> Result<String> {
             return Ok(m.id);
         }
     }
-    Err(XBackupError::Usage(
-        "PG 증분의 base가 될 Complete 풀백업이 없습니다 — 먼저 풀 백업(--type full)을 \
-         features.incremental.pg_logical=true로 한 번 수행하세요."
-            .into(),
-    ))
+    Err(XBackupError::Usage(crate::tr!("there is no Complete full backup to serve as the base for the PostgreSQL incremental — run a full backup (--type full) once with features.incremental.pg_logical=true first.", "PG 증분의 base가 될 Complete 풀백업이 없습니다 — 먼저 풀 백업(--type full)을 \
+         features.incremental.pg_logical=true로 한 번 수행하세요.")))
 }
 
 #[cfg(test)]
@@ -1213,9 +1229,10 @@ mod tests {
         mock.expect_put_stream()
             .withf(|p, _, _| p.ends_with("manifest.json"))
             .returning(|_, _, _| {
-                Err(XBackupError::StorageUpload(
-                    "manifest 저장 실패(주입)".into(),
-                ))
+                Err(XBackupError::StorageUpload(crate::tr!(
+                    "failed to save the manifest (injected)",
+                    "manifest 저장 실패(주입)"
+                )))
             });
         // cleanup의 delete 호출(3종)을 수용하고 플래그를 세운다.
         mock.expect_delete().returning(move |_| {

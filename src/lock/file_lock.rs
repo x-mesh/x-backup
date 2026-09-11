@@ -143,7 +143,8 @@ pub fn acquire_in(dir: &Path, profile: &str) -> Result<LockGuard> {
     // lock 디렉터리를 준비한다(없으면 생성).
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
-            XBackupError::Failure(format!(
+            XBackupError::Failure(crate::tr!(
+                "failed to prepare the lock directory ({}): {e}",
                 "lock 디렉터리 준비 실패({}): {e}",
                 parent.display()
             ))
@@ -189,12 +190,17 @@ fn try_create(path: &Path, profile: &str) -> Result<Option<LockGuard>> {
     match opts.open(path) {
         Ok(mut file) => {
             let data = LockData::for_current(profile);
-            let bytes = serde_json::to_vec_pretty(&data)
-                .map_err(|e| XBackupError::Failure(format!("lock 메타 직렬화 실패: {e}")))?;
+            let bytes = serde_json::to_vec_pretty(&data).map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "failed to serialize lock metadata: {e}",
+                    "lock 메타 직렬화 실패: {e}"
+                ))
+            })?;
             // 기록에 실패하면 막 만든 파일을 정리하고 에러를 올린다(부분 lock 방지).
             if let Err(e) = file.write_all(&bytes).and_then(|_| file.flush()) {
                 let _ = std::fs::remove_file(path);
-                return Err(XBackupError::Failure(format!(
+                return Err(XBackupError::Failure(crate::tr!(
+                    "failed to write the lock metadata ({}): {e}",
                     "lock 메타 기록 실패({}): {e}",
                     path.display()
                 )));
@@ -206,7 +212,8 @@ fn try_create(path: &Path, profile: &str) -> Result<Option<LockGuard>> {
             }))
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
-        Err(e) => Err(XBackupError::Failure(format!(
+        Err(e) => Err(XBackupError::Failure(crate::tr!(
+            "failed to create the lock file ({}): {e}",
             "lock 파일 생성 실패({}): {e}",
             path.display()
         ))),
@@ -233,17 +240,20 @@ fn classify(holder: &Option<LockData>) -> StaleDecision {
     let Some(h) = holder else {
         // lock 파일은 있는데 메타를 못 읽었다(손상/경쟁). 보수적으로 충돌 처리하되
         // 손상 가능성을 안내한다 — 운영자가 직접 확인·삭제하도록.
-        return StaleDecision::Conflict(Some(
+        return StaleDecision::Conflict(Some(crate::tr!(
+            "the lock file could not be read (it may be corrupt, or another process is \
+             writing it right now). Check it by hand and delete the lock file if it's safe to",
             "lock 파일을 읽을 수 없습니다(손상되었거나 다른 프로세스가 쓰는 중일 수 있음). \
              직접 확인 후 안전하다면 lock 파일을 삭제하세요"
-                .to_string(),
-        ));
+        )));
     };
 
     // 다른 호스트의 lock은 이 호스트에서 PID 생존을 판정할 수 없다(같은 pid가 다른
     // 호스트의 다른 프로세스일 수 있음). 보수적으로 회수하지 않는다.
     if h.hostname != hostname() {
-        return StaleDecision::Conflict(Some(format!(
+        return StaleDecision::Conflict(Some(crate::tr!(
+            "this is another host's ('{}') lock — this host will not reclaim it \
+             automatically. Check whether that host's operation has finished",
             "다른 호스트('{}')의 lock입니다 — 이 호스트에서는 자동 회수하지 않습니다. \
              해당 호스트에서 작업이 끝났는지 확인하세요",
             h.hostname
@@ -252,7 +262,8 @@ fn classify(holder: &Option<LockData>) -> StaleDecision {
 
     // 정책 1: PID 부재가 확실하면 자동 회수.
     if !pid_alive(h.pid) {
-        return StaleDecision::Reclaim(format!(
+        return StaleDecision::Reclaim(crate::tr!(
+            "the process holding the lock (pid {}) no longer exists",
             "lock 보유 프로세스(pid {})가 더 이상 존재하지 않습니다",
             h.pid
         ));
@@ -260,7 +271,11 @@ fn classify(holder: &Option<LockData>) -> StaleDecision {
 
     // 정책 3: 살아있으나 24h 초과 — 자동 해제 금지, 안내만.
     if lock_age_secs(&h.started_at).is_some_and(|age| age > STALE_AGE_SECS) {
-        return StaleDecision::Conflict(Some(format!(
+        return StaleDecision::Conflict(Some(crate::tr!(
+            "the lock has been held for over 24 hours (pid {} is still alive) — it may be \
+             abnormally old, but since the process is alive it will not be released \
+             automatically. If that operation is stuck, kill the process and then delete \
+             the lock file",
             "lock이 24시간 넘게(pid {} 생존 중) 유지되고 있습니다 — 비정상적으로 오래된 \
              lock일 수 있으나 프로세스가 살아 있어 자동 해제하지 않습니다. 해당 작업이 \
              멈춰 있다면 프로세스를 종료한 뒤 lock 파일을 삭제하세요",
@@ -275,12 +290,17 @@ fn classify(holder: &Option<LockData>) -> StaleDecision {
 /// 충돌 에러를 만든다(pid·시작 시각·추가 안내 포함, exit 5).
 fn conflict_error(path: &Path, holder: &Option<LockData>, extra: Option<String>) -> XBackupError {
     let mut msg = match holder {
-        Some(h) => format!(
+        Some(h) => crate::tr!(
+            "another instance of the same profile '{}' is running (pid {}, started {}). \
+             Wait for it to finish, or stop that operation",
             "동일 프로파일 '{}'의 다른 인스턴스가 실행 중입니다(pid {}, 시작 {}). \
              완료를 기다리거나 해당 작업을 종료하세요",
-            h.profile, h.pid, h.started_at
+            h.profile,
+            h.pid,
+            h.started_at
         ),
-        None => format!(
+        None => crate::tr!(
+            "another instance holds the lock '{}'",
             "lock '{}'을 다른 인스턴스가 점유하고 있습니다",
             path.display()
         ),
@@ -289,7 +309,11 @@ fn conflict_error(path: &Path, holder: &Option<LockData>, extra: Option<String>)
         msg.push_str(". ");
         msg.push_str(&extra);
     }
-    msg.push_str(&format!(" (lock 파일: {})", path.display()));
+    msg.push_str(&crate::tr!(
+        " (lock file: {})",
+        " (lock 파일: {})",
+        path.display()
+    ));
     XBackupError::LockConflict(msg)
 }
 
@@ -458,9 +482,10 @@ mod tests {
 
         let err = acquire_in(dir.path(), "prof").unwrap_err();
         assert_eq!(err.exit_code(), 5);
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("다른 호스트"),
-            "다른 호스트 안내 누락: {err}"
+            msg.contains("another host") || msg.contains("다른 호스트"),
+            "missing other-host guidance: {err}"
         );
     }
 
@@ -481,9 +506,10 @@ mod tests {
 
         let err = acquire_in(dir.path(), "prof").unwrap_err();
         assert_eq!(err.exit_code(), 5);
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("24시간"),
-            "오래된 lock 안내 누락: {err}"
+            msg.contains("24 hours") || msg.contains("24시간"),
+            "missing stale-lock guidance: {err}"
         );
     }
 
@@ -497,9 +523,10 @@ mod tests {
 
         let err = acquire_in(dir.path(), "prof").unwrap_err();
         assert_eq!(err.exit_code(), 5);
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("읽을 수 없"),
-            "손상 안내 누락: {err}"
+            msg.contains("could not be read") || msg.contains("읽을 수 없"),
+            "missing corruption guidance: {err}"
         );
     }
 

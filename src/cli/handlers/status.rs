@@ -37,10 +37,19 @@ pub async fn handle(
     lang_flag: Option<crate::i18n::Lang>,
     args: StatusArgs,
 ) -> Result<()> {
+    // config 부재/읽기 실패로 activate 전에 끝날 수 있는 경로들도 --lang을 따르도록
+    // 미리 잡아 둔다(§tr_lang! 주석 참고). config가 읽히면 아래에서 다시 정한다.
+    crate::i18n::set_active(lang_flag.unwrap_or_default());
+
     // config 파일은 한 번만 읽는다(--all은 여러 프로파일에 재사용).
     let config_toml = match &config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
-            XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
+            XBackupError::Config(crate::tr_lang!(
+                lang_flag.unwrap_or_default(),
+                "failed to read the config file ({}): {e}",
+                "config 파일 읽기 실패({}): {e}",
+                path.display()
+            ))
         })?),
         None => None,
     };
@@ -105,15 +114,21 @@ pub async fn handle(
             let counts = collect_ns_counts(config_toml.as_deref(), profile)
                 .await
                 .unwrap_or_default();
-            let mut v = serde_json::to_value(&report)
-                .map_err(|e| XBackupError::Failure(format!("status JSON 직렬화 실패: {e}")))?;
+            let mut v = serde_json::to_value(&report).map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "status: failed to serialize JSON: {e}",
+                    "status JSON 직렬화 실패: {e}"
+                ))
+            })?;
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("namespaces".to_string(), ns_counts_json(&counts));
             }
             println!(
                 "{}",
-                serde_json::to_string_pretty(&v)
-                    .map_err(|e| XBackupError::Failure(format!("status JSON 직렬화 실패: {e}")))?
+                serde_json::to_string_pretty(&v).map_err(|e| XBackupError::Failure(crate::tr!(
+                    "status: failed to serialize JSON: {e}",
+                    "status JSON 직렬화 실패: {e}"
+                )))?
             );
         } else {
             render_json(&report)?;
@@ -142,15 +157,19 @@ async fn handle_all(
     lang: Lang,
 ) -> Result<()> {
     let raw = config_toml.ok_or_else(|| {
-        XBackupError::Usage("--all에는 config 파일이 필요합니다(프로파일 목록)".into())
+        XBackupError::Usage(crate::tr!(
+            "--all requires a config file (for the profile list)",
+            "--all에는 config 파일이 필요합니다(프로파일 목록)"
+        ))
     })?;
     let config = crate::config::file::Config::from_toml_str(raw)?;
     let mut names: Vec<String> = config.profiles.keys().cloned().collect();
     names.sort();
     if names.is_empty() {
-        return Err(XBackupError::Usage(
-            "config에 프로파일이 없습니다([profiles.<name>])".into(),
-        ));
+        return Err(XBackupError::Usage(crate::tr!(
+            "the config has no profiles ([profiles.<name>])",
+            "config에 프로파일이 없습니다([profiles.<name>])"
+        )));
     }
 
     // --json은 기계 판독 안정성을 위해 언어를 En으로 고정한다.
@@ -254,7 +273,8 @@ async fn build_report(
         overrides: &overrides,
     })?;
     let uri = resolved.resolved_uri.clone().ok_or_else(|| {
-        XBackupError::Config(format!(
+        XBackupError::Config(crate::tr!(
+            "profile '{}' has no source.uri/uri_env",
             "프로파일 '{}'에 source.uri/uri_env가 없습니다",
             resolved.profile_name
         ))
@@ -922,8 +942,12 @@ fn report_to_result(report: &StatusReport, lang: Lang) -> Result<()> {
 
 /// 점검 결과를 `--json`(항목 배열 + overall)으로 stdout에 출력한다.
 fn render_json(report: &StatusReport) -> Result<()> {
-    let json = serde_json::to_string_pretty(report)
-        .map_err(|e| XBackupError::Failure(format!("status JSON 직렬화 실패: {e}")))?;
+    let json = serde_json::to_string_pretty(report).map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "status: failed to serialize JSON: {e}",
+            "status JSON 직렬화 실패: {e}"
+        ))
+    })?;
     println!("{json}");
     Ok(())
 }
@@ -942,7 +966,8 @@ async fn collect_ns_counts(config_toml: Option<&str>, profile: &str) -> Result<V
         overrides: &overrides,
     })?;
     let uri = resolved.resolved_uri.clone().ok_or_else(|| {
-        XBackupError::Config(format!(
+        XBackupError::Config(crate::tr!(
+            "profile '{}' has no source.uri/uri_env",
             "프로파일 '{}'에 source.uri/uri_env가 없습니다",
             resolved.profile_name
         ))
@@ -1234,7 +1259,8 @@ fn build_monitors(config_toml: Option<&str>, profiles: &[String]) -> Result<Vec<
             overrides: &overrides,
         })?;
         let uri = resolved.resolved_uri.clone().ok_or_else(|| {
-            XBackupError::Config(format!(
+            XBackupError::Config(crate::tr!(
+                "profile '{}' has no source.uri/uri_env",
                 "프로파일 '{}'에 source.uri/uri_env가 없습니다",
                 resolved.profile_name
             ))
@@ -1257,28 +1283,36 @@ fn build_monitors(config_toml: Option<&str>, profiles: &[String]) -> Result<Vec<
 /// 라이브 모드 진입 — 주기 갱신하며 변경량(Δ)을 추적한다. Ctrl-C 또는 `--count` 도달 시 종료(exit 0).
 async fn handle_watch(config_toml: Option<&str>, args: &StatusArgs, lang: Lang) -> Result<()> {
     if args.json {
-        return Err(XBackupError::Usage(
-            "--watch는 --json과 함께 쓸 수 없습니다(라이브 표시 전용)".into(),
-        ));
+        return Err(XBackupError::Usage(crate::tr!(
+            "--watch cannot be combined with --json (it is live-display only)",
+            "--watch는 --json과 함께 쓸 수 없습니다(라이브 표시 전용)"
+        )));
     }
     // 대상 프로파일 — --all이면 config의 모든 프로파일, 아니면 단일.
     let profiles: Vec<String> = if args.all {
-        let raw = config_toml
-            .ok_or_else(|| XBackupError::Usage("--all에는 config 파일이 필요합니다".into()))?;
+        let raw = config_toml.ok_or_else(|| {
+            XBackupError::Usage(crate::tr!(
+                "--all requires a config file",
+                "--all에는 config 파일이 필요합니다"
+            ))
+        })?;
         let config = crate::config::file::Config::from_toml_str(raw)?;
         let mut names: Vec<String> = config.profiles.keys().cloned().collect();
         names.sort();
         if names.is_empty() {
-            return Err(XBackupError::Usage(
-                "config에 프로파일이 없습니다([profiles.<name>])".into(),
-            ));
+            return Err(XBackupError::Usage(crate::tr!(
+                "the config has no profiles ([profiles.<name>])",
+                "config에 프로파일이 없습니다([profiles.<name>])"
+            )));
         }
         names
     } else {
-        let p = args
-            .profile
-            .clone()
-            .ok_or_else(|| XBackupError::Usage("--profile 또는 --all이 필요합니다".into()))?;
+        let p = args.profile.clone().ok_or_else(|| {
+            XBackupError::Usage(crate::tr!(
+                "--profile or --all is required",
+                "--profile 또는 --all이 필요합니다"
+            ))
+        })?;
         vec![p]
     };
 

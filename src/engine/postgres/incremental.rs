@@ -61,12 +61,22 @@ async fn ensure_publication(client: &Client, publication: &str) -> Result<()> {
         )
         .await
         .map(|r| r.get(0))
-        .map_err(|e| XBackupError::Failure(format!("publication 확인 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to check the publication: {e}",
+                "publication 확인 실패: {e}"
+            ))
+        })?;
     if !pub_exists {
         client
             .batch_execute(&format!("CREATE PUBLICATION {publication} FOR ALL TABLES"))
             .await
-            .map_err(|e| XBackupError::Failure(format!("publication 생성 실패: {e}")))?;
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "failed to create the publication: {e}",
+                    "publication 생성 실패: {e}"
+                ))
+            })?;
     }
     Ok(())
 }
@@ -101,7 +111,12 @@ pub async fn recreate_slot_and_publication(
         client
             .execute("SELECT pg_drop_replication_slot($1)", &[&slot])
             .await
-            .map_err(|e| XBackupError::Failure(format!("기존 slot drop 실패: {e}")))?;
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "failed to drop the existing slot: {e}",
+                    "기존 slot drop 실패: {e}"
+                ))
+            })?;
     }
     let lsn: String = client
         .query_one(
@@ -110,7 +125,12 @@ pub async fn recreate_slot_and_publication(
         )
         .await
         .map(|r| r.get(0))
-        .map_err(|e| XBackupError::Failure(format!("slot 생성 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to create the slot: {e}",
+                "slot 생성 실패: {e}"
+            ))
+        })?;
     Ok(lsn)
 }
 
@@ -136,7 +156,12 @@ pub async fn slot_health(client: &Client, slot: &str) -> Result<SlotHealth> {
             &[&slot],
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("slot 건강도 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to query slot health: {e}",
+                "slot 건강도 조회 실패: {e}"
+            ))
+        })?;
     match row {
         None => Ok(SlotHealth::Missing),
         Some(r) => {
@@ -178,9 +203,7 @@ pub struct CaptureOutcome {
 /// 이어서 캡처한다.
 pub async fn capture(client: &Client, slot: &str, publication: &str) -> Result<CaptureOutcome> {
     if !slot_exists(client, slot).await? {
-        return Err(XBackupError::PrecheckFailed(format!(
-            "logical replication slot '{slot}'이 없습니다 — 먼저 풀 백업으로 슬롯을 만드세요(gap)"
-        )));
+        return Err(XBackupError::PrecheckFailed(crate::tr!("logical replication slot '{slot}' does not exist — run a full backup first to create it (gap)", "logical replication slot '{slot}'이 없습니다 — 먼저 풀 백업으로 슬롯을 만드세요(gap)")));
     }
     let rows = client
         .query(
@@ -189,7 +212,12 @@ pub async fn capture(client: &Client, slot: &str, publication: &str) -> Result<C
             &[&slot, &publication, &MAX_CHANGES_PER_CAPTURE],
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("logical 변경 peek 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to peek logical changes: {e}",
+                "logical 변경 peek 실패: {e}"
+            ))
+        })?;
 
     // upto_nchanges는 B/C/R 등 모든 디코드 메시지를 세므로, 반환 행 수가 한도에 근접하면
     // backlog가 더 남았을 수 있다(다음 실행이 이어감).
@@ -225,13 +253,21 @@ pub async fn capture(client: &Client, slot: &str, publication: &str) -> Result<C
 
 /// 슬롯을 주어진 LSN까지 전진시킨다(저장 성공 후 호출 — 이후 그 변경은 다시 안 읽힘).
 pub async fn advance_slot(client: &Client, slot: &str, lsn: &str) -> Result<()> {
-    let lsn: PgLsn = lsn
-        .parse()
-        .map_err(|_| XBackupError::Failure(format!("LSN 파싱 실패: {lsn}")))?;
+    let lsn: PgLsn = lsn.parse().map_err(|_| {
+        XBackupError::Failure(crate::tr!(
+            "failed to parse the LSN: {lsn}",
+            "LSN 파싱 실패: {lsn}"
+        ))
+    })?;
     client
         .execute("SELECT pg_replication_slot_advance($1, $2)", &[&slot, &lsn])
         .await
-        .map_err(|e| XBackupError::Failure(format!("slot advance 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to advance the slot: {e}",
+                "slot advance 실패: {e}"
+            ))
+        })?;
     Ok(())
 }
 
@@ -244,7 +280,12 @@ pub async fn slot_exists(client: &Client, slot: &str) -> Result<bool> {
         )
         .await
         .map(|r| r.get(0))
-        .map_err(|e| XBackupError::Failure(format!("slot 확인 실패: {e}")))
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to check the slot: {e}",
+                "slot 확인 실패: {e}"
+            ))
+        })
 }
 
 /// 증분 아카이브를 복구 대상에 적용한다. `max_commit_micros`가 `Some`이면 그 시각 이하 변경만
@@ -259,13 +300,15 @@ pub async fn apply<R: AsyncRead + Unpin>(
         IncrFrame::Header(h) => {
             let fmt = h.get_str("format").unwrap_or("");
             if fmt != INCR_FORMAT_ID {
-                return Err(XBackupError::Failure(format!(
+                return Err(XBackupError::Failure(crate::tr!(
+                    "PostgreSQL incremental format mismatch: '{fmt}'",
                     "PG 증분 포맷 불일치: '{fmt}'"
                 )));
             }
         }
         other => {
-            return Err(XBackupError::Failure(format!(
+            return Err(XBackupError::Failure(crate::tr!(
+                "PostgreSQL incremental header missing: {other:?}",
                 "PG 증분 헤더 누락: {other:?}"
             )))
         }
@@ -279,7 +322,12 @@ pub async fn apply<R: AsyncRead + Unpin>(
     let mut applied = 0u64;
     loop {
         match read_frame(reader).await? {
-            IncrFrame::Header(_) => return Err(XBackupError::Failure("PG 증분 헤더 중복".into())),
+            IncrFrame::Header(_) => {
+                return Err(XBackupError::Failure(crate::tr!(
+                    "duplicate PostgreSQL incremental header",
+                    "PG 증분 헤더 중복"
+                )))
+            }
             IncrFrame::Change(c) => {
                 if let Some(max) = max_commit_micros {
                     if c.commit_unix_micros > max {
@@ -299,10 +347,7 @@ pub async fn apply<R: AsyncRead + Unpin>(
                     match map.get(name) {
                         Some(meta) => cols.push(meta.clone()),
                         None => {
-                            return Err(XBackupError::Failure(format!(
-                                "{}.{} 증분 적용: 대상에 컬럼 '{name}'이 없습니다(스키마 불일치)",
-                                c.schema, c.table
-                            )))
+                            return Err(XBackupError::Failure(crate::tr!("{}.{} incremental apply: target is missing column '{name}' (schema mismatch)", "{}.{} 증분 적용: 대상에 컬럼 '{name}'이 없습니다(스키마 불일치)", c.schema, c.table)))
                         }
                     }
                 }
@@ -311,9 +356,12 @@ pub async fn apply<R: AsyncRead + Unpin>(
                         let refs: Vec<&(dyn ToSql + Sync)> =
                             params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
                         client.execute(&sql, &refs).await.map_err(|e| {
-                            XBackupError::Failure(format!(
+                            XBackupError::Failure(crate::tr!(
+                                "{}.{} incremental apply failed: {e}
+ SQL: {sql}",
                                 "{}.{} 증분 적용 실패: {e}\n  SQL: {sql}",
-                                c.schema, c.table
+                                c.schema,
+                                c.table
                             ))
                         })?;
                         applied += 1;
@@ -368,7 +416,12 @@ async fn resync_sequences(client: &Client, schema: &str, table: &str) -> Result<
             &[&q],
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("시퀀스 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to query the sequence: {e}",
+                "시퀀스 조회 실패: {e}"
+            ))
+        })?;
 
     for r in &rows {
         let col: String = r.get(0);
@@ -380,7 +433,9 @@ async fn resync_sequences(client: &Client, schema: &str, table: &str) -> Result<
                 &[],
             )
             .await
-            .map_err(|e| XBackupError::Failure(format!("max 조회 실패: {e}")))?
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!("failed to query max: {e}", "max 조회 실패: {e}"))
+            })?
             .get(0);
         // setval(seq, value, is_called): max가 있으면 (max,true)→다음=max+1, 없으면 (1,false)→다음=1.
         let value = max.unwrap_or(1);
@@ -391,7 +446,12 @@ async fn resync_sequences(client: &Client, schema: &str, table: &str) -> Result<
                 &[&seq, &value, &is_called],
             )
             .await
-            .map_err(|e| XBackupError::Failure(format!("setval 실패({seq}): {e}")))?;
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "setval failed ({seq}): {e}",
+                    "setval 실패({seq}): {e}"
+                ))
+            })?;
     }
     Ok(())
 }
@@ -422,7 +482,12 @@ async fn column_meta_map(
             &[&schema, &table],
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("{schema}.{table} 컬럼 메타 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "{schema}.{table}: failed to query column metadata: {e}",
+                "{schema}.{table} 컬럼 메타 조회 실패: {e}"
+            ))
+        })?;
     Ok(rows
         .iter()
         .map(|r| {
@@ -615,21 +680,34 @@ async fn write_change<W: AsyncWrite + Unpin>(w: &mut W, c: &Change) -> Result<()
 }
 
 async fn write_end<W: AsyncWrite + Unpin>(w: &mut W) -> Result<()> {
-    w.write_all(&[TAG_END])
-        .await
-        .map_err(|e| XBackupError::Failure(format!("증분 끝 태그 쓰기 실패: {e}")))
+    w.write_all(&[TAG_END]).await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to write the incremental end tag: {e}",
+            "증분 끝 태그 쓰기 실패: {e}"
+        ))
+    })
 }
 
 async fn write_doc<W: AsyncWrite + Unpin>(w: &mut W, tag: u8, doc: &Document) -> Result<()> {
     let mut buf = Vec::new();
-    doc.to_writer(&mut buf)
-        .map_err(|e| XBackupError::Failure(format!("증분 프레임 직렬화 실패: {e}")))?;
-    w.write_all(&[tag])
-        .await
-        .map_err(|e| XBackupError::Failure(format!("증분 태그 쓰기 실패: {e}")))?;
-    w.write_all(&buf)
-        .await
-        .map_err(|e| XBackupError::Failure(format!("증분 본문 쓰기 실패: {e}")))?;
+    doc.to_writer(&mut buf).map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to serialize the incremental frame: {e}",
+            "증분 프레임 직렬화 실패: {e}"
+        ))
+    })?;
+    w.write_all(&[tag]).await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to write the incremental tag: {e}",
+            "증분 태그 쓰기 실패: {e}"
+        ))
+    })?;
+    w.write_all(&buf).await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to write the incremental body: {e}",
+            "증분 본문 쓰기 실패: {e}"
+        ))
+    })?;
     Ok(())
 }
 
@@ -638,13 +716,19 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<IncrFrame> {
     match r.read_exact(&mut tag).await {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(IncrFrame::End),
-        Err(e) => return Err(XBackupError::Failure(format!("증분 태그 읽기 실패: {e}"))),
+        Err(e) => {
+            return Err(XBackupError::Failure(crate::tr!(
+                "failed to read the incremental tag: {e}",
+                "증분 태그 읽기 실패: {e}"
+            )))
+        }
     }
     match tag[0] {
         TAG_END => Ok(IncrFrame::End),
         TAG_HEADER => Ok(IncrFrame::Header(read_doc(r).await?)),
         TAG_CHANGE => Ok(IncrFrame::Change(doc_to_change(&read_doc(r).await?)?)),
-        other => Err(XBackupError::Failure(format!(
+        other => Err(XBackupError::Failure(crate::tr!(
+            "corrupt incremental frame tag: 0x{other:02x}",
             "증분 프레임 태그 손상: 0x{other:02x}"
         ))),
     }
@@ -652,22 +736,33 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<IncrFrame> {
 
 async fn read_doc<R: AsyncRead + Unpin>(r: &mut R) -> Result<Document> {
     let mut len_buf = [0u8; 4];
-    r.read_exact(&mut len_buf)
-        .await
-        .map_err(|e| XBackupError::Failure(format!("증분 길이 읽기 실패: {e}")))?;
+    r.read_exact(&mut len_buf).await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to read the incremental length: {e}",
+            "증분 길이 읽기 실패: {e}"
+        ))
+    })?;
     let len = u32::from_le_bytes(len_buf);
     if !(5..=64 * 1024 * 1024).contains(&len) {
-        return Err(XBackupError::Failure(format!(
+        return Err(XBackupError::Failure(crate::tr!(
+            "invalid incremental frame length: {len}",
             "증분 프레임 길이 비정상: {len}"
         )));
     }
     let mut buf = vec![0u8; len as usize];
     buf[..4].copy_from_slice(&len_buf);
-    r.read_exact(&mut buf[4..])
-        .await
-        .map_err(|e| XBackupError::Failure(format!("증분 본문 읽기 실패: {e}")))?;
-    Document::from_reader(&buf[..])
-        .map_err(|e| XBackupError::Failure(format!("증분 프레임 파싱 실패: {e}")))
+    r.read_exact(&mut buf[4..]).await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to read the incremental body: {e}",
+            "증분 본문 읽기 실패: {e}"
+        ))
+    })?;
+    Document::from_reader(&buf[..]).map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to parse the incremental frame: {e}",
+            "증분 프레임 파싱 실패: {e}"
+        ))
+    })
 }
 
 fn change_to_doc(c: &Change) -> Document {
@@ -717,7 +812,12 @@ fn doc_to_change(d: &Document) -> Result<Change> {
         "I" => Op::Insert,
         "U" => Op::Update,
         "D" => Op::Delete,
-        other => return Err(XBackupError::Failure(format!("증분 op 손상: '{other}'"))),
+        other => {
+            return Err(XBackupError::Failure(crate::tr!(
+                "corrupt incremental op: '{other}'",
+                "증분 op 손상: '{other}'"
+            )))
+        }
     };
     let new_vals = opt_vals("new");
     // unchanged 마스크(H3) — 구 아카이브엔 없을 수 있으므로 없으면 모두 false(기존 동작).

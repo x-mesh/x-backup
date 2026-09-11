@@ -62,8 +62,12 @@ impl ResolvedConfig {
         //    — ENV 오버라이드(아래 3단계)가 정규화된 nested 트리에 정확히 적용되도록 이 시점에서 한다.
         let mut root: toml::Value = match input.config_toml {
             Some(raw) => {
-                let value: toml::Value = toml::from_str(raw)
-                    .map_err(|e| XBackupError::Config(format!("config.toml 파싱 실패: {e}")))?;
+                let value: toml::Value = toml::from_str(raw).map_err(|e| {
+                    XBackupError::Config(crate::tr!(
+                        "failed to parse config.toml: {e}",
+                        "config.toml 파싱 실패: {e}"
+                    ))
+                })?;
                 crate::config::v2::normalize_v2(value)?
             }
             None => toml::Value::Table(toml::value::Table::new()),
@@ -79,11 +83,8 @@ impl ResolvedConfig {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .ok_or_else(|| {
-                    XBackupError::Config(
-                        "사용할 프로파일이 없습니다 — --profile/XB_PROFILE 또는 config의 \
-                         default_profile을 지정하세요"
-                            .to_string(),
-                    )
+                    XBackupError::Config(crate::tr!("no profile to use — set --profile/XB_PROFILE, or default_profile in the config", "사용할 프로파일이 없습니다 — --profile/XB_PROFILE 또는 config의 \
+                         default_profile을 지정하세요"))
                 })?
         } else {
             input.profile_name.to_string()
@@ -97,7 +98,10 @@ impl ResolvedConfig {
 
         // 4) serde로 역직렬화 — 미지정 필드는 default가 채운다(우선순위 최하단).
         let profile: Profile = profile_value.clone().try_into().map_err(|e| {
-            XBackupError::Config(format!("프로파일 '{effective_name}' 역직렬화 실패: {e}"))
+            XBackupError::Config(crate::tr!(
+                "failed to deserialize profile '{effective_name}': {e}",
+                "프로파일 '{effective_name}' 역직렬화 실패: {e}"
+            ))
         })?;
 
         // 5) source URI 해석 — 우선순위: uri_env(env 값) > uri(직접 리터럴).
@@ -172,7 +176,8 @@ where
                 if let Some(uri) = literal.filter(|s| !s.is_empty()) {
                     return Ok(Some(Secret::new(uri.to_string())));
                 }
-                return Err(XBackupError::Config(format!(
+                return Err(XBackupError::Config(crate::tr!(
+                    "secret environment variable '{env_name}' is not set (or give a URI directly)",
                     "시크릿 환경변수 '{env_name}'가 설정되지 않았습니다(또는 직접 URI로 지정)"
                 )));
             }
@@ -187,16 +192,22 @@ where
 /// `root` 안에서 `[profiles.<name>]` 하위 테이블의 가변 참조를 얻는다(없으면 생성).
 fn profile_subtree<'a>(root: &'a mut toml::Value, name: &str) -> Result<&'a mut toml::Value> {
     let table = root.as_table_mut().ok_or_else(|| {
-        XBackupError::Config("config.toml 최상위가 테이블이 아닙니다".to_string())
+        XBackupError::Config(crate::tr!(
+            "the top level of config.toml is not a table",
+            "config.toml 최상위가 테이블이 아닙니다"
+        ))
     })?;
 
     let profiles = table
         .entry("profiles".to_string())
         .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
 
-    let profiles_table = profiles
-        .as_table_mut()
-        .ok_or_else(|| XBackupError::Config("'profiles'가 테이블이 아닙니다".to_string()))?;
+    let profiles_table = profiles.as_table_mut().ok_or_else(|| {
+        XBackupError::Config(crate::tr!(
+            "'profiles' is not a table",
+            "'profiles'가 테이블이 아닙니다"
+        ))
+    })?;
 
     Ok(profiles_table
         .entry(name.to_string())
@@ -362,9 +373,10 @@ bucket = "db-backups"
             lookup(&[]),
         )
         .unwrap_err();
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("프로파일이 없습니다"),
-            "기대한 폴백 에러가 아님: {err}"
+            msg.contains("no profile to use") || msg.contains("사용할 프로파일이 없습니다"),
+            "not the expected fallback error: {err}"
         );
     }
 

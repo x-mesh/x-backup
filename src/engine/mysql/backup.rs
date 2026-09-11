@@ -97,7 +97,10 @@ async fn write_archive(
         "SET SESSION time_zone = '+00:00'",
     ] {
         conn.query_drop(stmt).await.map_err(|e| {
-            XBackupError::Failure(format!("스냅샷 트랜잭션 설정 실패({stmt}): {e}"))
+            XBackupError::Failure(crate::tr!(
+                "failed to set the snapshot transaction ({stmt}): {e}",
+                "스냅샷 트랜잭션 설정 실패({stmt}): {e}"
+            ))
         })?;
     }
 
@@ -108,7 +111,12 @@ async fn write_archive(
     let ftwrl = conn.query_drop("FLUSH TABLES WITH READ LOCK").await.is_ok();
     conn.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT")
         .await
-        .map_err(|e| XBackupError::Failure(format!("일관 스냅샷 시작 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to start the consistent snapshot: {e}",
+                "일관 스냅샷 시작 실패: {e}"
+            ))
+        })?;
     let coords = super::incremental::current_coords(conn).await;
     if ftwrl {
         let _ = conn.query_drop("UNLOCK TABLES").await;
@@ -132,13 +140,18 @@ async fn write_archive_in_snapshot(
     let db: String = conn
         .query_first("SELECT DATABASE()")
         .await
-        .map_err(|e| XBackupError::Failure(format!("현재 데이터베이스 조회 실패: {e}")))?
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to query the current database: {e}",
+                "현재 데이터베이스 조회 실패: {e}"
+            ))
+        })?
         .flatten()
         .ok_or_else(|| {
-            XBackupError::Usage(
+            XBackupError::Usage(crate::tr!(
+                "the MySQL backup URI must name a database (mysql://user@host/<db>)",
                 "MySQL 백업은 URI에 데이터베이스가 지정되어야 합니다(mysql://user@host/<db>)"
-                    .into(),
-            )
+            ))
         })?;
 
     let version: String = conn
@@ -154,8 +167,18 @@ async fn write_archive_in_snapshot(
             (&db,),
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("데이터베이스 문자셋 조회 실패: {e}")))?
-        .ok_or_else(|| XBackupError::Failure(format!("데이터베이스 '{db}' metadata가 없습니다")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to query the database charset: {e}",
+                "데이터베이스 문자셋 조회 실패: {e}"
+            ))
+        })?
+        .ok_or_else(|| {
+            XBackupError::Failure(crate::tr!(
+                "no metadata for database '{db}'",
+                "데이터베이스 '{db}' metadata가 없습니다"
+            ))
+        })?;
 
     archive::write_header(
         writer,
@@ -214,9 +237,19 @@ async fn dump_table(
     let create_sql: String = conn
         .query_first::<(String, String), _>(format!("SHOW CREATE TABLE {quoted_src}"))
         .await
-        .map_err(|e| XBackupError::Failure(format!("{ns} SHOW CREATE TABLE 실패: {e}")))?
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "{ns}: SHOW CREATE TABLE failed: {e}",
+                "{ns} SHOW CREATE TABLE 실패: {e}"
+            ))
+        })?
         .map(|(_, ddl)| ddl)
-        .ok_or_else(|| XBackupError::Failure(format!("{ns} CREATE TABLE 결과 없음")))?;
+        .ok_or_else(|| {
+            XBackupError::Failure(crate::tr!(
+                "{ns}: SHOW CREATE TABLE returned nothing",
+                "{ns} CREATE TABLE 결과 없음"
+            ))
+        })?;
 
     // 컬럼 — generated 제외(GENERATION_EXPRESSION<>''), invisible 포함.
     let col_rows: Vec<(String, String, String)> = conn
@@ -227,7 +260,12 @@ async fn dump_table(
             (db, table),
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("{ns} 컬럼 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "{ns}: failed to query columns: {e}",
+                "{ns} 컬럼 조회 실패: {e}"
+            ))
+        })?;
 
     let mut insert_cols: Vec<String> = Vec::new();
     let mut render_plan: Vec<ColCategory> = Vec::new();
@@ -256,18 +294,26 @@ async fn dump_table(
     // 데이터 — 명시 컬럼 SELECT 스트림(text protocol). 컬럼이 모두 generated면 SELECT 생략.
     if !select_exprs.is_empty() {
         let select = format!("SELECT {} FROM {quoted_src}", select_exprs.join(", "));
-        let mut result = conn
-            .query_iter(select)
-            .await
-            .map_err(|e| XBackupError::Failure(format!("{ns} SELECT 실패: {e}")))?;
-        let stream_opt = result
-            .stream::<Row>()
-            .await
-            .map_err(|e| XBackupError::Failure(format!("{ns} 행 스트림 실패: {e}")))?;
+        let mut result = conn.query_iter(select).await.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "{ns}: SELECT failed: {e}",
+                "{ns} SELECT 실패: {e}"
+            ))
+        })?;
+        let stream_opt = result.stream::<Row>().await.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "{ns}: row stream failed: {e}",
+                "{ns} 행 스트림 실패: {e}"
+            ))
+        })?;
         if let Some(mut stream) = stream_opt {
             while let Some(row) = stream.next().await {
-                let row =
-                    row.map_err(|e| XBackupError::Failure(format!("{ns} 행 읽기 실패: {e}")))?;
+                let row = row.map_err(|e| {
+                    XBackupError::Failure(crate::tr!(
+                        "{ns}: failed to read a row: {e}",
+                        "{ns} 행 읽기 실패: {e}"
+                    ))
+                })?;
                 let tuple = render_row(&row, &render_plan);
                 archive::write_row(writer, tuple.as_bytes()).await?;
             }
@@ -304,7 +350,12 @@ async fn list_tables(conn: &mut Conn, db: &str, table_filter: Option<&str>) -> R
                 (db, t),
             )
             .await
-            .map_err(|e| XBackupError::Failure(format!("테이블 목록 조회 실패: {e}")))?,
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "failed to list tables: {e}",
+                    "테이블 목록 조회 실패: {e}"
+                ))
+            })?,
         None => conn
             .exec(
                 "SELECT TABLE_NAME FROM information_schema.TABLES \
@@ -312,7 +363,12 @@ async fn list_tables(conn: &mut Conn, db: &str, table_filter: Option<&str>) -> R
                 (db,),
             )
             .await
-            .map_err(|e| XBackupError::Failure(format!("테이블 목록 조회 실패: {e}")))?,
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "failed to list tables: {e}",
+                    "테이블 목록 조회 실패: {e}"
+                ))
+            })?,
     };
     Ok(rows)
 }
@@ -325,14 +381,19 @@ async fn write_views(conn: &mut Conn, writer: &mut DuplexStream, db: &str) -> Re
             (db,),
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("뷰 목록 조회 실패: {e}")))?;
+        .map_err(|e| XBackupError::Failure(crate::tr!("failed to list views: {e}", "뷰 목록 조회 실패: {e}")))?;
     for name in &names {
         let quoted = quote_qualified(db, name);
         // SHOW CREATE VIEW: (View, Create View, character_set_client, collation_connection).
         if let Some(mut row) = conn
             .query_first::<Row, _>(format!("SHOW CREATE VIEW {quoted}"))
             .await
-            .map_err(|e| XBackupError::Failure(format!("{name} SHOW CREATE VIEW 실패: {e}")))?
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "{name}: SHOW CREATE VIEW failed: {e}",
+                    "{name} SHOW CREATE VIEW 실패: {e}"
+                ))
+            })?
         {
             if let Some(ddl) = row.take::<String, _>(1) {
                 let charset = row.take::<String, _>(2);
@@ -363,14 +424,24 @@ async fn write_triggers(conn: &mut Conn, writer: &mut DuplexStream, db: &str) ->
             (db,),
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("트리거 목록 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to list triggers: {e}",
+                "트리거 목록 조회 실패: {e}"
+            ))
+        })?;
     for name in &names {
         let quoted = quote_qualified(db, name);
         // SHOW CREATE TRIGGER: (Trigger, sql_mode, SQL Original Statement, charset, collation, db collation).
         if let Some(mut row) = conn
             .query_first::<Row, _>(format!("SHOW CREATE TRIGGER {quoted}"))
             .await
-            .map_err(|e| XBackupError::Failure(format!("{name} SHOW CREATE TRIGGER 실패: {e}")))?
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "{name}: SHOW CREATE TRIGGER failed: {e}",
+                    "{name} SHOW CREATE TRIGGER 실패: {e}"
+                ))
+            })?
         {
             if let Some(ddl) = row.take::<String, _>(2) {
                 let sql_mode = row.take::<String, _>(1);
@@ -402,7 +473,12 @@ async fn write_routines(conn: &mut Conn, writer: &mut DuplexStream, db: &str) ->
             (db,),
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("루틴 목록 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to list routines: {e}",
+                "루틴 목록 조회 실패: {e}"
+            ))
+        })?;
     for (name, rtype) in &routines {
         let quoted = quote_qualified(db, name);
         let is_func = rtype.eq_ignore_ascii_case("FUNCTION");
@@ -412,7 +488,12 @@ async fn write_routines(conn: &mut Conn, writer: &mut DuplexStream, db: &str) ->
         if let Some(mut row) = conn
             .query_first::<Row, _>(format!("SHOW CREATE {kw} {quoted}"))
             .await
-            .map_err(|e| XBackupError::Failure(format!("{name} SHOW CREATE {kw} 실패: {e}")))?
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "{name}: SHOW CREATE {kw} failed: {e}",
+                    "{name} SHOW CREATE {kw} 실패: {e}"
+                ))
+            })?
         {
             if let Some(ddl) = row.take::<Option<String>, _>(2).flatten() {
                 let sql_mode = row.take::<String, _>(1);
@@ -443,14 +524,19 @@ async fn write_events(conn: &mut Conn, writer: &mut DuplexStream, db: &str) -> R
             (db,),
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("이벤트 목록 조회 실패: {e}")))?;
+        .map_err(|e| XBackupError::Failure(crate::tr!("failed to list events: {e}", "이벤트 목록 조회 실패: {e}")))?;
     for name in &names {
         let quoted = quote_qualified(db, name);
         // SHOW CREATE EVENT: (Event, sql_mode, time_zone, Create Event, charset, collation, db collation).
         if let Some(mut row) = conn
             .query_first::<Row, _>(format!("SHOW CREATE EVENT {quoted}"))
             .await
-            .map_err(|e| XBackupError::Failure(format!("{name} SHOW CREATE EVENT 실패: {e}")))?
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "{name}: SHOW CREATE EVENT failed: {e}",
+                    "{name} SHOW CREATE EVENT 실패: {e}"
+                ))
+            })?
         {
             if let Some(ddl) = row.take::<Option<String>, _>(3).flatten() {
                 let sql_mode = row.take::<String, _>(1);

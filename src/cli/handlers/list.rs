@@ -58,6 +58,9 @@ pub async fn handle(
     lang_flag: Option<crate::i18n::Lang>,
     args: ListArgs,
 ) -> Result<()> {
+    // config 부재/읽기 실패나 destination 설정 오류로 activate 전에 끝날 수 있는
+    // 경로들도 --lang을 따르도록 미리 잡아 둔다. config가 읽히면 아래에서 다시 정한다.
+    crate::i18n::set_active(lang_flag.unwrap_or_default());
     let storage = open_storage(&config_path, &args).await?;
     let all_rows = build_catalog(storage.as_ref()).await?;
 
@@ -106,9 +109,10 @@ pub async fn handle(
         )
     });
     if has_warning {
-        return Err(XBackupError::VerifyWarning(
-            "broken/incomplete/orphan/corrupt 항목이 있습니다 — list로 확인하세요".into(),
-        ));
+        return Err(XBackupError::VerifyWarning(crate::tr!(
+            "broken/incomplete/orphan/corrupt entries exist — check with list",
+            "broken/incomplete/orphan/corrupt 항목이 있습니다 — list로 확인하세요"
+        )));
     }
     Ok(())
 }
@@ -136,7 +140,8 @@ fn normalize_type(f: Option<&str>) -> Result<Option<String>> {
             let t = t.to_ascii_lowercase();
             match t.as_str() {
                 "full" | "incr" | "orphan" => Ok(Some(t)),
-                _ => Err(XBackupError::Usage(format!(
+                _ => Err(XBackupError::Usage(crate::tr!(
+                    "invalid --type value: '{t}' (full|incr|orphan)",
                     "--type 값이 올바르지 않습니다: '{t}'(full|incr|orphan)"
                 ))),
             }
@@ -152,7 +157,8 @@ fn normalize_engine_filter(f: Option<&str>) -> Result<Option<String>> {
             "postgresql" | "postgres" | "pg" => Ok(Some("postgresql".to_string())),
             "mongodb" | "mongo" => Ok(Some("mongodb".to_string())),
             "mysql" | "mariadb" => Ok(Some("mysql".to_string())),
-            other => Err(XBackupError::Usage(format!(
+            other => Err(XBackupError::Usage(crate::tr!(
+                "invalid --engine value: '{other}' (postgresql|mongodb|mysql)",
                 "--engine 값이 올바르지 않습니다: '{other}'(postgresql|mongodb|mysql)"
             ))),
         },
@@ -318,7 +324,11 @@ fn detect_orphans(entries: &[StorageEntry], known_ids: &[String]) -> Vec<Catalog
 async fn open_storage(config_path: &Option<PathBuf>, args: &ListArgs) -> Result<Box<dyn Storage>> {
     let config_toml = match config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
-            XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
+            XBackupError::Config(crate::tr!(
+                "failed to read the config file ({}): {e}",
+                "config 파일 읽기 실패({}): {e}",
+                path.display()
+            ))
         })?),
         None => None,
     };
@@ -334,23 +344,29 @@ async fn open_storage(config_path: &Option<PathBuf>, args: &ListArgs) -> Result<
     match dest.r#type.as_deref() {
         Some("local") => {}
         Some("s3") => {
-            return Err(XBackupError::Usage(
-                "destination type=s3는 아직 미지원입니다(t7) — type=local만 동작".into(),
-            ))
+            return Err(XBackupError::Usage(crate::tr!(
+                "destination type=s3 is not supported yet (t7) — only type=local works",
+                "destination type=s3는 아직 미지원입니다(t7) — type=local만 동작"
+            )))
         }
         Some(other) => {
-            return Err(XBackupError::Config(format!(
+            return Err(XBackupError::Config(crate::tr!(
+                "unknown destination type: '{other}' (only local is supported)",
                 "알 수 없는 destination type: '{other}'(local만 지원)"
             )))
         }
         None => {
-            return Err(XBackupError::Config(
-                "destination.type이 지정되지 않았습니다(local 필요)".into(),
-            ))
+            return Err(XBackupError::Config(crate::tr!(
+                "destination.type is not set (local is required)",
+                "destination.type이 지정되지 않았습니다(local 필요)"
+            )))
         }
     }
     let root = dest.path.as_deref().ok_or_else(|| {
-        XBackupError::Config("destination.path가 지정되지 않았습니다(local 경로)".into())
+        XBackupError::Config(crate::tr!(
+            "destination.path is not set (a local path)",
+            "destination.path가 지정되지 않았습니다(local 경로)"
+        ))
     })?;
     Ok(Box::new(LocalFs::new(root)?))
 }

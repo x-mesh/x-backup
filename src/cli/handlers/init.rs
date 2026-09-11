@@ -33,11 +33,8 @@ pub async fn handle(
 
     // 1) 비-TTY 가드 — 마법사는 대화형 전용. 표준입력이 터미널이 아니면 거부한다.
     if !std::io::stdin().is_terminal() {
-        return Err(XBackupError::Usage(
-            "init 마법사는 대화형(TTY) 전용입니다 — 파이프/CI에서는 config.toml을 직접 \
-             작성하거나 ENV(XB_*)로 구성하세요"
-                .into(),
-        ));
+        return Err(XBackupError::Usage(crate::tr!("the init wizard is interactive (TTY) only — in a pipe or CI, write config.toml directly or configure via ENV (XB_*)", "init 마법사는 대화형(TTY) 전용입니다 — 파이프/CI에서는 config.toml을 직접 \
+             작성하거나 ENV(XB_*)로 구성하세요")));
     }
 
     // 2) 대상 경로 결정 + 기존 파일 가드(--force).
@@ -194,7 +191,8 @@ fn ask_run_status(prompt: &mut dyn Prompt, lang: crate::i18n::Lang) -> Result<bo
 /// 기존 config 파일 가드 — 존재하는데 `--force`가 없으면 거부한다(exit 2).
 fn guard_existing(target: &Path, force: bool) -> Result<()> {
     if target.exists() && !force {
-        return Err(XBackupError::Usage(format!(
+        return Err(XBackupError::Usage(crate::tr!(
+            "the config file already exists: {} — pass --force to overwrite",
             "config 파일이 이미 존재합니다: {} — 덮어쓰려면 --force를 지정하세요",
             target.display()
         )));
@@ -208,7 +206,8 @@ fn write_config(target: &Path, config: &Config) -> Result<()> {
     if let Some(parent) = target.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                XBackupError::Failure(format!(
+                XBackupError::Failure(crate::tr!(
+                    "failed to create the config directory ({}): {e}",
                     "config 디렉터리 생성 실패({}): {e}",
                     parent.display()
                 ))
@@ -216,7 +215,11 @@ fn write_config(target: &Path, config: &Config) -> Result<()> {
         }
     }
     std::fs::write(target, toml).map_err(|e| {
-        XBackupError::Failure(format!("config.toml 기록 실패({}): {e}", target.display()))
+        XBackupError::Failure(crate::tr!(
+            "failed to write config.toml ({}): {e}",
+            "config.toml 기록 실패({}): {e}",
+            target.display()
+        ))
     })?;
     Ok(())
 }

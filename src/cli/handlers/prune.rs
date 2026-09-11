@@ -37,6 +37,10 @@ pub async fn handle(
     lang_flag: Option<crate::i18n::Lang>,
     args: PruneArgs,
 ) -> Result<()> {
+    // lock 충돌·config 부재/읽기 실패로 activate 전에 끝날 수 있는 경로들도 --lang을
+    // 따르도록 미리 잡아 둔다. config가 읽히면 아래에서 다시 정한다.
+    crate::i18n::set_active(lang_flag.unwrap_or_default());
+
     // 동시 실행 잠금(FR-12) — 같은 프로파일의 backup/restore/prune과 직렬화한다.
     // 가드를 함수 스코프 끝까지 유지(_lock)해 작업 동안 lock을 잡는다.
     let _lock: LockGuard = crate::lock::acquire(&args.profile)?;
@@ -74,12 +78,9 @@ pub async fn handle(
     // 보존 기준 미지정 가드: 명시적 기준 없는 prune은 거부(실수로 전부 보존만 하고 끝).
     if policy.is_unspecified() {
         print_plan(&plan, args.dry_run, lang);
-        return Err(XBackupError::Usage(
-            "보존 기준이 필요합니다 — --keep-full N / --keep-days D / --keep-last N 중 하나를 \
+        return Err(XBackupError::Usage(crate::tr!("a retention rule is required — give one of --keep-full N / --keep-days D / --keep-last N, or set [profiles.<name>.retention] in the config (a prune with no rule deletes nothing)", "보존 기준이 필요합니다 — --keep-full N / --keep-days D / --keep-last N 중 하나를 \
              주거나 config의 [profiles.<name>.retention]에 설정하세요(기준 없는 prune은 \
-             아무것도 삭제하지 않습니다)"
-                .into(),
-        ));
+             아무것도 삭제하지 않습니다)")));
     }
 
     // dry-run: 목록만 출력하고 종료(무변경).
@@ -172,10 +173,7 @@ fn decide_approval(
         });
     }
     if !is_tty {
-        return Err(XBackupError::Failure(
-            "비대화형 환경에서는 --force 없이 삭제할 수 없습니다(--dry-run으로 먼저 확인하세요)"
-                .into(),
-        ));
+        return Err(XBackupError::Failure(crate::tr!("non-interactive environments cannot delete without --force (check first with --dry-run)", "비대화형 환경에서는 --force 없이 삭제할 수 없습니다(--dry-run으로 먼저 확인하세요)")));
     }
     // 대화형 확인 — 정상 체인만 삭제(orphan/incomplete 잔재는 --force가 있어야 정리).
     let proceed = confirm(plan);
@@ -326,7 +324,11 @@ fn resolve_retention(
 async fn open_storage(config_path: &Option<PathBuf>, args: &PruneArgs) -> Result<Box<dyn Storage>> {
     let config_toml = match config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
-            XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
+            XBackupError::Config(crate::tr!(
+                "failed to read the config file ({}): {e}",
+                "config 파일 읽기 실패({}): {e}",
+                path.display()
+            ))
         })?),
         None => None,
     };
@@ -341,23 +343,29 @@ async fn open_storage(config_path: &Option<PathBuf>, args: &PruneArgs) -> Result
     match dest.r#type.as_deref() {
         Some("local") => {}
         Some("s3") => {
-            return Err(XBackupError::Usage(
-                "destination type=s3는 아직 미지원입니다(t7) — type=local만 동작".into(),
-            ))
+            return Err(XBackupError::Usage(crate::tr!(
+                "destination type=s3 is not supported yet (t7) — only type=local works",
+                "destination type=s3는 아직 미지원입니다(t7) — type=local만 동작"
+            )))
         }
         Some(other) => {
-            return Err(XBackupError::Config(format!(
+            return Err(XBackupError::Config(crate::tr!(
+                "unknown destination type: '{other}' (only local is supported)",
                 "알 수 없는 destination type: '{other}'(local만 지원)"
             )))
         }
         None => {
-            return Err(XBackupError::Config(
-                "destination.type이 지정되지 않았습니다(local 필요)".into(),
-            ))
+            return Err(XBackupError::Config(crate::tr!(
+                "destination.type is not set (local is required)",
+                "destination.type이 지정되지 않았습니다(local 필요)"
+            )))
         }
     }
     let root = dest.path.as_deref().ok_or_else(|| {
-        XBackupError::Config("destination.path가 지정되지 않았습니다(local 경로)".into())
+        XBackupError::Config(crate::tr!(
+            "destination.path is not set (a local path)",
+            "destination.path가 지정되지 않았습니다(local 경로)"
+        ))
     })?;
     Ok(Box::new(LocalFs::new(root)?))
 }

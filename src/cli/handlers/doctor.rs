@@ -46,13 +46,24 @@ pub async fn handle(
     lang_flag: Option<crate::i18n::Lang>,
     args: DoctorArgs,
 ) -> Result<()> {
+    // config 부재/읽기 실패로 activate 전에 끝날 수 있는 경로들도 --lang을 따르도록
+    // 미리 잡아 둔다(§tr_lang! 주석 참고). config가 읽히면 아래에서 다시 정한다.
+    crate::i18n::set_active(lang_flag.unwrap_or_default());
     let config_toml = match &config_path {
-        Some(p) => std::fs::read_to_string(p)
-            .map_err(|e| XBackupError::Config(format!("config 읽기 실패({}): {e}", p.display())))?,
-        None => {
-            return Err(XBackupError::Usage(
-                "doctor에는 config가 필요합니다 — --config <PATH>로 지정하세요".into(),
+        Some(p) => std::fs::read_to_string(p).map_err(|e| {
+            XBackupError::Config(crate::tr_lang!(
+                lang_flag.unwrap_or_default(),
+                "failed to read the config ({}): {e}",
+                "config 읽기 실패({}): {e}",
+                p.display()
             ))
+        })?,
+        None => {
+            return Err(XBackupError::Usage(crate::tr_lang!(
+                lang_flag.unwrap_or_default(),
+                "doctor needs a config — specify it with --config <PATH>",
+                "doctor에는 config가 필요합니다 — --config <PATH>로 지정하세요"
+            )))
         }
     };
     // from_toml_str로 통일 — v2 표면도 여기서 정규화된다(inline toml::from_str 금지).
@@ -63,7 +74,8 @@ pub async fn handle(
     let names: Vec<String> = match &args.profile {
         Some(p) => {
             if !cfg.profiles.contains_key(p) {
-                return Err(XBackupError::Usage(format!(
+                return Err(XBackupError::Usage(crate::tr!(
+                    "profile '{p}' is not in the config",
                     "프로파일 '{p}'가 config에 없습니다"
                 )));
             }
@@ -76,9 +88,10 @@ pub async fn handle(
         }
     };
     if names.is_empty() {
-        return Err(XBackupError::Usage(
-            "config에 프로파일이 없습니다([profiles.<name>])".into(),
-        ));
+        return Err(XBackupError::Usage(crate::tr!(
+            "the config has no profiles ([profiles.<name>])",
+            "config에 프로파일이 없습니다([profiles.<name>])"
+        )));
     }
 
     let reports: Vec<ProfileReport> = names
@@ -105,12 +118,14 @@ pub async fn handle(
     }
 
     match overall {
-        CheckStatus::Fail => Err(XBackupError::PrecheckFailed(
-            "doctor: 차단성 설정 문제가 있습니다(위 [FAIL] 항목 확인)".into(),
-        )),
-        CheckStatus::Warn => Err(XBackupError::Warning(
-            "doctor: 경고가 있습니다(위 [WARN] 항목 확인)".into(),
-        )),
+        CheckStatus::Fail => Err(XBackupError::PrecheckFailed(crate::tr!(
+            "doctor: there are blocking config problems (see [FAIL] above)",
+            "doctor: 차단성 설정 문제가 있습니다(위 [FAIL] 항목 확인)"
+        ))),
+        CheckStatus::Warn => Err(XBackupError::Warning(crate::tr!(
+            "doctor: there are warnings (see [WARN] above)",
+            "doctor: 경고가 있습니다(위 [WARN] 항목 확인)"
+        ))),
         CheckStatus::Ok => Ok(()),
     }
 }

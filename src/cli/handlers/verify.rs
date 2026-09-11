@@ -35,9 +35,17 @@ pub async fn handle(
     lang_flag: Option<crate::i18n::Lang>,
     args: VerifyArgs,
 ) -> Result<()> {
+    // config 부재/읽기 실패로 activate 전에 끝날 수 있는 경로들도 --lang을 따르도록
+    // 미리 잡아 둔다(§tr_lang! 주석 참고). config가 읽히면 아래에서 다시 정한다.
+    crate::i18n::set_active(lang_flag.unwrap_or_default());
     let config_toml = match &config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
-            XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
+            XBackupError::Config(crate::tr_lang!(
+                lang_flag.unwrap_or_default(),
+                "failed to read the config file ({}): {e}",
+                "config 파일 읽기 실패({}): {e}",
+                path.display()
+            ))
         })?),
         None => None,
     };
@@ -54,9 +62,7 @@ async fn run(storage: &dyn Storage, args: &VerifyArgs, lang: Lang) -> Result<()>
         Err(e) if args.deep && e.exit_code() == 2 => {
             // deep인데 키가 없어 Config(exit 2)가 났다 — 검증 실패(exit 1)로 보정하되
             // 키 격리 안내 메시지를 보존한다(§8.5).
-            return Err(XBackupError::Failure(format!(
-                "{e} — verify --deep은 개인키 보유 호스트에서 실행하세요(§8.5 키 격리)"
-            )));
+            return Err(XBackupError::Failure(crate::tr!("{e} — run verify --deep on a host that holds the private key (key isolation, §8.5)", "{e} — verify --deep은 개인키 보유 호스트에서 실행하세요(§8.5 키 격리)")));
         }
         Err(e) => return Err(e),
     };
@@ -81,7 +87,8 @@ async fn run(storage: &dyn Storage, args: &VerifyArgs, lang: Lang) -> Result<()>
     //    - 모두 정상: exit 0.
     let chain_broken = chain.as_ref().is_some_and(|c| !c.is_continuous());
     if chain_broken {
-        return Err(XBackupError::VerifyWarning(format!(
+        return Err(XBackupError::VerifyWarning(crate::tr!(
+            "chain '{}' has broken points and cannot be used for PITR ({} break(s))",
             "체인 '{}'에 끊어진 지점이 있어 PITR에 사용할 수 없습니다({}건)",
             args.id,
             chain.as_ref().map(|c| c.breaks.len()).unwrap_or(0)
@@ -97,7 +104,11 @@ async fn run(storage: &dyn Storage, args: &VerifyArgs, lang: Lang) -> Result<()>
 async fn open_storage(config_path: &Option<PathBuf>) -> Result<Box<dyn Storage>> {
     let config_toml = match config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
-            XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
+            XBackupError::Config(crate::tr!(
+                "failed to read the config file ({}): {e}",
+                "config 파일 읽기 실패({}): {e}",
+                path.display()
+            ))
         })?),
         None => None,
     };
@@ -115,23 +126,29 @@ async fn open_storage(config_path: &Option<PathBuf>) -> Result<Box<dyn Storage>>
     match dest.r#type.as_deref() {
         Some("local") => {}
         Some("s3") => {
-            return Err(XBackupError::Usage(
-                "destination type=s3는 아직 미지원입니다(t7) — type=local만 동작".into(),
-            ))
+            return Err(XBackupError::Usage(crate::tr!(
+                "destination type=s3 is not supported yet (t7) — only type=local works",
+                "destination type=s3는 아직 미지원입니다(t7) — type=local만 동작"
+            )))
         }
         Some(other) => {
-            return Err(XBackupError::Config(format!(
+            return Err(XBackupError::Config(crate::tr!(
+                "unknown destination type: '{other}' (only local is supported)",
                 "알 수 없는 destination type: '{other}'(local만 지원)"
             )))
         }
         None => {
-            return Err(XBackupError::Config(
-                "destination.type이 지정되지 않았습니다(local 필요)".into(),
-            ))
+            return Err(XBackupError::Config(crate::tr!(
+                "destination.type is not set (local is required)",
+                "destination.type이 지정되지 않았습니다(local 필요)"
+            )))
         }
     }
     let root = dest.path.as_deref().ok_or_else(|| {
-        XBackupError::Config("destination.path가 지정되지 않았습니다(local 경로)".into())
+        XBackupError::Config(crate::tr!(
+            "destination.path is not set (a local path)",
+            "destination.path가 지정되지 않았습니다(local 경로)"
+        ))
     })?;
     Ok(Box::new(LocalFs::new(root)?))
 }
@@ -384,7 +401,10 @@ mod tests {
             .unwrap_err();
         // §8.5: 키 부재 deep은 검증 실패(exit 1)로 보정.
         assert_eq!(err.exit_code(), 1, "키 부재 deep은 exit 1: {err}");
-        assert!(err.to_string().contains("개인키"), "격리 안내 누락: {err}");
+        assert!(
+            err.to_string().contains("private key"),
+            "missing key-isolation guidance: {err}"
+        );
     }
 
     /// incomplete 백업은 exit 4(경고 동반 성공).

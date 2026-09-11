@@ -49,7 +49,8 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
         Frame::Header(h) => {
             let fmt = h.get_str("format").unwrap_or("");
             if fmt != archive::FORMAT_ID {
-                return Err(XBackupError::Failure(format!(
+                return Err(XBackupError::Failure(crate::tr!(
+                    "PostgreSQL archive format mismatch: '{fmt}' (expected '{}')",
                     "PG 아카이브 포맷 불일치: '{fmt}'(기대 '{}')",
                     archive::FORMAT_ID
                 )));
@@ -57,7 +58,8 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
             warn_on_major_mismatch(client, h.get_str("pg_version").unwrap_or("")).await;
         }
         other => {
-            return Err(XBackupError::Failure(format!(
+            return Err(XBackupError::Failure(crate::tr!(
+                "PostgreSQL archive header missing (first frame: {other:?})",
                 "PG 아카이브 헤더 누락(첫 프레임: {other:?})"
             )))
         }
@@ -79,9 +81,10 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
     loop {
         match archive::read_frame(reader).await? {
             Frame::Header(_) => {
-                return Err(XBackupError::Failure(
-                    "PG 아카이브 헤더가 중복됩니다".into(),
-                ))
+                return Err(XBackupError::Failure(crate::tr!(
+                    "duplicate PostgreSQL archive header",
+                    "PG 아카이브 헤더가 중복됩니다"
+                )))
             }
             Frame::Pre(d) => {
                 if let Ok(sql) = d.get_str("sql") {
@@ -99,9 +102,12 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
                     unresolved_pre = retry_apply(client, &pre_ddls).await;
                     pre_applied = true;
                 }
-                let name = s
-                    .get_str("name")
-                    .map_err(|_| XBackupError::Failure("시퀀스 프레임에 name이 없습니다".into()))?;
+                let name = s.get_str("name").map_err(|_| {
+                    XBackupError::Failure(crate::tr!(
+                        "the sequence frame has no name",
+                        "시퀀스 프레임에 name이 없습니다"
+                    ))
+                })?;
                 let last_value = s.get_i64("last_value").unwrap_or(1);
                 let is_called = s.get_bool("is_called").unwrap_or(true);
                 // 비-기본 스키마는 시퀀스 전에 만든다(시퀀스가 그 스키마에 속할 수 있음).
@@ -110,7 +116,10 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
                     run_ignore_exists(client, &format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
                         .await
                         .map_err(|e| {
-                            XBackupError::Failure(format!("{schema} 스키마 생성 실패: {e}"))
+                            XBackupError::Failure(crate::tr!(
+                                "{schema}: failed to create the schema: {e}",
+                                "{schema} 스키마 생성 실패: {e}"
+                            ))
                         })?;
                 }
                 // 파라미터를 보존한 CREATE SEQUENCE DDL(없으면 기본 생성).
@@ -118,9 +127,12 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
                     .get_str("create_sql")
                     .map(String::from)
                     .unwrap_or_else(|_| format!("CREATE SEQUENCE {name}"));
-                run_ignore_exists(client, &create)
-                    .await
-                    .map_err(|e| XBackupError::Failure(format!("{name} 시퀀스 생성 실패: {e}")))?;
+                run_ignore_exists(client, &create).await.map_err(|e| {
+                    XBackupError::Failure(crate::tr!(
+                        "{name}: failed to create the sequence: {e}",
+                        "{name} 시퀀스 생성 실패: {e}"
+                    ))
+                })?;
                 setvals.push((name.to_string(), last_value, is_called));
             }
             Frame::Table(meta) => {
@@ -130,10 +142,18 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
                 }
                 let ns = meta
                     .get_str("ns")
-                    .map_err(|_| XBackupError::Failure("테이블 프레임에 ns가 없습니다".into()))?
+                    .map_err(|_| {
+                        XBackupError::Failure(crate::tr!(
+                            "the table frame has no ns",
+                            "테이블 프레임에 ns가 없습니다"
+                        ))
+                    })?
                     .to_string();
                 let create_sql = meta.get_str("create_sql").map_err(|_| {
-                    XBackupError::Failure(format!("{ns} 테이블에 create_sql이 없습니다"))
+                    XBackupError::Failure(crate::tr!(
+                        "{ns}: table has no create_sql",
+                        "{ns} 테이블에 create_sql이 없습니다"
+                    ))
                 })?;
                 // 식별자는 백업이 정확히 quote해 프레임에 담아둔다(create_sql 재파싱 불필요 — 리뷰 #13).
                 let quoted = meta.get_str("quoted").unwrap_or(&ns).to_string();
@@ -144,7 +164,10 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
                     run_ignore_exists(client, &format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
                         .await
                         .map_err(|e| {
-                            XBackupError::Failure(format!("{schema} 스키마 생성 실패: {e}"))
+                            XBackupError::Failure(crate::tr!(
+                                "{schema}: failed to create the schema: {e}",
+                                "{schema} 스키마 생성 실패: {e}"
+                            ))
                         })?;
                 }
 
@@ -154,9 +177,12 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
                         .await;
                 }
                 // 테이블 생성(이미 있으면 drop=false 경로 — append로 허용).
-                run_ignore_exists(client, create_sql)
-                    .await
-                    .map_err(|e| XBackupError::Failure(format!("{ns} 테이블 생성 실패: {e}")))?;
+                run_ignore_exists(client, create_sql).await.map_err(|e| {
+                    XBackupError::Failure(crate::tr!(
+                        "{ns}: failed to create the table: {e}",
+                        "{ns} 테이블 생성 실패: {e}"
+                    ))
+                })?;
 
                 // 제약·인덱스는 데이터 적재 후로 지연.
                 if let Ok(arr) = meta.get_array("constraints") {
@@ -197,36 +223,45 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
 
                 // COPY IN — 이 테이블의 Data*를 TableEnd까지 적재(text — 백업과 동일 포맷).
                 let copy_sql = format!("COPY {quoted}{col_list} FROM STDIN (FORMAT text)");
-                let sink = client
-                    .copy_in(copy_sql.as_str())
-                    .await
-                    .map_err(|e| XBackupError::Failure(format!("{ns} COPY IN 시작 실패: {e}")))?;
+                let sink = client.copy_in(copy_sql.as_str()).await.map_err(|e| {
+                    XBackupError::Failure(crate::tr!(
+                        "{ns}: COPY IN failed to start: {e}",
+                        "{ns} COPY IN 시작 실패: {e}"
+                    ))
+                })?;
                 futures::pin_mut!(sink);
                 loop {
                     match archive::read_frame(reader).await? {
                         Frame::Data(bytes) => {
                             sink.send(Bytes::from(bytes)).await.map_err(|e| {
-                                XBackupError::Failure(format!("{ns} COPY 데이터 전송 실패: {e}"))
+                                XBackupError::Failure(crate::tr!(
+                                    "{ns}: failed to send COPY data: {e}",
+                                    "{ns} COPY 데이터 전송 실패: {e}"
+                                ))
                             })?;
                         }
                         Frame::TableEnd => break,
                         other => {
-                            return Err(XBackupError::Failure(format!(
+                            return Err(XBackupError::Failure(crate::tr!(
+                                "{ns}: unexpected frame in data: {other:?}",
                                 "{ns} 데이터 중 예기치 못한 프레임: {other:?}"
                             )))
                         }
                     }
                 }
-                let n = sink
-                    .finish()
-                    .await
-                    .map_err(|e| XBackupError::Failure(format!("{ns} COPY IN 종료 실패: {e}")))?;
+                let n = sink.finish().await.map_err(|e| {
+                    XBackupError::Failure(crate::tr!(
+                        "{ns}: COPY IN failed to finish: {e}",
+                        "{ns} COPY IN 종료 실패: {e}"
+                    ))
+                })?;
                 inserted += n;
             }
             Frame::Data(_) | Frame::TableEnd => {
-                return Err(XBackupError::Failure(
-                    "테이블 밖에서 데이터 프레임을 만났습니다(손상)".into(),
-                ))
+                return Err(XBackupError::Failure(crate::tr!(
+                    "encountered a data frame outside a table (corrupt)",
+                    "테이블 밖에서 데이터 프레임을 만났습니다(손상)"
+                )))
             }
             Frame::End => break,
         }
@@ -234,14 +269,22 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
 
     // 지연 적용: 제약 → 인덱스(이미 있으면 무시) → 시퀀스 setval.
     for sql in &deferred_constraints {
-        run_ignore_exists(client, sql)
-            .await
-            .map_err(|e| XBackupError::Failure(format!("제약 적용 실패: {e}\n  SQL: {sql}")))?;
+        run_ignore_exists(client, sql).await.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to apply a constraint: {e}
+ SQL: {sql}",
+                "제약 적용 실패: {e}\n  SQL: {sql}"
+            ))
+        })?;
     }
     for sql in &deferred_indexes {
-        run_ignore_exists(client, sql)
-            .await
-            .map_err(|e| XBackupError::Failure(format!("인덱스 적용 실패: {e}\n  SQL: {sql}")))?;
+        run_ignore_exists(client, sql).await.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to apply an index: {e}
+ SQL: {sql}",
+                "인덱스 적용 실패: {e}\n  SQL: {sql}"
+            ))
+        })?;
     }
     for (name, last_value, is_called) in &setvals {
         // 식별자를 바인드 파라미터로 — 문자열 리터럴 인젝션 방지(리뷰 #1). name은 이미
@@ -318,7 +361,8 @@ async fn apply_with_retry(client: &Client, ddls: &[String], what: &str) -> Resul
         }
         // 한 라운드에서 하나도 못 줄였으면 순환/진짜 오류 — 중단.
         if still.len() == pending.len() {
-            return Err(XBackupError::Failure(format!(
+            return Err(XBackupError::Failure(crate::tr!(
+                "failed to apply {what} — could not resolve dependencies: {}",
                 "{what} 적용 실패(의존성 해소 불가): {}",
                 last_err.unwrap_or_default()
             )));

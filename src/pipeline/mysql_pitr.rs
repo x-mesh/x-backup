@@ -61,10 +61,8 @@ fn parse_at(at: &str) -> Result<Option<i64>> {
         return Ok(None);
     }
     let dt = DateTime::parse_from_rfc3339(at).map_err(|e| {
-        XBackupError::Usage(format!(
-            "--at 시각 파싱 실패('{at}'): {e} — RFC3339(예: 2026-06-14T09:00:00Z) 또는 'latest'가 \
-             필요합니다"
-        ))
+        XBackupError::Usage(crate::tr!("failed to parse --at ('{at}'): {e} — RFC3339 (e.g. 2026-06-14T09:00:00Z) or 'latest' is required", "--at 시각 파싱 실패('{at}'): {e} — RFC3339(예: 2026-06-14T09:00:00Z) 또는 'latest'가 \
+             필요합니다"))
     })?;
     Ok(Some(dt.with_timezone(&Utc).timestamp_micros()))
 }
@@ -90,7 +88,8 @@ where
         Some(id) => {
             let m = store.read(id).await?;
             if !is_mysql_full(&m) {
-                return Err(XBackupError::Usage(format!(
+                return Err(XBackupError::Usage(crate::tr!(
+                    "--id '{id}' is not a MySQL full backup (not eligible as a PITR base)",
                     "--id '{id}'는 MySQL 풀백업이 아닙니다(PITR base 부적격)"
                 )));
             }
@@ -132,7 +131,10 @@ where
 
     let drop_existing = decide_guard(&conflicting_tables, request.force, is_tty, confirm)?;
     let mut target = target.ok_or_else(|| {
-        XBackupError::Failure("MySQL PITR 대상 데이터베이스를 준비하지 못했습니다".into())
+        XBackupError::Failure(crate::tr!(
+            "could not prepare the MySQL PITR target database",
+            "MySQL PITR 대상 데이터베이스를 준비하지 못했습니다"
+        ))
     })?;
 
     // base 풀 복원(reverse stack → mysql restore_into).
@@ -188,16 +190,14 @@ where
         if confirm(conflicts) {
             Ok(true)
         } else {
-            Err(XBackupError::Failure(
-                "사용자가 복구를 취소했습니다(기존 데이터 보존)".into(),
-            ))
+            Err(XBackupError::Failure(crate::tr!(
+                "the user cancelled the restore (existing data preserved)",
+                "사용자가 복구를 취소했습니다(기존 데이터 보존)"
+            )))
         }
     } else {
-        Err(XBackupError::Failure(format!(
-            "복원 대상에 기존 데이터가 있습니다({}개 테이블). 비-TTY에서는 --force 없이 \
-             덮어쓰기를 거부합니다",
-            conflicts.len()
-        )))
+        Err(XBackupError::Failure(crate::tr!("the restore target already has data ({} table(s)). Non-TTY refuses to overwrite without --force", "복원 대상에 기존 데이터가 있습니다({}개 테이블). 비-TTY에서는 --force 없이 \
+             덮어쓰기를 거부합니다", conflicts.len())))
     }
 }
 
@@ -223,9 +223,10 @@ pub(crate) async fn latest_mysql_full(storage: &dyn Storage) -> Result<String> {
             }
         }
     }
-    Err(XBackupError::Usage(
-        "복구할 MySQL 풀백업이 없습니다 — 먼저 풀 백업을 수행하세요".into(),
-    ))
+    Err(XBackupError::Usage(crate::tr!(
+        "no MySQL full backup to restore — run a full backup first",
+        "복구할 MySQL 풀백업이 없습니다 — 먼저 풀 백업을 수행하세요"
+    )))
 }
 
 /// base에 체인된 MySQL 증분(`xb-mysql-incr-v1`) ID를 id 순(=시간 순)으로 모은다.
@@ -270,11 +271,8 @@ pub(crate) async fn chain_start_coords(
     }
     let base = store.read(base_id).await?;
     base.mysql_binlog.ok_or_else(|| {
-        XBackupError::Usage(
-            "base 풀백업에 binlog 좌표가 없습니다 — 증분은 log_bin=ON 서버에서 만든 풀백업이 \
-             필요합니다(features.incremental.mysql_binlog=true)."
-                .into(),
-        )
+        XBackupError::Usage(crate::tr!("the base full backup has no binlog coordinates — incremental requires a full backup made on a server with log_bin=ON (features.incremental.mysql_binlog=true).", "base 풀백업에 binlog 좌표가 없습니다 — 증분은 log_bin=ON 서버에서 만든 풀백업이 \
+             필요합니다(features.incremental.mysql_binlog=true)."))
     })
 }
 

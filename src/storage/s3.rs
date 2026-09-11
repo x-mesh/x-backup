@@ -108,16 +108,16 @@ impl S3Credentials {
     /// `"ACCESS:SECRET"` 형식 문자열을 파싱한다(첫 콜론에서 1회만 분리).
     fn parse(raw: &str) -> Result<Self, XBackupError> {
         let (access, secret) = raw.split_once(':').ok_or_else(|| {
-            XBackupError::Config(
+            XBackupError::Config(crate::tr!(
+                "malformed S3 credentials_env: must be 'ACCESS_KEY:SECRET_KEY'",
                 "S3 credentials_env 형식 오류: 'ACCESS_KEY:SECRET_KEY' 형식이어야 합니다"
-                    .to_string(),
-            )
+            ))
         })?;
         if access.is_empty() || secret.is_empty() {
-            return Err(XBackupError::Config(
+            return Err(XBackupError::Config(crate::tr!(
+                "malformed S3 credentials_env: the access key or secret key is empty",
                 "S3 credentials_env 형식 오류: access key 또는 secret key가 비어 있습니다"
-                    .to_string(),
-            ));
+            )));
         }
         Ok(Self {
             access_key_id: access.to_string(),
@@ -147,7 +147,10 @@ impl S3Compatible {
     /// HTTP 허용은 `endpoint`가 `http://`로 시작할 때만 켠다(로컬 테스트).
     pub fn new(cfg: &S3Config, credentials_raw: &str) -> Result<Self, XBackupError> {
         let bucket = cfg.bucket.as_deref().ok_or_else(|| {
-            XBackupError::Config("S3 destination에 bucket이 필요합니다".to_string())
+            XBackupError::Config(crate::tr!(
+                "an S3 destination requires a bucket",
+                "S3 destination에 bucket이 필요합니다"
+            ))
         })?;
         let creds = S3Credentials::parse(credentials_raw)?;
 
@@ -168,9 +171,12 @@ impl S3Compatible {
             builder = builder.with_endpoint(endpoint).with_allow_http(allow_http);
         }
 
-        let inner = builder
-            .build()
-            .map_err(|e| XBackupError::Config(format!("S3 백엔드 초기화 실패: {e}")))?;
+        let inner = builder.build().map_err(|e| {
+            XBackupError::Config(crate::tr!(
+                "failed to initialize the S3 backend: {e}",
+                "S3 백엔드 초기화 실패: {e}"
+            ))
+        })?;
 
         Ok(Self {
             inner,
@@ -228,7 +234,10 @@ impl Storage for S3Compatible {
         let mut guard = UploadGuard::new(&self.inner, object_path.clone());
 
         let upload = self.inner.put_multipart(&object_path).await.map_err(|e| {
-            XBackupError::StorageUpload(format!("'{path}' 멀티파트 업로드 시작 실패: {e}"))
+            XBackupError::StorageUpload(crate::tr!(
+                "'{path}': failed to start the multipart upload: {e}",
+                "'{path}' 멀티파트 업로드 시작 실패: {e}"
+            ))
         })?;
         // 적응 파트 크기로 WriteMultipart 구성 — 내부에서 청크를 모아 이 크기 파트로 분할.
         let mut writer = WriteMultipart::new_with_chunk_size(upload, part_size);
@@ -243,7 +252,8 @@ impl Storage for S3Compatible {
                     if let Err(cap_err) = writer.wait_for_capacity(MAX_CONCURRENCY).await {
                         let _ = writer.abort().await;
                         guard.disarm();
-                        return Err(XBackupError::StorageUpload(format!(
+                        return Err(XBackupError::StorageUpload(crate::tr!(
+                            "'{path}': failed to reserve upload capacity: {cap_err}",
                             "'{path}' 업로드 용량 확보 실패: {cap_err}"
                         )));
                     }
@@ -254,7 +264,8 @@ impl Storage for S3Compatible {
                     let _ = writer.abort().await;
                     // abort가 처리했으므로 가드의 추가 삭제는 불필요.
                     guard.disarm();
-                    return Err(XBackupError::StorageUpload(format!(
+                    return Err(XBackupError::StorageUpload(crate::tr!(
+                        "'{path}': failed to read the input stream: {read_err}",
                         "'{path}' 입력 스트림 읽기 실패: {read_err}"
                     )));
                 }
@@ -269,7 +280,8 @@ impl Storage for S3Compatible {
         // complete 직전 단계(wait_for_capacity) 실패 등 내부 abort가 닿지 않는
         // 드문 경로를 위한 2차 best-effort 삭제로 남긴다.
         if let Err(finish_err) = writer.finish().await {
-            return Err(XBackupError::StorageUpload(format!(
+            return Err(XBackupError::StorageUpload(crate::tr!(
+                "'{path}': failed to complete the multipart upload: {finish_err}",
                 "'{path}' 멀티파트 업로드 완료 실패: {finish_err}"
             )));
         }
@@ -281,10 +293,12 @@ impl Storage for S3Compatible {
 
     async fn get_stream(&self, path: &str) -> Result<BoxAsyncRead, XBackupError> {
         let object_path = self.object_path(path);
-        let result =
-            self.inner.get(&object_path).await.map_err(|e| {
-                XBackupError::StorageDownload(format!("'{path}' 다운로드 실패: {e}"))
-            })?;
+        let result = self.inner.get(&object_path).await.map_err(|e| {
+            XBackupError::StorageDownload(crate::tr!(
+                "'{path}': download failed: {e}",
+                "'{path}' 다운로드 실패: {e}"
+            ))
+        })?;
 
         // object_store 바이트 스트림(에러 타입)을 io::Error로 매핑해 StreamReader에 연결.
         let byte_stream = result
@@ -310,7 +324,10 @@ impl Storage for S3Compatible {
         let mut entries = Vec::new();
         while let Some(meta) = stream.next().await {
             let meta = meta.map_err(|e| {
-                XBackupError::StorageDownload(format!("'{prefix}' 목록 조회 실패: {e}"))
+                XBackupError::StorageDownload(crate::tr!(
+                    "'{prefix}': failed to list: {e}",
+                    "'{prefix}' 목록 조회 실패: {e}"
+                ))
             })?;
             entries.push(StorageEntry {
                 // 절대 경로에서 config prefix를 떼어 trait 상대 경로로 되돌린다.
@@ -324,10 +341,12 @@ impl Storage for S3Compatible {
 
     async fn delete(&self, path: &str) -> Result<(), XBackupError> {
         let object_path = self.object_path(path);
-        self.inner
-            .delete(&object_path)
-            .await
-            .map_err(|e| XBackupError::StorageDownload(format!("'{path}' 삭제 실패: {e}")))
+        self.inner.delete(&object_path).await.map_err(|e| {
+            XBackupError::StorageDownload(crate::tr!(
+                "'{path}': delete failed: {e}",
+                "'{path}' 삭제 실패: {e}"
+            ))
+        })
     }
 }
 

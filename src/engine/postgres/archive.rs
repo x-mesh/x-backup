@@ -169,8 +169,12 @@ pub async fn write_end<W: AsyncWrite + Unpin>(w: &mut W) -> Result<()> {
 /// BSON 문서 한 개를 태그와 함께 쓴다(H/Q/T 공용).
 async fn write_doc_frame<W: AsyncWrite + Unpin>(w: &mut W, tag: u8, doc: &Document) -> Result<()> {
     let mut buf = Vec::new();
-    doc.to_writer(&mut buf)
-        .map_err(|e| XBackupError::Failure(format!("PG 아카이브 프레임 직렬화 실패: {e}")))?;
+    doc.to_writer(&mut buf).map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to serialize a PostgreSQL archive frame: {e}",
+            "PG 아카이브 프레임 직렬화 실패: {e}"
+        ))
+    })?;
     w.write_all(&[tag])
         .await
         .map_err(io_err("프레임 태그 쓰기"))?;
@@ -197,7 +201,8 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame> {
         TAG_SEQUENCE => Ok(Frame::Sequence(read_doc(r).await?)),
         TAG_TABLE => Ok(Frame::Table(read_doc(r).await?)),
         TAG_DATA => Ok(Frame::Data(read_data(r).await?)),
-        other => Err(XBackupError::Failure(format!(
+        other => Err(XBackupError::Failure(crate::tr!(
+            "corrupt PostgreSQL archive frame tag: 0x{other:02x}",
             "PG 아카이브 프레임 태그 손상: 0x{other:02x}"
         ))),
     }
@@ -211,7 +216,8 @@ async fn read_doc<R: AsyncRead + Unpin>(r: &mut R) -> Result<Document> {
         .map_err(io_err("프레임 길이 읽기"))?;
     let len = u32::from_le_bytes(len_buf);
     if !(5..=MAX_FRAME_BYTES).contains(&len) {
-        return Err(XBackupError::Failure(format!(
+        return Err(XBackupError::Failure(crate::tr!(
+            "invalid PostgreSQL archive document length: {len} bytes",
             "PG 아카이브 문서 길이 비정상: {len}바이트"
         )));
     }
@@ -220,8 +226,12 @@ async fn read_doc<R: AsyncRead + Unpin>(r: &mut R) -> Result<Document> {
     r.read_exact(&mut buf[4..])
         .await
         .map_err(io_err("프레임 본문 읽기"))?;
-    Document::from_reader(&buf[..])
-        .map_err(|e| XBackupError::Failure(format!("PG 아카이브 프레임 파싱 실패: {e}")))
+    Document::from_reader(&buf[..]).map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to parse a PostgreSQL archive frame: {e}",
+            "PG 아카이브 프레임 파싱 실패: {e}"
+        ))
+    })
 }
 
 /// 길이 프리픽스 데이터 청크를 읽는다.
@@ -232,7 +242,8 @@ async fn read_data<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
         .map_err(io_err("데이터 길이 읽기"))?;
     let len = u32::from_le_bytes(len_buf);
     if len == 0 || len > MAX_FRAME_BYTES {
-        return Err(XBackupError::Failure(format!(
+        return Err(XBackupError::Failure(crate::tr!(
+            "invalid PostgreSQL archive data length: {len} bytes",
             "PG 아카이브 데이터 길이 비정상: {len}바이트"
         )));
     }
@@ -250,7 +261,12 @@ pub async fn write_data_bytes<W: AsyncWrite + Unpin>(w: &mut W, chunk: &Bytes) -
 
 /// IO 에러를 XBackupError로 감싸는 헬퍼.
 fn io_err(ctx: &'static str) -> impl Fn(std::io::Error) -> XBackupError {
-    move |e| XBackupError::Failure(format!("PG 아카이브 {ctx} 실패: {e}"))
+    move |e| {
+        XBackupError::Failure(crate::tr!(
+            "PostgreSQL archive {ctx} failed: {e}",
+            "PG 아카이브 {ctx} 실패: {e}"
+        ))
+    }
 }
 
 #[cfg(test)]

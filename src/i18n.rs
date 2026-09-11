@@ -11,7 +11,7 @@
 //! println!("{}", lang.sel("Backup complete", "백업 완료"));  // 설명: 토글
 //! ```
 
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 use clap::ValueEnum;
 
@@ -75,19 +75,34 @@ pub fn resolve_from_toml(flag: Option<Lang>, config_toml: Option<&str>) -> Lang 
 /// 끼워 넣는 것은 비용이 이득보다 크다. 그래서 서브커맨드가 시작할 때 언어를 한 번
 /// 정해 두고, 그 지점들이 여기서 읽어 간다.
 ///
-/// [`OnceLock`]이라 한 번만 정해지고, 정해지기 전에 읽으면 기본값 `En`이다. 테스트는
-/// 프로세스를 공유하므로 [`active`]에 의존하는 단정을 쓰지 않는다 — 순수 함수인
-/// [`Lang::sel`]에 언어를 직접 넘겨 검증한다.
-static ACTIVE: OnceLock<Lang> = OnceLock::new();
+/// **한 번만 정해지는 값이 아니라 여러 번 다시 정할 수 있다** — `OnceLock`에서
+/// `Mutex`로 바꾼 이유가 그것이다. 서브커맨드 핸들러는 보통 이렇게 두 단계를 거친다:
+///
+/// 1. `--config`를 읽기 **전에** CLI `--lang`만으로 한 번 정한다. config를 읽다가
+///    실패해도(파일 없음 등) 이 시점에 정한 언어로 에러 라벨과 본문이 나온다.
+/// 2. config를 성공적으로 읽으면 그 안의 `[output].language`까지 반영해
+///    [`activate_from_toml`]로 다시 정한다.
+///
+/// `OnceLock`이던 시절엔 1번이 2번을 막아 버렸다 — config를 못 읽는 에러 경로에서
+/// `--lang ko`를 줘도 라벨(`main`이 붙이는 `usage error:` 등)이 항상 영어로 고정되는
+/// 회귀가 실측됐다(1번 호출이 없으면 기본값 `En`으로 굳고, 있으면 그 값에 영원히 갇힘).
+///
+/// 정해지기 전에 읽으면 기본값 `En`이다. 테스트는 프로세스를 공유하므로 [`active`]에
+/// 의존하는 단정을 쓰지 않는다 — 순수 함수인 [`Lang::sel`]에 언어를 직접 넘겨 검증한다.
+static ACTIVE: Mutex<Lang> = Mutex::new(Lang::En);
 
-/// 전역 출력 언어를 정한다. 첫 호출만 반영되고 이후 호출은 조용히 무시된다.
+/// 전역 출력 언어를 (다시) 정한다. 이전 값을 덮어쓴다.
 pub fn set_active(lang: Lang) {
-    let _ = ACTIVE.set(lang);
+    if let Ok(mut guard) = ACTIVE.lock() {
+        *guard = lang;
+    }
+    // 락이 poison됐으면(다른 스레드의 panic) 조용히 무시한다 — 언어 설정은
+    // best-effort이고, 실패해도 [`active`]는 여전히 기본값을 안전하게 돌려준다.
 }
 
 /// 전역 출력 언어. 아직 정해지지 않았으면 기본 `En`.
 pub fn active() -> Lang {
-    ACTIVE.get().copied().unwrap_or_default()
+    ACTIVE.lock().map(|g| *g).unwrap_or_default()
 }
 
 /// [`resolve`]에 [`set_active`]를 붙인 것. 서브커맨드 진입부에서 쓴다.
@@ -110,6 +125,11 @@ pub fn activate_from_toml(flag: Option<Lang>, config_toml: Option<&str>) -> Lang
 /// 양쪽을 다 `format!`해 놓고 하나를 버리게 된다. 이 매크로는 고른 쪽만 포맷한다.
 /// 인자는 인라인 캡처를 그대로 쓴다 — `tr!("failed: {e}", "실패: {e}")`.
 ///
+/// 위치 인자도 받는다 — `tr!("failed ({}): {e}", "실패({}): {e}", path.display())`.
+/// en/ko 두 포맷 문자열이 같은 위치 인자 목록을 공유한다(둘 다 `{}` 개수가 같아야
+/// 한다). `path.display()`처럼 인라인 캡처로 옮기기 번거로운 표현식을 위한 경로다 —
+/// 대부분은 인라인 캡처 쪽(위 형태)을 쓴다.
+///
 /// 언어를 인자로 받을 수 있는 자리에서는 이걸 쓰지 말고 [`Lang::sel`]에 그 언어를
 /// 직접 넘긴다. 전역 상태에 기대는 범위를 좁게 유지하려는 것이다.
 #[macro_export]
@@ -118,6 +138,39 @@ macro_rules! tr {
         match $crate::i18n::active() {
             $crate::i18n::Lang::En => format!($en),
             $crate::i18n::Lang::Ko => format!($ko),
+        }
+    };
+    ($en:expr, $ko:expr, $($arg:expr),+ $(,)?) => {
+        match $crate::i18n::active() {
+            $crate::i18n::Lang::En => format!($en, $($arg),+),
+            $crate::i18n::Lang::Ko => format!($ko, $($arg),+),
+        }
+    };
+}
+
+/// [`tr!`]과 같지만 전역 언어 대신 **주어진 언어**로 고른다.
+///
+/// 서브커맨드 핸들러는 보통 `--config`를 읽어 `[output].language`까지 본 뒤에야
+/// [`activate_from_toml`]로 전역 언어를 정한다. 그런데 그 config를 읽는 도중 실패하면
+/// — 파일이 없거나 읽기 권한이 없으면 — 이 에러는 전역 언어가 정해지기 **전에** 만들어
+/// 진다. 그 자리에서 [`tr!`]을 쓰면 `active()`가 항상 기본값(`En`)을 돌려주므로
+/// `--lang ko`를 줘도 영어로 나온다(회귀로 실측됨: config 부재/읽기 실패 두 경로).
+///
+/// 이 시점엔 config 내용을 아직 못 읽었으니 그 안의 `[output].language`는 알 수 없고,
+/// 알 수 있는 건 CLI `--lang`(`lang_flag`)뿐이다. 그래서 이 매크로는 전역 상태를 읽지
+/// 않고 첫 인자로 받은 언어(대개 `lang_flag.unwrap_or_default()`)로 직접 고른다.
+#[macro_export]
+macro_rules! tr_lang {
+    ($lang:expr, $en:expr, $ko:expr $(,)?) => {
+        match $lang {
+            $crate::i18n::Lang::En => format!($en),
+            $crate::i18n::Lang::Ko => format!($ko),
+        }
+    };
+    ($lang:expr, $en:expr, $ko:expr, $($arg:expr),+ $(,)?) => {
+        match $lang {
+            $crate::i18n::Lang::En => format!($en, $($arg),+),
+            $crate::i18n::Lang::Ko => format!($ko, $($arg),+),
         }
     };
 }
@@ -130,6 +183,26 @@ mod tests {
     fn sel_picks_by_language() {
         assert_eq!(Lang::En.sel("size", "크기"), "size");
         assert_eq!(Lang::Ko.sel("size", "크기"), "크기");
+    }
+
+    /// `tr!`은 활성 언어 쪽만 포맷한다 — 인라인 캡처, 위치 인자 둘 다 같은 규칙을
+    /// 따르는지 본다. `active()`는 프로세스 전역(`OnceLock`)이라 다른 테스트가 먼저
+    /// 정했을 수 있으므로, 특정 언어로 고정하지 않고 "지금 활성 언어에 맞는 쪽이
+    /// 나온다"만 검증한다.
+    #[test]
+    fn tr_macro_formats_only_the_active_language() {
+        let e = "boom";
+        let expect_inline = match active() {
+            Lang::En => format!("failed: {e}"),
+            Lang::Ko => format!("실패: {e}"),
+        };
+        assert_eq!(tr!("failed: {e}", "실패: {e}"), expect_inline);
+
+        let expect_positional = match active() {
+            Lang::En => format!("failed ({})", 42),
+            Lang::Ko => format!("실패({})", 42),
+        };
+        assert_eq!(tr!("failed ({})", "실패({})", 42), expect_positional);
     }
 
     #[test]

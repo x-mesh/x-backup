@@ -33,6 +33,11 @@ pub async fn handle(
     lang_flag: Option<crate::i18n::Lang>,
     args: RestoreArgs,
 ) -> Result<()> {
+    // lock 충돌·config 부재/읽기 실패로 activate 전에 끝날 수 있는 경로들도 --lang을
+    // 따르도록 미리 잡아 둔다(§tr_lang! 주석 참고). config가 읽히면 아래(또는 handle_pitr
+    // 안)에서 다시 정한다.
+    crate::i18n::set_active(lang_flag.unwrap_or_default());
+
     // 동시 실행 잠금(FR-12) — 같은 프로파일의 backup/restore/prune과 직렬화한다.
     // PITR·풀 복구 양쪽을 덮도록 --at 분기보다 먼저 잡고, 가드(_lock)를 끝까지 유지한다.
     let _lock = crate::lock::acquire(&args.profile)?;
@@ -46,7 +51,12 @@ pub async fn handle(
     // 1) config 로드 + 레이어 병합(file + ENV).
     let config_toml = match &config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
-            XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
+            XBackupError::Config(crate::tr_lang!(
+                lang_flag.unwrap_or_default(),
+                "failed to read the config file ({}): {e}",
+                "config 파일 읽기 실패({}): {e}",
+                path.display()
+            ))
         })?),
         None => None,
     };
@@ -395,7 +405,10 @@ async fn resolve_backup_id(
     }
     match crate::cli::picker::pick_backup(&choices, lang).await? {
         Some(id) => Ok(Some(id)),
-        None => Err(XBackupError::Failure("백업 선택을 취소했습니다".into())),
+        None => Err(XBackupError::Failure(crate::tr!(
+            "cancelled the backup selection",
+            "백업 선택을 취소했습니다"
+        ))),
     }
 }
 
@@ -711,9 +724,7 @@ async fn handle_pg_pitr(
     lang: Lang,
 ) -> Result<()> {
     if args.only.is_some() {
-        return Err(XBackupError::Usage(
-            "PG 시점 복구(--at)는 --only(선택적 복구)와 함께 쓸 수 없습니다".into(),
-        ));
+        return Err(XBackupError::Usage(crate::tr!("PostgreSQL point-in-time restore (--at) cannot be combined with --only (selective restore)", "PG 시점 복구(--at)는 --only(선택적 복구)와 함께 쓸 수 없습니다")));
     }
 
     let mode = crate::cli::output::context_mode(args.json);
@@ -812,9 +823,10 @@ async fn handle_mysql_pitr(
     lang: Lang,
 ) -> Result<()> {
     if args.only.is_some() {
-        return Err(XBackupError::Usage(
-            "MySQL 시점 복구(--at)는 --only(선택적 복구)와 함께 쓸 수 없습니다".into(),
-        ));
+        return Err(XBackupError::Usage(crate::tr!(
+            "MySQL point-in-time restore (--at) cannot be combined with --only (selective restore)",
+            "MySQL 시점 복구(--at)는 --only(선택적 복구)와 함께 쓸 수 없습니다"
+        )));
     }
 
     let mode = crate::cli::output::context_mode(args.json);
@@ -1153,7 +1165,8 @@ fn resolve_restore_target(
                 overrides,
             })?;
             let uri = tcfg.resolved_uri.ok_or_else(|| {
-                XBackupError::Config(format!(
+                XBackupError::Config(crate::tr!(
+                    "target profile '{tp}' has no source.uri/uri_env",
                     "target 프로파일 '{tp}'에 source.uri/uri_env가 없습니다"
                 ))
             })?;
@@ -1161,11 +1174,8 @@ fn resolve_restore_target(
         }
         (None, None) => {
             let uri = resolved.resolved_uri.clone().ok_or_else(|| {
-                XBackupError::Config(format!(
-                    "프로파일 '{}'에 source.uri/uri_env가 없고 --target/--target-profile도 \
-                     지정되지 않았습니다",
-                    resolved.profile_name
-                ))
+                XBackupError::Config(crate::tr!("profile '{}' has no source.uri/uri_env, and neither --target nor --target-profile was given", "프로파일 '{}'에 source.uri/uri_env가 없고 --target/--target-profile도 \
+                     지정되지 않았습니다", resolved.profile_name))
             })?;
             Ok((uri, RestoreTargetOrigin::InPlace))
         }
@@ -1188,7 +1198,11 @@ fn resolve_target_and_storage(
 )> {
     let config_toml = match config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
-            XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
+            XBackupError::Config(crate::tr!(
+                "failed to read the config file ({}): {e}",
+                "config 파일 읽기 실패({}): {e}",
+                path.display()
+            ))
         })?),
         None => None,
     };
@@ -1229,12 +1243,11 @@ fn select_restore_storage(
 ) -> Result<Box<dyn Storage>> {
     let dest = choose_destination(profile, from)?;
     if dest.r#type.is_none() {
-        return Err(XBackupError::Usage(format!(
-            "프로파일 '{profile_name}'은(는) 백업 store(dest)가 없어 복구 소스가 될 수 없습니다\
+        return Err(XBackupError::Usage(crate::tr!("profile '{profile_name}' has no backup store (dest), so it cannot be a restore source (it is endpoint-only — for a restore/migration target). To restore onto this server, name the profile that has backups as the source and this profile as the target:
+ x-backup restore --profile <backup-profile> --target-profile {profile_name}", "프로파일 '{profile_name}'은(는) 백업 store(dest)가 없어 복구 소스가 될 수 없습니다\
              (endpoint 전용 — 복구/이관 대상용). 이 서버로 복구하려면 백업을 가진 프로파일을 \
              소스로, 이 프로파일을 대상으로 지정하세요:\n  \
-             x-backup restore --profile <백업프로파일> --target-profile {profile_name}"
-        )));
+             x-backup restore --profile <백업프로파일> --target-profile {profile_name}")));
     }
     from_config(dest)
 }
@@ -1257,7 +1270,8 @@ fn choose_destination<'a>(
             .ok_or_else(|| {
                 let avail: Vec<String> =
                     dests.iter().enumerate().map(|(i, d)| d.label(i)).collect();
-                XBackupError::Config(format!(
+                XBackupError::Config(crate::tr!(
+                    "no destination matches --from '{name}' (available: {})",
                     "--from '{name}'에 해당하는 destination이 없습니다(가용: {})",
                     avail.join(", ")
                 ))

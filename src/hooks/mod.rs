@@ -167,7 +167,8 @@ impl HookSet {
                 tracing::info!(hook = event.as_str(), "게이트 훅 통과");
                 Ok(())
             }
-            Ok(status) => Err(XBackupError::Failure(format!(
+            Ok(status) => Err(XBackupError::Failure(crate::tr!(
+                "the {} hook blocked the operation with a non-zero exit (code {})",
                 "{} 훅이 비-0 종료(code {})로 작업을 차단했습니다",
                 event.as_str(),
                 status.code().unwrap_or(-1)
@@ -229,9 +230,12 @@ impl HookSet {
         #[cfg(unix)]
         command.process_group(0);
 
-        let child = command
-            .spawn()
-            .map_err(|e| XBackupError::Failure(format!("훅 프로세스 시작 실패: {e}")))?;
+        let child = command.spawn().map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to start the hook process: {e}",
+                "훅 프로세스 시작 실패: {e}"
+            ))
+        })?;
         // wait_with_output이 child를 소비하므로 pid(=pgid)를 미리 확보한다.
         #[cfg(unix)]
         let pgid = child.id();
@@ -241,7 +245,10 @@ impl HookSet {
                 log_hook_output(&output);
                 Ok(output.status)
             }
-            Ok(Err(e)) => Err(XBackupError::Failure(format!("훅 실행 오류: {e}"))),
+            Ok(Err(e)) => Err(XBackupError::Failure(crate::tr!(
+                "hook execution error: {e}",
+                "훅 실행 오류: {e}"
+            ))),
             Err(_elapsed) => {
                 // future drop → kill_on_drop이 직계 sh를 죽인다. 손자까지 확실히 정리하려고
                 // 프로세스 그룹 전체(-pgid)에 SIGKILL을 보낸다.
@@ -253,7 +260,8 @@ impl HookSet {
                         libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
                     }
                 }
-                Err(XBackupError::Failure(format!(
+                Err(XBackupError::Failure(crate::tr!(
+                    "hook timed out (exceeded {}s) — the process was killed",
                     "훅 타임아웃({}초 초과) — 프로세스를 종료했습니다",
                     self.timeout().as_secs()
                 )))
@@ -390,7 +398,11 @@ mod tests {
             .unwrap_err();
         // 게이트 차단은 작업 실패(exit 1)로 매핑된다.
         assert_eq!(err.exit_code(), 1);
-        assert!(err.to_string().contains("차단"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("blocked") || msg.contains("차단"),
+            "message: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -451,7 +463,11 @@ mod tests {
             .run_gate(HookEvent::PreBackup, &ctx())
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("타임아웃"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("timed out") || msg.contains("타임아웃"),
+            "message: {msg}"
+        );
     }
 
     #[tokio::test]

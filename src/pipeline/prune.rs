@@ -451,7 +451,8 @@ async fn delete_if_exists(storage: &dyn Storage, path: &str) -> Result<()> {
                 tracing::debug!(path = %path, "삭제 대상이 이미 없음(무시)");
                 Ok(())
             } else {
-                Err(XBackupError::StorageDownload(format!(
+                Err(XBackupError::StorageDownload(crate::tr!(
+                    "'{path}': delete failed: {e}",
                     "'{path}' 삭제 실패: {e}"
                 )))
             }

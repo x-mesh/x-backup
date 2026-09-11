@@ -149,7 +149,12 @@ pub async fn plan_migrate(request: &MigrateRequest) -> Result<MigratePlan> {
 
     let target = MongoMeta::connect(&request.target_uri, request.timeout_secs)
         .await
-        .map_err(|e| XBackupError::PrecheckFailed(format!("target 연결 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::PrecheckFailed(crate::tr!(
+                "failed to connect to the target: {e}",
+                "target 연결 실패: {e}"
+            ))
+        })?;
     let target_meta = target.server_meta().await?;
 
     // 서버 버전 메이저 불일치는 경고(마이그레이션을 막지는 않음).
@@ -204,21 +209,15 @@ where
     match migrate_guard(target_had_data, request.drop, force) {
         GuardOutcome::Proceed => {}
         GuardOutcome::NeedDrop => {
-            return Err(XBackupError::Usage(format!(
-                "target에 기존 데이터가 있습니다({}개 네임스페이스). 마이그레이션은 교체를 \
+            return Err(XBackupError::Usage(crate::tr!("the target already has existing data ({} namespace(s)). Migration means replacement, so it requires --drop (a copy without --drop is an awkward merge). Move to an empty target, or use --drop --force.", "target에 기존 데이터가 있습니다({}개 네임스페이스). 마이그레이션은 교체를 \
                  의미하므로 --drop이 필요합니다(--drop 없는 복사는 어중간한 merge가 됩니다). \
-                 빈 target으로 옮기거나 --drop --force를 쓰세요.",
-                plan.conflicting_namespaces.len()
-            )));
+                 빈 target으로 옮기거나 --drop --force를 쓰세요.", plan.conflicting_namespaces.len())));
         }
         GuardOutcome::NeedConfirm => {
             // --drop은 파괴적이므로 --force가 없으면 TTY 대화형 확인을 받는다.
             if !(is_tty && confirm(&plan)) {
-                return Err(XBackupError::Failure(
-                    "target 기존 데이터를 --drop으로 교체하려면 --force 또는 대화형 확인이 \
-                     필요합니다(프로덕션 가드레일)."
-                        .into(),
-                ));
+                return Err(XBackupError::Failure(crate::tr!("replacing the target's existing data with --drop requires --force or an interactive confirmation (a production guardrail).", "target 기존 데이터를 --drop으로 교체하려면 --force 또는 대화형 확인이 \
+                     필요합니다(프로덕션 가드레일).")));
             }
         }
     }
@@ -254,9 +253,18 @@ async fn native_transfer(request: &MigrateRequest, plan: &MigratePlan) -> Result
     // target 드라이버 클라이언트(복구 경로와 동일 정책).
     let options = conn::client_options(&request.target_uri, request.timeout_secs)
         .await
-        .map_err(|e| XBackupError::PrecheckFailed(format!("target 연결 준비 실패: {e}")))?;
-    let client = Client::with_options(options)
-        .map_err(|e| XBackupError::Failure(format!("target 클라이언트 생성 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::PrecheckFailed(crate::tr!(
+                "failed to prepare the target connection: {e}",
+                "target 연결 준비 실패: {e}"
+            ))
+        })?;
+    let client = Client::with_options(options).map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to create the target client: {e}",
+            "target 클라이언트 생성 실패: {e}"
+        ))
+    })?;
 
     let restore_res = native_restore(&mut stream, &client, request.drop, plan.ns.as_deref()).await;
     // 리더를 닫아 덤프 task가 EOF/BrokenPipe로 끝나게 한 뒤 결과를 회수한다.
@@ -308,7 +316,8 @@ async fn mongodump_transfer(request: &MigrateRequest, plan: &MigratePlan) -> Res
         // 파이프 실패: 양쪽 프로세스를 kill+wait로 정리(좀비 방지).
         dump.abort().await;
         restore.abort().await;
-        return Err(XBackupError::Failure(format!(
+        return Err(XBackupError::Failure(crate::tr!(
+            "migration streaming failed: {copy_err}",
             "마이그레이션 스트리밍 실패: {copy_err}"
         )));
     }
@@ -326,7 +335,12 @@ pub async fn plan_pg_migrate(request: &MigrateRequest) -> Result<MigratePlan> {
     let src = pg_meta::connect(&request.source_uri, request.timeout_secs).await?;
     let tgt = pg_meta::connect(&request.target_uri, request.timeout_secs)
         .await
-        .map_err(|e| XBackupError::PrecheckFailed(format!("target 연결 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::PrecheckFailed(crate::tr!(
+                "failed to connect to the target: {e}",
+                "target 연결 실패: {e}"
+            ))
+        })?;
     let source_server_version = pg_server_version(src.client()).await;
     let target_server_version = pg_server_version(tgt.client()).await;
     let version_warning = version_compat_warning(&source_server_version, &target_server_version);
@@ -334,9 +348,12 @@ pub async fn plan_pg_migrate(request: &MigrateRequest) -> Result<MigratePlan> {
     let ns = ns_of(&request.db, &request.collection);
     // 충돌 감지는 **하드 에러** 존재 질의로 — count(best-effort)와 분리해 가드 무력화를 막는다(리뷰 #2).
     let conflicting_namespaces = {
-        let names = pg_meta::list_qualified(tgt.client())
-            .await
-            .map_err(|e| XBackupError::PrecheckFailed(format!("target 테이블 열거 실패: {e}")))?;
+        let names = pg_meta::list_qualified(tgt.client()).await.map_err(|e| {
+            XBackupError::PrecheckFailed(crate::tr!(
+                "failed to enumerate the target's tables: {e}",
+                "target 테이블 열거 실패: {e}"
+            ))
+        })?;
         filter_names(names, &ns)
     };
     // 표시용 카운트는 best-effort(조회 실패해도 계획 출력은 계속).
@@ -387,20 +404,14 @@ where
     match migrate_guard(target_had_data, request.drop, force) {
         GuardOutcome::Proceed => {}
         GuardOutcome::NeedDrop => {
-            return Err(XBackupError::Usage(format!(
-                "target에 기존 테이블이 있습니다({}개). 마이그레이션은 교체를 의미하므로 \
+            return Err(XBackupError::Usage(crate::tr!("the target already has {} existing table(s). Migration means replacement, so it requires --drop (a copy without --drop is an awkward merge). Move to an empty target, or use --drop --force.", "target에 기존 테이블이 있습니다({}개). 마이그레이션은 교체를 의미하므로 \
                  --drop이 필요합니다(--drop 없는 복사는 어중간한 merge가 됩니다). \
-                 빈 target으로 옮기거나 --drop --force를 쓰세요.",
-                plan.conflicting_namespaces.len()
-            )));
+                 빈 target으로 옮기거나 --drop --force를 쓰세요.", plan.conflicting_namespaces.len())));
         }
         GuardOutcome::NeedConfirm => {
             if !(is_tty && confirm(&plan)) {
-                return Err(XBackupError::Failure(
-                    "target 기존 테이블을 --drop으로 교체하려면 --force 또는 대화형 확인이 \
-                     필요합니다(프로덕션 가드레일)."
-                        .into(),
-                ));
+                return Err(XBackupError::Failure(crate::tr!("replacing the target's existing tables with --drop requires --force or an interactive confirmation (a production guardrail).", "target 기존 테이블을 --drop으로 교체하려면 --force 또는 대화형 확인이 \
+                     필요합니다(프로덕션 가드레일).")));
             }
         }
     }
@@ -411,7 +422,12 @@ where
     let handle = stream.handle();
     let tgt = pg_meta::connect(&request.target_uri, request.timeout_secs)
         .await
-        .map_err(|e| XBackupError::PrecheckFailed(format!("target 연결 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::PrecheckFailed(crate::tr!(
+                "failed to connect to the target: {e}",
+                "target 연결 실패: {e}"
+            ))
+        })?;
     let restore_res = pg_restore::restore_into(&mut stream, tgt.client(), request.drop).await;
     drop(stream);
     let dump_res = handle.finish().await;
@@ -419,7 +435,8 @@ where
     let inserted = match (restore_res, dump_res) {
         (Ok(n), Ok(())) => n,
         (Err(re), Err(de)) => {
-            return Err(XBackupError::Failure(format!(
+            return Err(XBackupError::Failure(crate::tr!(
+                "restore failed: {re} (the dump also failed — possibly the cause: {de})",
                 "복구 실패: {re} (덤프도 실패 — 원인일 수 있음: {de})"
             )))
         }
@@ -489,16 +506,24 @@ pub async fn plan_mysql_migrate(request: &MigrateRequest) -> Result<MigratePlan>
     let mut src = my_meta::connect(&request.source_uri, request.timeout_secs).await?;
     let mut tgt = my_meta::connect(&request.target_uri, request.timeout_secs)
         .await
-        .map_err(|e| XBackupError::PrecheckFailed(format!("target 연결 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::PrecheckFailed(crate::tr!(
+                "failed to connect to the target: {e}",
+                "target 연결 실패: {e}"
+            ))
+        })?;
     let source_server_version = mysql_server_version(src.conn_mut()).await;
     let target_server_version = mysql_server_version(tgt.conn_mut()).await;
     let version_warning = version_compat_warning(&source_server_version, &target_server_version);
 
     let ns = ns_of(&request.db, &request.collection);
     let conflicting_namespaces = {
-        let names = my_meta::list_qualified(tgt.conn_mut())
-            .await
-            .map_err(|e| XBackupError::PrecheckFailed(format!("target 테이블 열거 실패: {e}")))?;
+        let names = my_meta::list_qualified(tgt.conn_mut()).await.map_err(|e| {
+            XBackupError::PrecheckFailed(crate::tr!(
+                "failed to enumerate the target's tables: {e}",
+                "target 테이블 열거 실패: {e}"
+            ))
+        })?;
         filter_names(names, &ns)
     };
     let source_counts = filter_counts(
@@ -547,19 +572,13 @@ where
     match migrate_guard(target_had_data, request.drop, force) {
         GuardOutcome::Proceed => {}
         GuardOutcome::NeedDrop => {
-            return Err(XBackupError::Usage(format!(
-                "target에 기존 테이블이 있습니다({}개). 마이그레이션은 교체를 의미하므로 \
-                 --drop이 필요합니다. 빈 target으로 옮기거나 --drop --force를 쓰세요.",
-                plan.conflicting_namespaces.len()
-            )));
+            return Err(XBackupError::Usage(crate::tr!("the target already has {} existing table(s). Migration means replacement, so it requires --drop. Move to an empty target, or use --drop --force.", "target에 기존 테이블이 있습니다({}개). 마이그레이션은 교체를 의미하므로 \
+                 --drop이 필요합니다. 빈 target으로 옮기거나 --drop --force를 쓰세요.", plan.conflicting_namespaces.len())));
         }
         GuardOutcome::NeedConfirm => {
             if !(is_tty && confirm(&plan)) {
-                return Err(XBackupError::Failure(
-                    "target 기존 테이블을 --drop으로 교체하려면 --force 또는 대화형 확인이 \
-                     필요합니다(프로덕션 가드레일)."
-                        .into(),
-                ));
+                return Err(XBackupError::Failure(crate::tr!("replacing the target's existing tables with --drop requires --force or an interactive confirmation (a production guardrail).", "target 기존 테이블을 --drop으로 교체하려면 --force 또는 대화형 확인이 \
+                     필요합니다(프로덕션 가드레일).")));
             }
         }
     }
@@ -570,14 +589,20 @@ where
     let handle = stream.handle();
     let mut tgt = MysqlClient::connect(&request.target_uri, request.timeout_secs)
         .await
-        .map_err(|e| XBackupError::PrecheckFailed(format!("target 연결 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::PrecheckFailed(crate::tr!(
+                "failed to connect to the target: {e}",
+                "target 연결 실패: {e}"
+            ))
+        })?;
     let restore_res = restore_into(&mut stream, tgt.conn_mut(), request.drop).await;
     drop(stream);
     let dump_res = handle.finish().await;
     let inserted = match (restore_res, dump_res) {
         (Ok(n), Ok(_)) => n,
         (Err(re), Err(de)) => {
-            return Err(XBackupError::Failure(format!(
+            return Err(XBackupError::Failure(crate::tr!(
+                "restore failed: {re} (the dump also failed — possibly the cause: {de})",
                 "복구 실패: {re} (덤프도 실패 — 원인일 수 있음: {de})"
             )))
         }

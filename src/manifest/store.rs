@@ -64,8 +64,12 @@ impl<'a> ManifestStore<'a> {
 
         // manifest를 직렬화한다. 사이드카는 *직렬화된 바이트*의 sha256이어야
         // 하므로(파일을 그대로 검증), 같은 바이트로 양쪽을 만든다.
-        let bytes = serde_json::to_vec_pretty(manifest)
-            .map_err(|e| XBackupError::Failure(format!("manifest 직렬화 실패: {e}")))?;
+        let bytes = serde_json::to_vec_pretty(manifest).map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to serialize the manifest: {e}",
+                "manifest 직렬화 실패: {e}"
+            ))
+        })?;
         let sidecar = sidecar_checksum(&bytes);
 
         // 1) manifest.json
@@ -94,8 +98,12 @@ impl<'a> ManifestStore<'a> {
     /// manifest.json을 읽어 역직렬화한다(list/verify 경로).
     pub async fn read(&self, backup_id: &str) -> Result<BackupManifest> {
         let bytes = read_all(self.storage, &manifest_path(backup_id)).await?;
-        serde_json::from_slice(&bytes)
-            .map_err(|e| XBackupError::Failure(format!("manifest 파싱 실패({backup_id}): {e}")))
+        serde_json::from_slice(&bytes).map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to parse the manifest ({backup_id}): {e}",
+                "manifest 파싱 실패({backup_id}): {e}"
+            ))
+        })
     }
 }
 
@@ -123,10 +131,12 @@ async fn read_all(storage: &dyn Storage, path: &str) -> Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
     let mut reader = storage.get_stream(path).await?;
     let mut buf = Vec::new();
-    reader
-        .read_to_end(&mut buf)
-        .await
-        .map_err(|e| XBackupError::StorageDownload(format!("'{path}' 읽기 실패: {e}")))?;
+    reader.read_to_end(&mut buf).await.map_err(|e| {
+        XBackupError::StorageDownload(crate::tr!(
+            "'{path}': failed to read: {e}",
+            "'{path}' 읽기 실패: {e}"
+        ))
+    })?;
     Ok(buf)
 }
 

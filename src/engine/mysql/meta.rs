@@ -22,10 +22,18 @@ pub async fn connect(uri: &Secret, timeout_secs: Option<u64>) -> Result<MysqlCli
 pub async fn current_db(conn: &mut Conn) -> Result<String> {
     conn.query_first::<Option<String>, _>("SELECT DATABASE()")
         .await
-        .map_err(|e| XBackupError::Failure(format!("현재 데이터베이스 조회 실패: {e}")))?
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to query the current database: {e}",
+                "현재 데이터베이스 조회 실패: {e}"
+            ))
+        })?
         .flatten()
         .ok_or_else(|| {
-            XBackupError::Usage("URI에 데이터베이스가 지정되어야 합니다(mysql://.../<db>)".into())
+            XBackupError::Usage(crate::tr!(
+                "the URI must name a database (mysql://.../<db>)",
+                "URI에 데이터베이스가 지정되어야 합니다(mysql://.../<db>)"
+            ))
         })
 }
 
@@ -36,7 +44,12 @@ async fn list_tables(conn: &mut Conn) -> Result<Vec<String>> {
          WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME",
     )
     .await
-    .map_err(|e| XBackupError::Failure(format!("테이블 목록 조회 실패: {e}")))
+    .map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to list tables: {e}",
+            "테이블 목록 조회 실패: {e}"
+        ))
+    })
 }
 
 /// 사용자 테이블의 `db.table` 목록 — migrate 충돌 감지용(실패는 하드 에러로 전파).
@@ -59,7 +72,12 @@ pub async fn table_counts_exact(conn: &mut Conn) -> Result<Vec<(String, u64)>> {
         let count: u64 = conn
             .query_first(format!("SELECT COUNT(*) FROM {quoted}"))
             .await
-            .map_err(|e| XBackupError::Failure(format!("{db}.{table} count 실패: {e}")))?
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "{db}.{table}: count failed: {e}",
+                    "{db}.{table} count 실패: {e}"
+                ))
+            })?
             .unwrap_or(0);
         out.push((format!("{db}.{table}"), count));
     }
@@ -75,7 +93,12 @@ pub async fn table_counts_estimated(conn: &mut Conn) -> Result<Vec<(String, u64)
          WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE' ORDER BY 1",
     )
     .await
-    .map_err(|e| XBackupError::Failure(format!("행 수 추정 조회 실패: {e}")))
+    .map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to estimate the row count: {e}",
+            "행 수 추정 조회 실패: {e}"
+        ))
+    })
 }
 
 /// 현재 데이터베이스의 논리 크기(바이트) — `SUM(data_length + index_length)`.
@@ -86,7 +109,12 @@ pub async fn data_size_bytes(conn: &mut Conn) -> Result<u64> {
              FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("DB 크기 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to query the database size: {e}",
+                "DB 크기 조회 실패: {e}"
+            ))
+        })?;
     Ok(sz.unwrap_or(0))
 }
 
@@ -95,9 +123,12 @@ pub async fn data_size_bytes(conn: &mut Conn) -> Result<u64> {
 /// `ns`는 `db.table`. PK가 있으면 그 역순(`PK DESC`)으로 "가장 최근 삽입에 가까운" 행을 본다
 /// (AUTO_INCREMENT 가정 — 정확한 시간순은 아님). 바이너리는 `0x..`, 그 외는 문자열로 표현한다.
 pub async fn latest_rows(conn: &mut Conn, ns: &str, limit: i64) -> Result<Vec<String>> {
-    let (db, table) = ns
-        .split_once('.')
-        .ok_or_else(|| XBackupError::Usage(format!("네임스페이스 형식 오류: '{ns}'(db.table)")))?;
+    let (db, table) = ns.split_once('.').ok_or_else(|| {
+        XBackupError::Usage(crate::tr!(
+            "malformed namespace: '{ns}' (db.table)",
+            "네임스페이스 형식 오류: '{ns}'(db.table)"
+        ))
+    })?;
     let quoted = quote_qualified(db, table);
 
     // 컬럼(이름 + 카테고리).
@@ -108,7 +139,12 @@ pub async fn latest_rows(conn: &mut Conn, ns: &str, limit: i64) -> Result<Vec<St
             (db, table),
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("{ns} 컬럼 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "{ns}: failed to query columns: {e}",
+                "{ns} 컬럼 조회 실패: {e}"
+            ))
+        })?;
     if cols.is_empty() {
         return Ok(Vec::new());
     }
@@ -132,7 +168,12 @@ pub async fn latest_rows(conn: &mut Conn, ns: &str, limit: i64) -> Result<Vec<St
             (db, table),
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("{ns} PK 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "{ns}: failed to query the primary key: {e}",
+                "{ns} PK 조회 실패: {e}"
+            ))
+        })?;
     let order = if pk.is_empty() {
         String::new()
     } else {
@@ -145,10 +186,12 @@ pub async fn latest_rows(conn: &mut Conn, ns: &str, limit: i64) -> Result<Vec<St
     };
 
     let sql = format!("SELECT {select_list} FROM {quoted}{order} LIMIT {limit}");
-    let rows: Vec<Row> = conn
-        .query(sql)
-        .await
-        .map_err(|e| XBackupError::Failure(format!("{ns} 최신 행 조회 실패: {e}")))?;
+    let rows: Vec<Row> = conn.query(sql).await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "{ns}: failed to query the latest row: {e}",
+            "{ns} 최신 행 조회 실패: {e}"
+        ))
+    })?;
     Ok(rows
         .iter()
         .map(|row| row_to_json(row, &col_names, &cats))

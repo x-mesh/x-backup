@@ -25,13 +25,22 @@ pub async fn handle(
     lang_flag: Option<crate::i18n::Lang>,
     args: MigrateArgs,
 ) -> Result<()> {
+    // lock 충돌·config 부재/읽기 실패로 activate 전에 끝날 수 있는 경로들도 --lang을
+    // 따르도록 미리 잡아 둔다(§tr_lang! 주석 참고). config가 읽히면 아래에서 다시 정한다.
+    crate::i18n::set_active(lang_flag.unwrap_or_default());
+
     // source를 동시에 dump하지 않도록 같은 프로파일 작업과 직렬화한다(FR-12).
     let _lock = crate::lock::acquire(&args.profile)?;
 
     // 1) config 로드 + 병합.
     let config_toml = match &config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
-            XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
+            XBackupError::Config(crate::tr_lang!(
+                lang_flag.unwrap_or_default(),
+                "failed to read the config file ({}): {e}",
+                "config 파일 읽기 실패({}): {e}",
+                path.display()
+            ))
         })?),
         None => None,
     };
@@ -45,7 +54,8 @@ pub async fn handle(
 
     // 2) source URI(프로파일 source) 확보.
     let source_uri = resolved.resolved_uri.clone().ok_or_else(|| {
-        XBackupError::Config(format!(
+        XBackupError::Config(crate::tr!(
+            "profile '{}' has no source.uri/uri_env (the migration source)",
             "프로파일 '{}'에 source.uri/uri_env가 없습니다(마이그레이션 원본)",
             resolved.profile_name
         ))
@@ -62,15 +72,17 @@ pub async fn handle(
                 overrides: &overrides,
             })?;
             tcfg.resolved_uri.ok_or_else(|| {
-                XBackupError::Config(format!(
+                XBackupError::Config(crate::tr!(
+                    "target profile '{tp}' has no source.uri/uri_env",
                     "target 프로파일 '{tp}'에 source.uri/uri_env가 없습니다"
                 ))
             })?
         }
         (None, None) => {
-            return Err(XBackupError::Usage(
-                "--target <uri> 또는 --target-profile <name> 중 하나가 필요합니다".into(),
-            ))
+            return Err(XBackupError::Usage(crate::tr!(
+                "either --target <uri> or --target-profile <name> is required",
+                "--target <uri> 또는 --target-profile <name> 중 하나가 필요합니다"
+            )))
         }
     };
 
@@ -90,11 +102,8 @@ pub async fn handle(
     // 실행 컨텍스트(소스 프로파일·DB) 표시 — 다중 DB 툴(대상은 아래 계획에 표시).
     crate::cli::output::print_run_context(&args.profile, Some(source_kind), mode);
     if source_kind != target_kind {
-        return Err(XBackupError::Usage(
-            "source와 target의 DB 종류가 다릅니다 — 엔진 간 마이그레이션(예: Mongo↔PG)은 \
-             지원하지 않습니다. 같은 종류끼리만 가능합니다."
-                .into(),
-        ));
+        return Err(XBackupError::Usage(crate::tr!("source and target are different kinds of database — cross-engine migration (e.g. Mongo↔PostgreSQL) is not supported. Only the same kind can migrate to itself.", "source와 target의 DB 종류가 다릅니다 — 엔진 간 마이그레이션(예: Mongo↔PG)은 \
+             지원하지 않습니다. 같은 종류끼리만 가능합니다.")));
     }
 
     // 전송 엔진은 source 프로파일의 mode.engine을 따른다(기본 native — 외부 도구 불필요).

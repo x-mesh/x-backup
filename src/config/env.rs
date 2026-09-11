@@ -72,7 +72,8 @@ fn insert_at_path(node: &mut toml::Value, segments: &[&str], value: &str) -> Res
 
     // 현재 노드가 테이블이 아니면 오버라이드를 안전히 적용할 수 없다.
     let table = node.as_table_mut().ok_or_else(|| {
-        XBackupError::Config(format!(
+        XBackupError::Config(crate::tr!(
+            "ENV override path conflict: '{head}' is not a table there",
             "ENV 오버라이드 경로 충돌: '{head}' 위치가 테이블이 아닙니다"
         ))
     })?;
@@ -113,10 +114,12 @@ where
 {
     match lookup(env_name) {
         Some(v) if !v.is_empty() => Ok(Secret::new(v)),
-        Some(_) => Err(XBackupError::Config(format!(
+        Some(_) => Err(XBackupError::Config(crate::tr!(
+            "secret environment variable '{env_name}' is empty",
             "시크릿 환경변수 '{env_name}'가 비어 있습니다"
         ))),
-        None => Err(XBackupError::Config(format!(
+        None => Err(XBackupError::Config(crate::tr!(
+            "secret environment variable '{env_name}' is not set",
             "시크릿 환경변수 '{env_name}'가 설정되지 않았습니다"
         ))),
     }

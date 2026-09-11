@@ -117,11 +117,8 @@ where
     let mongo = MongoMeta::connect(&request.uri, request.timeout_secs).await?;
     let server_meta = mongo.server_meta().await?;
     if !server_meta.supports_oplog() {
-        return Err(XBackupError::Failure(
-            "standalone 서버는 oplog가 없어 증분 백업을 할 수 없습니다 — \
-             replica set이 필요합니다(FR-2). 풀 백업(--type full)을 사용하세요."
-                .into(),
-        ));
+        return Err(XBackupError::Failure(crate::tr!("a standalone server has no oplog, so an incremental backup is not possible — a replica set is required (FR-2). Use a full backup (--type full) instead.", "standalone 서버는 oplog가 없어 증분 백업을 할 수 없습니다 — \
+             replica set이 필요합니다(FR-2). 풀 백업(--type full)을 사용하세요.")));
     }
 
     // 2) base 선택 — 체인 끝의 Complete 백업(풀 또는 증분). 없거나 부적격이면 거부.
@@ -236,9 +233,12 @@ where
     }
 
     // 6) 체크섬·크기 확정 + manifest 작성(Incremental, base_id, oplog_range, oplog_count).
-    let checksum = checksum_handle
-        .finalize()
-        .ok_or_else(|| XBackupError::Failure("체크섬 확정 실패(이미 소비됨)".into()))?;
+    let checksum = checksum_handle.finalize().ok_or_else(|| {
+        XBackupError::Failure(crate::tr!(
+            "failed to finalize the checksum (already consumed)",
+            "체크섬 확정 실패(이미 소비됨)"
+        ))
+    })?;
     let stored_size = stored_size_handle.total();
 
     let oplog_range = OplogRange {
@@ -472,15 +472,32 @@ async fn select_base(storage: &dyn Storage) -> Result<BaseSelection> {
 
     // 적격 base가 없음 — 가장 그럴듯한 사유를 골라 거부한다(exit 2).
     let detail = if manifest_ids.is_empty() {
-        "저장소에 백업이 없습니다 — 먼저 풀 백업(--type full)을 한 번 수행하세요."
+        crate::tr!(
+            "no backups in the store — run a full backup (--type full) once first.",
+            "저장소에 백업이 없습니다 — 먼저 풀 백업(--type full)을 한 번 수행하세요."
+        )
     } else if saw_selective {
-        "적격 base가 없습니다 — 선택적 백업(--db/--collection)은 증분 base로 쓸 수 없습니다(FR-1)."
+        crate::tr!(
+            "no eligible base — a selective backup (--db/--collection) cannot serve as an \
+             incremental base (FR-1).",
+            "적격 base가 없습니다 — 선택적 백업(--db/--collection)은 증분 base로 쓸 수 \
+             없습니다(FR-1)."
+        )
     } else if saw_incomplete {
-        "적격 base가 없습니다 — 가장 최근 백업이 incomplete(부분 성공)라 base로 쓸 수 없습니다."
+        crate::tr!(
+            "no eligible base — the most recent backup is incomplete (partially succeeded) \
+             and cannot serve as a base.",
+            "적격 base가 없습니다 — 가장 최근 백업이 incomplete(부분 성공)라 base로 쓸 수 \
+             없습니다."
+        )
     } else {
-        "적격 base가 없습니다 — oplog 구간이 기록된 Complete 풀/증분 백업이 필요합니다."
+        crate::tr!(
+            "no eligible base — a Complete full or incremental backup with a recorded \
+             oplog range is required.",
+            "적격 base가 없습니다 — oplog 구간이 기록된 Complete 풀/증분 백업이 필요합니다."
+        )
     };
-    Err(XBackupError::Usage(detail.into()))
+    Err(XBackupError::Usage(detail))
 }
 
 /// 증분 manifest 값을 조립한다(backup_type=Incremental, base_id·oplog_range·oplog_count).
@@ -796,7 +813,11 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.exit_code(), 2);
-        assert!(err.to_string().contains("선택적"), "사유 메시지: {err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("selective") || msg.contains("선택적"),
+            "reason message: {err}"
+        );
     }
 
     /// 빈 슬라이스 manifest: oplog_count=0, stored=0, start==end==last, data 없음.
