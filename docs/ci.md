@@ -1,7 +1,7 @@
 # CI 워크플로 (GitHub Actions)
 
 > 대상: `.github/workflows/ci.yml` · 작성: 2026-06-13 · 태스크: CI 자동화
-> x-backup의 검증(단위 343 / 통합=replica set / S3=MinIO / PG=docker compose / musl=cross)을 GitHub Actions로 자동화한다.
+> x-backup의 검증(단위 / 통합=replica set / S3=MinIO / PG=docker compose / MySQL=docker compose / musl=cross)을 GitHub Actions로 자동화한다.
 
 ## 1. 트리거
 
@@ -27,8 +27,8 @@ DB·Docker 불필요. 로컬과 동일 커맨드:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --lib                 # 단위 343
-cargo test --test exit_codes_e2e # DB 불필요 E2E(종료 코드, SC6) 7
+cargo test --lib                 # 단위
+cargo test --test exit_codes_e2e # DB 불필요 E2E(종료 코드, SC6)
 ```
 통합/S3 스위트는 `#![cfg(feature = ...)]`로 격리돼 있어 feature 미지정 시 **컴파일 대상에서
 제외**된다 — 따라서 `cargo test --lib`/`--test exit_codes_e2e`는 DB가 전혀 필요 없다.
@@ -94,11 +94,15 @@ cross build --release --target x86_64-unknown-linux-musl
 ```
 - acceptance-report §5 방식: `cross 0.2.5` + `ghcr.io/cross-rs/x86_64-unknown-linux-musl`
   컨테이너가 musl 툴체인을 제공해 zstd C 빌드 + ring 어셈블리를 함께 컴파일한다.
-- 산출물(static-pie ELF)을 `actions/upload-artifact@v4`로 업로드한다(14일 보존).
+- 산출물(static-pie ELF)을 `actions/upload-artifact@v7`로 업로드한다(14일 보존).
 
 ## 3. 캐시 / 토큰체인
 
 - 캐시: `Swatinem/rust-cache@v2`(잡별 `key`로 분리).
+- 액션 런타임: GitHub이 Node 20 액션을 Node 24로 강제 실행하면서 잡마다 deprecation
+  경고를 남긴다. `actions/checkout`·`actions/upload-artifact`를 **v7**(둘 다 `node24`)로
+  올려 경고를 없앴다. `Swatinem/rust-cache@v2`는 이미 node24라 그대로 둔다.
+  최소 러너 버전은 2.327.1이다 — self-hosted 러너를 쓴다면 먼저 올려야 한다.
 - 토큰체인: `dtolnay/rust-toolchain`으로 **1.93.0** 핀. 액션 자체도 `@master`가 아니라
   커밋 SHA(`d1031067…`, master @ 2026-09-03)로 박는다. `@master`는 움직이는 ref라
   액션 저장소 쪽이 바뀌면 그 코드가 다음 CI 실행에 그대로 들어온다. public 저장소는
@@ -114,25 +118,21 @@ YAML은 `python3 -c "import yaml; yaml.safe_load(...)"`로 파싱 검증했고 `
 
 | 항목 | 로컬 실측(toolchain 1.93.0) | GitHub 첫 실행에서 확인 필요 |
 |---|---|---|
-| `cargo test --lib` | ✅ 343 passed | — |
+| `cargo test --lib` | ✅ 479 passed | — |
 | `cargo test --test exit_codes_e2e` | ✅ 7 passed | — |
 | `cargo clippy --all-targets --all-features -D warnings` | ✅ 0 경고(1.93.0) | — |
-| `cargo fmt --all -- --check` | ❌ **실패**(아래 주의) | 소스 포맷 정리 후 green |
+| `cargo fmt --all -- --check` | ✅ 통과 | — |
 | mongodb-database-tools URL+sha256 | ✅ URL 200·sha256 실측 일치 | tar 추출 경로/PATH 등록 |
 | replica set fixture `up`/`down` | (로컬 미기동) | RS 기동·통합 테스트 첫 실행 |
 | s3 MinIO 자체 기동 | (로컬 미기동) | `host.docker.internal` 게이트웨이 |
 | postgres `make scenario-pg` | ✅ 로컬 21단언 PASS(PG16, slot·DB 정리) | GHA 러너 docker compose v2·python3 |
 | `cross build … musl` | (acceptance-report §5에서 별도 실측) | 캐시 없는 첫 빌드 시간/ghcr pull |
 
-### ⚠ 알려진 선결 조건: `cargo fmt --all -- --check` 실패
-현재 커밋된 소스(`src/**`, `tests/**`)는 `cargo fmt --check`를 통과하지 **못한다**.
-- 1.88.0·1.93.0 **양쪽 rustfmt에서 동일하게 실패**(rustfmt 버전 문제가 아님).
-- PRD §12 수용 기준 #1은 `build + clippy`만 요구했고 `fmt --check`는 포함된 적이 없어,
-  소스가 한 번도 rustfmt-clean이 아니었다(acceptance-report도 fmt를 돌리지 않음).
-- 대표 차이: 테스트의 한 줄 배열(`"x-backup", "backup", …`)을 rustfmt가 멀티라인으로
-  펼치려 하고, `use` 순서를 재정렬한다.
-- **해결:** 코드 소유 측이 `cargo fmt --all`을 1회 실행해 커밋하면 이 step이 green이 된다.
-  CI는 표준 위생 게이트로서 `fmt --check`를 **유지**한다(제거하면 회귀를 숨김).
+### 해결된 선결 조건: `cargo fmt --all -- --check`
+이 문서를 처음 쓸 당시 소스는 `fmt --check`를 통과하지 못했다. PRD §12 수용 기준이
+`build + clippy`만 요구해서 소스가 한 번도 rustfmt-clean인 적이 없었기 때문이다.
+이후 `cargo fmt --all`을 적용해 해소했고 지금은 통과한다. CI는 회귀를 숨기지 않도록
+`fmt --check`를 위생 게이트로 유지한다.
 
 ### MSRV 회귀 감시(적용됨)
 `msrv` 잡이 `toolchain: 1.88.0`으로 `cargo check --all-features --all-targets`를 돈다
