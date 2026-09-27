@@ -131,8 +131,13 @@ where
     }
 
     // 3) 종료 ts 내림 매핑 + 마지막(limit) 슬라이스 결정.
-    let base_node = find_node(&nodes, &report.base_id)
-        .ok_or_else(|| XBackupError::Failure(format!("base '{}' 노드 소실", report.base_id)))?;
+    let base_node = find_node(&nodes, &report.base_id).ok_or_else(|| {
+        XBackupError::Failure(crate::tr!(
+            "base '{}' node missing",
+            "base '{}' 노드 소실",
+            report.base_id
+        ))
+    })?;
     let slices = ordered_slices(&nodes, &report.incremental_ids);
     let mapping = map_target_to_end(base_node, &slices, target_unix);
 
@@ -199,11 +204,8 @@ where
 /// 어떤 작업도 시작하기 전에 호출한다.
 pub fn reject_pitr_with_only(only: Option<&str>) -> Result<()> {
     if only.is_some() {
-        return Err(XBackupError::Usage(
-            "PITR(--at)은 --only(선택적 복구)와 함께 쓸 수 없습니다 — oplog 재생(--oplogReplay)은 \
-             네임스페이스 필터(--nsInclude)와 병용 불가합니다(전체 복구만 가능)"
-                .into(),
-        ));
+        return Err(XBackupError::Usage(crate::tr!("PITR (--at) cannot be combined with --only (selective restore) — oplog replay (--oplogReplay) cannot be combined with a namespace filter (--nsInclude); only a full restore is possible", "PITR(--at)은 --only(선택적 복구)와 함께 쓸 수 없습니다 — oplog 재생(--oplogReplay)은 \
+             네임스페이스 필터(--nsInclude)와 병용 불가합니다(전체 복구만 가능)")));
     }
     Ok(())
 }
@@ -213,9 +215,7 @@ fn parse_at(at: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(at)
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|e| {
-            XBackupError::Usage(format!(
-                "--at 시각 파싱 실패('{at}'): {e} — RFC3339 형식이 필요합니다(예: 2026-06-12T13:00:00Z)"
-            ))
+            XBackupError::Usage(crate::tr!("failed to parse --at ('{at}'): {e} — RFC3339 is required (e.g. 2026-06-12T13:00:00Z)", "--at 시각 파싱 실패('{at}'): {e} — RFC3339 형식이 필요합니다(예: 2026-06-12T13:00:00Z)"))
         })
 }
 
@@ -266,11 +266,8 @@ fn select_base_before(nodes: &[ChainNode], target_unix: i64) -> Result<String> {
         }
     }
     best.map(|n| n.id.clone()).ok_or_else(|| {
-        XBackupError::Failure(format!(
-            "목표 시점({}) 이전의 base 풀백업을 찾지 못했습니다 — PITR에는 목표 시각보다 \
-             앞선 풀백업이 필요합니다",
-            wall_clock_of_unix(target_unix)
-        ))
+        XBackupError::Failure(crate::tr!("no base full backup found before the target time ({}) — PITR needs a full backup earlier than the target time", "목표 시점({}) 이전의 base 풀백업을 찾지 못했습니다 — PITR에는 목표 시각보다 \
+             앞선 풀백업이 필요합니다", wall_clock_of_unix(target_unix)))
     })
 }
 
@@ -282,11 +279,8 @@ fn chain_rejection_error(report: &ChainReport) -> XBackupError {
         .map(|b| b.to_string())
         .collect::<Vec<_>>()
         .join("; ");
-    XBackupError::Failure(format!(
-        "증분 체인이 연속적이지 않아 PITR을 거부합니다(base '{}'): {breaks} \
-         — `x-backup verify --id <id> --chain`으로 체인 무결성을 확인하세요",
-        report.base_id
-    ))
+    XBackupError::Failure(crate::tr!("refusing PITR because the incremental chain is not continuous (base '{}'): {breaks} — check chain integrity with `x-backup verify --id <id> --chain`", "증분 체인이 연속적이지 않아 PITR을 거부합니다(base '{}'): {breaks} \
+         — `x-backup verify --id <id> --chain`으로 체인 무결성을 확인하세요", report.base_id))
 }
 
 /// `incremental_ids`(verify_chain이 정렬한 순서)에 대응하는 노드를 그 순서로 모은다.
@@ -429,7 +423,12 @@ async fn replay_one_slice(
     let temp_dir = tempfile::Builder::new()
         .prefix("xb-pitr-replay-")
         .tempdir()
-        .map_err(|e| XBackupError::Failure(format!("PITR 임시 디렉터리 생성 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to create the PITR temp directory: {e}",
+                "PITR 임시 디렉터리 생성 실패: {e}"
+            ))
+        })?;
     let oplog_path = temp_dir.path().join("oplog.bson");
     write_oplog_bson(&oplog_path, &mut decoded).await?;
 
@@ -463,27 +462,38 @@ async fn write_oplog_bson(path: &Path, decoded: &mut crate::storage::BoxAsyncRea
         .mode(0o600)
         .open(path)
         .await
-        .map_err(|e| XBackupError::Failure(format!("oplog.bson 생성 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to create oplog.bson: {e}",
+                "oplog.bson 생성 실패: {e}"
+            ))
+        })?;
     let mut writer = tokio::io::BufWriter::new(file);
 
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        let n = decoded
-            .read(&mut buf)
-            .await
-            .map_err(|e| XBackupError::Failure(format!("슬라이스 디코드 읽기 실패: {e}")))?;
+        let n = decoded.read(&mut buf).await.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to read a decoded slice: {e}",
+                "슬라이스 디코드 읽기 실패: {e}"
+            ))
+        })?;
         if n == 0 {
             break;
         }
-        writer
-            .write_all(&buf[..n])
-            .await
-            .map_err(|e| XBackupError::Failure(format!("oplog.bson 쓰기 실패: {e}")))?;
+        writer.write_all(&buf[..n]).await.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to write oplog.bson: {e}",
+                "oplog.bson 쓰기 실패: {e}"
+            ))
+        })?;
     }
-    writer
-        .flush()
-        .await
-        .map_err(|e| XBackupError::Failure(format!("oplog.bson flush 실패: {e}")))?;
+    writer.flush().await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to flush oplog.bson: {e}",
+            "oplog.bson flush 실패: {e}"
+        ))
+    })?;
     Ok(())
 }
 
@@ -516,20 +526,27 @@ async fn spawn_replay(
         .kill_on_drop(true);
 
     let mut child = cmd.spawn().map_err(|e| {
-        XBackupError::Failure(format!("'{program}' 실행 실패(설치/PATH 확인): {e}"))
+        XBackupError::Failure(crate::tr!(
+            "failed to run '{program}' (check install/PATH): {e}",
+            "'{program}' 실행 실패(설치/PATH 확인): {e}"
+        ))
     })?;
 
     // stderr를 독립 task로 끝까지 drain(데드락 방지·진단 tail 회수).
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| XBackupError::Failure("mongorestore stderr 파이프 획득 실패".into()))?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        XBackupError::Failure(crate::tr!(
+            "failed to get the mongorestore stderr pipe",
+            "mongorestore stderr 파이프 획득 실패"
+        ))
+    })?;
     let drain = tokio::spawn(drain_stderr(stderr));
 
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| XBackupError::Failure(format!("mongorestore wait 실패: {e}")))?;
+    let status = child.wait().await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to wait for mongorestore: {e}",
+            "mongorestore wait 실패: {e}"
+        ))
+    })?;
     let tail = drain.await.unwrap_or_default();
 
     if status.success() {
@@ -544,7 +561,8 @@ async fn spawn_replay(
         } else {
             format!(" — 마지막 stderr: {}", tail.join(" | "))
         };
-        Err(XBackupError::Failure(format!(
+        Err(XBackupError::Failure(crate::tr!(
+            "PITR oplog replay failed (mongorestore exit {code}){detail}",
             "PITR oplog 재생 실패(mongorestore exit {code}){detail}"
         )))
     }

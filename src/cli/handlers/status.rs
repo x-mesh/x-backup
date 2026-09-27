@@ -44,14 +44,23 @@ pub async fn handle(
     lang_flag: Option<crate::i18n::Lang>,
     args: StatusArgs,
 ) -> Result<()> {
+    // config 부재/읽기 실패로 activate 전에 끝날 수 있는 경로들도 --lang을 따르도록
+    // 미리 잡아 둔다(§tr_lang! 주석 참고). config가 읽히면 아래에서 다시 정한다.
+    crate::i18n::set_active(lang_flag.unwrap_or_default());
+
     // config 파일은 한 번만 읽는다(--all은 여러 프로파일에 재사용).
     let config_toml = match &config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
-            XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
+            XBackupError::Config(crate::tr_lang!(
+                lang_flag.unwrap_or_default(),
+                "failed to read the config file ({}): {e}",
+                "config 파일 읽기 실패({}): {e}",
+                path.display()
+            ))
         })?),
         None => None,
     };
-    let lang = crate::i18n::resolve_from_toml(lang_flag, config_toml.as_deref());
+    let lang = crate::i18n::activate_from_toml(lang_flag, config_toml.as_deref());
 
     // 참조 중인 config 위치를 stderr에 한 줄 알린다(다중 DB 툴 + xbenv 자동 XB_CONFIG 환경에서
     // "지금 어느 config를 보는지"를 분명히). json은 기계 판독 오염 방지로 생략.
@@ -118,8 +127,10 @@ pub async fn handle(
             }
             println!(
                 "{}",
-                serde_json::to_string_pretty(&v)
-                    .map_err(|e| XBackupError::Failure(format!("status JSON 직렬화 실패: {e}")))?
+                serde_json::to_string_pretty(&v).map_err(|e| XBackupError::Failure(crate::tr!(
+                    "status: failed to serialize JSON: {e}",
+                    "status JSON 직렬화 실패: {e}"
+                )))?
             );
         } else {
             render_json(&report)?;
@@ -135,7 +146,7 @@ pub async fn handle(
     }
 
     // 신호등 → 종료 코드. fail이면 PrecheckFailed(exit 3), warn이면 Warning(exit 4), ok면 0.
-    report_to_result(&report)
+    report_to_result(&report, lang)
 }
 
 /// `--all` — config의 모든 프로파일을 점검한다. 사람용 출력은 **프로파일별 전체 상세**
@@ -148,15 +159,19 @@ async fn handle_all(
     lang: Lang,
 ) -> Result<()> {
     let raw = config_toml.ok_or_else(|| {
-        XBackupError::Usage("--all에는 config 파일이 필요합니다(프로파일 목록)".into())
+        XBackupError::Usage(crate::tr!(
+            "--all requires a config file (for the profile list)",
+            "--all에는 config 파일이 필요합니다(프로파일 목록)"
+        ))
     })?;
     let config = crate::config::file::Config::from_toml_str(raw)?;
     let mut names: Vec<String> = config.profiles.keys().cloned().collect();
     names.sort();
     if names.is_empty() {
-        return Err(XBackupError::Usage(
-            "config에 프로파일이 없습니다([profiles.<name>])".into(),
-        ));
+        return Err(XBackupError::Usage(crate::tr!(
+            "the config has no profiles ([profiles.<name>])",
+            "config에 프로파일이 없습니다([profiles.<name>])"
+        )));
     }
 
     // --json은 기계 판독 안정성을 위해 언어를 En으로 고정한다.
@@ -241,7 +256,10 @@ async fn handle_all(
             CheckStatus::Fail => 2,
         })
         .unwrap_or(CheckStatus::Ok);
-    report_to_result(&StatusReport::new("(전체)", overall_placeholder(worst)))
+    report_to_result(
+        &StatusReport::new("(전체)", overall_placeholder(worst)),
+        lang,
+    )
 }
 
 /// 한 프로파일의 점검 보고서를 만든다(connect 실패도 보고서로 표현 — Err로 끊지 않음).
@@ -257,7 +275,8 @@ async fn build_report(
         overrides: &overrides,
     })?;
     let uri = resolved.resolved_uri.clone().ok_or_else(|| {
-        XBackupError::Config(format!(
+        XBackupError::Config(crate::tr!(
+            "profile '{}' has no source.uri/uri_env",
             "프로파일 '{}'에 source.uri/uri_env가 없습니다",
             resolved.profile_name
         ))
@@ -703,7 +722,15 @@ fn free_space_bytes(path: &str) -> Option<u64> {
     if rc != 0 {
         return None;
     }
-    Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+    // `f_bavail`의 너비는 플랫폼마다 다르다 — macOS는 u32, Linux glibc는 u64다.
+    // 그래서 어떤 변환을 써도 한쪽에서는 항등 변환이 되고, clippy가 그걸 문다:
+    // `as u64`는 Linux에서 `unnecessary_cast`, `u64::from`은 Linux에서
+    // `useless_conversion`이다. `-D warnings`로 도는 lint 잡은 Linux에서만 돌므로
+    // 둘 중 어느 쪽을 골라도 로컬(macOS)에서는 멀쩡한 코드가 CI에서만 깨진다.
+    // 잘림이 절대 없는 `u64::from`을 쓰고, 항등이 되는 플랫폼의 린트만 끈다.
+    #[allow(clippy::useless_conversion)]
+    let avail = u64::from(st.f_bavail);
+    Some(avail.saturating_mul(st.f_frsize))
 }
 
 /// 신호등 합산을 [`report_to_result`]에 태우기 위한 단일 항목 보고서(--all 종합용).
@@ -906,24 +933,37 @@ fn fmt_cell(text: &str, status: CheckStatus, differs: bool, width: usize, color:
 }
 
 /// 신호등 합산을 [`Result`]로 변환한다 — main의 exit code 매핑에 태운다.
-fn report_to_result(report: &StatusReport) -> Result<()> {
+///
+/// 이 메시지는 점검 표 바로 아래에 찍히므로 표와 같은 언어여야 한다. `lang`을 받는
+/// 이유가 그것이다 — 예전에는 한국어로 고정돼 있어서 `language = "en"` 설정에서도
+/// 영어 표 끝에 한국어 한 줄이 붙었다.
+fn report_to_result(report: &StatusReport, lang: Lang) -> Result<()> {
+    let profile = &report.profile;
     match report.overall {
         CheckStatus::Ok => Ok(()),
-        CheckStatus::Warn => Err(XBackupError::Warning(format!(
-            "프로파일 '{}' 점검에 경고가 있습니다(백업 가능하나 주의)",
-            report.profile
-        ))),
-        CheckStatus::Fail => Err(XBackupError::PrecheckFailed(format!(
-            "프로파일 '{}' 점검 실패 — 백업 불가 항목이 있습니다",
-            report.profile
-        ))),
+        CheckStatus::Warn => Err(XBackupError::Warning(match lang {
+            Lang::En => {
+                format!("profile '{profile}' — backup can run, but review the checks above")
+            }
+            Lang::Ko => {
+                format!("프로파일 '{profile}' — 백업은 가능하지만 위 점검 결과를 확인하세요")
+            }
+        })),
+        CheckStatus::Fail => Err(XBackupError::PrecheckFailed(match lang {
+            Lang::En => format!("profile '{profile}' failed its checks — backup cannot run"),
+            Lang::Ko => format!("프로파일 '{profile}' 점검 실패 — 백업 불가 항목이 있습니다"),
+        })),
     }
 }
 
 /// 점검 결과를 `--json`(항목 배열 + overall)으로 stdout에 출력한다.
 fn render_json(report: &StatusReport) -> Result<()> {
-    let json = serde_json::to_string_pretty(&report_json(report)?)
-        .map_err(|e| XBackupError::Failure(format!("status JSON 직렬화 실패: {e}")))?;
+    let json = serde_json::to_string_pretty(&report_json(report)?).map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "status: failed to serialize JSON: {e}",
+            "status JSON 직렬화 실패: {e}"
+        ))
+    })?;
     println!("{json}");
     Ok(())
 }
@@ -934,8 +974,12 @@ fn render_json(report: &StatusReport) -> Result<()> {
 /// 직렬화한 뒤 최상위에 한 번만 찍어서 `--ns-detail` 유무와 관계없이 같은 자리에 오게 한다
 /// (두 경로가 각자 찍으면 한쪽만 갱신되는 사고가 난다).
 fn report_json(report: &StatusReport) -> Result<serde_json::Value> {
-    let mut v = serde_json::to_value(report)
-        .map_err(|e| XBackupError::Failure(format!("status JSON 직렬화 실패: {e}")))?;
+    let mut v = serde_json::to_value(report).map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "status: failed to serialize JSON: {e}",
+            "status JSON 직렬화 실패: {e}"
+        ))
+    })?;
     // StatusReport는 구조체라 직렬화 결과는 항상 객체다.
     if let Some(obj) = v.as_object_mut() {
         obj.insert("schema".to_string(), STATUS_JSON_SCHEMA.into());
@@ -968,7 +1012,8 @@ async fn collect_ns_counts(config_toml: Option<&str>, profile: &str) -> Result<V
         overrides: &overrides,
     })?;
     let uri = resolved.resolved_uri.clone().ok_or_else(|| {
-        XBackupError::Config(format!(
+        XBackupError::Config(crate::tr!(
+            "profile '{}' has no source.uri/uri_env",
             "프로파일 '{}'에 source.uri/uri_env가 없습니다",
             resolved.profile_name
         ))
@@ -1260,7 +1305,8 @@ fn build_monitors(config_toml: Option<&str>, profiles: &[String]) -> Result<Vec<
             overrides: &overrides,
         })?;
         let uri = resolved.resolved_uri.clone().ok_or_else(|| {
-            XBackupError::Config(format!(
+            XBackupError::Config(crate::tr!(
+                "profile '{}' has no source.uri/uri_env",
                 "프로파일 '{}'에 source.uri/uri_env가 없습니다",
                 resolved.profile_name
             ))
@@ -1284,22 +1330,29 @@ fn build_monitors(config_toml: Option<&str>, profiles: &[String]) -> Result<Vec<
 async fn handle_watch(config_toml: Option<&str>, args: &StatusArgs, lang: Lang) -> Result<()> {
     // 대상 프로파일 — --all이면 config의 모든 프로파일, 아니면 단일.
     let profiles: Vec<String> = if args.all {
-        let raw = config_toml
-            .ok_or_else(|| XBackupError::Usage("--all에는 config 파일이 필요합니다".into()))?;
+        let raw = config_toml.ok_or_else(|| {
+            XBackupError::Usage(crate::tr!(
+                "--all requires a config file",
+                "--all에는 config 파일이 필요합니다"
+            ))
+        })?;
         let config = crate::config::file::Config::from_toml_str(raw)?;
         let mut names: Vec<String> = config.profiles.keys().cloned().collect();
         names.sort();
         if names.is_empty() {
-            return Err(XBackupError::Usage(
-                "config에 프로파일이 없습니다([profiles.<name>])".into(),
-            ));
+            return Err(XBackupError::Usage(crate::tr!(
+                "the config has no profiles ([profiles.<name>])",
+                "config에 프로파일이 없습니다([profiles.<name>])"
+            )));
         }
         names
     } else {
-        let p = args
-            .profile
-            .clone()
-            .ok_or_else(|| XBackupError::Usage("--profile 또는 --all이 필요합니다".into()))?;
+        let p = args.profile.clone().ok_or_else(|| {
+            XBackupError::Usage(crate::tr!(
+                "--profile or --all is required",
+                "--profile 또는 --all이 필요합니다"
+            ))
+        })?;
         vec![p]
     };
 
@@ -1791,13 +1844,13 @@ mod tests {
     #[test]
     fn ok_report_maps_to_ok_result() {
         let report = StatusReport::new("p", vec![CheckItem::ok("a", "A", "")]);
-        assert!(report_to_result(&report).is_ok());
+        assert!(report_to_result(&report, Lang::En).is_ok());
     }
 
     #[test]
     fn warn_report_maps_to_exit_4() {
         let report = StatusReport::new("p", vec![CheckItem::warn("a", "A", "")]);
-        let err = report_to_result(&report).unwrap_err();
+        let err = report_to_result(&report, Lang::En).unwrap_err();
         assert_eq!(err.exit_code(), 4);
     }
 
@@ -1807,7 +1860,7 @@ mod tests {
             "p",
             vec![CheckItem::fail("topology", "토폴로지", "샤딩 감지")],
         );
-        let err = report_to_result(&report).unwrap_err();
+        let err = report_to_result(&report, Lang::En).unwrap_err();
         assert_eq!(err.exit_code(), 3);
     }
 

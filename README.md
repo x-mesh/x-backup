@@ -8,11 +8,16 @@
 
 x-backup backs up a running MongoDB (standalone or replica set), PostgreSQL, or MySQL into an encrypted form you can verify and actually restore from. By default it talks to the database directly through the Rust driver — **no `mongodump`/`mongorestore`, `pg_dump`/`pg_restore`, or `mysqldump`/`mysql` required** — and streams every stage, so memory stays flat no matter how large the dataset is. A 6 GiB backup peaks at 54.6 MiB RSS ([measured](docs/memory-profile.md)). The database is chosen automatically from the source URI scheme (`mongodb://`, `postgresql://`, or `mysql://`/`mariadb://`).
 
+<img src="docs/assets/demo-backup.gif" alt="A full backup, then an incremental one, and the chain they form in x-backup list" width="100%">
+
+A full backup, an incremental one that captures only what changed since it, and the chain
+they form. Recorded against a live replica set; [the tape is in the repo](docs/assets/).
+
 ## Features
 
 - ✅ **Full backup** — driver-native streaming archive (data + indexes + collection options), no external tools; `mongodump --archive --oplog` available as an opt-in engine
 - ✅ **Incremental backup** — captures the oplog directly; on a gap it promotes to a full backup automatically (exit 4)
-- ✅ **PITR** — restore to a moment with `--at <RFC3339>|latest` (base restore + replay of MongoDB oplog or PostgreSQL logical-decoding changes, gated on chain verification)
+- ✅ **PITR** — restore to a moment with `--at <RFC3339>`: the base is restored, then increments replay up to that time (MongoDB oplog, PostgreSQL logical-decoding changes, or MySQL binlog), gated on chain verification. On PostgreSQL and MySQL, `--at latest` replays everything instead
 - ✅ **Storage** — local disk or S3-compatible (MinIO, R2, OCI), streaming multipart upload with abort cleanup
 - ✅ **Encrypted by default** — `age` (X25519; only the public key lives on the backup host) or AES-256-GCM, compressed with zstd before encryption
 - ✅ **Integrity** — manifest + sha256, with `verify` (structural check, no key needed), `--deep`, and `--chain`
@@ -31,21 +36,10 @@ Scope: MongoDB replica sets get full and incremental backups, standalone gets fu
 brew install x-mesh/tap/x-backup
 ```
 
-While the repository is private, downloading release assets needs a GitHub token:
-
-```bash
-export HOMEBREW_GITHUB_API_TOKEN=$(gh auth token)
-brew install x-mesh/tap/x-backup
-```
-
 ### curl (install.sh)
 
 ```bash
-# Once the repository is public:
 curl -fsSL https://raw.githubusercontent.com/x-mesh/x-backup/main/install.sh | sh
-
-# While private (reuses your gh auth):
-gh api repos/x-mesh/x-backup/contents/install.sh --jq '.content' | base64 -d | sh
 ```
 
 This installs to `~/.local/bin/x-backup`. Override with `XB_VERSION` or `XB_INSTALL_DIR`.
@@ -69,8 +63,6 @@ x-backup update --check   # check only, no install
 - **Homebrew install** → delegates to `brew upgrade x-mesh/tap/x-backup`
 - **install.sh install** → downloads the latest release, verifies sha256, and replaces itself atomically
 - **cargo install** → prints the upgrade command instead of overwriting
-
-While the repository is private, this needs `GITHUB_TOKEN` (or a prior `gh auth login`).
 
 ## Quick Start
 
@@ -96,6 +88,13 @@ Every command prints a one-line context to stderr — the active profile and DB 
 e.g. `▸ 프로파일 prod · DB postgresql` — so you always know what you're touching in a
 multi-DB config (skipped under `--json`). `--profile` can also come from the `XB_PROFILE`
 env var, and `--config` from `XB_CONFIG`.
+
+`status` is the one to run first. It answers "can this server be backed up right now?"
+without writing anything — connection, topology, privileges, version/FCV, clock skew,
+oplog window, data shape, how old the last backup is, and whether the destination is
+writable with room to spare:
+
+<img src="docs/assets/demo-status.gif" alt="x-backup status printing sixteen preflight checks, each marked OK or WARN, with an overall verdict and exit code" width="100%">
 
 ### Migrate (direct copy, no file)
 
@@ -635,8 +634,15 @@ To treat 4 as success in cron: `x-backup backup ...; rc=$?; [ $rc -eq 4 ] && rc=
 
 ## Restore semantics
 
+The cheapest way to find out a backup is broken is *before* you need it. `verify --deep`
+decrypts and decodes the archive, and `--chain` walks the increments back to their base,
+so you learn whether a restore would work without running one — nothing is written to a
+database, and nothing in the store is modified:
+
+<img src="docs/assets/demo-verify.gif" alt="x-backup verify reporting manifest integrity, data checksum and deep decode all OK, then a continuous chain back to its base backup" width="100%">
+
 - `restore` (no `--at`) restores the **base full backup snapshot only**.
-- `restore --at <time>|latest` is PITR: it restores the base, then replays increments up to that time — MongoDB oplog (the largest ts at or before it) or PostgreSQL logical-decoding changes; `latest` replays everything. It requires `verify --chain` to pass, and it cannot be combined with `--only` (selective restore).
+- `restore --at <RFC3339>` is PITR: it restores the base, then replays increments up to that time — MongoDB oplog (the largest ts at or before it), PostgreSQL logical-decoding changes, or MySQL binlog. PostgreSQL and MySQL also accept `--at latest`, which replays everything; MongoDB takes a timestamp only. It requires `verify --chain` to pass, and it cannot be combined with `--only` (selective restore).
 - `verify --deep` runs only on a host that holds the private key (key isolation, PRD §8.5). The backup host carries only the public key, so a compromised backup host still cannot decrypt past backups.
 
 ## Development
@@ -718,10 +724,12 @@ The docs are written in Korean.
 
 | Document | Contents |
 |------|------|
+| [docs/postgres.md](docs/postgres.md) | PostgreSQL engine deep-dive (logical decoding, PITR, schema fidelity) |
 | [docs/mysql.md](docs/mysql.md) | MySQL engine deep-dive (schema fidelity, binlog internals, PITR, dev/CI) |
 | [docs/web-console.ko.md](docs/web-console.ko.md) | Running the web console (`serve`) — systemd unit, binding, auth, age key permissions, audit log, TLS via reverse proxy |
-| [docs/control-server.ko.md](docs/control-server.ko.md) | Central control-server operations (multi-DB backup/restore/migrate) — example: [examples/control-server.toml](examples/control-server.toml) |
+| [docs/control-server.ko.md](docs/control-server.ko.md) | Central control-server operation (many DBs, one config) — see [examples/control-server.toml](examples/control-server.toml) |
 | [docs/PRD.md](docs/PRD.md) | Product requirements (FR-1–12, incremental design, encryption design) |
+| [docs/prd/](docs/prd/) | Per-feature PRDs (WAL physical PITR, recovery-window retention, RPO status, hooks, standby backup) |
 | [docs/test-scenario.md](docs/test-scenario.md) | E2E scenario definition |
 | [docs/acceptance-report.md](docs/acceptance-report.md) | Acceptance criteria 10/10, with measured evidence |
 | [docs/memory-profile.md](docs/memory-profile.md) | Memory ceiling measurement (constant RSS) |
@@ -732,3 +740,7 @@ The docs are written in Korean.
 
 GFS retention, Prometheus metrics, KMS/HSM key integration, live migration (oplog-tailing,
 near-zero-downtime cutover) — see [PRD §12](docs/PRD.md).
+
+## License
+
+MIT. Full text in [LICENSE](LICENSE).

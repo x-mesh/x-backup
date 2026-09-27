@@ -49,10 +49,14 @@ impl AgeEncryptStage {
     /// 파일에는 한 줄짜리 age recipient 공개키가 있어야 한다(주석·빈 줄 허용).
     pub fn from_recipient_file(path: &str) -> Result<Self> {
         let raw = std::fs::read_to_string(path).map_err(|e| {
-            XBackupError::Config(format!("age recipient 파일 읽기 실패({path}): {e}"))
+            XBackupError::Config(crate::tr!(
+                "failed to read the age recipient file ({path}): {e}",
+                "age recipient 파일 읽기 실패({path}): {e}"
+            ))
         })?;
         let recipient = parse_recipient(&raw).ok_or_else(|| {
-            XBackupError::Config(format!(
+            XBackupError::Config(crate::tr!(
+                "the age recipient file has no valid public key (age1...): {path}",
                 "age recipient 파일에 유효한 공개키(age1...)가 없습니다: {path}"
             ))
         })?;
@@ -135,10 +139,14 @@ impl AgeDecryptStage {
     /// identity 파일(개인키 `AGE-SECRET-KEY-1...`)을 읽어 복호화 단계를 만든다.
     pub fn from_identity_file(path: &str) -> Result<Self> {
         let raw = std::fs::read_to_string(path).map_err(|e| {
-            XBackupError::Config(format!("age identity 파일 읽기 실패({path}): {e}"))
+            XBackupError::Config(crate::tr!(
+                "failed to read the age identity file ({path}): {e}",
+                "age identity 파일 읽기 실패({path}): {e}"
+            ))
         })?;
         let identity = parse_identity(&raw).ok_or_else(|| {
-            XBackupError::Config(format!(
+            XBackupError::Config(crate::tr!(
+                "the age identity file has no valid private key (AGE-SECRET-KEY-1...): {path}",
                 "age identity 파일에 유효한 개인키(AGE-SECRET-KEY-1...)가 없습니다: {path}"
             ))
         })?;
@@ -243,7 +251,8 @@ pub fn generate_keypair_files(
         if let Some(parent) = p.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).map_err(|e| {
-                    XBackupError::Config(format!(
+                    XBackupError::Config(crate::tr!(
+                        "failed to create the key directory ({}): {e}",
                         "키 디렉터리 생성 실패({}): {e}",
                         parent.display()
                     ))
@@ -260,18 +269,24 @@ pub fn generate_keypair_files(
         .mode(0o600)
         .open(key_path)
         .map_err(|e| {
-            XBackupError::Config(format!(
+            XBackupError::Config(crate::tr!(
+                "failed to create the private key file ({}): {e}",
                 "개인키 파일 생성 실패({}): {e}",
                 key_path.display()
             ))
         })?;
     writeln!(key_file, "{}", identity.to_string().expose_secret()).map_err(|e| {
-        XBackupError::Config(format!("개인키 기록 실패({}): {e}", key_path.display()))
+        XBackupError::Config(crate::tr!(
+            "failed to write the private key ({}): {e}",
+            "개인키 기록 실패({}): {e}",
+            key_path.display()
+        ))
     })?;
 
     // 공개키(recipient) — 시크릿 아님.
     std::fs::write(pub_path, format!("{recipient}\n")).map_err(|e| {
-        XBackupError::Config(format!(
+        XBackupError::Config(crate::tr!(
+            "failed to write the public key file ({}): {e}",
             "공개키 파일 기록 실패({}): {e}",
             pub_path.display()
         ))

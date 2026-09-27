@@ -34,7 +34,14 @@ pub async fn mysql_restore<R: AsyncRead + Unpin>(
     timeout_secs: Option<u64>,
     drop: bool,
 ) -> Result<u64> {
-    let mut client = MysqlClient::connect(target_uri, timeout_secs).await?;
+    let mut client = MysqlClient::connect_restore_target(target_uri, timeout_secs, true)
+        .await?
+        .ok_or_else(|| {
+            XBackupError::Failure(crate::tr!(
+                "could not prepare the MySQL restore target database",
+                "MySQL 복구 대상 데이터베이스를 준비하지 못했습니다"
+            ))
+        })?;
     restore_into(reader, client.conn_mut(), drop).await
 }
 
@@ -43,6 +50,10 @@ struct PostObj {
     kind: String,
     name: String,
     sql: String,
+    sql_mode: Option<String>,
+    character_set_client: Option<String>,
+    collation_connection: Option<String>,
+    time_zone: Option<String>,
 }
 
 /// 이미 연결된 conn으로 복원한다(migrate 등에서 재사용).
@@ -59,9 +70,12 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
         "SET SESSION time_zone = '+00:00'",
         "SET NAMES utf8mb4",
     ] {
-        conn.query_drop(stmt)
-            .await
-            .map_err(|e| XBackupError::Failure(format!("복구 세션 설정 실패({stmt}): {e}")))?;
+        conn.query_drop(stmt).await.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to set up the restore session ({stmt}): {e}",
+                "복구 세션 설정 실패({stmt}): {e}"
+            ))
+        })?;
     }
 
     // 헤더 확인 + 버전 정합 경고.
@@ -69,15 +83,18 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
         Frame::Header(h) => {
             let fmt = h.get_str("format").unwrap_or("");
             if fmt != archive::FORMAT_ID {
-                return Err(XBackupError::Failure(format!(
+                return Err(XBackupError::Failure(crate::tr!(
+                    "MySQL archive format mismatch: '{fmt}' (expected '{}')",
                     "MySQL 아카이브 포맷 불일치: '{fmt}'(기대 '{}')",
                     archive::FORMAT_ID
                 )));
             }
+            apply_database_defaults(conn, &h).await?;
             warn_on_major_mismatch(conn, h.get_str("mysql_version").unwrap_or("")).await;
         }
         other => {
-            return Err(XBackupError::Failure(format!(
+            return Err(XBackupError::Failure(crate::tr!(
+                "MySQL archive header missing (first frame: {other:?})",
                 "MySQL 아카이브 헤더 누락(첫 프레임: {other:?})"
             )))
         }
@@ -90,9 +107,10 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
     loop {
         match archive::read_frame(reader).await? {
             Frame::Header(_) => {
-                return Err(XBackupError::Failure(
-                    "MySQL 아카이브 헤더가 중복됩니다".into(),
-                ))
+                return Err(XBackupError::Failure(crate::tr!(
+                    "duplicate MySQL archive header",
+                    "MySQL 아카이브 헤더가 중복됩니다"
+                )))
             }
             Frame::Pre(d) => {
                 if let Ok(sql) = d.get_str("sql") {
@@ -106,19 +124,34 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
                     sql: d
                         .get_str("sql")
                         .map_err(|_| {
-                            XBackupError::Failure("후행 DDL 프레임에 sql이 없습니다".into())
+                            XBackupError::Failure(crate::tr!(
+                                "the trailing DDL frame has no sql",
+                                "후행 DDL 프레임에 sql이 없습니다"
+                            ))
                         })?
                         .to_string(),
+                    sql_mode: optional_str(&d, "sql_mode"),
+                    character_set_client: optional_str(&d, "character_set_client"),
+                    collation_connection: optional_str(&d, "collation_connection"),
+                    time_zone: optional_str(&d, "time_zone"),
                 });
             }
             Frame::Table(meta) => {
                 let ns = meta.get_str("ns").unwrap_or("");
                 let quoted = meta
                     .get_str("quoted")
-                    .map_err(|_| XBackupError::Failure(format!("{ns} 테이블에 quoted가 없습니다")))?
+                    .map_err(|_| {
+                        XBackupError::Failure(crate::tr!(
+                            "{ns}: table has no quoted",
+                            "{ns} 테이블에 quoted가 없습니다"
+                        ))
+                    })?
                     .to_string();
                 let create_sql = meta.get_str("create_sql").map_err(|_| {
-                    XBackupError::Failure(format!("{ns} 테이블에 create_sql이 없습니다"))
+                    XBackupError::Failure(crate::tr!(
+                        "{ns}: table has no create_sql",
+                        "{ns} 테이블에 create_sql이 없습니다"
+                    ))
                 })?;
                 let insert_cols: Vec<String> = meta
                     .get_array("insert_cols")
@@ -134,9 +167,12 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
                         .query_drop(format!("DROP TABLE IF EXISTS {quoted}"))
                         .await;
                 }
-                run_ignore_exists(conn, create_sql)
-                    .await
-                    .map_err(|e| XBackupError::Failure(format!("{ns} 테이블 생성 실패: {e}")))?;
+                run_ignore_exists(conn, create_sql).await.map_err(|e| {
+                    XBackupError::Failure(crate::tr!(
+                        "{ns}: failed to create the table: {e}",
+                        "{ns} 테이블 생성 실패: {e}"
+                    ))
+                })?;
 
                 let col_list = if insert_cols.is_empty() {
                     String::new()
@@ -151,7 +187,10 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
                     match archive::read_frame(reader).await? {
                         Frame::Data(bytes) => {
                             let tuple = String::from_utf8(bytes).map_err(|e| {
-                                XBackupError::Failure(format!("{ns} 행 튜플 디코드 실패: {e}"))
+                                XBackupError::Failure(crate::tr!(
+                                    "{ns}: failed to decode a row tuple: {e}",
+                                    "{ns} 행 튜플 디코드 실패: {e}"
+                                ))
                             })?;
                             batch_bytes += tuple.len() + 1;
                             batch.push(tuple);
@@ -167,7 +206,8 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
                             break;
                         }
                         other => {
-                            return Err(XBackupError::Failure(format!(
+                            return Err(XBackupError::Failure(crate::tr!(
+                                "{ns}: unexpected frame in data: {other:?}",
                                 "{ns} 데이터 중 예기치 못한 프레임: {other:?}"
                             )))
                         }
@@ -175,9 +215,10 @@ pub async fn restore_into<R: AsyncRead + Unpin>(
                 }
             }
             Frame::Data(_) | Frame::TableEnd => {
-                return Err(XBackupError::Failure(
-                    "테이블 밖에서 데이터 프레임을 만났습니다(손상)".into(),
-                ))
+                return Err(XBackupError::Failure(crate::tr!(
+                    "encountered a data frame outside a table (corrupt)",
+                    "테이블 밖에서 데이터 프레임을 만났습니다(손상)"
+                )))
             }
             Frame::End => break,
         }
@@ -207,9 +248,12 @@ async fn flush_insert(
     }
     let n = batch.len() as u64;
     let sql = format!("INSERT INTO {quoted}{col_list} VALUES {}", batch.join(", "));
-    conn.query_drop(sql)
-        .await
-        .map_err(|e| XBackupError::Failure(format!("{ns} INSERT 실패: {e}")))?;
+    conn.query_drop(sql).await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "{ns}: INSERT failed: {e}",
+            "{ns} INSERT 실패: {e}"
+        ))
+    })?;
     batch.clear();
     Ok(n)
 }
@@ -232,7 +276,7 @@ async fn apply_post(conn: &mut Conn, post: &[PostObj], drop: bool) -> Result<()>
         let mut still: Vec<&PostObj> = Vec::new();
         let mut last_err: Option<String> = None;
         for obj in &pending {
-            match run_ignore_exists(conn, &obj.sql).await {
+            match apply_post_object(conn, obj).await {
                 Ok(()) => {}
                 Err(e) => {
                     last_err = Some(format!("{e}\n  SQL: {}", obj.sql));
@@ -241,14 +285,87 @@ async fn apply_post(conn: &mut Conn, post: &[PostObj], drop: bool) -> Result<()>
             }
         }
         if still.len() == pending.len() {
-            return Err(XBackupError::Failure(format!(
-                "후행 DDL(뷰/트리거/루틴/이벤트) 적용 실패(의존성 해소 불가): {}",
-                last_err.unwrap_or_default()
-            )));
+            return Err(XBackupError::Failure(crate::tr!("failed to apply trailing DDL (views/triggers/routines/events) — could not resolve dependencies: {}", "후행 DDL(뷰/트리거/루틴/이벤트) 적용 실패(의존성 해소 불가): {}", last_err.unwrap_or_default())));
         }
         pending = still;
     }
     Ok(())
+}
+
+fn optional_str(doc: &bson::Document, key: &str) -> Option<String> {
+    doc.get_str(key)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// 새 아카이브는 소스 DB 기본값을 보존한다. 기존 아카이브에는 필드가 없으므로 건너뛴다.
+async fn apply_database_defaults(conn: &mut Conn, header: &bson::Document) -> Result<()> {
+    let (Ok(charset), Ok(collation)) = (
+        header.get_str("database_charset"),
+        header.get_str("database_collation"),
+    ) else {
+        return Ok(());
+    };
+    let database: Option<String> = conn.query_first("SELECT DATABASE()").await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to query the restore target database: {e}",
+            "복구 대상 데이터베이스 조회 실패: {e}"
+        ))
+    })?;
+    let database = database.ok_or_else(|| {
+        XBackupError::Usage(crate::tr!(
+            "the MySQL restore target URI must name a database",
+            "MySQL 복구 대상 URI에 데이터베이스가 필요합니다"
+        ))
+    })?;
+    conn.query_drop(format!(
+        "ALTER DATABASE {} CHARACTER SET {} COLLATE {}",
+        quote_ident(&database),
+        quote_ident(charset),
+        quote_ident(collation)
+    ))
+    .await
+    .map_err(|e| {
+        XBackupError::Failure(crate::tr!("failed to apply the restore target database's default charset ({charset}/{collation}): {e}", "복구 대상 데이터베이스 기본 문자셋 적용 실패({charset}/{collation}): {e}"))
+    })
+}
+
+/// 객체 생성 당시의 session metadata를 복원한 뒤 DDL을 실행한다.
+async fn apply_post_object(conn: &mut Conn, obj: &PostObj) -> Result<()> {
+    if let Some(sql_mode) = &obj.sql_mode {
+        conn.exec_drop("SET SESSION sql_mode = ?", (sql_mode,))
+            .await
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "failed to restore sql_mode: {e}",
+                    "sql_mode 복원 실패: {e}"
+                ))
+            })?;
+    }
+    if let Some(time_zone) = &obj.time_zone {
+        conn.exec_drop("SET SESSION time_zone = ?", (time_zone,))
+            .await
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "failed to restore time_zone: {e}",
+                    "time_zone 복원 실패: {e}"
+                ))
+            })?;
+    }
+    if let Some(charset) = &obj.character_set_client {
+        let mut sql = format!("SET NAMES {}", quote_ident(charset));
+        if let Some(collation) = &obj.collation_connection {
+            sql.push_str(&format!(" COLLATE {}", quote_ident(collation)));
+        }
+        conn.query_drop(sql).await.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to restore the object-creation charset: {e}",
+                "객체 생성 문자셋 복원 실패: {e}"
+            ))
+        })?;
+    }
+    run_ignore_exists(conn, &obj.sql).await
 }
 
 /// 객체 kind → DROP 키워드.

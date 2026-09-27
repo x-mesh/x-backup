@@ -149,10 +149,7 @@ pub fn build_encrypt_stage(
     match enc.algorithm.as_str() {
         ALGORITHM_AGE => {
             let recipient_file = enc.recipient_file.as_deref().ok_or_else(|| {
-                XBackupError::Config(
-                    "age 암호화에는 features.encryption.recipient_file(공개키 경로)이 필요합니다"
-                        .into(),
-                )
+                XBackupError::Config(crate::tr!("age encryption requires features.encryption.recipient_file (a public key path)", "age 암호화에는 features.encryption.recipient_file(공개키 경로)이 필요합니다"))
             })?;
             let stage = AgeEncryptStage::from_recipient_file(recipient_file)?;
             let meta = EncryptionMeta {
@@ -164,9 +161,10 @@ pub fn build_encrypt_stage(
         }
         ALGORITHM_AES_GCM => {
             let key_hex = aes_key_hex.ok_or_else(|| {
-                XBackupError::Config(
-                    "aes-256-gcm 암호화에는 키(env 32바이트 hex)가 필요합니다".into(),
-                )
+                XBackupError::Config(crate::tr!(
+                    "aes-256-gcm encryption requires a key (a 32-byte hex env var)",
+                    "aes-256-gcm 암호화에는 키(env 32바이트 hex)가 필요합니다"
+                ))
             })?;
             let stage = AesGcmEncryptStage::from_hex_key(key_hex)?;
             let meta = EncryptionMeta {
@@ -176,7 +174,8 @@ pub fn build_encrypt_stage(
             };
             Ok((Box::new(stage), meta))
         }
-        other => Err(XBackupError::Config(format!(
+        other => Err(XBackupError::Config(crate::tr!(
+            "unknown encryption algorithm: '{other}' (age | aes-256-gcm)",
             "알 수 없는 암호화 알고리즘: '{other}'(age | aes-256-gcm)"
         ))),
     }
@@ -196,7 +195,8 @@ pub fn build_decrypt_stage(
         (ALGORITHM_AES_GCM, DecryptKeySource::AesHexKey(hex)) => {
             Ok(Box::new(AesGcmDecryptStage::from_hex_key(hex)?))
         }
-        (algo, _) => Err(XBackupError::Config(format!(
+        (algo, _) => Err(XBackupError::Config(crate::tr!(
+            "the decryption key source does not match the '{algo}' encryption algorithm",
             "암호화 알고리즘 '{algo}'에 맞지 않는 복호화 키 소스"
         ))),
     }

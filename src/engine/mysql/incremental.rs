@@ -107,10 +107,12 @@ pub async fn binlog_available(conn: &mut Conn, base: &MysqlBinlogCoords) -> Resu
     if base.file.is_empty() {
         return Ok(false);
     }
-    let logs: Vec<Row> = conn
-        .query("SHOW BINARY LOGS")
-        .await
-        .map_err(|e| XBackupError::Failure(format!("SHOW BINARY LOGS 실패: {e}")))?;
+    let logs: Vec<Row> = conn.query("SHOW BINARY LOGS").await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "SHOW BINARY LOGS failed: {e}",
+            "SHOW BINARY LOGS 실패: {e}"
+        ))
+    })?;
     Ok(logs
         .iter()
         .filter_map(|r| r.get::<String, usize>(0))
@@ -152,10 +154,12 @@ pub async fn capture(
         .with_non_blocking()
         .with_filename(start.file.as_bytes())
         .with_pos(start_pos);
-    let mut stream = conn
-        .get_binlog_stream(req)
-        .await
-        .map_err(|e| XBackupError::Failure(format!("binlog 스트림 시작 실패: {e}")))?;
+    let mut stream = conn.get_binlog_stream(req).await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to start the binlog stream: {e}",
+            "binlog 스트림 시작 실패: {e}"
+        ))
+    })?;
 
     let mut archive = Vec::new();
     write_header(&mut archive, &chrono::Utc::now().to_rfc3339());
@@ -173,15 +177,22 @@ pub async fn capture(
     let mut more_pending = false;
 
     while let Some(ev) = stream.next().await {
-        let ev = ev.map_err(|e| XBackupError::Failure(format!("binlog 이벤트 읽기 실패: {e}")))?;
+        let ev = ev.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to read a binlog event: {e}",
+                "binlog 이벤트 읽기 실패: {e}"
+            ))
+        })?;
         let header = ev.header();
         let ts_secs = header.timestamp();
         let log_pos = header.log_pos() as u64;
 
-        let data = match ev
-            .read_data()
-            .map_err(|e| XBackupError::Failure(format!("binlog 이벤트 디코드 실패: {e}")))?
-        {
+        let data = match ev.read_data().map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to decode a binlog event: {e}",
+                "binlog 이벤트 디코드 실패: {e}"
+            ))
+        })? {
             Some(d) => d,
             None => continue,
         };
@@ -240,7 +251,10 @@ pub async fn capture(
 
                 for row in re.rows(tme) {
                     let (before, after) = row.map_err(|e| {
-                        XBackupError::Failure(format!("binlog 행 디코드 실패: {e}"))
+                        XBackupError::Failure(crate::tr!(
+                            "failed to decode a binlog row: {e}",
+                            "binlog 행 디코드 실패: {e}"
+                        ))
                     })?;
                     tx_buf.push(Change {
                         op,
@@ -298,9 +312,12 @@ fn render_binlog_row(
     col_types: &[Option<ColumnType>],
 ) -> Result<Vec<String>> {
     let Some(br) = row else { return Ok(Vec::new()) };
-    let r: Row = br
-        .try_into()
-        .map_err(|e| XBackupError::Failure(format!("binlog 행→Row 변환 실패: {e}")))?;
+    let r: Row = br.try_into().map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to convert a binlog row to Row: {e}",
+            "binlog 행→Row 변환 실패: {e}"
+        ))
+    })?;
     let mut out = Vec::with_capacity(r.len());
     for i in 0..r.len() {
         let ct = col_types.get(i).copied().flatten();
@@ -330,13 +347,15 @@ pub async fn apply<R: AsyncRead + Unpin>(
         IncrFrame::Header(h) => {
             let fmt = h.get_str("format").unwrap_or("");
             if fmt != INCR_FORMAT_ID {
-                return Err(XBackupError::Failure(format!(
+                return Err(XBackupError::Failure(crate::tr!(
+                    "MySQL incremental format mismatch: '{fmt}'",
                     "MySQL 증분 포맷 불일치: '{fmt}'"
                 )));
             }
         }
         other => {
-            return Err(XBackupError::Failure(format!(
+            return Err(XBackupError::Failure(crate::tr!(
+                "MySQL incremental header missing: {other:?}",
                 "MySQL 증분 헤더 누락: {other:?}"
             )))
         }
@@ -356,7 +375,10 @@ pub async fn apply<R: AsyncRead + Unpin>(
     loop {
         match read_frame(reader).await? {
             IncrFrame::Header(_) => {
-                return Err(XBackupError::Failure("MySQL 증분 헤더 중복".into()))
+                return Err(XBackupError::Failure(crate::tr!(
+                    "duplicate MySQL incremental header",
+                    "MySQL 증분 헤더 중복"
+                )))
             }
             IncrFrame::Change(c) => {
                 if let Some(max) = max_commit_micros {
@@ -373,9 +395,12 @@ pub async fn apply<R: AsyncRead + Unpin>(
                 let cols = &meta_cache[&key];
                 if let Some(sql) = build_dml(&c, cols) {
                     conn.query_drop(&sql).await.map_err(|e| {
-                        XBackupError::Failure(format!(
+                        XBackupError::Failure(crate::tr!(
+                            "{}.{} incremental apply failed: {e}
+ SQL: {sql}",
                             "{}.{} 증분 적용 실패: {e}\n  SQL: {sql}",
-                            c.db, c.table
+                            c.db,
+                            c.table
                         ))
                     })?;
                     applied += 1;
@@ -397,7 +422,12 @@ async fn target_columns(conn: &mut Conn, table: &str) -> Result<Vec<ColInfo>> {
             (table,),
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("{table} 컬럼 메타 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "{table}: failed to query column metadata: {e}",
+                "{table} 컬럼 메타 조회 실패: {e}"
+            ))
+        })?;
     Ok(rows
         .into_iter()
         // virtual generated만 row 이미지에서 빠지므로 제외. STORED generated는 이미지엔 있으나
@@ -563,13 +593,19 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<IncrFrame> {
     match r.read_exact(&mut tag).await {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(IncrFrame::End),
-        Err(e) => return Err(XBackupError::Failure(format!("증분 태그 읽기 실패: {e}"))),
+        Err(e) => {
+            return Err(XBackupError::Failure(crate::tr!(
+                "failed to read the incremental tag: {e}",
+                "증분 태그 읽기 실패: {e}"
+            )))
+        }
     }
     match tag[0] {
         TAG_END => Ok(IncrFrame::End),
         TAG_HEADER => Ok(IncrFrame::Header(read_doc(r).await?)),
         TAG_CHANGE => Ok(IncrFrame::Change(doc_to_change(&read_doc(r).await?)?)),
-        other => Err(XBackupError::Failure(format!(
+        other => Err(XBackupError::Failure(crate::tr!(
+            "corrupt incremental frame tag: 0x{other:02x}",
             "증분 프레임 태그 손상: 0x{other:02x}"
         ))),
     }
@@ -577,22 +613,33 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<IncrFrame> {
 
 async fn read_doc<R: AsyncRead + Unpin>(r: &mut R) -> Result<Document> {
     let mut len_buf = [0u8; 4];
-    r.read_exact(&mut len_buf)
-        .await
-        .map_err(|e| XBackupError::Failure(format!("증분 길이 읽기 실패: {e}")))?;
+    r.read_exact(&mut len_buf).await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to read the incremental length: {e}",
+            "증분 길이 읽기 실패: {e}"
+        ))
+    })?;
     let len = u32::from_le_bytes(len_buf);
     if !(5..=256 * 1024 * 1024).contains(&len) {
-        return Err(XBackupError::Failure(format!(
+        return Err(XBackupError::Failure(crate::tr!(
+            "invalid incremental frame length: {len}",
             "증분 프레임 길이 비정상: {len}"
         )));
     }
     let mut buf = vec![0u8; len as usize];
     buf[..4].copy_from_slice(&len_buf);
-    r.read_exact(&mut buf[4..])
-        .await
-        .map_err(|e| XBackupError::Failure(format!("증분 본문 읽기 실패: {e}")))?;
-    Document::from_reader(&buf[..])
-        .map_err(|e| XBackupError::Failure(format!("증분 프레임 파싱 실패: {e}")))
+    r.read_exact(&mut buf[4..]).await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to read the incremental body: {e}",
+            "증분 본문 읽기 실패: {e}"
+        ))
+    })?;
+    Document::from_reader(&buf[..]).map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to parse the incremental frame: {e}",
+            "증분 프레임 파싱 실패: {e}"
+        ))
+    })
 }
 
 fn change_to_doc(c: &Change) -> Document {
@@ -630,7 +677,12 @@ fn doc_to_change(d: &Document) -> Result<Change> {
         "I" => Op::Insert,
         "U" => Op::Update,
         "D" => Op::Delete,
-        other => return Err(XBackupError::Failure(format!("증분 op 손상: '{other}'"))),
+        other => {
+            return Err(XBackupError::Failure(crate::tr!(
+                "corrupt incremental op: '{other}'",
+                "증분 op 손상: '{other}'"
+            )))
+        }
     };
     Ok(Change {
         op,

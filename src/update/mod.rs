@@ -6,9 +6,9 @@
 //! - **manual**(install.sh — `~/.local/bin` 등) → GitHub 릴리스 자산을 내려받아
 //!   `checksums.txt`로 sha256 검증 후 **원자적 rename**으로 자기 교체.
 //!
-//! private 저장소 단계에서는 GitHub API 호출·자산 다운로드에 토큰이 필요하다 —
-//! `GITHUB_TOKEN` > `GH_TOKEN` > `gh auth token`(설치돼 있으면) 순으로 찾는다.
-//! 저장소가 public이 되면 토큰 없이도 동작한다(있으면 rate-limit 완화용으로 사용).
+//! 토큰 없이 동작한다. 다만 토큰이 있으면 쓴다. 비인증 GitHub API는 IP당 시간 60회라
+//! CI처럼 자주 부르는 환경에서는 한도에 걸리기 때문이다. 탐색 순서는 `GITHUB_TOKEN` >
+//! `GH_TOKEN` > `gh auth token`(설치돼 있으면).
 
 use std::path::{Path, PathBuf};
 
@@ -80,7 +80,8 @@ pub fn platform_asset_name() -> Result<String> {
         "macos" => "darwin",
         "linux" => "linux",
         other => {
-            return Err(XBackupError::Failure(format!(
+            return Err(XBackupError::Failure(crate::tr!(
+                "unsupported OS: {other} (only darwin/linux)",
                 "지원하지 않는 OS: {other} (darwin/linux만 지원)"
             )))
         }
@@ -89,7 +90,8 @@ pub fn platform_asset_name() -> Result<String> {
         "aarch64" => "arm64",
         "x86_64" => "amd64",
         other => {
-            return Err(XBackupError::Failure(format!(
+            return Err(XBackupError::Failure(crate::tr!(
+                "unsupported architecture: {other} (only arm64/amd64)",
                 "지원하지 않는 아키텍처: {other} (arm64/amd64만 지원)"
             )))
         }
@@ -116,8 +118,9 @@ pub struct Release {
     pub assets: Vec<Asset>,
 }
 
-/// 릴리스 자산 — private 저장소에서는 `url`(API asset endpoint)로 받아야 한다
-/// (`browser_download_url`은 토큰 인증으로 받을 수 없음).
+/// 릴리스 자산. 다운로드는 `browser_download_url`이 아니라 `url`(API asset endpoint)로
+/// 한다. `browser_download_url`은 Bearer 인증과 같이 못 쓰므로, 토큰이 있는 환경까지
+/// 한 경로로 덮으려면 이쪽이어야 한다.
 #[derive(Debug, Deserialize)]
 pub struct Asset {
     /// 자산 파일명.
@@ -154,7 +157,12 @@ fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(concat!("x-backup/", env!("CARGO_PKG_VERSION")))
         .build()
-        .map_err(|e| XBackupError::Failure(format!("HTTP 클라이언트 생성 실패: {e}")))
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to create the HTTP client: {e}",
+                "HTTP 클라이언트 생성 실패: {e}"
+            ))
+        })
 }
 
 fn auth_header(req: reqwest::RequestBuilder, token: &Option<String>) -> reqwest::RequestBuilder {
@@ -164,48 +172,67 @@ fn auth_header(req: reqwest::RequestBuilder, token: &Option<String>) -> reqwest:
     }
 }
 
-/// 최신 릴리스를 조회한다. private + 토큰 부재(404)는 안내 메시지로 변환한다.
+/// 최신 릴리스를 조회한다. 404는 게시된 릴리스가 없는 경우라 안내 메시지로 바꾼다.
 pub async fn fetch_latest(token: &Option<String>) -> Result<Release> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
     let resp = auth_header(http_client()?.get(&url), token)
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
-        .map_err(|e| XBackupError::Failure(format!("릴리스 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to query the release: {e}",
+                "릴리스 조회 실패: {e}"
+            ))
+        })?;
 
     match resp.status().as_u16() {
-        200 => resp
-            .json::<Release>()
-            .await
-            .map_err(|e| XBackupError::Failure(format!("릴리스 응답 파싱 실패: {e}"))),
-        404 if token.is_none() => Err(XBackupError::Config(format!(
-            "{REPO} 릴리스를 찾을 수 없습니다 — private 저장소면 GITHUB_TOKEN을 \
-             설정하거나 gh auth login 후 다시 실행하세요."
+        200 => resp.json::<Release>().await.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to parse the release response: {e}",
+                "릴리스 응답 파싱 실패: {e}"
+            ))
+        }),
+        404 => Err(XBackupError::Config(crate::tr!(
+            "{REPO} has no published releases — check https://github.com/{REPO}/releases",
+            "{REPO}에 게시된 릴리스가 없습니다 — \
+             https://github.com/{REPO}/releases 를 확인하세요."
         ))),
-        s => Err(XBackupError::Failure(format!(
+        s => Err(XBackupError::Failure(crate::tr!(
+            "failed to query the release: HTTP {s} ({url})",
             "릴리스 조회 실패: HTTP {s} ({url})"
         ))),
     }
 }
 
-/// 자산을 API endpoint로 내려받는다(private 호환 — Accept: octet-stream).
+/// 자산을 API endpoint로 내려받는다(`Accept: application/octet-stream`).
 pub async fn download_asset(asset: &Asset, token: &Option<String>) -> Result<Vec<u8>> {
     let resp = auth_header(http_client()?.get(&asset.url), token)
         .header("Accept", "application/octet-stream")
         .send()
         .await
-        .map_err(|e| XBackupError::Failure(format!("{} 다운로드 실패: {e}", asset.name)))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "{}: download failed: {e}",
+                "{} 다운로드 실패: {e}",
+                asset.name
+            ))
+        })?;
     if !resp.status().is_success() {
-        return Err(XBackupError::Failure(format!(
+        return Err(XBackupError::Failure(crate::tr!(
+            "{}: download failed: HTTP {}",
             "{} 다운로드 실패: HTTP {}",
             asset.name,
             resp.status()
         )));
     }
-    resp.bytes()
-        .await
-        .map(|b| b.to_vec())
-        .map_err(|e| XBackupError::Failure(format!("{} 수신 실패: {e}", asset.name)))
+    resp.bytes().await.map(|b| b.to_vec()).map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "{}: failed to receive: {e}",
+            "{} 수신 실패: {e}",
+            asset.name
+        ))
+    })
 }
 
 /// tar.gz 바이트에서 `x-backup` 단일 엔트리를 추출한다.
@@ -213,27 +240,42 @@ pub fn extract_binary(targz: &[u8]) -> Result<Vec<u8>> {
     use std::io::Read;
     let gz = flate2::read::GzDecoder::new(targz);
     let mut archive = tar::Archive::new(gz);
-    for entry in archive
-        .entries()
-        .map_err(|e| XBackupError::Failure(format!("tar 읽기 실패: {e}")))?
-    {
-        let mut entry =
-            entry.map_err(|e| XBackupError::Failure(format!("tar 엔트리 실패: {e}")))?;
+    for entry in archive.entries().map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to read the tar: {e}",
+            "tar 읽기 실패: {e}"
+        ))
+    })? {
+        let mut entry = entry.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to read a tar entry: {e}",
+                "tar 엔트리 실패: {e}"
+            ))
+        })?;
         let path = entry
             .path()
-            .map_err(|e| XBackupError::Failure(format!("tar 경로 실패: {e}")))?
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "failed to read a tar path: {e}",
+                    "tar 경로 실패: {e}"
+                ))
+            })?
             .to_path_buf();
         if path.file_name().and_then(|n| n.to_str()) == Some("x-backup") {
             let mut buf = Vec::new();
-            entry
-                .read_to_end(&mut buf)
-                .map_err(|e| XBackupError::Failure(format!("tar 추출 실패: {e}")))?;
+            entry.read_to_end(&mut buf).map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "failed to extract the tar: {e}",
+                    "tar 추출 실패: {e}"
+                ))
+            })?;
             return Ok(buf);
         }
     }
-    Err(XBackupError::Failure(
-        "릴리스 tarball에 x-backup 바이너리가 없습니다".into(),
-    ))
+    Err(XBackupError::Failure(crate::tr!(
+        "the release tarball has no x-backup binary",
+        "릴리스 tarball에 x-backup 바이너리가 없습니다"
+    )))
 }
 
 /// 새 바이너리로 자기 자신을 **원자적으로** 교체한다.
@@ -245,7 +287,8 @@ pub fn replace_binary(current: &Path, new_bytes: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let dir = current.parent().ok_or_else(|| {
-        XBackupError::Failure(format!(
+        XBackupError::Failure(crate::tr!(
+            "the executable path is invalid: {}",
             "실행 파일 경로가 비정상입니다: {}",
             current.display()
         ))
@@ -260,20 +303,25 @@ pub fn replace_binary(current: &Path, new_bytes: &[u8]) -> Result<()> {
         .mode(0o755)
         .open(&tmp)
         .map_err(|e| {
-            XBackupError::Failure(format!(
-                "{} 쓰기 실패: {e} — 설치 디렉터리에 쓰기 권한이 없으면 \
-                 소유자 권한으로 다시 실행하세요",
-                tmp.display()
-            ))
+            XBackupError::Failure(crate::tr!("failed to write {}: {e} — if the install directory is not writable, re-run with owner permissions", "{} 쓰기 실패: {e} — 설치 디렉터리에 쓰기 권한이 없으면 \
+                 소유자 권한으로 다시 실행하세요", tmp.display()))
         })?;
     f.write_all(new_bytes)
         .and_then(|_| f.sync_all())
-        .map_err(|e| XBackupError::Failure(format!("새 바이너리 쓰기 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to write the new binary: {e}",
+                "새 바이너리 쓰기 실패: {e}"
+            ))
+        })?;
     drop(f);
 
     std::fs::rename(&tmp, current).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
-        XBackupError::Failure(format!("바이너리 교체(rename) 실패: {e}"))
+        XBackupError::Failure(crate::tr!(
+            "failed to rename (replace) the binary: {e}",
+            "바이너리 교체(rename) 실패: {e}"
+        ))
     })
 }
 

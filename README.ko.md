@@ -12,11 +12,16 @@
 스트리밍(데이터 크기와 무관한 상수 메모리 — [실측 보고서](docs/memory-profile.md): 6 GiB 백업
 피크 RSS 54.6 MiB)으로 동작한다. DB 종류는 source URI 스킴(`mongodb://`·`postgresql://`·`mysql://`/`mariadb://`)으로 자동 선택된다.
 
+<img src="docs/assets/demo-backup.gif" alt="풀 백업, 이어지는 증분 백업, 그리고 x-backup list에 나타난 둘의 체인" width="100%">
+
+풀 백업 → 그 이후 변경만 담는 증분 백업 → 둘이 이루는 체인. 실제로 떠 있는 replica set을
+대상으로 녹화했고, [테이프 스크립트도 리포에 있다](docs/assets/).
+
 ## Features
 
 - ✅ **풀 백업** — 드라이버 네이티브 스트리밍 아카이브(데이터 + 인덱스 + 컬렉션 옵션), 외부 도구 불필요. `mongodump --archive --oplog`는 opt-in 엔진으로 선택 가능
 - ✅ **증분 백업** — oplog 직접 캡처, gap 감지 시 풀 백업 자동 승격(exit 4)
-- ✅ **PITR** — `--at <RFC3339>|latest` 시점 복구 (base + replay, 체인 검증 전제). MongoDB(oplog)·PostgreSQL(logical decoding) 모두 지원
+- ✅ **PITR** — `--at <RFC3339>` 시점 복구(base 복원 후 증분 재생, 체인 검증 전제). MongoDB(oplog)·PostgreSQL(logical decoding)·MySQL(binlog) 지원. PostgreSQL·MySQL은 `--at latest`로 전체 재생도 된다
 - ✅ **스토리지** — 로컬 디스크 / S3 호환(MinIO·R2·OCI), 스트리밍 멀티파트 + abort
 - ✅ **암호화 기본** — `age`(X25519, 공개키만 백업 호스트에 배치) / AES-256-GCM 대안, zstd 압축 후 암호화
 - ✅ **무결성** — manifest + sha256, `verify`(키 불필요 구조 검증) / `--deep` / `--chain`
@@ -35,21 +40,10 @@
 brew install x-mesh/tap/x-backup
 ```
 
-private 단계에서는 릴리스 자산 다운로드에 GitHub 토큰이 필요하다:
-
-```bash
-export HOMEBREW_GITHUB_API_TOKEN=$(gh auth token)
-brew install x-mesh/tap/x-backup
-```
-
 ### curl (install.sh)
 
 ```bash
-# 저장소 공개 후:
 curl -fsSL https://raw.githubusercontent.com/x-mesh/x-backup/main/install.sh | sh
-
-# private 단계(gh 인증 재사용):
-gh api repos/x-mesh/x-backup/contents/install.sh --jq '.content' | base64 -d | sh
 ```
 
 `~/.local/bin/x-backup`에 설치된다. `XB_VERSION`, `XB_INSTALL_DIR`로 조정.
@@ -76,8 +70,6 @@ x-backup update --check   # 확인만
 - **install.sh 설치** → 최신 릴리스 다운로드 + sha256 검증 + 원자적 자기 교체
 - **cargo install** → 갱신 명령 안내만(덮어쓰지 않음)
 
-private 단계에서는 `GITHUB_TOKEN`(또는 `gh auth login`)이 필요하다.
-
 ## Quick Start
 
 ```bash
@@ -99,6 +91,12 @@ x-backup migrate --profile prod --target mongodb://newcluster --force # 파일 �
 ```
 
 다중 DB 툴이라, 모든 명령은 실행 시 stderr에 활성 프로파일·DB를 한 줄로 보여준다(`▸ 프로파일 prod · DB postgresql`) — 지금 무엇을 건드리는지 항상 보이게(`--json`이면 생략). `--profile`은 `XB_PROFILE` 환경변수로도 줄 수 있다(`--config`/`XB_CONFIG`와 동일).
+
+가장 먼저 돌릴 것은 `status`다. "지금 이 서버를 백업해도 되는가"에 아무것도 쓰지 않고
+답한다 — 연결·토폴로지·권한·버전/FCV·시계 오차·oplog 윈도·데이터 형태·마지막 백업 경과
+시간, 그리고 destination이 쓰기 가능하고 여유 공간이 있는지까지.
+
+<img src="docs/assets/demo-status.gif" alt="x-backup status가 16개 사전 점검 항목을 OK/WARN으로 찍고 종합 판정과 종료 코드를 내놓는 화면" width="100%">
 
 ### Migrate (파일 없이 직접 복사)
 
@@ -612,9 +610,17 @@ cron에서 4를 성공으로 다루려면: `x-backup backup ...; rc=$?; [ $rc -e
 
 ## 복구 의미론
 
+백업이 망가진 걸 가장 싸게 아는 방법은 *필요해지기 전에* 아는 것이다. `verify --deep`은
+아카이브를 복호화·디코드까지 해보고, `--chain`은 증분을 base까지 거슬러 올라간다. 복구를
+실제로 돌리지 않고도 복구가 될지 알 수 있다 — DB에는 아무것도 쓰지 않고, 저장소도 그대로다.
+
+<img src="docs/assets/demo-verify.gif" alt="x-backup verify가 manifest 무결성·데이터 체크섬·deep decode를 모두 OK로 보고하고, base까지 연속된 체인을 확인하는 화면" width="100%">
+
 - `restore`(--at 없음) = **base 풀백업 스냅샷만** 복원
-- `restore --at <시각>` = PITR — base 복원 후 증분 oplog를 해당 시각(이하 최대 ts)까지 재생.
-  `verify --chain` 통과가 전제이며, `--only`(선택 복구)와는 병용 불가(mongorestore 제약)
+- `restore --at <RFC3339>` = PITR — base 복원 후 증분을 해당 시각(이하 최대 ts)까지 재생.
+  MongoDB는 oplog, PostgreSQL은 logical decoding, MySQL은 binlog를 재생한다. PostgreSQL·MySQL은
+  `--at latest`로 전체 재생도 되지만 **MongoDB는 시각만 받는다**. `verify --chain` 통과가
+  전제이며, `--only`(선택 복구)와는 병용 불가(oplog 재생은 네임스페이스 필터와 함께 쓸 수 없다)
 - 복구 검증: `verify --deep`은 개인키 보유 호스트에서만 동작한다(§8.5 키 격리 — 백업
   호스트는 공개키만 가지므로 침해돼도 과거 백업을 복호화할 수 없다)
 
@@ -713,10 +719,12 @@ gap 가드가 동작하는 것이지 오류가 아니다. churn으로 데이터�
 
 | 문서 | 내용 |
 |------|------|
+| [docs/postgres.md](docs/postgres.md) | PostgreSQL 엔진 상세(logical decoding·PITR·스키마 충실도) |
 | [docs/mysql.md](docs/mysql.md) | MySQL 엔진 상세(스키마 충실도·binlog 내부 구조·PITR·개발/CI) |
 | [docs/web-console.ko.md](docs/web-console.ko.md) | 웹 운영 콘솔(`serve`) 운영 — systemd 유닛·바인딩·인증·age 키 권한·감사 로그·TLS 리버스 프록시 위임 |
 | [docs/control-server.ko.md](docs/control-server.ko.md) | 중앙 control 서버 운영(다중 DB 백업·복구·마이그레이션) — 예시: [examples/control-server.toml](examples/control-server.toml) |
 | [docs/PRD.md](docs/PRD.md) | 제품 요구사항(FR-1~12, 증분 설계, 암호화 설계) |
+| [docs/prd/](docs/prd/) | 기능별 PRD(WAL 물리 PITR·recovery window retention·RPO status·hooks·standby 백업) |
 | [docs/test-scenario.md](docs/test-scenario.md) | E2E 시나리오 정의 |
 | [docs/acceptance-report.md](docs/acceptance-report.md) | 수용 기준 10/10 실측 근거 |
 | [docs/memory-profile.md](docs/memory-profile.md) | 메모리 상한 실측(상수 RSS 입증) |
@@ -727,3 +735,7 @@ gap 가드가 동작하는 것이지 오류가 아니다. churn으로 데이터�
 
 GFS retention · Prometheus 메트릭 · KMS/HSM 키 연동 ·
 라이브 마이그레이션(oplog tailing 무중단 cutover) — [PRD §12](docs/PRD.md)
+
+## License
+
+MIT. 전문은 [LICENSE](LICENSE)에 있다.

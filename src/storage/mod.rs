@@ -102,38 +102,53 @@ pub trait Storage: Send + Sync {
 ///   [`XBackupError::Config`](exit 2)로 반환한다.
 pub fn from_config(dest: &DestinationConfig) -> Result<Box<dyn Storage>, XBackupError> {
     let backend = dest.r#type.as_deref().ok_or_else(|| {
-        XBackupError::Config("destination.type이 필요합니다(local | s3)".to_string())
+        XBackupError::Config(crate::tr!(
+            "destination.type is required (local | s3)",
+            "destination.type이 필요합니다(local | s3)"
+        ))
     })?;
 
     match backend {
         "local" => {
             let path = dest.path.as_deref().ok_or_else(|| {
-                XBackupError::Config("local destination에 path가 필요합니다".to_string())
+                XBackupError::Config(crate::tr!(
+                    "a local destination requires path",
+                    "local destination에 path가 필요합니다"
+                ))
             })?;
             // object_store LocalFileSystem은 루트가 미리 존재해야 한다 — 없으면 생성.
             std::fs::create_dir_all(path).map_err(|e| {
-                XBackupError::Config(format!("destination 디렉터리 준비 실패({path}): {e}"))
+                XBackupError::Config(crate::tr!(
+                    "failed to prepare the destination directory ({path}): {e}",
+                    "destination 디렉터리 준비 실패({path}): {e}"
+                ))
             })?;
             Ok(Box::new(LocalFs::new(path)?))
         }
         "s3" => {
             let s3_cfg = dest.s3.as_ref().ok_or_else(|| {
-                XBackupError::Config(
-                    "s3 destination에 [destination.s3] 블록이 필요합니다".to_string(),
-                )
+                XBackupError::Config(crate::tr!(
+                    "an s3 destination requires a [destination.s3] block",
+                    "s3 destination에 [destination.s3] 블록이 필요합니다"
+                ))
             })?;
             let creds_env = s3_cfg.credentials_env.as_deref().ok_or_else(|| {
-                XBackupError::Config("s3 destination에 credentials_env가 필요합니다".to_string())
+                XBackupError::Config(crate::tr!(
+                    "an s3 destination requires credentials_env",
+                    "s3 destination에 credentials_env가 필요합니다"
+                ))
             })?;
             // credentials_env가 가리키는 환경변수에서 "ACCESS:SECRET" 값을 읽는다.
             let creds_raw = std::env::var(creds_env).map_err(|_| {
-                XBackupError::Config(format!(
+                XBackupError::Config(crate::tr!(
+                    "S3 credentials environment variable '{creds_env}' is not set",
                     "S3 자격증명 환경변수 '{creds_env}'가 설정되지 않았습니다"
                 ))
             })?;
             Ok(Box::new(S3Compatible::new(s3_cfg, &creds_raw)?))
         }
-        other => Err(XBackupError::Config(format!(
+        other => Err(XBackupError::Config(crate::tr!(
+            "unsupported destination.type: '{other}' (only local | s3 are supported)",
             "지원하지 않는 destination.type: '{other}'(local | s3만 지원)"
         ))),
     }

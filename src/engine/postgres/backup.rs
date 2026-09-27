@@ -120,7 +120,12 @@ async fn write_archive(
     client
         .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .await
-        .map_err(|e| XBackupError::Failure(format!("스냅샷 트랜잭션 시작 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to start the snapshot transaction: {e}",
+                "스냅샷 트랜잭션 시작 실패: {e}"
+            ))
+        })?;
     let res = write_archive_in_snapshot(client, writer, schema_filter, table_filter).await;
     // 읽기 전용이라 부작용은 없지만, 성공은 COMMIT·실패는 ROLLBACK으로 명시적으로 닫는다.
     let _ = client
@@ -140,7 +145,12 @@ async fn write_archive_in_snapshot(
         .query_one("SHOW server_version", &[])
         .await
         .map(|r| r.get(0))
-        .map_err(|e| XBackupError::Failure(format!("server_version 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to query server_version: {e}",
+                "server_version 조회 실패: {e}"
+            ))
+        })?;
     archive::write_header(writer, &chrono::Utc::now().to_rfc3339(), &version).await?;
 
     // 선행 DDL — 확장 → 타입 → 함수/프로시저. 테이블 컬럼·DEFAULT·CHECK·트리거가 이들을 쓰므로
@@ -177,13 +187,20 @@ async fn write_archive_in_snapshot(
         if def.has_data && !def.copy_cols.is_empty() {
             let cols = def.copy_cols.join(", ");
             let copy_sql = format!("COPY {} ({cols}) TO STDOUT (FORMAT text)", def.quoted);
-            let stream = client
-                .copy_out(copy_sql.as_str())
-                .await
-                .map_err(|e| XBackupError::Failure(format!("{} COPY OUT 실패: {e}", def.ns)))?;
+            let stream = client.copy_out(copy_sql.as_str()).await.map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "{} COPY OUT failed: {e}",
+                    "{} COPY OUT 실패: {e}",
+                    def.ns
+                ))
+            })?;
             futures::pin_mut!(stream);
             while let Some(chunk) = stream.try_next().await.map_err(|e| {
-                XBackupError::Failure(format!("{} COPY 청크 읽기 실패: {e}", def.ns))
+                XBackupError::Failure(crate::tr!(
+                    "{} failed to read a COPY chunk: {e}",
+                    "{} COPY 청크 읽기 실패: {e}",
+                    def.ns
+                ))
             })? {
                 archive::write_data_bytes(writer, &chunk).await?;
             }
@@ -232,7 +249,12 @@ async fn write_functions(
     for r in client
         .query(sql.as_str(), &[&schema_filter])
         .await
-        .map_err(|e| XBackupError::Failure(format!("함수 조회 실패: {e}")))?
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to query functions: {e}",
+                "함수 조회 실패: {e}"
+            ))
+        })?
     {
         archive::write_pre(writer, &r.get::<_, String>(0)).await?;
     }
@@ -255,7 +277,12 @@ async fn write_triggers(
     for r in client
         .query(sql.as_str(), &[&schema_filter])
         .await
-        .map_err(|e| XBackupError::Failure(format!("트리거 조회 실패: {e}")))?
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to query triggers: {e}",
+                "트리거 조회 실패: {e}"
+            ))
+        })?
     {
         archive::write_post(writer, &r.get::<_, String>(0)).await?;
     }
@@ -272,7 +299,7 @@ async fn write_extensions(client: &Client, writer: &mut DuplexStream) -> Result<
             &[],
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("확장 목록 조회 실패: {e}")))?;
+        .map_err(|e| XBackupError::Failure(crate::tr!("failed to list extensions: {e}", "확장 목록 조회 실패: {e}")))?;
     for r in rows {
         archive::write_pre(writer, &r.get::<_, String>(0)).await?;
     }
@@ -300,7 +327,12 @@ async fn write_types(
     for r in client
         .query(enum_sql.as_str(), &[&schema_filter])
         .await
-        .map_err(|e| XBackupError::Failure(format!("enum 타입 조회 실패: {e}")))?
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to query enum types: {e}",
+                "enum 타입 조회 실패: {e}"
+            ))
+        })?
     {
         archive::write_pre(writer, &r.get::<_, String>(0)).await?;
     }
@@ -325,7 +357,12 @@ async fn write_types(
     for r in client
         .query(domain_sql.as_str(), &[&schema_filter])
         .await
-        .map_err(|e| XBackupError::Failure(format!("도메인 타입 조회 실패: {e}")))?
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to query domain types: {e}",
+                "도메인 타입 조회 실패: {e}"
+            ))
+        })?
     {
         archive::write_pre(writer, &r.get::<_, String>(0)).await?;
     }
@@ -347,7 +384,12 @@ async fn write_types(
     for r in client
         .query(comp_sql.as_str(), &[&schema_filter])
         .await
-        .map_err(|e| XBackupError::Failure(format!("복합 타입 조회 실패: {e}")))?
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to query composite types: {e}",
+                "복합 타입 조회 실패: {e}"
+            ))
+        })?
     {
         archive::write_pre(writer, &r.get::<_, String>(0)).await?;
     }
@@ -375,7 +417,12 @@ async fn write_views(
     for r in client
         .query(sql.as_str(), &[&schema_filter])
         .await
-        .map_err(|e| XBackupError::Failure(format!("뷰/머티뷰 조회 실패: {e}")))?
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to query views/matviews: {e}",
+                "뷰/머티뷰 조회 실패: {e}"
+            ))
+        })?
     {
         archive::write_post(writer, &r.get::<_, String>(0)).await?;
     }
@@ -412,7 +459,12 @@ async fn write_sequences(
     let rows = client
         .query(sql.as_str(), &[&schema_filter])
         .await
-        .map_err(|e| XBackupError::Failure(format!("시퀀스 목록 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to list sequences: {e}",
+                "시퀀스 목록 조회 실패: {e}"
+            ))
+        })?;
     for row in rows {
         let quoted: String = row.get(0);
         let schema: String = row.get(1);
@@ -456,7 +508,12 @@ async fn list_tables(
     let rows = client
         .query(sql.as_str(), &[&schema_filter, &table_filter])
         .await
-        .map_err(|e| XBackupError::Failure(format!("테이블 목록 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to list tables: {e}",
+                "테이블 목록 조회 실패: {e}"
+            ))
+        })?;
     Ok(rows
         .into_iter()
         .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
@@ -475,7 +532,12 @@ async fn introspect_table(client: &Client, (schema, table): &(String, String)) -
             &[schema, table],
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("{ns} 식별자/oid 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "{ns}: failed to query identifier/oid: {e}",
+                "{ns} 식별자/oid 조회 실패: {e}"
+            ))
+        })?;
     let quoted: String = row.get(0);
     let oid: u32 = row.get(1);
     let schema_quoted: String = row.get(2);
@@ -494,7 +556,7 @@ async fn introspect_table(client: &Client, (schema, table): &(String, String)) -
             &[&oid],
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("{ns} 파티션 정보 조회 실패: {e}")))?;
+        .map_err(|e| XBackupError::Failure(crate::tr!("{ns}: failed to query partition info: {e}", "{ns} 파티션 정보 조회 실패: {e}")))?;
     let is_partitioned_parent: bool = prow.get(0);
     let is_partition_child: bool = prow.get(1);
     let part_key: Option<String> = prow.get(2);
@@ -516,7 +578,12 @@ async fn introspect_table(client: &Client, (schema, table): &(String, String)) -
             &[&oid],
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("{ns} 컬럼 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "{ns}: failed to query columns: {e}",
+                "{ns} 컬럼 조회 실패: {e}"
+            ))
+        })?;
     let mut cols = Vec::new();
     let mut copy_cols = Vec::new();
     let mut identity_cols = Vec::new();
@@ -559,8 +626,12 @@ async fn introspect_table(client: &Client, (schema, table): &(String, String)) -
     // 파티션 자식은 PARTITION OF로 부모 정의를 상속(컬럼/제약/인덱스 재선언 불필요·금지).
     // 부모(relkind='p')는 PARTITION BY 절을 붙이고 직접 데이터가 없다(데이터는 자식에 있음).
     if is_partition_child {
-        let parent = part_parent
-            .ok_or_else(|| XBackupError::Failure(format!("{ns} 파티션 부모를 찾지 못했습니다")))?;
+        let parent = part_parent.ok_or_else(|| {
+            XBackupError::Failure(crate::tr!(
+                "{ns}: could not find the partition parent",
+                "{ns} 파티션 부모를 찾지 못했습니다"
+            ))
+        })?;
         let bound = part_bound.unwrap_or_else(|| "DEFAULT".to_string());
         // 중간 노드(자식이면서 또 파티션 부모)는 PARTITION BY도 덧붙인다(다중 레벨).
         let mut create_sql = format!("CREATE TABLE {quoted} PARTITION OF {parent} {bound}");
@@ -606,7 +677,12 @@ async fn introspect_table(client: &Client, (schema, table): &(String, String)) -
             &[&oid],
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("{ns} 제약 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "{ns}: failed to query constraints: {e}",
+                "{ns} 제약 조회 실패: {e}"
+            ))
+        })?;
     let mut constraints = Vec::new();
     for c in &con_rows {
         let cident: String = c.get(0);
@@ -626,7 +702,12 @@ async fn introspect_table(client: &Client, (schema, table): &(String, String)) -
             &[&oid],
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("{ns} 인덱스 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "{ns}: failed to query indexes: {e}",
+                "{ns} 인덱스 조회 실패: {e}"
+            ))
+        })?;
     let indexes = idx_rows.iter().map(|r| r.get::<_, String>(0)).collect();
 
     Ok(TableDef {
@@ -653,7 +734,12 @@ async fn local_constraints(client: &Client, oid: u32, quoted: &str) -> Result<Ve
             &[&oid],
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("파티션 로컬 제약 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to query the partition's local constraints: {e}",
+                "파티션 로컬 제약 조회 실패: {e}"
+            ))
+        })?;
     Ok(rows
         .iter()
         .map(|c| {
@@ -679,7 +765,12 @@ async fn local_partition_indexes(client: &Client, oid: u32) -> Result<Vec<String
             &[&oid],
         )
         .await
-        .map_err(|e| XBackupError::Failure(format!("파티션 로컬 인덱스 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to query the partition's local indexes: {e}",
+                "파티션 로컬 인덱스 조회 실패: {e}"
+            ))
+        })?;
     Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
 }
 

@@ -322,19 +322,28 @@ fn parse_major(v: &str) -> Option<u32> {
 /// 권한은 비용 때문에 사전 점검하지 않고 백업 스트림에서 fail-fast로 표면화한다.
 pub async fn precheck(uri: &Secret, timeout_secs: Option<u64>) -> crate::error::Result<()> {
     use crate::error::XBackupError;
-    let mut client = MysqlClient::connect(uri, timeout_secs)
-        .await
-        .map_err(|e| XBackupError::PrecheckFailed(format!("MySQL 연결 실패: {e}")))?;
+    let mut client = MysqlClient::connect(uri, timeout_secs).await.map_err(|e| {
+        XBackupError::PrecheckFailed(crate::tr!(
+            "failed to connect to MySQL: {e}",
+            "MySQL 연결 실패: {e}"
+        ))
+    })?;
     let conn = client.conn_mut();
     let db: Option<String> = conn
         .query_first::<Option<String>, _>("SELECT DATABASE()")
         .await
-        .map_err(|e| XBackupError::PrecheckFailed(format!("DATABASE() 질의 실패: {e}")))?
+        .map_err(|e| {
+            XBackupError::PrecheckFailed(crate::tr!(
+                "the DATABASE() query failed: {e}",
+                "DATABASE() 질의 실패: {e}"
+            ))
+        })?
         .flatten();
     if db.as_deref().unwrap_or("").is_empty() {
-        return Err(XBackupError::PrecheckFailed(
-            "백업 대상 데이터베이스가 URI에 없습니다(mysql://user@host/<db> 형식 필요).".into(),
-        ));
+        return Err(XBackupError::PrecheckFailed(crate::tr!(
+            "the URI names no backup target database (mysql://user@host/<db> is required).",
+            "백업 대상 데이터베이스가 URI에 없습니다(mysql://user@host/<db> 형식 필요)."
+        )));
     }
     Ok(())
 }

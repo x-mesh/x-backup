@@ -53,7 +53,8 @@ impl LocalFs {
     /// 대상 디렉터리를 사전 보장한다(config destination.path).
     pub fn new(root: impl AsRef<FsPath>) -> Result<Self, XBackupError> {
         let inner = LocalFileSystem::new_with_prefix(root.as_ref()).map_err(|e| {
-            XBackupError::StorageUpload(format!(
+            XBackupError::StorageUpload(crate::tr!(
+                "failed to initialize the local storage root ({}): {e}",
                 "로컬 스토리지 루트 초기화 실패({}): {e}",
                 root.as_ref().display()
             ))
@@ -63,8 +64,12 @@ impl LocalFs {
 
     /// trait의 `&str` 경로를 object_store `Path`로 변환한다.
     fn object_path(path: &str) -> Result<ObjectPath, XBackupError> {
-        ObjectPath::parse(path)
-            .map_err(|e| XBackupError::StorageUpload(format!("잘못된 스토리지 경로 '{path}': {e}")))
+        ObjectPath::parse(path).map_err(|e| {
+            XBackupError::StorageUpload(crate::tr!(
+                "invalid storage path '{path}': {e}",
+                "잘못된 스토리지 경로 '{path}': {e}"
+            ))
+        })
     }
 }
 
@@ -81,10 +86,12 @@ impl Storage for LocalFs {
         // 커밋 전 Drop되면(패닉·조기 반환) best-effort로 삭제를 시도하는 가드.
         let mut guard = UploadGuard::new(&self.inner, object_path.clone());
 
-        let upload =
-            self.inner.put_multipart(&object_path).await.map_err(|e| {
-                XBackupError::StorageUpload(format!("'{path}' 업로드 시작 실패: {e}"))
-            })?;
+        let upload = self.inner.put_multipart(&object_path).await.map_err(|e| {
+            XBackupError::StorageUpload(crate::tr!(
+                "'{path}': failed to start the upload: {e}",
+                "'{path}' 업로드 시작 실패: {e}"
+            ))
+        })?;
         let mut writer = WriteMultipart::new(upload);
 
         // reader를 청크 스트림으로 변환해 업로드 버퍼에 순차 공급한다.
@@ -97,7 +104,8 @@ impl Storage for LocalFs {
                     let _ = writer.abort().await;
                     // abort가 처리했으므로 가드의 추가 삭제는 불필요.
                     guard.disarm();
-                    return Err(XBackupError::StorageUpload(format!(
+                    return Err(XBackupError::StorageUpload(crate::tr!(
+                        "'{path}': failed to read the input stream: {read_err}",
                         "'{path}' 입력 스트림 읽기 실패: {read_err}"
                     )));
                 }
@@ -105,10 +113,12 @@ impl Storage for LocalFs {
         }
 
         // 마지막 파트 flush + 완료. 실패 시 WriteMultipart::finish 내부에서 abort한다.
-        writer
-            .finish()
-            .await
-            .map_err(|e| XBackupError::StorageUpload(format!("'{path}' 업로드 완료 실패: {e}")))?;
+        writer.finish().await.map_err(|e| {
+            XBackupError::StorageUpload(crate::tr!(
+                "'{path}': failed to complete the upload: {e}",
+                "'{path}' 업로드 완료 실패: {e}"
+            ))
+        })?;
 
         // 정상 커밋 — 가드 해제(삭제 시도하지 않음).
         guard.disarm();
@@ -117,10 +127,12 @@ impl Storage for LocalFs {
 
     async fn get_stream(&self, path: &str) -> Result<BoxAsyncRead, XBackupError> {
         let object_path = Self::object_path(path)?;
-        let result =
-            self.inner.get(&object_path).await.map_err(|e| {
-                XBackupError::StorageDownload(format!("'{path}' 다운로드 실패: {e}"))
-            })?;
+        let result = self.inner.get(&object_path).await.map_err(|e| {
+            XBackupError::StorageDownload(crate::tr!(
+                "'{path}': download failed: {e}",
+                "'{path}' 다운로드 실패: {e}"
+            ))
+        })?;
 
         // object_store 바이트 스트림(에러 타입)을 io::Error로 매핑해 StreamReader에 연결.
         let byte_stream = result
@@ -142,7 +154,10 @@ impl Storage for LocalFs {
         let mut entries = Vec::new();
         while let Some(meta) = stream.next().await {
             let meta = meta.map_err(|e| {
-                XBackupError::StorageDownload(format!("'{prefix}' 목록 조회 실패: {e}"))
+                XBackupError::StorageDownload(crate::tr!(
+                    "'{prefix}': failed to list: {e}",
+                    "'{prefix}' 목록 조회 실패: {e}"
+                ))
             })?;
             entries.push(StorageEntry {
                 path: meta.location.to_string(),
@@ -155,10 +170,12 @@ impl Storage for LocalFs {
 
     async fn delete(&self, path: &str) -> Result<(), XBackupError> {
         let object_path = Self::object_path(path)?;
-        self.inner
-            .delete(&object_path)
-            .await
-            .map_err(|e| XBackupError::StorageDownload(format!("'{path}' 삭제 실패: {e}")))
+        self.inner.delete(&object_path).await.map_err(|e| {
+            XBackupError::StorageDownload(crate::tr!(
+                "'{path}': delete failed: {e}",
+                "'{path}' 삭제 실패: {e}"
+            ))
+        })
     }
 }
 

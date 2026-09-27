@@ -26,9 +26,12 @@ pub async fn client_options(
     uri: &Secret,
     config_timeout_secs: Option<u64>,
 ) -> Result<ClientOptions> {
-    let mut options = ClientOptions::parse(uri.expose())
-        .await
-        .map_err(|e| XBackupError::Failure(format!("MongoDB URI 파싱 실패: {e}")))?;
+    let mut options = ClientOptions::parse(uri.expose()).await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to parse the MongoDB URI: {e}",
+            "MongoDB URI 파싱 실패: {e}"
+        ))
+    })?;
 
     let effective = Duration::from_secs(config_timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
 

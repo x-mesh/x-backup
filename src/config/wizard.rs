@@ -37,14 +37,18 @@ impl Prompt for StdinPrompt {
         let _ = std::io::stderr().flush();
 
         let mut buf = String::new();
-        let n = std::io::stdin()
-            .read_line(&mut buf)
-            .map_err(|e| XBackupError::Usage(format!("입력 읽기 실패: {e}")))?;
+        let n = std::io::stdin().read_line(&mut buf).map_err(|e| {
+            XBackupError::Usage(crate::tr!(
+                "failed to read input: {e}",
+                "입력 읽기 실패: {e}"
+            ))
+        })?;
         if n == 0 {
             // EOF — 비대화형 입력. 마법사는 대화형 전용이다.
-            return Err(XBackupError::Usage(
-                "입력이 종료되었습니다(EOF) — init 마법사는 대화형 전용입니다".into(),
-            ));
+            return Err(XBackupError::Usage(crate::tr!(
+                "input ended (EOF) — the init wizard is interactive-only",
+                "입력이 종료되었습니다(EOF) — init 마법사는 대화형 전용입니다"
+            )));
         }
         Ok(buf.trim_end_matches(['\n', '\r']).to_string())
     }
@@ -71,7 +75,10 @@ impl VecPrompt {
 impl Prompt for VecPrompt {
     fn read_line(&mut self, _question: &str) -> Result<String> {
         self.answers.pop_front().ok_or_else(|| {
-            XBackupError::Usage("테스트 입력 시퀀스가 부족합니다(질문이 더 많음)".into())
+            XBackupError::Usage(crate::tr!(
+                "the test input sequence ran out (more questions than answers)",
+                "테스트 입력 시퀀스가 부족합니다(질문이 더 많음)"
+            ))
         })
     }
 }
@@ -91,7 +98,8 @@ fn ask_required(prompt: &mut dyn Prompt, question: &str) -> Result<String> {
     let answer = prompt.read_line(&format!("{question}: "))?;
     let trimmed = answer.trim();
     if trimmed.is_empty() {
-        return Err(XBackupError::Config(format!(
+        return Err(XBackupError::Config(crate::tr!(
+            "this field is required and is empty: {question}",
             "필수 항목이 비어 있습니다: {question}"
         )));
     }
@@ -228,9 +236,12 @@ pub fn run_wizard(prompt: &mut dyn Prompt) -> Result<Config> {
 
     // 4) 압축 레벨(zstd 단일).
     let level_str = ask_default(prompt, "압축 레벨(zstd, 1~22)", "10")?;
-    let level: i32 = level_str
-        .parse()
-        .map_err(|_| XBackupError::Config(format!("압축 레벨이 숫자가 아닙니다: '{level_str}'")))?;
+    let level: i32 = level_str.parse().map_err(|_| {
+        XBackupError::Config(crate::tr!(
+            "the compression level is not a number: '{level_str}'",
+            "압축 레벨이 숫자가 아닙니다: '{level_str}'"
+        ))
+    })?;
 
     // 5) 암호화 — 기본 ON. 시크릿 키는 받지 않고 recipient 파일 경로(공개키)만 받는다.
     let enc_enabled = ask_yes_no(prompt, "백업을 암호화하시겠습니까?", true)?;

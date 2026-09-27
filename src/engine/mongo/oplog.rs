@@ -102,8 +102,12 @@ impl OplogReader {
     /// 증분 핸들러가 메타 질의와 별개로 oplog 전용 리더를 만들 때 쓴다.
     pub async fn connect(uri: &Secret, timeout_secs: Option<u64>) -> Result<Self> {
         let options = super::conn::client_options(uri, timeout_secs).await?;
-        let client = Client::with_options(options)
-            .map_err(|e| XBackupError::Failure(format!("MongoDB 클라이언트 생성 실패: {e}")))?;
+        let client = Client::with_options(options).map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to create the MongoDB client: {e}",
+                "MongoDB 클라이언트 생성 실패: {e}"
+            ))
+        })?;
         Ok(Self::new(client))
     }
 
@@ -307,9 +311,10 @@ impl CaptureHandle {
             Some(Ok(())) => Ok(self.count()),
             Some(Err(e)) => Err(e),
             // task가 결과를 못 남긴 경우(드뭄) — 보수적으로 Other 처리.
-            None => Err(CaptureError::Other(XBackupError::Failure(
-                "oplog 캡처 task가 결과를 남기지 않음".into(),
-            ))),
+            None => Err(CaptureError::Other(XBackupError::Failure(crate::tr!(
+                "the oplog capture task left no result",
+                "oplog 캡처 task가 결과를 남기지 않음"
+            )))),
         }
     }
 
@@ -381,12 +386,18 @@ fn classify_cursor_err(e: mongodb::error::Error) -> CaptureError {
             ));
         }
     }
-    CaptureError::Other(XBackupError::Failure(format!("oplog 캡처 실패: {e}")))
+    CaptureError::Other(XBackupError::Failure(crate::tr!(
+        "failed to capture the oplog: {e}",
+        "oplog 캡처 실패: {e}"
+    )))
 }
 
 /// find/advance 에러를 일반 실패로 매핑한다(gap 사전 점검 경로).
 fn map_find_err(e: mongodb::error::Error) -> XBackupError {
-    XBackupError::Failure(format!("oplog 질의 실패: {e}"))
+    XBackupError::Failure(crate::tr!(
+        "oplog query failed: {e}",
+        "oplog 질의 실패: {e}"
+    ))
 }
 
 /// raw document에서 `ts`(BSON Timestamp)를 꺼낸다. 없거나 타입 불일치면 None.

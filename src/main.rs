@@ -25,10 +25,14 @@ async fn main() -> ExitCode {
             // 시크릿이 새지 않도록 에러는 Display로만 출력한다(Secret은 [REDACTED]).
             // 경고 동반 성공(exit 4)은 실패가 아니므로 WARN으로 내려, 색·레벨로
             // 성공/경고/실패가 구분되게 한다(gap→풀 승격, verify 경고 등).
+            //
+            // 종류 라벨은 Display가 아니라 여기서 붙인다. 서브커맨드가 시작할 때 정해 둔
+            // 언어를 따라야 하는데, Display는 컴파일 시점에 고정되기 때문이다.
+            let label = err.kind_label(x_backup::i18n::active());
             if err.is_warning() {
-                tracing::warn!("{err}");
+                tracing::warn!("{label}: {err}");
             } else {
-                tracing::error!("{err}");
+                tracing::error!("{label}: {err}");
             }
             err.exit()
         }

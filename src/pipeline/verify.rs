@@ -77,20 +77,20 @@ pub async fn verify_backup(
     let store = ManifestStore::new(storage);
 
     // 1) manifest 로드(읽기 실패 = 검증 불가, exit 1).
-    let manifest = store
-        .read(backup_id)
-        .await
-        .map_err(|e| XBackupError::Failure(format!("manifest 로드 실패({backup_id}): {e}")))?;
+    let manifest = store.read(backup_id).await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to load the manifest ({backup_id}): {e}",
+            "manifest 로드 실패({backup_id}): {e}"
+        ))
+    })?;
 
     let mut warnings = Vec::new();
 
     // 2) manifest 사이드카 체크섬으로 manifest 자체 정합 확인.
     let manifest_sidecar_ok = verify_manifest_sidecar(storage, backup_id).await?;
     if !manifest_sidecar_ok {
-        return Err(XBackupError::Failure(format!(
-            "manifest 자체 무결성 검증 실패({backup_id}): manifest.json이 \
-             사이드카 체크섬과 일치하지 않습니다(변조 또는 손상)"
-        )));
+        return Err(XBackupError::Failure(crate::tr!("manifest self-integrity check failed ({backup_id}): manifest.json does not match its sidecar checksum (tampered or corrupt)", "manifest 자체 무결성 검증 실패({backup_id}): manifest.json이 \
+             사이드카 체크섬과 일치하지 않습니다(변조 또는 손상)")));
     }
 
     // 3) incomplete 경고(증분 base 부적격·복구 위험).
@@ -106,10 +106,8 @@ pub async fn verify_backup(
     // 5) data.bin 스트림 sha256 재계산 vs manifest.checksum_sha256(키 불필요).
     let data_checksum_ok = verify_data_checksum(storage, backup_id, &manifest, empty_slice).await?;
     if !data_checksum_ok {
-        return Err(XBackupError::Failure(format!(
-            "data.bin 체크섬 불일치({backup_id}): 저장 바이트가 manifest.checksum_sha256과 \
-             다릅니다(변조 또는 손상)"
-        )));
+        return Err(XBackupError::Failure(crate::tr!("data.bin checksum mismatch ({backup_id}): the stored bytes differ from manifest.checksum_sha256 (tampered or corrupt)", "data.bin 체크섬 불일치({backup_id}): 저장 바이트가 manifest.checksum_sha256과 \
+             다릅니다(변조 또는 손상)")));
     }
 
     // 6) 심층 검증(옵션) — 복호화·압축해제 디코드 소진.
@@ -167,9 +165,7 @@ async fn verify_data_checksum(
             return Ok(manifest.checksum_sha256.eq_ignore_ascii_case(EMPTY_SHA256));
         }
         Err(e) => {
-            return Err(XBackupError::Failure(format!(
-                "data.bin 읽기 실패({backup_id}): {e} — 산출물이 없거나 접근 불가"
-            )));
+            return Err(XBackupError::Failure(crate::tr!("failed to read data.bin ({backup_id}): {e} — the artifact is missing or unreachable", "data.bin 읽기 실패({backup_id}): {e} — 산출물이 없거나 접근 불가")));
         }
     };
 
@@ -197,7 +193,12 @@ async fn verify_deep_decode(
     let raw = storage
         .get_stream(&data_path(backup_id))
         .await
-        .map_err(|e| XBackupError::Failure(format!("data.bin 읽기 실패({backup_id}): {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to read data.bin ({backup_id}): {e}",
+                "data.bin 읽기 실패({backup_id}): {e}"
+            ))
+        })?;
     let mut decoded = stages.apply(raw);
 
     // 끝까지 읽어 디코드 가능성만 확인한다(평문은 그대로 흘려 보냄). 메모리에 쌓지 않고
@@ -208,10 +209,8 @@ async fn verify_deep_decode(
             Ok(0) => break, // EOF — 끝까지 디코드 성공.
             Ok(_) => continue,
             Err(e) => {
-                return Err(XBackupError::Failure(format!(
-                    "심층 검증 실패({backup_id}): 복호화·압축해제 디코드 중 오류 — {e} \
-                     (키 불일치 또는 산출물 손상)"
-                )));
+                return Err(XBackupError::Failure(crate::tr!("deep verification failed ({backup_id}): error while decrypting/decompressing — {e} (wrong key or corrupt artifact)", "심층 검증 실패({backup_id}): 복호화·압축해제 디코드 중 오류 — {e} \
+                     (키 불일치 또는 산출물 손상)")));
             }
         }
     }
@@ -224,10 +223,12 @@ async fn stream_sha256(mut reader: crate::storage::BoxAsyncRead) -> Result<Strin
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        let n = reader
-            .read(&mut buf)
-            .await
-            .map_err(|e| XBackupError::Failure(format!("data.bin 스트림 읽기 실패: {e}")))?;
+        let n = reader.read(&mut buf).await.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to read the data.bin stream: {e}",
+                "data.bin 스트림 읽기 실패: {e}"
+            ))
+        })?;
         if n == 0 {
             break;
         }
@@ -280,10 +281,12 @@ pub async fn collect_manifest_ids(storage: &dyn Storage) -> Result<Vec<String>> 
 async fn read_all(storage: &dyn Storage, path: &str) -> Result<Vec<u8>> {
     let mut reader = storage.get_stream(path).await?;
     let mut buf = Vec::new();
-    reader
-        .read_to_end(&mut buf)
-        .await
-        .map_err(|e| XBackupError::Failure(format!("'{path}' 읽기 실패: {e}")))?;
+    reader.read_to_end(&mut buf).await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "'{path}': failed to read: {e}",
+            "'{path}' 읽기 실패: {e}"
+        ))
+    })?;
     Ok(buf)
 }
 
@@ -365,7 +368,11 @@ mod tests {
 
         let err = verify_backup(&fs, "bk-tamper", false).await.unwrap_err();
         assert_eq!(err.exit_code(), 1, "변조는 exit 1이어야 함: {err}");
-        assert!(err.to_string().contains("체크섬"), "메시지: {err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("checksum") || msg.contains("체크섬"),
+            "message: {err}"
+        );
     }
 
     /// manifest 변조(사이드카 불일치)도 실패한다(exit 1).

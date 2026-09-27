@@ -86,8 +86,12 @@ pub async fn write_end<W: AsyncWrite + Unpin>(w: &mut W) -> Result<()> {
 /// BSON 문서 한 개를 태그와 함께 쓴다(H/C 공용).
 async fn write_doc_frame<W: AsyncWrite + Unpin>(w: &mut W, tag: u8, doc: &Document) -> Result<()> {
     let mut buf = Vec::new();
-    doc.to_writer(&mut buf)
-        .map_err(|e| XBackupError::Failure(format!("아카이브 프레임 직렬화 실패: {e}")))?;
+    doc.to_writer(&mut buf).map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to serialize an archive frame: {e}",
+            "아카이브 프레임 직렬화 실패: {e}"
+        ))
+    })?;
     w.write_all(&[tag])
         .await
         .map_err(io_err("프레임 태그 쓰기"))?;
@@ -111,7 +115,8 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame> {
         TAG_HEADER => Ok(Frame::Header(read_doc(r).await?)),
         TAG_COLLECTION => Ok(Frame::Collection(read_doc(r).await?)),
         TAG_DOCUMENT => Ok(Frame::Document(read_doc(r).await?)),
-        other => Err(XBackupError::Failure(format!(
+        other => Err(XBackupError::Failure(crate::tr!(
+            "corrupt archive frame tag: 0x{other:02x}",
             "아카이브 프레임 태그 손상: 0x{other:02x}"
         ))),
     }
@@ -125,7 +130,8 @@ async fn read_doc<R: AsyncRead + Unpin>(r: &mut R) -> Result<Document> {
         .map_err(io_err("프레임 길이 읽기"))?;
     let len = u32::from_le_bytes(len_buf);
     if !(5..=MAX_FRAME_BYTES).contains(&len) {
-        return Err(XBackupError::Failure(format!(
+        return Err(XBackupError::Failure(crate::tr!(
+            "invalid archive frame length: {len} bytes",
             "아카이브 프레임 길이 비정상: {len}바이트"
         )));
     }
@@ -134,13 +140,22 @@ async fn read_doc<R: AsyncRead + Unpin>(r: &mut R) -> Result<Document> {
     r.read_exact(&mut buf[4..])
         .await
         .map_err(io_err("프레임 본문 읽기"))?;
-    Document::from_reader(&buf[..])
-        .map_err(|e| XBackupError::Failure(format!("아카이브 프레임 파싱 실패: {e}")))
+    Document::from_reader(&buf[..]).map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to parse an archive frame: {e}",
+            "아카이브 프레임 파싱 실패: {e}"
+        ))
+    })
 }
 
 /// IO 에러를 XBackupError로 감싸는 헬퍼.
 fn io_err(ctx: &'static str) -> impl Fn(std::io::Error) -> XBackupError {
-    move |e| XBackupError::Failure(format!("아카이브 {ctx} 실패: {e}"))
+    move |e| {
+        XBackupError::Failure(crate::tr!(
+            "archive {ctx} failed: {e}",
+            "아카이브 {ctx} 실패: {e}"
+        ))
+    }
 }
 
 #[cfg(test)]

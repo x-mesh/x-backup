@@ -50,21 +50,24 @@ pub async fn native_export_to_dir<R: AsyncRead + Unpin>(
         Frame::Header(h) => {
             let fmt = h.get_str("format").unwrap_or("");
             if fmt != archive::FORMAT_ID {
-                return Err(XBackupError::Failure(format!(
+                return Err(XBackupError::Failure(crate::tr!(
+                    "native archive format mismatch: '{fmt}' (expected '{}')",
                     "네이티브 아카이브 포맷 불일치: '{fmt}'(기대 '{}')",
                     archive::FORMAT_ID
                 )));
             }
         }
         other => {
-            return Err(XBackupError::Failure(format!(
+            return Err(XBackupError::Failure(crate::tr!(
+                "native archive header missing (first frame: {other:?})",
                 "네이티브 아카이브 헤더 누락(첫 프레임: {other:?})"
             )))
         }
     }
 
     fs::create_dir_all(out_dir).await.map_err(|e| {
-        XBackupError::Failure(format!(
+        XBackupError::Failure(crate::tr!(
+            "failed to create the output directory ({}): {e}",
             "출력 디렉터리 생성 실패({}): {e}",
             out_dir.display()
         ))
@@ -76,19 +79,28 @@ pub async fn native_export_to_dir<R: AsyncRead + Unpin>(
     loop {
         match archive::read_frame(reader).await? {
             Frame::Header(_) => {
-                return Err(XBackupError::Failure("아카이브에 헤더가 중복됩니다".into()))
+                return Err(XBackupError::Failure(crate::tr!(
+                    "duplicate archive header",
+                    "아카이브에 헤더가 중복됩니다"
+                )))
             }
             Frame::Collection(meta) => {
                 // 이전 컬렉션 파일을 flush·close.
                 if let Some(c) = current.take() {
                     finish_file(c).await?;
                 }
-                let ns = meta
-                    .get_str("ns")
-                    .map_err(|_| XBackupError::Failure("컬렉션 프레임에 ns가 없습니다".into()))?;
-                let (db_name, coll_name) = ns
-                    .split_once('.')
-                    .ok_or_else(|| XBackupError::Failure(format!("ns 형식 오류: '{ns}'")))?;
+                let ns = meta.get_str("ns").map_err(|_| {
+                    XBackupError::Failure(crate::tr!(
+                        "the collection frame has no ns",
+                        "컬렉션 프레임에 ns가 없습니다"
+                    ))
+                })?;
+                let (db_name, coll_name) = ns.split_once('.').ok_or_else(|| {
+                    XBackupError::Failure(crate::tr!(
+                        "malformed ns: '{ns}'",
+                        "ns 형식 오류: '{ns}'"
+                    ))
+                })?;
 
                 if ns_include.is_some_and(|want| want != ns) {
                     // 필터 비매칭 — 파일을 만들지 않고 문서만 흘려보낸다(skip).
@@ -98,7 +110,8 @@ pub async fn native_export_to_dir<R: AsyncRead + Unpin>(
 
                 let db_dir = out_dir.join(db_name);
                 fs::create_dir_all(&db_dir).await.map_err(|e| {
-                    XBackupError::Failure(format!(
+                    XBackupError::Failure(crate::tr!(
+                        "failed to create the database directory ({}): {e}",
                         "DB 디렉터리 생성 실패({}): {e}",
                         db_dir.display()
                     ))
@@ -109,26 +122,38 @@ pub async fn native_export_to_dir<R: AsyncRead + Unpin>(
 
                 let bson_path = db_dir.join(format!("{coll_name}.bson"));
                 let file = fs::File::create(&bson_path).await.map_err(|e| {
-                    XBackupError::Failure(format!(".bson 생성 실패({}): {e}", bson_path.display()))
+                    XBackupError::Failure(crate::tr!(
+                        "failed to create the .bson file ({}): {e}",
+                        ".bson 생성 실패({}): {e}",
+                        bson_path.display()
+                    ))
                 })?;
                 summary.collections += 1;
                 current = Some(CurrentColl { file: Some(file) });
             }
             Frame::Document(d) => {
                 let Some(c) = current.as_mut() else {
-                    return Err(XBackupError::Failure(
-                        "문서 프레임이 컬렉션보다 먼저 나왔습니다".into(),
-                    ));
+                    return Err(XBackupError::Failure(crate::tr!(
+                        "a document frame appeared before its collection",
+                        "문서 프레임이 컬렉션보다 먼저 나왔습니다"
+                    )));
                 };
                 let Some(file) = c.file.as_mut() else {
                     continue; // skip 컬렉션
                 };
                 let mut bytes = Vec::new();
-                d.to_writer(&mut bytes)
-                    .map_err(|e| XBackupError::Failure(format!("문서 BSON 직렬화 실패: {e}")))?;
-                file.write_all(&bytes)
-                    .await
-                    .map_err(|e| XBackupError::Failure(format!(".bson 쓰기 실패: {e}")))?;
+                d.to_writer(&mut bytes).map_err(|e| {
+                    XBackupError::Failure(crate::tr!(
+                        "failed to serialize the document to BSON: {e}",
+                        "문서 BSON 직렬화 실패: {e}"
+                    ))
+                })?;
+                file.write_all(&bytes).await.map_err(|e| {
+                    XBackupError::Failure(crate::tr!(
+                        "failed to write the .bson file: {e}",
+                        ".bson 쓰기 실패: {e}"
+                    ))
+                })?;
                 summary.documents += 1;
                 summary.bytes += bytes.len() as u64;
             }
@@ -158,20 +183,31 @@ async fn write_metadata(db_dir: &Path, coll: &str, meta: &Document) -> Result<()
         "type": "collection",
     };
     let ext = Bson::Document(meta_doc).into_canonical_extjson();
-    let json = serde_json::to_string_pretty(&ext)
-        .map_err(|e| XBackupError::Failure(format!("metadata.json 직렬화 실패: {e}")))?;
+    let json = serde_json::to_string_pretty(&ext).map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to serialize metadata.json: {e}",
+            "metadata.json 직렬화 실패: {e}"
+        ))
+    })?;
     let path = db_dir.join(format!("{coll}.metadata.json"));
     fs::write(&path, json).await.map_err(|e| {
-        XBackupError::Failure(format!("metadata.json 쓰기 실패({}): {e}", path.display()))
+        XBackupError::Failure(crate::tr!(
+            "failed to write metadata.json ({}): {e}",
+            "metadata.json 쓰기 실패({}): {e}",
+            path.display()
+        ))
     })
 }
 
 /// 컬렉션 .bson 파일을 flush한다(close는 Drop).
 async fn finish_file(c: CurrentColl) -> Result<()> {
     if let Some(mut file) = c.file {
-        file.flush()
-            .await
-            .map_err(|e| XBackupError::Failure(format!(".bson flush 실패: {e}")))?;
+        file.flush().await.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to flush the .bson file: {e}",
+                ".bson flush 실패: {e}"
+            ))
+        })?;
     }
     Ok(())
 }
