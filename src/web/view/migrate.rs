@@ -83,7 +83,7 @@ pub fn form_body(
     html! {
         (components::page_head(route::MIGRATE_TITLE, Some(lang.sel(
             "Copy data straight from one profile's server to another's. This is not a backup — no manifest, no checksum, no PITR.",
-            "한 프로파일의 서버에서 다른 프로파일의 서버로 데이터를 직접 복사합니다. 백업이 아닙니다 — manifest·체크섬·PITR가 만들어지지 않습니다.",
+            "한 프로파일의 서버에서 다른 프로파일의 서버로 데이터를 직접 복사합니다. 백업이 아니므로 manifest·체크섬·PITR가 없습니다.",
         ))))
         @if let Some(notice) = notice { (notice) }
         (components::panel(
@@ -103,7 +103,7 @@ pub fn form_body(
                         input id="f-db" type="text" name=(route::FIELD_DB) autocomplete="off";
                         p class="field__hint" { (lang.sel(
                             "Optional — migrate only this database. Leave empty for everything.",
-                            "선택 — 이 데이터베이스만 옮깁니다. 비우면 전체입니다.",
+                            "선택: 이 데이터베이스만 옮깁니다. 비우면 전체를 옮깁니다.",
                         )) }
                     }
                     div class="field" {
@@ -111,7 +111,7 @@ pub fn form_body(
                         input id="f-collection" type="text" name=(route::FIELD_COLLECTION) autocomplete="off";
                         p class="field__hint" { (lang.sel(
                             "Optional — needs a db above. A collection name alone would match that name in every database.",
-                            "선택 — 위의 db가 함께 있어야 합니다. 컬렉션 이름만 주면 모든 데이터베이스의 동명 컬렉션이 대상이 됩니다.",
+                            "선택: 위의 db도 함께 채워야 합니다. 컬렉션 이름만 적으면 모든 데이터베이스에서 같은 이름의 컬렉션이 대상이 됩니다.",
                         )) }
                     }
                     button type="submit" { (lang.sel("Preview the migration", "마이그레이션 미리보기")) }
@@ -155,7 +155,7 @@ pub fn plan_body(lang: Lang, plan: &Plan, confirm: Option<Markup>) -> Markup {
     html! {
         (components::page_head(route::MIGRATE_TITLE, Some(lang.sel(
             "Nothing has been copied yet — this is the plan.",
-            "아직 아무것도 옮기지 않았습니다 — 이것은 계획입니다.",
+            "아직 아무것도 옮기지 않았습니다. 지금 보는 것은 계획입니다.",
         ))))
         (components::meta_list(&[
             ("source profile", plan.profile.clone()),
@@ -181,7 +181,7 @@ pub fn plan_body(lang: Lang, plan: &Plan, confirm: Option<Markup>) -> Markup {
                 html! {
                     p { (lang.sel(
                         "These namespaces exist on the target. Migrating writes into them — with the drop option below, they are removed first; without it, documents are merged in and existing ones can be replaced.",
-                        "아래 네임스페이스가 target에 이미 있습니다. 마이그레이션은 그 안에 씁니다 — 아래 drop 옵션을 켜면 먼저 지우고, 켜지 않으면 문서가 섞여 들어가며 기존 문서가 대체될 수 있습니다.",
+                        "아래 네임스페이스가 target에 이미 있어 마이그레이션이 그 안에 씁니다. 아래 drop 옵션을 켜면 먼저 삭제하고, 끄면 문서가 합쳐져 기존 문서가 대체될 수 있습니다.",
                     )) }
                     ul class="plain" {
                         @for ns in &plan.conflicting {
@@ -197,7 +197,7 @@ pub fn plan_body(lang: Lang, plan: &Plan, confirm: Option<Markup>) -> Markup {
                 h3 class="panel__title" { (lang.sel("Namespaces", "네임스페이스")) }
                 p class="field__hint" { (lang.sel(
                     "Document counts are estimates from the server — the number after the copy can differ.",
-                    "문서 수는 서버가 준 추정치입니다 — 복사 후 숫자가 다를 수 있습니다.",
+                    "문서 수는 서버가 준 추정치라서 복사한 뒤에는 숫자가 다를 수 있습니다.",
                 )) }
             },
             html! {
@@ -242,16 +242,16 @@ pub fn plan_changed_notice(lang: Lang) -> Markup {
         Level::Fail,
         lang.sel(
             "The plan changed — nothing was copied",
-            "계획이 바뀌었습니다 — 아무것도 옮기지 않았습니다",
+            "계획이 바뀌어 아무것도 옮기지 않았습니다",
         ),
         html! {
             p { (lang.sel(
                 "Between the preview and your approval, one of these servers changed — a namespace appeared, or its size moved. The plan you approved is no longer the plan that would run, so nothing was copied.",
-                "미리보기와 승인 사이에 두 서버 중 한쪽이 바뀌었습니다 — 네임스페이스가 생겼거나 규모가 달라졌습니다. 승인한 계획과 지금 실행될 계획이 다르므로 아무것도 옮기지 않았습니다.",
+                "미리보기와 승인 사이에 두 서버 중 한쪽에서 네임스페이스가 새로 생겼거나 크기가 달라졌습니다. 승인한 계획과 지금 실행될 계획이 다르므로 아무것도 옮기지 않았습니다.",
             )) }
             p { (lang.sel(
                 "The current plan is shown below. Review it and approve again if it is still what you want.",
-                "아래가 지금의 계획입니다. 확인한 뒤 여전히 원하는 것이면 다시 승인하세요.",
+                "아래는 현재 계획입니다. 확인한 뒤 이대로 진행하려면 다시 승인하세요.",
             )) }
         },
     )
@@ -279,10 +279,10 @@ pub fn guard_rejection_notice(lang: Lang, message: &str) -> Markup {
 pub fn malformed_id(lang: Lang) -> Markup {
     components::notice(
         Level::Fail,
-        lang.sel("Malformed job id", "잘못된 잡 id"),
+        lang.sel("Malformed job id", "잘못된 작업 id"),
         html! { p { (lang.sel(
             "That is not a job id this console issued.",
-            "이 콘솔이 발급한 잡 id 형식이 아닙니다.",
+            "이 콘솔이 발급한 작업 id 형식이 아닙니다.",
         )) } },
     )
 }
@@ -291,10 +291,10 @@ pub fn malformed_id(lang: Lang) -> Markup {
 pub fn unknown_job(lang: Lang) -> Markup {
     components::notice(
         Level::Fail,
-        lang.sel("Unknown job", "모르는 잡"),
+        lang.sel("Unknown job", "알 수 없는 작업"),
         html! { p { (lang.sel(
             "No migrate job with that id is in this console's history.",
-            "그 id의 migrate 잡이 이 콘솔 이력에 없습니다.",
+            "그 id의 migrate 작업이 이 콘솔 이력에 없습니다.",
         )) } },
     )
 }
@@ -415,7 +415,7 @@ mod tests {
     fn the_form_says_this_is_not_a_backup() {
         let out = form_body(Lang::Ko, &[], None, None, None).into_string();
         assert!(
-            out.contains("백업이 아닙니다"),
+            out.contains("백업이 아니므로"),
             "백업이 아니라는 고지가 없다"
         );
     }

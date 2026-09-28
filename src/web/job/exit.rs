@@ -147,7 +147,7 @@ pub fn present(outcome: &JobOutcome, lang: Lang) -> ExitPresentation {
             detail: lang
                 .sel(
                     "exit 0 — completed cleanly. Nothing to review.",
-                    "exit 0 — 문제 없이 끝났습니다. 확인할 것이 없습니다.",
+                    "exit 0: 문제 없이 끝났습니다. 확인할 것이 없습니다.",
                 )
                 .to_string(),
             retryable: false,
@@ -166,8 +166,7 @@ pub fn present(outcome: &JobOutcome, lang: Lang) -> ExitPresentation {
                     "exit 4 — this is success with caveats, not a failure. The job finished \
                      and produced output. Review the warnings below; nothing here needs a \
                      retry.",
-                    "exit 4 — 이것은 실패가 아니라 '단서가 붙은 성공'입니다. 작업은 끝났고 \
-                     산출물이 있습니다. 아래 경고를 확인하세요 — 다시 돌릴 필요는 없습니다.",
+                    "exit 4: 실패가 아니라 단서가 붙은 성공이며, 작업은 끝났고 산출물도 있습니다. 다시 실행할 필요 없이 아래 경고를 확인하세요.",
                 )
                 .to_string(),
             retryable: false,
@@ -180,8 +179,7 @@ pub fn present(outcome: &JobOutcome, lang: Lang) -> ExitPresentation {
                 .sel(
                     "exit 1 — the job started and ran, but did not finish successfully. Read \
                      the log for the cause, fix it, then run it again.",
-                    "exit 1 — 작업이 시작되어 실행됐지만 성공적으로 끝나지 못했습니다. \
-                     로그에서 원인을 확인하고 고친 뒤 다시 실행하세요.",
+                    "exit 1: 작업이 시작되어 실행됐지만 성공적으로 끝나지 못했습니다. 로그에서 원인을 확인하고 고친 뒤 다시 실행하세요.",
                 )
                 .to_string(),
             retryable: false,
@@ -192,7 +190,7 @@ pub fn present(outcome: &JobOutcome, lang: Lang) -> ExitPresentation {
             headline: lang
                 .sel(
                     "The console sent a request the job could not accept.",
-                    "콘솔이 작업이 받아들일 수 없는 요청을 보냈습니다.",
+                    "콘솔이 보낸 요청을 작업이 받아들일 수 없었습니다.",
                 )
                 .to_string(),
             detail: lang
@@ -200,9 +198,7 @@ pub fn present(outcome: &JobOutcome, lang: Lang) -> ExitPresentation {
                     "exit 2 — usage/configuration error. The job never started, so nothing \
                      changed. This is the console's fault, not the target server's — retrying \
                      the exact same request will fail again the same way. Please report it.",
-                    "exit 2 — 사용법·설정 오류입니다. 작업은 시작되지 않았고 아무것도 \
-                     바뀌지 않았습니다. 이건 대상 서버가 아니라 콘솔 쪽 잘못이라, 같은 요청을 \
-                     그대로 다시 보내도 똑같이 실패합니다. 문제를 보고해 주세요.",
+                    "exit 2: 사용법·설정 오류이며, 작업이 시작되지 않아 아무것도 바뀌지 않았습니다. 대상 서버가 아니라 콘솔 쪽 잘못이라 같은 요청을 그대로 다시 보내도 똑같이 실패하니, 문제를 보고해 주세요.",
                 )
                 .to_string(),
             retryable: false,
@@ -221,9 +217,7 @@ pub fn present(outcome: &JobOutcome, lang: Lang) -> ExitPresentation {
                     "exit 3 — the job never started, so nothing changed. Fix the target server \
                      or its configuration (not the console) before trying again — retrying \
                      without a fix will fail the same way.",
-                    "exit 3 — 작업은 시작되지 않았고 아무것도 바뀌지 않았습니다. 콘솔이 \
-                     아니라 대상 서버·설정을 먼저 고쳐야 합니다 — 고치지 않고 재시도하면 \
-                     같은 결과가 납니다.",
+                    "exit 3: 작업이 시작되지 않아 아무것도 바뀌지 않았습니다. 콘솔이 아니라 대상 서버나 그 설정을 먼저 고치세요. 그대로 다시 시도하면 똑같이 실패합니다.",
                 )
                 .to_string(),
             retryable: false,
@@ -234,9 +228,7 @@ pub fn present(outcome: &JobOutcome, lang: Lang) -> ExitPresentation {
                 "exit 5 — this is not a failure, and nothing changed. The same profile is \
                  locked by another instance (it may be a cron-run CLI, not another web \
                  request). Wait for it to finish, then retry the exact same request.",
-                "exit 5 — 이것은 실패가 아니며 아무것도 바뀌지 않았습니다. 같은 프로파일을 \
-                 다른 인스턴스(웹이 아니라 cron이 띄운 CLI일 수도 있습니다)가 잡고 있습니다. \
-                 끝나기를 기다렸다가 같은 요청을 그대로 다시 보내세요.",
+                "exit 5: 실패가 아니며 아무것도 바뀌지 않았습니다. 다른 인스턴스(다른 웹 요청이 아니라 cron이 띄운 CLI일 수도 있습니다)가 같은 프로파일을 잡고 있으니, 끝나기를 기다렸다가 같은 요청을 그대로 다시 보내세요.",
             );
             let pointer = lang.sel("Who is holding it:", "누가 잡고 있는지:");
             ExitPresentation {
@@ -258,7 +250,7 @@ pub fn present(outcome: &JobOutcome, lang: Lang) -> ExitPresentation {
                 "{} (exit {code})",
                 lang.sel(
                     "Job exited with a code this console does not know.",
-                    "작업이 이 콘솔이 모르는 종료 코드로 끝났습니다."
+                    "이 콘솔이 모르는 종료 코드로 작업이 끝났습니다."
                 )
             ),
             detail: lang
@@ -266,9 +258,7 @@ pub fn present(outcome: &JobOutcome, lang: Lang) -> ExitPresentation {
                     "This code is outside the 0-5 range the console understands. The console \
                      and the job binary may be different builds — check versions before \
                      assuming anything about what happened to the data.",
-                    "이 코드는 콘솔이 아는 0~5 범위 밖입니다. 콘솔과 작업 바이너리가 다른 \
-                     빌드일 수 있습니다 — 데이터에 무슨 일이 있었는지 단정하기 전에 버전부터 \
-                     확인하세요.",
+                    "이 코드는 콘솔이 아는 0~5 범위 밖입니다. 콘솔과 작업 바이너리가 다른 빌드일 수 있으니, 데이터에 무슨 일이 있었는지 단정하기 전에 버전부터 확인하세요.",
                 )
                 .to_string(),
             retryable: false,
@@ -280,7 +270,7 @@ pub fn present(outcome: &JobOutcome, lang: Lang) -> ExitPresentation {
                 "{} (signal {signal})",
                 lang.sel(
                     "Job was terminated from outside.",
-                    "작업이 밖에서 종료되었습니다."
+                    "작업이 외부에서 종료되었습니다."
                 )
             ),
             detail: lang
@@ -289,9 +279,7 @@ pub fn present(outcome: &JobOutcome, lang: Lang) -> ExitPresentation {
                      out-of-memory kill, or a crash). Output may be partially written. Check \
                      the destination before trusting it, and do not assume the same result if \
                      you retry.",
-                    "작업이 스스로 결과를 정하지 못했습니다 — 밖에서 종료됐습니다(취소, OOM \
-                     kill, 크래시 등). 산출물이 반쯤 남아 있을 수 있습니다. 신뢰하기 전에 \
-                     목적지를 확인하고, 다시 돌린다고 같은 결과가 나온다고 가정하지 마세요.",
+                    "작업이 결과를 정하기 전에 외부에서 종료됐습니다(취소, OOM kill, 크래시 등). 산출물이 일부만 남았을 수 있으니 쓰기 전에 destination을 확인하세요. 다시 실행해도 결과가 같다고 가정하지 마세요.",
                 )
                 .to_string(),
             retryable: false,
@@ -309,8 +297,7 @@ pub fn present(outcome: &JobOutcome, lang: Lang) -> ExitPresentation {
                 .sel(
                     "Neither an exit code nor a signal was available. This should not happen \
                      on a supported platform — treat this as unknown, not as success.",
-                    "종료 코드도 시그널 번호도 얻지 못했습니다. 지원 플랫폼에서는 일어나지 \
-                     않아야 하는 상황입니다 — 성공이 아니라 '판정 불가'로 취급하세요.",
+                    "종료 코드도 시그널 번호도 얻지 못했습니다. 지원하는 플랫폼에서는 일어나지 않아야 하는 상황이니, 성공이 아니라 '판정 불가'로 취급하세요.",
                 )
                 .to_string(),
             retryable: false,

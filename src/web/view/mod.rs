@@ -89,8 +89,8 @@ mod tests {
             APP_CSS.len()
         );
         assert!(
-            APP_CSS.contains("--c-bg"),
-            "색 토큰이 없다 — 잘못된 파일 임베드"
+            APP_CSS.contains(r#"[data-level="ok"]"#),
+            "상태 레벨 규칙이 없다 — 잘못된 파일 임베드"
         );
     }
 

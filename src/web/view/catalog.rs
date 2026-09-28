@@ -84,7 +84,7 @@ pub fn render(
 ) -> Markup {
     let subtitle = lang.sel(
         "Full backup and incremental chain catalog for one destination, read via `list --json`.",
-        "하나의 destination에 대한 백업·증분 체인 카탈로그입니다(`list --json` 경유).",
+        "destination 하나에 있는 전체 백업과 증분 체인의 카탈로그입니다. `list --json`으로 읽습니다.",
     );
     html! {
         (components::page_head(routes::CATALOG_TITLE, Some(subtitle)))
@@ -154,7 +154,7 @@ fn filter_form(lang: Lang, current: Option<&CatalogParams>, profiles: &[String])
                 }
                 p class="field__hint" { (lang.sel(
                     "Default is descending (newest/largest first).",
-                    "기본은 내림차순입니다(최신/큰 것이 위).",
+                    "기본값은 최신이나 가장 큰 항목이 먼저 오는 내림차순입니다.",
                 )) }
             }
             div class="field" {
@@ -307,10 +307,10 @@ fn unreadable_notice(lang: Lang, stderr: &str, registry: &SecretRegistry) -> Mar
     let masked = registry.mask(stderr);
     components::notice(
         Level::Error,
-        lang.sel("Child diagnostics", "자식 프로세스 진단"),
+        lang.sel("Child diagnostics", "명령의 진단 출력"),
         html! {
             @if masked.is_empty() {
-                p class="muted" { (lang.sel("The child wrote nothing to stderr either.", "자식이 stderr에도 아무것도 쓰지 않았습니다.")) }
+                p class="muted" { (lang.sel("The child wrote nothing to stderr either.", "명령이 stderr에도 아무것도 쓰지 않았습니다.")) }
             } @else {
                 pre class="logdump" { (masked) }
             }

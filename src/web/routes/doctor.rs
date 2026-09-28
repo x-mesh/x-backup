@@ -181,13 +181,13 @@ impl Verdict {
             Verdict::Warned => lang
                 .sel(
                     "Passed with warnings.",
-                    "경고와 함께 통과했습니다(성공입니다).",
+                    "경고가 있지만 통과했습니다(성공입니다).",
                 )
                 .to_string(),
             Verdict::Blocked => lang
                 .sel(
                     "Blocking configuration problem found.",
-                    "차단성 설정 문제가 있습니다.",
+                    "백업을 막는 설정 문제가 있습니다.",
                 )
                 .to_string(),
             Verdict::Misconfigured => lang
@@ -217,19 +217,19 @@ impl Verdict {
         let text = match self {
             Verdict::Clean => lang.sel(
                 "exit 0 — nothing to do.",
-                "exit 0 — 조치할 것이 없습니다.",
+                "exit 0: 조치할 것이 없습니다.",
             ),
             Verdict::Warned => lang.sel(
                 "exit 4 — warnings are success with caveats: backups still run. Review the WARN rows.",
-                "exit 4 — 경고는 '단서가 붙은 성공'입니다. 백업은 계속 동작합니다. 아래 WARN 행을 확인하세요.",
+                "exit 4: 경고는 '단서가 붙은 성공'이므로 백업은 계속 실행됩니다. 아래 WARN 행을 확인하세요.",
             ),
             Verdict::Blocked => lang.sel(
                 "exit 3 — fix the FAIL rows before the next backup; the run will refuse to start.",
-                "exit 3 — 아래 FAIL 항목을 고치기 전에는 백업이 시작을 거부합니다.",
+                "exit 3: 아래 FAIL 행을 고치기 전에는 백업이 시작을 거부합니다.",
             ),
             Verdict::Misconfigured => lang.sel(
                 "exit 2 — restart the console with --config <PATH> (or XB_CONFIG) so doctor has something to read.",
-                "exit 2 — 콘솔을 --config <PATH>(또는 XB_CONFIG)와 함께 다시 띄우면 doctor가 읽을 대상이 생깁니다.",
+                "exit 2: 콘솔을 --config <PATH>(또는 XB_CONFIG)와 함께 다시 시작하면 doctor가 읽을 대상이 생깁니다.",
             ),
             Verdict::Unexpected(_) => return None,
         };
@@ -306,20 +306,20 @@ impl ReportError {
             ReportError::Empty => lang
                 .sel(
                     "doctor produced no output. The child may have died before writing anything.",
-                    "doctor가 아무 출력도 내지 않았습니다. 자식 프로세스가 쓰기 전에 죽었을 수 있습니다.",
+                    "doctor가 아무것도 출력하지 않았습니다. 명령이 출력하기 전에 비정상 종료됐을 수 있습니다.",
                 )
                 .to_string(),
             ReportError::NotUtf8 => lang
                 .sel(
                     "doctor output was not valid UTF-8, so it cannot be text at all.",
-                    "doctor 출력이 UTF-8이 아닙니다 — 애초에 텍스트가 아닙니다.",
+                    "doctor 출력이 UTF-8이 아니므로 애초에 텍스트가 아닙니다.",
                 )
                 .to_string(),
             ReportError::Malformed(detail) => format!(
                 "{} {}",
                 lang.sel(
                     "doctor output could not be parsed as the expected JSON:",
-                    "doctor 출력을 기대한 JSON으로 해석할 수 없습니다:",
+                    "doctor 출력을 예상한 JSON 형식으로 해석하지 못했습니다:",
                 ),
                 excerpt(detail)
             ),
@@ -327,14 +327,14 @@ impl ReportError {
                 "{} (schema {found} ≠ {expected})",
                 lang.sel(
                     "doctor reported a JSON schema this console does not know — the console and the CLI are probably different builds.",
-                    "doctor가 이 콘솔이 모르는 JSON 스키마를 냈습니다 — 콘솔과 CLI가 서로 다른 빌드일 가능성이 큽니다.",
+                    "doctor 출력의 JSON 스키마를 이 콘솔이 알지 못합니다. 콘솔과 CLI가 서로 다른 빌드일 가능성이 큽니다.",
                 )
             ),
             ReportError::TooDeep { found, max } => format!(
                 "{} ({found} > {max})",
                 lang.sel(
                     "doctor output is nested more deeply than this console parses. The console and the CLI are probably different builds.",
-                    "doctor 출력의 중첩 깊이가 이 콘솔이 파싱하는 상한을 넘었습니다. 콘솔과 CLI가 서로 다른 빌드일 가능성이 큽니다.",
+                    "doctor 출력의 중첩 깊이가 이 콘솔의 해석 한도를 넘었습니다. 콘솔과 CLI가 서로 다른 빌드일 가능성이 큽니다.",
                 )
             ),
         }
@@ -455,7 +455,7 @@ impl RunError {
                 "{} {}",
                 lang.sel(
                     "The console could not locate its own executable, so it cannot run doctor:",
-                    "콘솔이 자기 실행 파일 경로를 알 수 없어 doctor를 띄울 수 없습니다:",
+                    "콘솔이 자기 실행 파일을 찾지 못해 doctor를 실행할 수 없습니다:",
                 ),
                 excerpt(detail)
             ),
@@ -463,7 +463,7 @@ impl RunError {
                 "{} {}",
                 lang.sel(
                     "Spawning the doctor child failed:",
-                    "doctor 자식 프로세스를 띄우지 못했습니다:",
+                    "doctor 명령을 실행하지 못했습니다:",
                 ),
                 excerpt(detail)
             ),
@@ -471,7 +471,7 @@ impl RunError {
                 "{} {}",
                 lang.sel(
                     "Reading the doctor child's output failed:",
-                    "doctor 자식 프로세스의 출력을 읽는 중 실패했습니다:",
+                    "doctor 명령의 출력을 읽지 못했습니다:",
                 ),
                 excerpt(detail)
             ),
@@ -479,7 +479,7 @@ impl RunError {
                 "{} ({}s)",
                 lang.sel(
                     "doctor did not finish within the time limit and was killed. A stalled network mount under recipient_file is the usual cause.",
-                    "doctor가 상한 시간 안에 끝나지 않아 종료시켰습니다. recipient_file이 멈춘 네트워크 마운트에 있는 경우가 흔한 원인입니다.",
+                    "doctor가 제한 시간 안에 끝나지 않아 강제로 종료했습니다. 대개 recipient_file이 있는 네트워크 마운트가 멈춘 것이 원인입니다.",
                 ),
                 limit.as_secs()
             ),
@@ -681,7 +681,7 @@ pub fn render(
 ) -> Markup {
     let subtitle = lang.sel(
         "Offline configuration check — no database connection is made.",
-        "오프라인 설정 점검 — DB에 연결하지 않습니다.",
+        "DB에 연결하지 않는 오프라인 설정 점검입니다.",
     );
     html! {
         (components::page_head(DOCTOR_TITLE, Some(subtitle)))
@@ -702,7 +702,7 @@ pub fn render(
                 (components::notice(Level::Error, lang.sel("What to check", "확인할 것"), html! {
                     p { (lang.sel(
                         "The console runs checks with its own executable. Verify that the binary is still readable and executable, then retry.",
-                        "콘솔은 자기 실행 파일로 점검을 수행합니다. 바이너리가 여전히 읽기·실행 가능한지 확인한 뒤 다시 시도하세요.",
+                        "콘솔은 자기 실행 파일로 점검합니다. 그 바이너리를 여전히 읽고 실행할 수 있는지 확인한 뒤 다시 시도하세요.",
                     )) }
                 }))
             }
@@ -782,7 +782,7 @@ fn items_table(lang: Lang, items: &[Item], registry: &SecretRegistry) -> Markup 
                     @if items.is_empty() {
                         tr {
                             td colspan="3" class="muted" {
-                                (lang.sel("No checks were reported for this profile.", "이 프로파일에 대해 보고된 점검이 없습니다."))
+                                (lang.sel("No checks were reported for this profile.", "이 프로파일에는 보고된 점검이 없습니다."))
                             }
                         }
                     }
@@ -815,11 +815,11 @@ fn unreadable_notice(
     let masked = registry.mask(stderr);
     components::notice(
         Level::Error,
-        lang.sel("Child diagnostics", "자식 프로세스 진단"),
+        lang.sel("Child diagnostics", "명령의 진단 출력"),
         html! {
             (components::meta_list(&[("verdict", verdict.headline(lang))]))
             @if masked.is_empty() {
-                p class="muted" { (lang.sel("The child wrote nothing to stderr either.", "자식이 stderr에도 아무것도 쓰지 않았습니다.")) }
+                p class="muted" { (lang.sel("The child wrote nothing to stderr either.", "명령이 stderr에도 아무것도 쓰지 않았습니다.")) }
             } @else {
                 pre class="logdump" { (masked) }
             }
@@ -1080,7 +1080,7 @@ mod tests {
         };
         let out = render(Lang::Ko, true, &outcome, &empty_registry()).into_string();
         assert!(out.contains(r#"data-level="error""#));
-        assert!(out.contains("상한 시간"), "타임아웃 설명 누락: {out}");
+        assert!(out.contains("제한 시간"), "타임아웃 설명 누락: {out}");
         assert!(
             out.contains(&DOCTOR_TIMEOUT.as_secs().to_string()),
             "상한 값이 화면에 없다"

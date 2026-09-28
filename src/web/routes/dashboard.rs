@@ -123,6 +123,8 @@ use crate::web::view::components::Level;
 use crate::web::view::{dashboard as view, layout};
 use crate::web::ServeConfig;
 
+pub mod history;
+
 /// 화면 경로. 라우터·마크업·테스트가 이 상수를 공유한다.
 ///
 /// `/`를 쓰지 않는다 — 그 자리는 현재 콘솔 랜딩이고, 무엇이 첫 화면인지는 라우터 배선
@@ -202,6 +204,14 @@ impl Default for ProbeLimits {
     }
 }
 
+/// 백업 이력 목록 조회(`list --json`) 전체가 쓸 수 있는 시간.
+///
+/// 상태 프로브 예산과 **따로** 둔다. 느린 destination이 상태 점검 시간을 빼앗으면 안 된다.
+/// 예산은 조회를 **시작할지**만 가른다 — 마감 직전에 시작한 조회는 프로파일별 상한
+/// ([`ProbeLimits::profile`])까지 더 돌 수 있으므로, 이력 단계의 최악은 6초 + 8초다. 명부·상태
+/// 단계와 합쳐도 앞단 프록시 기본 읽기 상한(nginx 60초) 안에 든다.
+const HISTORY_BUDGET: Duration = Duration::from_secs(6);
+
 // ---------------------------------------------------------------------------
 // 파싱 — `status --json` 문서 (순수)
 // ---------------------------------------------------------------------------
@@ -274,14 +284,14 @@ impl StatusError {
             StatusError::Empty => lang
                 .sel(
                     "status produced no JSON on stdout. Read the exit code below — the child usually stopped before it could report.",
-                    "status가 stdout에 JSON을 내지 않았습니다. 아래 종료 코드를 보세요 — 대개 보고하기 전에 자식이 멈춘 경우입니다.",
+                    "status가 stdout에 JSON을 출력하지 않았습니다. 대개 명령이 결과를 보고하기 전에 멈춘 경우이니 아래 종료 코드를 확인하세요.",
                 )
                 .to_string(),
             StatusError::Malformed(detail) => format!(
                 "{} {}",
                 lang.sel(
                     "status output could not be parsed as the expected JSON:",
-                    "status 출력을 기대한 JSON으로 해석할 수 없습니다:",
+                    "status 출력을 예상한 JSON 형식으로 해석하지 못했습니다:",
                 ),
                 excerpt(detail)
             ),
@@ -289,14 +299,14 @@ impl StatusError {
                 "{} (schema {found} ≠ {expected})",
                 lang.sel(
                     "status reported a JSON schema this console does not know — the console and the CLI are probably different builds.",
-                    "status가 이 콘솔이 모르는 JSON 스키마를 냈습니다 — 콘솔과 CLI가 서로 다른 빌드일 가능성이 큽니다.",
+                    "status 출력의 JSON 스키마를 이 콘솔이 알지 못합니다. 콘솔과 CLI가 서로 다른 빌드일 가능성이 큽니다.",
                 )
             ),
             StatusError::TooDeep { found, max } => format!(
                 "{} ({found} > {max})",
                 lang.sel(
                     "status output is nested more deeply than this console parses. Only this profile's row is affected — the others are unaffected.",
-                    "status 출력의 중첩 깊이가 이 콘솔이 파싱하는 상한을 넘었습니다. 이 프로파일 행만 영향을 받고 나머지는 무관합니다.",
+                    "status 출력의 중첩 깊이가 이 콘솔의 해석 한도를 넘었습니다. 이 프로파일 행만 영향을 받고 나머지 행은 그대로입니다.",
                 )
             ),
         }
@@ -983,6 +993,78 @@ pub async fn collect(ctx: &ServeConfig, cache: &ProbeCache, limits: ProbeLimits)
     }
 }
 
+/// 표에 오른 프로파일들의 백업 이력 격자를 모은다.
+///
+/// 목록 조회(`list --json`)는 DB가 아니라 destination만 읽으므로 상태 프로브의 동시 폭
+/// 근거(DB 연결 수)가 걸리지 않지만, 같은 폭으로 묶어 자식 수의 상한은 유지한다. 잡 이력은
+/// 파일만 읽으므로 요청마다 새로 읽는다.
+pub async fn collect_history(
+    ctx: &ServeConfig,
+    cache: &ProbeCache,
+    limits: ProbeLimits,
+    profiles: &[String],
+    today: chrono::NaiveDate,
+) -> history::History {
+    let config = cache::config_key(ctx);
+    let jobs = crate::web::state::jobs::JobStore::attach(&ctx.state_dir)
+        .list()
+        .await
+        .entries;
+    let deadline = Instant::now() + HISTORY_BUDGET;
+    let width = limits.concurrency.max(1);
+    let mut rows = Vec::with_capacity(profiles.len());
+    for chunk in profiles.chunks(width) {
+        let batch = chunk.iter().map(|profile| {
+            history_row(ctx, cache, &config, profile, &jobs, limits, deadline, today)
+        });
+        rows.extend(futures::future::join_all(batch).await);
+    }
+    history::History { today, rows }
+}
+
+/// 프로파일 하나의 이력 행. 캐시 확인이 예산 확인보다 먼저인 이유는 [`probe_row`]와 같다.
+#[allow(clippy::too_many_arguments)] // 요청 문맥·캐시·예산을 한 번에 받는 비공개 도우미다.
+async fn history_row(
+    ctx: &ServeConfig,
+    cache: &ProbeCache,
+    config: &str,
+    profile: &str,
+    jobs: &[crate::web::state::jobs::JobSummary],
+    limits: ProbeLimits,
+    deadline: Instant,
+    today: chrono::NaiveDate,
+) -> history::HistoryRow {
+    let name = match ProfileName::parse(profile, ctx.lang) {
+        Ok(name) => name,
+        Err(e) => {
+            return history::HistoryRow::Unavailable {
+                profile: profile.to_string(),
+                reason: excerpt(&e.to_string()),
+            }
+        }
+    };
+    let key = ProbeKey::Catalog {
+        config: config.to_string(),
+        profile: name.as_str().to_string(),
+    };
+    if let Some(cached) = cache.peek(&key) {
+        return history::row_from_list(profile, &cached.value, jobs, today, ctx.lang);
+    }
+    if Instant::now() >= deadline {
+        return history::not_checked(profile, ctx.lang);
+    }
+    let spec = super::catalog::list_spec(
+        Some(name),
+        crate::cli::args::ListSort::Created,
+        false,
+        ctx.lang,
+    );
+    let probe = cache
+        .fetch(key, || shared_probe(&ctx.jobs, spec, limits.profile))
+        .await;
+    history::row_from_list(profile, &probe.value, jobs, today, ctx.lang)
+}
+
 /// 명부 프로브 결과를 프로파일 목록으로 읽는다. 못 읽으면 화면 전체가
 /// [`Dashboard::NoRoster`]다.
 ///
@@ -1000,14 +1082,14 @@ fn read_roster(probe: &ProbeOutput, lang: Lang) -> Result<Vec<RosterEntry>, Dash
                 headline: lang
                     .sel(
                         "The console could not start the profile inventory check.",
-                        "콘솔이 프로파일 목록 점검을 시작할 수 없었습니다.",
+                        "콘솔이 프로파일 목록 점검을 시작하지 못했습니다.",
                     )
                     .to_string(),
                 detail: format!(
                     "{} {detail}",
                     lang.sel(
                         "The console runs checks with its own executable — verify that the binary is still readable and executable:",
-                        "콘솔은 자기 실행 파일로 점검을 수행합니다 — 바이너리가 여전히 읽기·실행 가능한지 확인하세요:",
+                        "콘솔은 자기 실행 파일로 점검합니다. 그 바이너리를 여전히 읽고 실행할 수 있는지 확인하세요:",
                     )
                 ),
                 stderr: String::new(),
@@ -1018,7 +1100,7 @@ fn read_roster(probe: &ProbeOutput, lang: Lang) -> Result<Vec<RosterEntry>, Dash
                 headline: lang
                     .sel(
                         "Reading the profile inventory check's output failed.",
-                        "프로파일 목록 점검의 출력을 읽는 데 실패했습니다.",
+                        "프로파일 목록 점검의 출력을 읽지 못했습니다.",
                     )
                     .to_string(),
                 detail: detail.clone(),
@@ -1031,14 +1113,14 @@ fn read_roster(probe: &ProbeOutput, lang: Lang) -> Result<Vec<RosterEntry>, Dash
                     "{} ({}s)",
                     lang.sel(
                         "The profile inventory check did not finish within the time limit and was killed.",
-                        "프로파일 목록 점검이 상한 시간 안에 끝나지 않아 종료시켰습니다.",
+                        "프로파일 목록 점검이 제한 시간 안에 끝나지 않아 강제로 종료했습니다.",
                     ),
                     limit.as_secs()
                 ),
                 detail: lang
                     .sel(
                         "doctor only reads config and stats files, so a stalled network mount under recipient_file is the usual cause.",
-                        "doctor는 config와 파일 정보만 읽습니다 — recipient_file이 멈춘 네트워크 마운트에 있는 경우가 흔한 원인입니다.",
+                        "doctor는 config와 파일 정보만 읽으므로, 대개 recipient_file이 있는 네트워크 마운트가 멈춘 것이 원인입니다.",
                     )
                     .to_string(),
                 stderr: String::new(),
@@ -1136,14 +1218,14 @@ async fn probe_row(
                     .lang
                     .sel(
                         "Not checked in this request — the page ran out of its probe budget.",
-                        "이번 요청에서 점검하지 않았습니다 — 화면의 프로브 예산이 끝났습니다.",
+                        "이번 요청에서는 점검하지 않았습니다. 이 화면에 주어진 점검 시간을 다 썼습니다.",
                     )
                     .to_string(),
                 detail: format!(
                     "{} ({}s)",
                     ctx.lang.sel(
                         "This is not a failure and says nothing about the profile. Earlier profiles were slow; reload to check this one, or reduce how many profiles one console serves.",
-                        "이것은 실패가 아니며 이 프로파일에 대해 아무것도 말해 주지 않습니다. 앞선 프로파일들이 느렸다는 뜻입니다 — 새로고침하면 이 프로파일을 점검합니다.",
+                        "실패가 아니며 이 프로파일의 상태와도 관계없습니다. 앞선 프로파일이 느렸을 뿐이고, 새로고침하면 점검합니다.",
                     ),
                     limits.budget.as_secs()
                 ),
@@ -1184,14 +1266,14 @@ pub fn row_from_probe(
             headline: lang
                 .sel(
                     "The console could not start the check for this profile.",
-                    "콘솔이 이 프로파일의 점검을 시작할 수 없었습니다.",
+                    "콘솔이 이 프로파일의 점검을 시작하지 못했습니다.",
                 )
                 .to_string(),
             detail: format!(
                 "{} {detail}",
                 lang.sel(
                     "Verify that the console's own binary is still readable and executable:",
-                    "콘솔 자신의 바이너리가 여전히 읽기·실행 가능한지 확인하세요:",
+                    "콘솔 자신의 바이너리를 여전히 읽고 실행할 수 있는지 확인하세요:",
                 )
             ),
         },
@@ -1199,7 +1281,7 @@ pub fn row_from_probe(
             headline: lang
                 .sel(
                     "Reading this profile's check output failed.",
-                    "이 프로파일의 점검 출력을 읽는 데 실패했습니다.",
+                    "이 프로파일의 점검 출력을 읽지 못했습니다.",
                 )
                 .to_string(),
             detail: detail.clone(),
@@ -1209,7 +1291,7 @@ pub fn row_from_probe(
                 "{} ({}s)",
                 lang.sel(
                     "The check did not finish within the per-profile time limit and was killed.",
-                    "점검이 프로파일별 상한 시간 안에 끝나지 않아 종료시켰습니다.",
+                    "점검이 프로파일별 제한 시간 안에 끝나지 않아 강제로 종료했습니다.",
                 ),
                 limit.as_secs()
             ),
@@ -1302,12 +1384,23 @@ pub async fn page(
     State(ctx): State<Arc<ServeConfig>>,
     Extension(auth): Extension<Arc<AuthState>>,
 ) -> Markup {
-    let dashboard = collect(&ctx, cache::probe_cache(), ProbeLimits::default()).await;
-    let body = view::body(
+    let limits = ProbeLimits::default();
+    let dashboard = collect(&ctx, cache::probe_cache(), limits).await;
+    let registry = request_registry(&ctx, Some(&auth));
+    let history = match &dashboard {
+        Dashboard::Rows { rows, .. } if !rows.is_empty() => {
+            let profiles: Vec<String> = rows.iter().map(|r| r.profile.clone()).collect();
+            let today = chrono::Utc::now().date_naive();
+            Some(collect_history(&ctx, cache::probe_cache(), limits, &profiles, today).await)
+        }
+        _ => None,
+    };
+    let body = view::body_with_history(
         ctx.lang,
         ctx.config_path.is_some(),
         &dashboard,
-        &request_registry(&ctx, Some(&auth)),
+        history.as_ref(),
+        &registry,
     );
     layout::shell(ctx.lang, DASHBOARD_TITLE, body)
 }

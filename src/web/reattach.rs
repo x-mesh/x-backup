@@ -237,7 +237,7 @@ pub async fn scan(store: &Arc<JobStore>, lang: Lang) -> ReattachReport {
                                 "{} — {REATTACHED_PROGRESS_LABEL}",
                                 lang.sel(
                                     "Reattached after a console restart: the job is still running",
-                                    "콘솔 재시작 후 재부착했습니다: 이 잡은 아직 실행 중입니다",
+                                    "콘솔 재시작 후 재부착했습니다: 이 작업은 아직 실행 중입니다",
                                 )
                             ),
                         )
@@ -261,7 +261,7 @@ pub async fn scan(store: &Arc<JobStore>, lang: Lang) -> ReattachReport {
                     .sel(
                         "no pid or profile was recorded, so this job can never be verified or \
                          reattached",
-                        "pid·프로파일이 기록되지 않아 이 잡은 검증도 재부착도 할 수 없습니다",
+                        "pid·프로파일이 기록되지 않아 이 작업은 검증도 재부착도 할 수 없습니다",
                     )
                     .to_string();
                 if close(store, &id, lang, &reason).await {
@@ -299,13 +299,12 @@ async fn close(store: &Arc<JobStore>, id: &JobId, lang: Lang, reason: &str) -> b
             "{} ({reason}) — {}",
             lang.sel(
                 "Reattach scan: this job's process is gone",
-                "재부착 스캔: 이 잡의 프로세스가 사라졌습니다"
+                "재부착 스캔: 이 작업의 프로세스가 사라졌습니다"
             ),
             lang.sel(
                 "closing it as 'unknown' (we cannot tell whether it succeeded) so the profile is \
                  not blocked from running again",
-                "성공 여부를 알 수 없으므로 'unknown'으로 마감합니다 — 이 프로파일이 다시 \
-                 실행되지 못하고 막히는 것을 막기 위해서입니다",
+                "성공 여부를 알 수 없지만 이 프로파일이 다시 실행되지 못하는 일이 없도록 'unknown'으로 마감합니다",
             )
         ),
     )
@@ -342,8 +341,7 @@ fn spawn_orphan_watcher(store: Arc<JobStore>, id: JobId, pid: u32, lang: Lang) {
             lang.sel(
                 "The reattached process has exited. Its exit code is unknown — the console lost \
                  the pipe when it restarted, so the result is recorded as 'unknown'.",
-                "재부착된 프로세스가 종료됐습니다. 종료 코드는 알 수 없습니다 — 콘솔이 재시작될 \
-                 때 파이프를 잃었으므로 결과를 'unknown'으로 기록합니다.",
+                "재부착된 프로세스가 종료됐습니다. 콘솔 재시작으로 파이프를 잃어 종료 코드를 알 수 없으므로 결과를 'unknown'으로 기록합니다.",
             ),
         )
         .await;

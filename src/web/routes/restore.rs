@@ -133,11 +133,11 @@ impl AtProblem {
         match self {
             AtProblem::MissingTimezone => lang.sel(
                 "The point in time needs a timezone. Add a trailing Z for UTC — for example 2026-06-12T13:00:00Z — or an offset like +09:00.",
-                "복구 시점에 타임존이 없습니다. UTC라면 끝에 Z를 붙이세요 — 예: 2026-06-12T13:00:00Z — 또는 +09:00 같은 오프셋을 적으세요.",
+                "복구 시점에 타임존이 없습니다. 2026-06-12T13:00:00Z처럼 끝에 UTC를 뜻하는 Z를 붙이거나, +09:00 같은 오프셋을 붙이세요.",
             ).to_string(),
             AtProblem::Malformed => lang.sel(
                 "The point in time is not a valid RFC 3339 timestamp. It looks like 2026-06-12T13:00:00Z — year-month-day, then T, then hours:minutes:seconds, then the timezone.",
-                "복구 시점이 올바른 RFC 3339 시각이 아닙니다. 형식은 2026-06-12T13:00:00Z입니다 — 연-월-일, T, 시:분:초, 그다음 타임존.",
+                "복구 시점이 올바른 RFC 3339 시각이 아닙니다. 형식은 2026-06-12T13:00:00Z처럼 연-월-일, T, 시:분:초, 타임존 순서입니다.",
             ).to_string(),
             AtProblem::InFuture { requested } => format!(
                 "{} ({requested})",
@@ -357,7 +357,7 @@ impl PlanError {
             PlanError::Empty => lang
                 .sel(
                     "restore produced no plan. Read the diagnostics below — a point in time outside the recoverable window ends here.",
-                    "restore가 계획을 내지 않았습니다. 아래 진단을 보세요 — 복구 가능 범위 밖의 시점이 이 경로로 끝납니다.",
+                    "restore가 계획을 내지 않았습니다. 복구 가능 범위 밖의 시점을 요청하면 이렇게 되니 아래 진단을 확인하세요.",
                 )
                 .to_string(),
             PlanError::Malformed(detail) => format!(
@@ -371,7 +371,7 @@ impl PlanError {
                 "{} (schema {found} \u{2260} {expected})",
                 lang.sel(
                     "restore reported a JSON schema this console does not know — the console and the CLI are probably different builds.",
-                    "restore가 이 콘솔이 모르는 JSON 스키마를 냈습니다 — 콘솔과 CLI가 서로 다른 빌드일 가능성이 큽니다.",
+                    "restore가 낸 JSON 스키마를 이 콘솔이 알지 못합니다. 콘솔과 CLI가 서로 다른 빌드일 가능성이 큽니다.",
                 )
             ),
             PlanError::TooDeep { found, max } => format!(
@@ -832,13 +832,13 @@ fn confirm_request<'a>(
         } else {
             lang.sel(
                 "This writes into a live server",
-                "이 작업은 살아 있는 서버에 씁니다",
+                "이 작업은 실행 중인 서버에 씁니다",
             )
         }
         .to_string(),
         irreversible_notice: lang.sel(
             "Whatever is on the target now is replaced by the backup's contents. This console cannot undo it — getting the target back to its current state would need a backup taken right now.",
-            "지금 대상에 있는 내용이 백업의 내용으로 대체됩니다. 이 콘솔로는 되돌릴 수 없습니다 — 현재 상태로 돌아가려면 지금 이 순간의 백업이 필요합니다.",
+            "지금 대상에 있는 내용이 백업 내용으로 바뀝니다. 이 콘솔에서는 되돌릴 수 없습니다. 현재 상태로 돌아가려면 지금 받아 둔 백업이 필요합니다.",
         ).to_string(),
         summary,
         overwrite: plan.has_conflicts().then(|| guard::OverwriteOption {
@@ -850,7 +850,7 @@ fn confirm_request<'a>(
                 .to_string(),
             hint: lang.sel(
                 "Off by default, matching the CLI's guardrail. Without it the restore refuses when the target already holds data.",
-                "CLI의 가드레일과 같이 기본은 꺼짐입니다. 켜지 않으면 대상에 데이터가 있을 때 복구가 거부됩니다.",
+                "CLI의 가드레일과 마찬가지로 기본값은 꺼짐입니다. 켜지 않으면 대상에 이미 데이터가 있을 때 복구를 거부합니다.",
             ).to_string(),
         }),
         extra_hidden: request.as_hidden(&plan.fingerprint),

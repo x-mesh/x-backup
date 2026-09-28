@@ -301,7 +301,7 @@ pub async fn delete_submit(
             ctx.lang,
             ctx.lang.sel(
                 "The confirmation text did not match the profile name — nothing was deleted.",
-                "확인 입력이 프로파일 이름과 다릅니다 — 아무것도 삭제하지 않았습니다.",
+                "입력한 확인 문구가 프로파일 이름과 달라 아무것도 삭제하지 않았습니다.",
             ),
             Some(ctx.lang.sel(
                 "Type the name exactly as shown.",

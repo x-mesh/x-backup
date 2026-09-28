@@ -237,7 +237,7 @@ pub fn form_body(lang: Lang, profiles: &[String], notice: Option<Markup>) -> Mar
                             input id="f-collection" type="text" name="collection" autocomplete="off";
                             p class="field__hint" { (lang.sel(
                                 "Optional. Requires db — the child rejects collection without db (exit 2).",
-                                "선택 항목입니다. db가 함께 있어야 합니다 — 없으면 자식이 exit 2로 거부합니다.",
+                                "선택 항목이며 db가 필요합니다. db 없이 넣으면 exit 2로 거부됩니다.",
                             )) }
                         }
                         div class="field" {
@@ -245,7 +245,7 @@ pub fn form_body(lang: Lang, profiles: &[String], notice: Option<Markup>) -> Mar
                             input id="f-from" type="text" name="from" autocomplete="off";
                             p class="field__hint" { (lang.sel(
                                 "Optional. Which read destination to source from (name or type#index).",
-                                "선택 항목입니다. 어느 destination에서 읽을지(이름 또는 type#idx).",
+                                "선택 항목입니다. 읽을 destination의 이름 또는 type#idx입니다.",
                             )) }
                         }
                         div class="field" {
@@ -295,7 +295,7 @@ pub fn already_running_notice(lang: Lang, running_href: &str) -> Markup {
         html! {
             p { (lang.sel(
                 "Another backup for this profile is already running. Starting a second one would only fail with a lock conflict — wait for it to finish, or watch it now.",
-                "이 프로파일의 다른 백업이 이미 실행 중입니다. 지금 또 시작해도 락 충돌로 끝날 뿐입니다 — 끝나기를 기다리거나, 지금 지켜보세요.",
+                "이 프로파일의 다른 백업이 이미 실행 중이라 지금 시작하면 락 충돌로 실패합니다. 끝날 때까지 기다리거나 실행 중인 백업을 지켜보세요.",
             )) }
             p { a href=(running_href) { (lang.sel("Watch the running backup", "실행 중인 백업 보기")) } }
         },
@@ -310,7 +310,7 @@ pub fn cancel_unavailable(lang: Lang) -> Markup {
         html! {
             p { (lang.sel(
                 "This job has no recorded pid or profile, so there is nothing safe to signal.",
-                "이 잡에는 기록된 pid·프로파일이 없어 안전하게 신호를 보낼 대상이 없습니다.",
+                "이 작업에는 기록된 pid·프로파일이 없어 안전하게 신호를 보낼 대상이 없습니다.",
             )) }
         },
     )
@@ -320,10 +320,10 @@ pub fn cancel_unavailable(lang: Lang) -> Markup {
 pub fn malformed_id(lang: Lang) -> Markup {
     html! {
         (components::page_head(BACKUP_TITLE, None))
-        (components::notice(Level::Error, lang.sel("Malformed job id", "잡 id 형식 오류"), html! {
+        (components::notice(Level::Error, lang.sel("Malformed job id", "잘못된 작업 id"), html! {
             p { (lang.sel(
                 "That link does not carry a job id. Start a new backup instead.",
-                "이 링크에는 잡 id가 없습니다. 새 백업을 시작하세요.",
+                "이 링크에는 작업 id가 없습니다. 새 백업을 시작하세요.",
             )) }
         }))
         p class="muted" { a href=(BACKUP_PATH) { (lang.sel("Back to backup", "백업으로 돌아가기")) } }
@@ -334,10 +334,10 @@ pub fn malformed_id(lang: Lang) -> Markup {
 pub fn unknown_job(lang: Lang) -> Markup {
     html! {
         (components::page_head(BACKUP_TITLE, None))
-        (components::notice(Level::Error, lang.sel("Unknown job", "알 수 없는 잡"), html! {
+        (components::notice(Level::Error, lang.sel("Unknown job", "알 수 없는 작업"), html! {
             p { (lang.sel(
                 "No history was found for this job id.",
-                "이 잡 id에 대한 이력을 찾지 못했습니다.",
+                "이 작업 id의 이력을 찾지 못했습니다.",
             )) }
         }))
         p class="muted" { a href=(BACKUP_PATH) { (lang.sel("Back to backup", "백업으로 돌아가기")) } }

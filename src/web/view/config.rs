@@ -91,7 +91,7 @@ impl ConfigSyntax {
         match self {
             ConfigSyntax::V1 => lang.sel(
                 "This file uses the v1 nested syntax. Saving preserves that syntax — it will not be rewritten as v2.",
-                "이 파일은 v1 중첩 문법입니다. 저장은 그 문법을 보존합니다 — v2로 다시 쓰지 않습니다.",
+                "이 파일은 v1 중첩 문법입니다. 저장해도 이 문법을 유지하며 v2로 다시 쓰지 않습니다.",
             ),
             ConfigSyntax::V2 => lang.sel(
                 "This file uses the v2 flat syntax with inheritance. Values coming from [defaults] or extends stay where they are defined.",
@@ -160,7 +160,7 @@ impl Origin {
         match self {
             Origin::Direct => lang.sel(
                 "Clearing this box removes the key from the profile.",
-                "이 칸을 비우면 프로파일에서 이 키를 지웁니다.",
+                "이 칸을 비우면 프로파일에서 이 키를 삭제합니다.",
             ),
             Origin::Defaults => lang.sel(
                 "Leave empty to keep inheriting from [defaults].",
@@ -183,7 +183,7 @@ impl Origin {
     /// `[defaults]` 섹션이 아니라 코드 안 상수이고, 운영자가 고칠 곳이 완전히 다르다.
     pub fn empty_option_label(&self, lang: Lang) -> &'static str {
         match self {
-            Origin::Direct => lang.sel("(remove this key)", "(이 키를 지움)"),
+            Origin::Direct => lang.sel("(remove this key)", "(이 키 삭제)"),
             Origin::Defaults => lang.sel("(keep [defaults])", "([defaults] 유지)"),
             Origin::Inherited { .. } => lang.sel("(keep inherited)", "(상속 유지)"),
             Origin::Builtin => lang.sel("(keep built-in default)", "(내장 기본값 유지)"),
@@ -554,7 +554,7 @@ pub fn list_page(
 ) -> Markup {
     let subtitle = lang.sel(
         "Profiles are read from the config file. Secret values never appear here — only the environment variable names that hold them.",
-        "프로파일은 config 파일에서 읽습니다. 시크릿 값은 여기 나오지 않습니다 — 값을 담은 환경변수 이름만 표시합니다.",
+        "프로파일은 config 파일에서 읽습니다. 시크릿 값은 이 화면에 나오지 않고, 값을 담은 환경변수 이름만 나옵니다.",
     );
     html! {
         (components::page_head(route::CONFIG_TITLE, Some(subtitle)))
@@ -582,7 +582,7 @@ pub fn list_page(
                 p class="muted" {
                     (lang.sel(
                         "A new profile needs a name and a source — either a plain uri or the name of an environment variable that holds it (uri_env).",
-                        "새 프로파일에는 이름과 소스가 필요합니다 — 평문 uri 또는 그 값을 담은 환경변수 이름(uri_env) 중 하나.",
+                        "새 프로파일에는 이름과 소스가 필요합니다. 소스는 평문 uri나 그 값을 담은 환경변수 이름(uri_env)입니다.",
                     ))
                 }
                 p {
@@ -703,7 +703,7 @@ fn secret_table(lang: Lang, secrets: &[SecretEnvRef]) -> Markup {
                 caption class="muted" {
                     (lang.sel(
                         "Secret references (names only — values are never read into this page)",
-                        "시크릿 참조(이름만 — 값은 이 화면으로 읽어 오지 않습니다)",
+                        "시크릿 참조(이름만 표시, 값은 읽지 않음)",
                     ))
                 }
                 thead {
@@ -751,7 +751,7 @@ fn destination_table(lang: Lang, profile: &ProfileView) -> Markup {
     html! {
         div class="dtable-scroll" {
             table class="dtable" {
-                caption class="muted" { (lang.sel("Destinations", "백업 위치")) }
+                caption class="muted" { (lang.sel("Destinations", "destination")) }
                 thead {
                     tr {
                         th scope="col" { "Name" }
@@ -768,7 +768,7 @@ fn destination_table(lang: Lang, profile: &ProfileView) -> Markup {
                             td colspan="6" class="muted" {
                                 (lang.sel(
                                     "No destination — this profile is a restore/migrate target only.",
-                                    "destination 없음 — 복구·이관 대상 전용 프로파일입니다.",
+                                    "destination이 없는 복구·이관 대상 전용 프로파일입니다.",
                                 ))
                             }
                         }
@@ -851,7 +851,7 @@ fn inheritance_legend(lang: Lang, mode: FormMode, profile: &ProfileView) -> Mark
     html! {
         (components::panel(
             html! {
-                h3 class="panel__title" { (lang.sel("How empty boxes are read", "빈 칸을 어떻게 읽는가")) }
+                h3 class="panel__title" { (lang.sel("How empty boxes are read", "빈 칸의 의미")) }
                 span class="counts" { (format!("{inherited} inherited")) }
             },
             html! {
@@ -860,21 +860,21 @@ fn inheritance_legend(lang: Lang, mode: FormMode, profile: &ProfileView) -> Mark
                     dd class="meta__v" {
                         (lang.sel(
                             "written in this profile — the box is pre-filled, and clearing it removes the key.",
-                            "이 프로파일에 적혀 있음 — 칸이 미리 채워져 있고, 비우면 키가 지워집니다.",
+                            "이 프로파일에 적힌 값입니다. 칸이 미리 채워져 있고, 비우면 키가 삭제됩니다.",
                         ))
                     }
                     dt class="meta__k" { "defaults / extends / builtin" }
                     dd class="meta__v" {
                         (lang.sel(
                             "inherited — the box is left empty on purpose. Empty keeps the inheritance; typing a value pins an override into this profile.",
-                            "상속된 값 — 칸을 의도적으로 비워 둡니다. 비어 있으면 상속을 유지하고, 값을 적으면 이 프로파일에 override가 박힙니다.",
+                            "상속된 값이라 칸을 일부러 비워 둡니다. 비워 두면 상속을 유지하고, 값을 적으면 이 프로파일에 override로 고정됩니다.",
                         ))
                     }
                     dt class="meta__k" { "uri / read_uri" }
                     dd class="meta__v" {
                         (lang.sel(
                             "never pre-filled (the shown value is redacted). Empty means no change; use the clear checkbox to remove it.",
-                            "절대 미리 채우지 않습니다(표시값은 가려진 표기입니다). 비어 있으면 변경 없음이고, 지우려면 clear 체크박스를 쓰세요.",
+                            "절대 미리 채우지 않습니다(표시된 값은 가려진 값입니다). 비워 두면 바뀌지 않고, 삭제는 clear 체크박스로 합니다.",
                         ))
                     }
                 }
@@ -882,7 +882,7 @@ fn inheritance_legend(lang: Lang, mode: FormMode, profile: &ProfileView) -> Mark
                     p class="muted" {
                         (lang.sel(
                             "Values marked defaults or extends are shared policy. Pinning them here means the shared policy no longer reaches this profile.",
-                            "defaults·extends로 표시된 값은 공용 정책입니다. 여기에 박아 넣으면 공용 정책이 이 프로파일에 더 이상 닿지 않습니다.",
+                            "defaults·extends로 표시된 값은 공용 정책입니다. 여기에 값을 고정하면 공용 정책이 더 이상 이 프로파일에 반영되지 않습니다.",
                         ))
                     }
                 }
@@ -914,7 +914,7 @@ fn name_field(lang: Lang, mode: FormMode, profile: &ProfileView) -> Markup {
                     p class="field__hint" {
                         (lang.sel(
                             "Renaming is not supported here — a name change moves lock and state files. Create a new profile and delete this one instead.",
-                            "이름 변경은 지원하지 않습니다 — 이름을 바꾸면 락·상태 파일이 이동합니다. 새로 만들고 이 프로파일을 지우세요.",
+                            "이름을 바꾸면 락·상태 파일이 옮겨지므로 여기서는 이름 변경을 지원하지 않습니다. 새 프로파일을 만들고 이 프로파일을 삭제하세요.",
                         ))
                     }
                 }
@@ -940,7 +940,7 @@ fn field_row(lang: Lang, field: &FieldView) -> Markup {
                 label class="field__clear" {
                     input type="checkbox" name=(format!("{}{}", field.key, route::CLEAR_SUFFIX)) value="1";
                     " "
-                    (lang.sel("clear this value", "이 값을 지운다"))
+                    (lang.sel("clear this value", "이 값 삭제"))
                 }
             }
             p class="field__hint" { (field_hint(lang, field)) }
@@ -991,7 +991,7 @@ fn field_hint(lang: Lang, field: &FieldView) -> String {
     let kind_hint = match field.kind {
         FieldKind::EnvName => lang.sel(
             "Name of an environment variable, not the secret itself.",
-            "환경변수 **이름**입니다 — 시크릿 값이 아닙니다.",
+            "시크릿 값이 아니라 환경변수 **이름**입니다.",
         ),
         FieldKind::Dest => lang.sel(
             "Compact form: local:/path or s3:bucket/prefix.",
@@ -999,7 +999,7 @@ fn field_hint(lang: Lang, field: &FieldView) -> String {
         ),
         FieldKind::Uri => lang.sel(
             "A URI with a password does not belong here — put it in an environment variable and name it in uri_env.",
-            "비밀번호가 들어간 URI를 여기 쓰지 마세요 — 환경변수에 담고 그 이름을 uri_env에 적으세요.",
+            "비밀번호가 들어간 URI는 여기에 쓰지 말고, 환경변수에 담아 그 이름을 uri_env에 적으세요.",
         ),
         FieldKind::Bool | FieldKind::Choice(_) | FieldKind::Number | FieldKind::Text => "",
     };
@@ -1030,7 +1030,7 @@ pub fn delete_page(lang: Lang, profile: &ProfileView) -> Markup {
             ),
             Some(lang.sel(
                 "Backups already written are not touched — but nothing will schedule, prune, or restore under this name any more.",
-                "이미 쌓인 백업은 손대지 않습니다 — 다만 이 이름으로는 더 이상 어떤 백업·정리·복구도 돌지 않습니다.",
+                "이미 쌓인 백업은 손대지 않습니다. 다만 이 이름으로는 더 이상 예약 백업·정리·복구가 실행되지 않습니다.",
             )),
         ))
         (components::panel(
@@ -1080,7 +1080,7 @@ fn conversion_panel(lang: Lang, syntax: ConfigSyntax) -> Markup {
                         p class="muted" {
                             (lang.sel(
                                 "The v2 surface writes one [profile.<name>] table per profile with flat keys, and lets shared policy live in [defaults] or [base.<name>]. Converting is an explicit, separate action — saving a field never changes the syntax.",
-                                "v2 표면은 프로파일당 [profile.<name>] 테이블 하나 + flat 키로 적고, 공통 정책을 [defaults]·[base.<name>]에 둘 수 있게 합니다. 전환은 명시적인 별개 동작입니다 — 필드를 저장하는 것으로는 문법이 바뀌지 않습니다.",
+                                "v2 문법은 프로파일마다 [profile.<name>] 테이블 하나에 flat 키를 적고, 공용 정책을 [defaults]나 [base.<name>]에 둘 수 있습니다. 전환은 별도 동작이며, 필드를 저장해도 문법은 바뀌지 않습니다.",
                             ))
                         }
                         p class="actions" {
@@ -1107,7 +1107,7 @@ fn conversion_panel(lang: Lang, syntax: ConfigSyntax) -> Markup {
 fn no_reverse_reason(lang: Lang) -> &'static str {
     lang.sel(
         "v2 can express things v1 cannot: [defaults], [base.<name>] and extends. Going back would have to flatten that shared policy into every profile — the file would keep working, but one place to edit would become many, and that loss would not be visible in the resulting file. If you need v1, write it by hand so the choice is yours.",
-        "v2는 v1이 표현할 수 없는 것을 담습니다 — [defaults]·[base.<name>]·extends. 되돌리려면 그 공용 정책을 모든 프로파일에 펼쳐 넣어야 하고, 파일은 계속 동작하지만 한 곳에서 고치던 것이 여러 곳으로 흩어집니다. 그 손실은 결과 파일만 봐서는 보이지 않습니다. v1이 필요하면 직접 작성하세요 — 그 선택은 사람이 해야 합니다.",
+        "v2는 v1이 표현할 수 없는 [defaults]·[base.<name>]·extends를 쓸 수 있어서, 되돌리려면 그 공용 정책을 모든 프로파일에 펼쳐 넣어야 하고 한 곳에서 고치던 것이 여러 곳으로 흩어집니다. 파일은 계속 동작하지만 결과 파일만 봐서는 이 손실이 보이지 않으므로, v1이 필요하면 직접 판단해 손으로 작성하세요.",
     )
 }
 
@@ -1145,7 +1145,7 @@ pub fn convert_page(lang: Lang, preview: &ConvertPreview) -> Markup {
                     dd class="meta__v" {
                         (lang.sel(
                             "No [defaults], [base.<name>] or extends is created. v1 has no inheritance surface, so every value is written in its own profile and stays there. This is a syntax conversion — consolidating shared policy is a separate decision only you can make, because the file cannot tell which value is common policy and which is a deliberate exception for that one profile.",
-                            "[defaults]·[base.<name>]·extends는 생기지 않습니다. v1에는 상속 표면이 없어서 모든 값이 각 프로파일에 적혀 있고, 전환 후에도 그대로 남습니다. 이것은 문법 변환입니다 — 공통 정책을 한 곳으로 모으는 일은 사람만 할 수 있는 별개의 판단입니다. 어느 값이 공용 정책이고 어느 값이 그 프로파일만의 의도적 예외인지는 파일이 알려주지 않기 때문입니다.",
+                            "이 전환은 문법만 바꿉니다: v1에는 상속 문법이 없어 모든 값이 각 프로파일에 적힌 그대로 남고, [defaults]·[base.<name>]·extends는 생기지 않습니다. 어느 값이 공용 정책이고 어느 값이 그 프로파일만의 의도적 예외인지 파일로는 알 수 없으므로, 공용 정책을 한 곳으로 모으는 일은 직접 따로 판단해야 합니다.",
                         ))
                     }
                     dt class="meta__k" { "values" }
@@ -1159,7 +1159,7 @@ pub fn convert_page(lang: Lang, preview: &ConvertPreview) -> Markup {
                     dd class="meta__v" {
                         (lang.sel(
                             "Comments and key order are not preserved — the file is written from its parsed contents, so comments are dropped and keys come out sorted. Copy anything you want to keep before confirming.",
-                            "주석과 키 순서는 보존되지 않습니다 — 파일을 파싱된 내용에서 다시 쓰므로 주석이 사라지고 키가 정렬됩니다. 남겨야 할 주석이 있으면 실행 전에 복사해 두세요.",
+                            "파일을 파싱한 내용으로 다시 쓰므로 주석은 사라지고 키 순서는 정렬 순서로 바뀝니다. 남겨 둘 내용이 있으면 실행 전에 복사해 두세요.",
                         ))
                     }
                 }
@@ -1182,7 +1182,7 @@ pub fn convert_page(lang: Lang, preview: &ConvertPreview) -> Markup {
                 p class="muted" {
                     (lang.sel(
                         "Plain uri values are shown redacted here — the file itself keeps whatever it already had.",
-                        "평문 uri 값은 이 화면에서만 가려 보여줍니다 — 파일에는 원래 있던 값이 그대로 쓰입니다.",
+                        "평문 uri 값은 이 화면에서만 가려서 보여 주며, 파일에는 원래 값이 그대로 남습니다.",
                     ))
                 }
                 pre class="logdump" { (preview.new_text) }
@@ -1271,7 +1271,7 @@ pub fn convert_result_page(lang: Lang, profiles: usize, outcome: SaveOutcome<'_>
     let headline = if !persisted {
         lang.sel(
             "The conversion passed validation. The config file was NOT written.",
-            "전환이 검증을 통과했습니다. config 파일은 아직 쓰이지 않았습니다.",
+            "전환이 검증을 통과했습니다. config 파일에는 쓰지 않았습니다.",
         )
     } else if warnings.is_empty() {
         lang.sel(
@@ -1295,18 +1295,18 @@ pub fn convert_result_page(lang: Lang, profiles: usize, outcome: SaveOutcome<'_>
         @if persisted {
             (components::notice(
                 Level::Warn,
-                lang.sel("Syntax only — policy is unchanged", "문법만 바뀌었습니다 — 정책은 그대로입니다"),
+                lang.sel("Syntax only — policy is unchanged", "문법만 바뀌고 정책은 그대로입니다"),
                 html! {
                     p {
                         (lang.sel(
                             "Every profile still carries its own values: no [defaults], no [base.<name>], no extends was created. That is not a bug — v1 had no inheritance to carry over, and guessing which values are shared policy would quietly spread one profile's exception to the others.",
-                            "각 프로파일은 여전히 자기 값을 그대로 들고 있습니다 — [defaults]·[base.<name>]·extends는 생기지 않았습니다. 버그가 아닙니다: v1에는 옮겨올 상속이 없었고, 어느 값이 공용 정책인지 추측하면 한 프로파일의 예외가 조용히 다른 프로파일로 번집니다.",
+                            "각 프로파일에는 자기 값이 그대로 남아 있고, [defaults]·[base.<name>]·extends는 생기지 않았습니다. 버그가 아닙니다: v1에는 옮겨 올 상속이 없었고, 어느 값이 공용 정책인지 추측하면 한 프로파일의 예외가 조용히 다른 프로파일로 번집니다.",
                         ))
                     }
                     p class="muted" {
                         (lang.sel(
                             "Consolidating shared policy is now possible and is a separate, manual step: move the common keys into [defaults] (or a [base.<name>] plus extends) in the config file, then reload this screen and check the origin badges.",
-                            "공통 정책을 모으는 일은 이제 가능해졌지만 별개의 수동 작업입니다 — config 파일에서 공통 키를 [defaults](또는 [base.<name>] + extends)로 옮긴 뒤 이 화면을 새로 열어 출처 배지를 확인하세요.",
+                            "이제 공용 정책을 한 곳으로 모을 수 있지만, 이 작업은 따로 직접 해야 합니다. config 파일에서 공통 키를 [defaults](또는 [base.<name>] + extends)로 옮긴 뒤 이 화면을 새로 고쳐 출처 배지를 확인하세요.",
                         ))
                     }
                 },
@@ -1366,7 +1366,7 @@ pub fn result_page(
     let headline = if !persisted {
         lang.sel(
             "The change passed validation. The config file was NOT written.",
-            "변경이 검증을 통과했습니다. config 파일은 아직 쓰이지 않았습니다.",
+            "변경이 검증을 통과했습니다. config 파일에는 쓰지 않았습니다.",
         )
     } else if warnings.is_empty() {
         lang.sel(
@@ -1384,7 +1384,7 @@ pub fn result_page(
     } else {
         Some(lang.sel(
             "This console is running with a validator-only store — the change was checked but nothing was written to disk.",
-            "이 콘솔은 검증 전용 저장소로 동작 중입니다 — 변경은 점검했지만 디스크에는 아무것도 쓰지 않았습니다.",
+            "이 콘솔은 검증 전용 저장소로 실행 중입니다. 변경은 검증만 했고 디스크에는 쓰지 않았습니다.",
         ))
     };
     html! {
@@ -1440,7 +1440,7 @@ pub fn result_page(
                 p {
                     (lang.sel(
                         "The save went through — doctor's warnings are success with caveats, not a failure. Review these before the next backup:",
-                        "저장은 진행됐습니다 — doctor의 경고는 실패가 아니라 단서가 붙은 성공입니다. 다음 백업 전에 아래를 확인하세요:",
+                        "저장은 완료됐습니다. doctor의 경고는 실패가 아니라 단서가 붙은 성공이므로, 다음 백업 전에 아래 항목을 확인하세요:",
                     ))
                 }
                 ul {
@@ -1480,7 +1480,7 @@ pub fn problem_page(lang: Lang, level: Level, headline: &str, detail: Option<&st
             p {
                 (lang.sel(
                     "The console reads the config file it was started with. Fix the file (or restart the console with --config <PATH>) and reload.",
-                    "콘솔은 기동할 때 지정된 config 파일을 읽습니다. 파일을 고치거나(또는 --config <PATH>로 다시 띄우고) 새로 고치세요.",
+                    "콘솔은 시작할 때 지정한 config 파일을 읽습니다. 파일을 고치거나 --config <PATH>로 콘솔을 다시 시작한 뒤 페이지를 새로 고치세요.",
                 ))
             }
         }))
@@ -1905,7 +1905,7 @@ mod tests {
         let ko =
             result_page(Lang::Ko, "prod", "update", &[], &[], &[], not_persisted_ko).into_string();
         assert!(
-            ko.contains("쓰이지 않았습니다"),
+            ko.contains("config 파일에는 쓰지 않았습니다"),
             "한국어 미저장 문장 누락: {ko}"
         );
     }
@@ -2022,7 +2022,7 @@ mod tests {
                 "{out}"
             );
             assert!(
-                out.contains(lang.sel("syntax conversion", "문법 변환")),
+                out.contains(lang.sel("syntax conversion", "문법만 바꿉니다")),
                 "문법 변환일 뿐이라는 말이 없다: {out}"
             );
             // 2) 값이 바뀌지 않는다.
@@ -2032,7 +2032,7 @@ mod tests {
             );
             // 3) 주석은 보존되지 않는다.
             assert!(
-                out.contains(lang.sel("Comments and key order", "주석과 키 순서")),
+                out.contains(lang.sel("Comments and key order", "주석은 사라지고")),
                 "{out}"
             );
             // 역방향이 없는 이유.
@@ -2090,7 +2090,7 @@ mod tests {
         .into_string();
         assert!(done.contains("v2 flat 문법을 씁니다"), "{done}");
         assert!(
-            done.contains("문법만 바뀌었습니다"),
+            done.contains("정책은 그대로입니다"),
             "정책이 그대로라는 말이 없다: {done}"
         );
         assert!(done.contains("버그가 아닙니다"), "{done}");

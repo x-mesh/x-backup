@@ -131,7 +131,8 @@ credentials_env = "{ENV_S3_CREDS}"
 /// (파일 헤더 "라우트를 추가할 때 해야 할 일" 참고).
 fn known_routes() -> Vec<String> {
     vec![
-        "/".to_string(), // index — server.rs가 경로 상수를 노출하지 않아 리터럴로 등록
+        // `/`는 싣지 않는다 — 본문 없이 고정 `Location`(대시보드)만 내는 303이라 검사할
+        // 화면이 없고, 그 목적지는 아래 DASHBOARD_PATH가 덮는다.
         server::HEALTHZ_PATH.to_string(),
         // doctor 화면(t9). 인증 쿠키를 싣게 된 뒤로는 자식 프로세스가 **실제로** 뜬다 —
         // 자기 자신(`current_exe()`)이 이 테스트 바이너리라 doctor로서 동작하지는 않지만,

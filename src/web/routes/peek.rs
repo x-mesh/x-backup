@@ -343,21 +343,21 @@ impl RunError {
                 "{} {detail}",
                 lang.sel(
                     "Spawning the peek child failed:",
-                    "peek 자식 프로세스를 띄우지 못했습니다:",
+                    "peek 명령을 실행하지 못했습니다:",
                 )
             ),
             RunError::Wait(detail) => format!(
                 "{} {detail}",
                 lang.sel(
                     "Reading the peek child's output failed:",
-                    "peek 자식 프로세스의 출력을 읽는 중 실패했습니다:",
+                    "peek 명령의 출력을 읽지 못했습니다:",
                 )
             ),
             RunError::Timeout(limit) => format!(
                 "{} ({}s)",
                 lang.sel(
                     "peek did not finish within the time limit and was killed. A stalled or unreachable source is the usual cause.",
-                    "peek가 상한 시간 안에 끝나지 않아 종료시켰습니다. 소스에 연결할 수 없거나 멈춘 경우가 흔한 원인입니다.",
+                    "peek가 제한 시간 안에 끝나지 않아 강제로 종료했습니다. 대개 소스가 멈췄거나 소스에 연결할 수 없는 경우입니다.",
                 ),
                 limit.as_secs()
             ),
@@ -453,7 +453,7 @@ impl ReportError {
             ReportError::Empty => lang
                 .sel(
                     "peek produced no output. The child may have died before writing anything.",
-                    "peek가 아무 출력도 내지 않았습니다. 자식 프로세스가 쓰기 전에 죽었을 수 있습니다.",
+                    "peek가 아무 출력도 내지 않았습니다. 명령이 출력을 쓰기 전에 비정상 종료됐을 수 있습니다.",
                 )
                 .to_string(),
             ReportError::Malformed(detail) => format!(
@@ -468,14 +468,14 @@ impl ReportError {
                 "{} (schema {found} ≠ {expected})",
                 lang.sel(
                     "peek reported a JSON schema this console does not know — the console and the CLI are probably different builds.",
-                    "peek가 이 콘솔이 모르는 JSON 스키마를 냈습니다 — 콘솔과 CLI가 서로 다른 빌드일 가능성이 큽니다.",
+                    "peek가 낸 JSON 스키마를 이 콘솔이 알지 못합니다. 콘솔과 CLI가 서로 다른 빌드일 가능성이 큽니다.",
                 )
             ),
             ReportError::TooDeep { found, max } => format!(
                 "{} ({found} > {max})",
                 lang.sel(
                     "peek output is nested more deeply than this console parses. Nothing was read — suspect the document itself, or whatever generated it.",
-                    "peek 출력의 중첩 깊이가 이 콘솔이 파싱하는 상한을 넘었습니다. 내용을 읽지 않았습니다 — 문서 자체나 그것을 만든 쪽을 의심하세요.",
+                    "peek 출력의 중첩 깊이가 이 콘솔이 파싱하는 상한을 넘어 내용을 읽지 않았습니다. 문서 자체나 그 문서를 만든 쪽을 의심하세요.",
                 )
             ),
         }
@@ -791,7 +791,7 @@ pub async fn reveal(
                 html! {
                     p { (ctx.lang.sel(
                         "Revealing raw values requires a single namespace — the overview cannot be revealed as a whole.",
-                        "원문 노출에는 네임스페이스 하나가 필요합니다 — 개요 전체는 한 번에 노출할 수 없습니다.",
+                        "원문을 노출하려면 네임스페이스 하나가 필요합니다. 개요 전체는 한 번에 노출할 수 없습니다.",
                     )) }
                 },
             ),

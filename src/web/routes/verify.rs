@@ -222,7 +222,7 @@ impl ParseProblem {
                 "{} {}",
                 lang.sel(
                     "verify output could not be parsed as the expected JSON:",
-                    "verify 출력을 기대한 JSON으로 해석할 수 없습니다:",
+                    "verify 출력을 예상한 형식의 JSON으로 해석할 수 없습니다:",
                 ),
                 detail
             ),
@@ -230,14 +230,14 @@ impl ParseProblem {
                 "{} (schema {found} \u{2260} {expected})",
                 lang.sel(
                     "verify reported a JSON schema this console does not know — the console and the CLI are probably different builds.",
-                    "verify가 이 콘솔이 모르는 JSON 스키마를 냈습니다 — 콘솔과 CLI가 서로 다른 빌드일 가능성이 큽니다.",
+                    "verify가 보고한 JSON 스키마를 이 콘솔은 모릅니다. 콘솔과 CLI가 서로 다른 빌드일 가능성이 큽니다.",
                 )
             ),
             ParseProblem::TooDeep { found, max } => format!(
                 "{} ({found} > {max})",
                 lang.sel(
                     "verify output is nested more deeply than this console parses. The verification itself still ran — read the exit code.",
-                    "verify 출력의 중첩 깊이가 이 콘솔이 파싱하는 상한을 넘었습니다. 검증 자체는 수행됐습니다 — 종료 코드를 보세요.",
+                    "verify 출력의 중첩 깊이가 이 콘솔이 파싱할 수 있는 상한을 넘었습니다. 검증 자체는 실행됐으니 종료 코드를 확인하세요.",
                 )
             ),
         }

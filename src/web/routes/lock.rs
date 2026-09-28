@@ -139,8 +139,7 @@ impl IndeterminateReason {
         let prefix = lang.sel(
             "Undetermined — a lock file exists but its status cannot be verified. \
              This does NOT mean the profile is free.",
-            "판정 불가 — 락 파일은 있지만 상태를 확인할 수 없습니다. \
-             프로파일이 비어 있다는 뜻이 아닙니다.",
+            "판정 불가: 락 파일은 있지만 상태를 확인할 수 없습니다. 프로파일 락이 없다는 뜻은 아닙니다.",
         );
         let cause = match self {
             IndeterminateReason::Unreadable(detail) => format!(
@@ -153,21 +152,20 @@ impl IndeterminateReason {
             IndeterminateReason::Empty => lang
                 .sel(
                     "The lock file is empty (0 bytes) — likely caught mid-write or truncated.",
-                    "락 파일이 비어 있습니다(0바이트) — 쓰는 도중이었거나 잘렸을 수 있습니다.",
+                    "락 파일이 비어 있습니다(0바이트). 쓰는 도중이었거나 잘렸을 수 있습니다.",
                 )
                 .to_string(),
             IndeterminateReason::Malformed => lang
                 .sel(
                     "The lock file is not valid JSON in the expected shape.",
-                    "락 파일이 기대한 모양의 JSON이 아닙니다.",
+                    "락 파일이 예상한 형식의 JSON이 아닙니다.",
                 )
                 .to_string(),
             IndeterminateReason::ImplausibleTimestamp => lang
                 .sel(
                     "The recorded start time could not be parsed, or is in the future — the \
                      file cannot be trusted.",
-                    "기록된 시작 시각을 해석할 수 없거나 미래입니다 — 이 파일을 신뢰할 수 \
-                     없습니다.",
+                    "기록된 시작 시각을 해석할 수 없거나 미래 시각이라 이 파일을 신뢰할 수 없습니다.",
                 )
                 .to_string(),
             IndeterminateReason::ForeignHost(host) => format!(
@@ -328,8 +326,7 @@ fn render(lang: Lang, scan: &Scan) -> Markup {
     let subtitle = lang.sel(
         "Who currently holds a profile lock — read-only; this screen never acquires or \
          releases anything.",
-        "지금 어떤 프로파일 락을 누가 잡고 있는지 — 읽기 전용이며 이 화면은 락을 잡거나 \
-         풀지 않습니다.",
+        "프로파일 락 보유 현황입니다. 읽기 전용이라 이 화면에서 락을 잡거나 풀지 않습니다.",
     );
     html! {
         (components::page_head(LOCK_TITLE, Some(subtitle)))
@@ -482,15 +479,14 @@ fn detail_text(lang: Lang, status: &LockStatus) -> String {
         LockStatus::Held(_) => lang
             .sel(
                 "Running — wait for it to finish before starting the same profile.",
-                "실행 중 — 같은 프로파일 작업을 시작하려면 끝나기를 기다리세요.",
+                "실행 중: 같은 프로파일 작업을 시작하려면 끝나기를 기다리세요.",
             )
             .to_string(),
         LockStatus::Stale(_) => lang
             .sel(
                 "Reclaimable — the holding process no longer exists. The next run on this \
                  profile will clear it automatically; no action is required here.",
-                "회수 가능 — 보유 프로세스가 더 이상 존재하지 않습니다. 이 프로파일의 다음 \
-                 실행에서 자동으로 정리됩니다 — 여기서 할 일은 없습니다.",
+                "회수 가능: 락을 잡았던 프로세스가 더 이상 없습니다. 이 프로파일을 다음에 실행할 때 자동으로 정리되며, 여기서 할 일은 없습니다.",
             )
             .to_string(),
         LockStatus::Indeterminate(reason) => reason.explain(lang),
@@ -698,7 +694,7 @@ mod tests {
                     Lang::Ko => {
                         assert!(text.contains("판정 불가"), "{reason:?}: {text}");
                         assert!(
-                            text.contains("비어 있다는 뜻이 아닙니다"),
+                            text.contains("락이 없다는 뜻은 아닙니다"),
                             "{reason:?} ko 설명이 '락 없음 아님'을 말하지 않는다: {text}"
                         );
                     }

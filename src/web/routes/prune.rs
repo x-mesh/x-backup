@@ -235,7 +235,7 @@ impl PlanError {
             PlanError::Empty => lang
                 .sel(
                     "prune produced no plan. Read the exit code — the child usually stopped before it could report.",
-                    "prune이 계획을 내지 않았습니다. 종료 코드를 보세요 — 대개 보고 전에 자식이 멈춘 경우입니다.",
+                    "prune이 계획을 내지 않았습니다. 대개 명령이 보고하기 전에 멈춘 경우이니 종료 코드를 확인하세요.",
                 )
                 .to_string(),
             PlanError::Malformed(detail) => format!(
@@ -249,7 +249,7 @@ impl PlanError {
                 "{} (schema {found} \u{2260} {expected})",
                 lang.sel(
                     "prune reported a JSON schema this console does not know — the console and the CLI are probably different builds.",
-                    "prune이 이 콘솔이 모르는 JSON 스키마를 냈습니다 — 콘솔과 CLI가 서로 다른 빌드일 가능성이 큽니다.",
+                    "prune이 낸 JSON 스키마를 이 콘솔이 알지 못합니다. 콘솔과 CLI가 서로 다른 빌드일 가능성이 큽니다.",
                 )
             ),
             PlanError::TooDeep { found, max } => format!(
@@ -731,7 +731,7 @@ fn confirm_request<'a>(
                 .to_string(),
             hint: lang.sel(
                 "Off by default, matching the CLI: leftovers need --force there too. Leaving them is safe — they only take space.",
-                "CLI와 같이 기본은 꺼짐입니다 — 그쪽에서도 잔재는 --force가 있어야 지워집니다. 남겨 두어도 안전하며 공간만 차지합니다.",
+                "기본값은 꺼짐이며, 잔재는 CLI에서도 --force가 있어야 삭제됩니다. 남겨 두어도 공간만 차지하므로 안전합니다.",
             ).to_string(),
         }),
         extra_hidden: hidden_state(profile, overrides, plan),

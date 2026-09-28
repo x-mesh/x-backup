@@ -195,13 +195,22 @@ pub enum ProbeKey {
         /// 프로파일 이름.
         profile: String,
     },
+    /// 프로파일 하나의 백업 목록 — `list --profile <name> --json` 한 번(대시보드 이력).
+    Catalog {
+        /// 이 서버가 자식에게 넘기는 config 경로([`config_key`]).
+        config: String,
+        /// 프로파일 이름.
+        profile: String,
+    },
 }
 
 impl ProbeKey {
     /// 이 키가 속한 config 조각 — [`invalidate_config`]가 범위를 가르는 데 쓴다.
     pub fn config(&self) -> &str {
         match self {
-            Self::Roster { config } | Self::Profile { config, .. } => config,
+            Self::Roster { config }
+            | Self::Profile { config, .. }
+            | Self::Catalog { config, .. } => config,
         }
     }
 }
@@ -469,6 +478,11 @@ pub fn probe_cache() -> &'static TtlCache<ProbeKey, Arc<ProbeOutput>> {
 /// [`invalidate_config`]가 맞다.
 pub fn invalidate_profile(ctx: &ServeConfig, profile: &str) {
     probe_cache().invalidate(&ProbeKey::Profile {
+        config: config_key(ctx),
+        profile: profile.to_string(),
+    });
+    // 백업이 끝나면 목록도 바뀐다 — 대시보드 이력이 방금 끝난 백업을 빠뜨리지 않게.
+    probe_cache().invalidate(&ProbeKey::Catalog {
         config: config_key(ctx),
         profile: profile.to_string(),
     });

@@ -117,7 +117,7 @@ pub fn body(lang: Lang, interval_secs: u32) -> Markup {
             html! {
                 p { (lang.sel(
                     "However many people have this screen open, the console runs exactly one live reader against your databases. When the last viewer leaves, it stops.",
-                    "이 화면을 몇 명이 열어 두든 콘솔은 데이터베이스에 라이브 리더를 정확히 하나만 돌립니다. 마지막 뷰어가 떠나면 멈춥니다.",
+                    "이 화면을 몇 명이 열어 두든 콘솔은 데이터베이스를 읽는 라이브 리더를 하나만 실행합니다. 마지막 사람이 화면을 닫으면 리더도 멈춥니다.",
                 )) }
             },
         ))
@@ -130,7 +130,7 @@ pub fn body(lang: Lang, interval_secs: u32) -> Markup {
             data-label-down=(lang.sel("unreachable", "연결 실패")) {
 
             p class="actions" {
-                span id="monitor-status" data-level="warn" { (lang.sel("waiting for the first frame", "첫 프레임 대기 중")) }
+                span id="monitor-status" data-level="warn" { (lang.sel("waiting for the first frame", "첫 갱신 대기 중")) }
                 " "
                 span id="monitor-tick" class="mono" {}
             }
@@ -193,9 +193,12 @@ mod tests {
     #[test]
     fn the_screen_states_that_one_reader_is_shared() {
         let ko = body(Lang::Ko, 2).into_string();
-        assert!(ko.contains("정확히 하나만"), "공유 사실을 말하지 않는다");
         assert!(
-            ko.contains("마지막 뷰어가 떠나면 멈춥니다"),
+            ko.contains("리더를 하나만 실행합니다"),
+            "공유 사실을 말하지 않는다"
+        );
+        assert!(
+            ko.contains("마지막 사람이 화면을 닫으면 리더도 멈춥니다"),
             "종료 조건을 말하지 않는다"
         );
     }

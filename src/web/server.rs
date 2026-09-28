@@ -33,13 +33,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::middleware;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Redirect};
 use axum::routing::{get, post};
 use axum::{Extension, Router};
-use maud::Markup;
 
 use crate::cli::output::{config_source_label, field_line, style, Tone};
 use crate::error::{Result, XBackupError};
@@ -323,9 +321,12 @@ async fn app_css() -> impl IntoResponse {
     )
 }
 
-/// `GET /` — 진입 화면. 대시보드(t15)가 이 자리를 차지한다.
-async fn index(State(ctx): State<Arc<ServeConfig>>) -> Markup {
-    view::layout::shell(ctx.lang, "Console", view::layout::landing(ctx.lang))
+/// `GET /` — 대시보드로 보낸다(303).
+///
+/// 로그인 직후 운영자가 가장 먼저 봐야 하는 것은 전 프로파일의 상태다. `/`에 별도 화면을
+/// 두면 레일과 같은 목록을 한 번 더 보여 주는 빈 화면이 된다.
+async fn index() -> Redirect {
+    Redirect::to(routes::dashboard::DASHBOARD_PATH)
 }
 
 /// 기동 배너 — 어디에 떴고 무엇을 보고 있는지 stdout 한 덩이로 알린다.
@@ -365,7 +366,7 @@ fn print_banner(cfg: &ServeConfig, bound: SocketAddr) {
             crate::cli::output::style_stderr(
                 cfg.lang.sel(
                     "! bound outside loopback — terminate TLS and restrict access at a reverse proxy.",
-                    "! 루프백 밖에 바인딩됨 — TLS 종단과 접근 제한을 앞단 리버스 프록시에서 처리하세요.",
+                    "! 루프백이 아닌 주소에 바인딩했습니다. TLS 종단과 접근 제한은 앞단 리버스 프록시에서 처리하세요.",
                 ),
                 Tone::Warning
             )
@@ -401,8 +402,7 @@ fn warn_unmaskable_secrets(cfg: &ServeConfig) {
                 cfg.lang.sel(
                     "! these secret env values are too short to mask — they are injected into job \
                      children but will appear verbatim in job logs, SSE, and job history:",
-                    "! 다음 시크릿 env의 값이 너무 짧아 마스킹할 수 없습니다 — 자식 프로세스에는 \
-                     주입되지만 잡 로그·SSE·잡 이력에 원문이 그대로 남습니다:",
+                    "! 다음 시크릿 env 값은 너무 짧아 마스킹할 수 없습니다. 콘솔이 실행한 명령에는 주입되지만 작업 로그·SSE·작업 이력에 원문 그대로 남습니다:",
                 )
             ),
             Tone::Warning
@@ -595,22 +595,16 @@ mod tests {
         assert_eq!(call("/").await.0, StatusCode::UNAUTHORIZED);
     }
 
-    /// 유효한 세션 쿠키가 있으면 진입 화면은 레이아웃 껍데기를 렌더하고 스타일시트를 링크한다.
+    /// 유효한 세션 쿠키가 있으면 `/`는 대시보드로 303을 돌려준다.
     #[tokio::test]
-    async fn index_renders_shell_when_authenticated() {
-        let (status, headers, body) = call_authed("/").await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(
-            headers[header::CONTENT_TYPE]
-                .to_str()
-                .unwrap()
-                .starts_with("text/html"),
-            "HTML content-type이 아니다: {:?}",
-            headers[header::CONTENT_TYPE]
+    async fn index_redirects_to_dashboard_when_authenticated() {
+        let (status, headers, _) = call_authed("/").await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(
+            headers[header::LOCATION],
+            routes::dashboard::DASHBOARD_PATH,
+            "대시보드가 아닌 곳으로 보냈다"
         );
-        assert!(body.starts_with("<!DOCTYPE html>"), "문서 골격 누락");
-        assert!(body.contains(&view::app_css_url()), "스타일시트 링크 누락");
-        assert!(body.contains(HEALTHZ_PATH), "헬스 체크 안내 누락");
     }
 
     /// `GET /doctor`는 쿠키 없이는 401 — config 구조를 보여주는 화면이 열려 있지 않다.
@@ -737,10 +731,11 @@ mod tests {
             "Set-Cookie 어디에도 토큰이 있으면 안 된다: {set_cookie}"
         );
 
+        // `/`는 인증을 통과하면 대시보드로 303, 통과하지 못하면 401이다.
         let (status, _, _) = call_with_cookie("/", Some(session_id)).await;
         assert_eq!(
             status,
-            StatusCode::OK,
+            StatusCode::SEE_OTHER,
             "발급된 쿠키로 인증 뒤 라우트에 들어가야 함"
         );
 

@@ -21,20 +21,19 @@ use crate::i18n::Lang;
 /// 헤더에 노출하는 제품명. 라벨이므로 언어와 무관하게 영문 고정.
 const PRODUCT: &str = "x-backup";
 
-/// 상단 내비게이션 항목 — `(라벨, 경로)`. 라벨은 영문 고정([`crate::i18n`] 규약).
+/// 레일 내비게이션 — `(묶음 라벨, [(화면 라벨, 경로)])`. 라벨은 영문 고정([`crate::i18n`] 규약).
 ///
-/// 화면이 늘어나면 여기 한 줄씩 추가한다. 링크가 코드에 있고 경로가 상수를 가리키므로,
-/// 라우트를 옮기면 컴파일이 깨져 죽은 링크가 남지 않는다.
+/// 화면이 늘어나면 해당 묶음에 한 줄씩 추가한다. 경로가 상수를 가리키므로 라우트를 옮기면
+/// 컴파일이 깨져 죽은 링크가 남지 않는다.
 ///
-/// 라벨도 각 화면의 `*_TITLE` 상수를 그대로 쓴다 — 라벨과 `<title>`이 같아야 한다는 규약
-/// ([`nav_labels_match_titles`])을 문자열을 두 번 적는 대신 **같은 상수를 가리켜서** 지킨다.
+/// 화면 라벨은 각 화면의 `*_TITLE` 상수를 그대로 쓴다 — 라벨과 `<title>`이 같아야 한다는
+/// 규약([`nav_labels_match_titles`])을 같은 상수를 가리켜서 지킨다.
 ///
-/// 순서는 운영 흐름이다: 개요(Console·Dashboard·Monitor·Catalog) → 실행(Backup·Verify·Peek·
-/// Restore·Prune·Migrate·Schedule) → 사후(Jobs·Lock) → 설정(Config·Doctor).
-fn nav_items() -> [(&'static str, &'static str); 15] {
+/// 묶음은 운영 흐름이다: 개요 → 실행 → 사후 기록 → 설정. 열다섯 개를 한 줄로 늘어놓으면
+/// 운영자가 매번 목록 전체를 훑어야 한다.
+fn nav_groups() -> [(&'static str, &'static [(&'static str, &'static str)]); 4] {
     use crate::web::routes;
-    [
-        ("Console", "/"),
+    const OVERVIEW: &[(&str, &str)] = &[
         (
             routes::dashboard::DASHBOARD_TITLE,
             routes::dashboard::DASHBOARD_PATH,
@@ -47,6 +46,8 @@ fn nav_items() -> [(&'static str, &'static str); 15] {
             routes::catalog::CATALOG_TITLE,
             routes::catalog::CATALOG_PATH,
         ),
+    ];
+    const OPERATE: &[(&str, &str)] = &[
         (routes::backup::BACKUP_TITLE, routes::backup::BACKUP_PATH),
         (routes::verify::VERIFY_TITLE, routes::verify::VERIFY_PATH),
         (routes::peek::PEEK_TITLE, routes::peek::PEEK_PATH),
@@ -63,20 +64,41 @@ fn nav_items() -> [(&'static str, &'static str); 15] {
             routes::schedule::SCHEDULE_TITLE,
             routes::schedule::SCHEDULE_PATH,
         ),
+    ];
+    const RECORDS: &[(&str, &str)] = &[
         (routes::jobs::JOBS_TITLE, routes::jobs::JOBS_PATH),
         (routes::lock::LOCK_TITLE, routes::lock::LOCK_PATH),
+    ];
+    const SETUP: &[(&str, &str)] = &[
         (routes::config::CONFIG_TITLE, routes::config::CONFIG_PATH),
         (routes::doctor::DOCTOR_TITLE, routes::doctor::DOCTOR_PATH),
+    ];
+    [
+        ("Overview", OVERVIEW),
+        ("Operate", OPERATE),
+        ("Records", RECORDS),
+        ("Setup", SETUP),
     ]
 }
 
+/// 모든 화면 링크를 묶음 순서대로 편 목록.
+#[cfg(test)]
+fn nav_items() -> impl Iterator<Item = (&'static str, &'static str)> {
+    nav_groups()
+        .into_iter()
+        .flat_map(|(_, items)| items.iter().copied())
+}
+
+/// 본문 영역의 앵커 — 바로가기 링크가 가리킨다.
+const MAIN_ID: &str = "main";
+
 /// 모든 화면의 공통 껍데기.
 ///
-/// - `title`: `<title>`에 들어가는 화면 이름(영문 라벨 — "Console", "Catalog" 등).
+/// - `title`: `<title>`에 들어가는 화면 이름(영문 라벨 — "Dashboard", "Catalog" 등).
 /// - `body`: 본문 마크업. 호출자가 `html! { ... }`로 만들어 넘긴다.
 ///
 /// ## 현재 화면 표시를 `title`로 판정하는 이유
-/// `title`이 곧 그 화면의 내비게이션 라벨이라는 규약을 둔다([`nav_items`]의 첫 원소와
+/// `title`이 곧 그 화면의 내비게이션 라벨이라는 규약을 둔다([`nav_groups`] 항목의 첫 원소와
 /// 일치). 그래서 `shell`에 "현재 경로" 인자를 따로 받지 않아도 `aria-current`를 붙일 수
 /// 있다 — 인자를 하나 더 받으면 모든 화면이 자기 경로를 두 번(라우터에 한 번, 여기에 한 번)
 /// 적어야 하고 그 둘이 어긋나는 사고가 생긴다. 규약이 깨지면 강조가 사라질 뿐 화면은
@@ -96,46 +118,38 @@ pub fn shell(lang: Lang, title: &str, body: Markup) -> Markup {
                 link rel="stylesheet" href=(super::app_css_url());
             }
             body {
+                a class="skip-link" href=(format!("#{MAIN_ID}")) {
+                    (lang.sel("Skip to content", "본문으로 건너뛰기"))
+                }
                 div class="shell" {
-                    header class="shell-head" {
-                        h1 { (PRODUCT) }
-                        span class="ver" { "v" (env!("CARGO_PKG_VERSION")) }
-                        nav class="shell-nav" aria-label="Screens" {
-                            @for (label, href) in nav_items() {
-                                @if label == title {
-                                    // 현재 화면은 링크로 두되 aria-current로 표시한다 —
-                                    // 링크를 지우면 키보드 탐색 순서가 화면마다 달라진다.
-                                    a href=(href) aria-current="page" { (label) }
-                                } @else {
-                                    a href=(href) { (label) }
+                    aside class="rail" {
+                        a class="rail__mark" href="/" {
+                            h1 { (PRODUCT) }
+                            span class="rail__ver" { "v" (env!("CARGO_PKG_VERSION")) }
+                        }
+                        nav class="rail__nav" aria-label="Screens" {
+                            @for (group, items) in nav_groups() {
+                                div class="rail__group" {
+                                    p class="rail__group-label" { (group) }
+                                    ul class="rail__list" {
+                                        @for (label, href) in items {
+                                            li {
+                                                @if *label == title {
+                                                    // 현재 화면은 링크로 두되 aria-current로 표시한다 —
+                                                    // 링크를 지우면 키보드 탐색 순서가 화면마다 달라진다.
+                                                    a href=(href) aria-current="page" { (label) }
+                                                } @else {
+                                                    a href=(href) { (label) }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                    main { (body) }
+                    main class="stage" id=(MAIN_ID) { (body) }
                 }
-            }
-        }
-    }
-}
-
-/// 최초 진입 화면 — 서버가 살아 있다는 사실만 알린다.
-///
-/// 대시보드(t15)가 이 자리를 차지하면 그때 교체된다. 지금 이 페이지가 존재하는 이유는
-/// [`shell`]이 실제로 렌더되는 경로를 하나 두어, 레이아웃이 쓰이지 않는 코드로 남지 않게
-/// 하려는 것이다. 서버 내부 정보(bind 주소·config 경로)는 의도적으로 싣지 않는다.
-pub fn landing(lang: Lang) -> Markup {
-    html! {
-        div class="card" {
-            p {
-                (lang.sel(
-                    "The web console is running. Operational screens land in later steps.",
-                    "웹 콘솔이 동작 중입니다. 운영 화면은 후속 단계에서 붙습니다.",
-                ))
-            }
-            p class="muted" {
-                (lang.sel("Health check: ", "헬스 체크: "))
-                code { a href=(crate::web::server::HEALTHZ_PATH) { (crate::web::server::HEALTHZ_PATH) } }
             }
         }
     }
@@ -148,10 +162,10 @@ mod tests {
     /// 껍데기는 문서 골격 + 지문 붙은 스타일시트 링크를 포함한다.
     #[test]
     fn shell_renders_document_skeleton() {
-        let out = shell(Lang::En, "Console", html! { p { "hi" } }).into_string();
+        let out = shell(Lang::En, "Dashboard", html! { p { "hi" } }).into_string();
         assert!(out.starts_with("<!DOCTYPE html>"), "DOCTYPE 누락: {out}");
         assert!(out.contains(r#"<html lang="en">"#), "lang 속성 누락");
-        assert!(out.contains("<title>x-backup — Console</title>"));
+        assert!(out.contains("<title>x-backup — Dashboard</title>"));
         assert!(
             out.contains(&format!(r#"href="{}""#, super::super::app_css_url())),
             "지문 붙은 CSS 링크 누락: {out}"
@@ -162,12 +176,13 @@ mod tests {
     /// `--lang ko`는 `<html lang>`과 설명 문장에만 반영되고 라벨(제품명)은 영문 고정이다.
     #[test]
     fn korean_switches_descriptions_only() {
-        let out = shell(Lang::Ko, "Console", landing(Lang::Ko)).into_string();
+        let out = shell(Lang::Ko, "Dashboard", html! {}).into_string();
         assert!(out.contains(r#"<html lang="ko">"#));
-        assert!(out.contains("웹 콘솔이 동작 중입니다"), "한국어 설명 누락");
+        assert!(out.contains("본문으로 건너뛰기"), "한국어 설명 누락");
         assert!(out.contains("<h1>x-backup</h1>"), "제품명 라벨은 영문 고정");
+        assert!(out.contains(">Overview<"), "묶음 라벨 번역 금지");
         assert!(
-            out.contains("<title>x-backup — Console</title>"),
+            out.contains("<title>x-backup — Dashboard</title>"),
             "라벨 번역 금지"
         );
     }
@@ -206,7 +221,7 @@ mod tests {
     fn unknown_title_marks_nothing_current() {
         const NOT_A_SCREEN: &str = "Not A Screen";
         assert!(
-            !nav_items().iter().any(|(label, _)| *label == NOT_A_SCREEN),
+            !nav_items().any(|(label, _)| label == NOT_A_SCREEN),
             "견본 title이 실제 화면이 됐다 — 다른 이름을 골라야 한다"
         );
 
@@ -222,11 +237,28 @@ mod tests {
     /// 현재 화면 강조가 조용히 사라진다(모듈 `shell` 문서 참고).
     #[test]
     fn nav_labels_match_titles() {
-        let labels: Vec<&str> = nav_items().iter().map(|(l, _)| *l).collect();
-        assert!(labels.contains(&"Console"), "index 화면 라벨 드리프트");
+        let labels: Vec<&str> = nav_items().map(|(l, _)| l).collect();
+        assert!(
+            labels.contains(&crate::web::routes::dashboard::DASHBOARD_TITLE),
+            "dashboard 화면 라벨 드리프트: {labels:?}"
+        );
         assert!(
             labels.contains(&crate::web::routes::doctor::DOCTOR_TITLE),
             "doctor 화면 라벨 드리프트: {labels:?}"
+        );
+    }
+
+    /// 화면은 정확히 한 묶음에만 속한다 — 두 묶음에 걸치면 현재 화면 탭이 두 개가 된다.
+    #[test]
+    fn every_screen_belongs_to_exactly_one_group() {
+        let mut paths: Vec<&str> = nav_items().map(|(_, href)| href).collect();
+        let total = paths.len();
+        paths.sort_unstable();
+        paths.dedup();
+        assert_eq!(paths.len(), total, "같은 화면이 두 번 등록됐다: {paths:?}");
+        assert!(
+            nav_groups().iter().all(|(_, items)| !items.is_empty()),
+            "빈 묶음이 있다"
         );
     }
 
@@ -234,7 +266,7 @@ mod tests {
     #[test]
     fn interpolated_text_is_escaped() {
         let hostile = "<script>alert(1)</script>";
-        let out = shell(Lang::En, "Console", html! { p { (hostile) } }).into_string();
+        let out = shell(Lang::En, "Dashboard", html! { p { (hostile) } }).into_string();
         assert!(
             !out.contains("<script>alert"),
             "이스케이프되지 않았다: {out}"

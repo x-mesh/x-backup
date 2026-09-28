@@ -103,7 +103,7 @@ pub fn form_body(
                     }
                     p class="field__hint" { (lang.sel(
                         "Leave the retention fields empty to use the profile's configured policy. Values here override it for this run only.",
-                        "보존 항목을 비워 두면 프로파일에 설정된 정책을 씁니다. 여기 값은 이번 실행에만 적용되는 덮어쓰기입니다.",
+                        "보존 항목을 비워 두면 프로파일에 설정된 정책을 씁니다. 여기 적은 값은 이번 실행에만 적용됩니다.",
                     )) }
                     @for (field, label, hint) in retention_fields(lang) {
                         div class="field" {
@@ -151,7 +151,7 @@ fn retention_fields(lang: Lang) -> [(&'static str, &'static str, &'static str); 
             "recovery-window-days",
             lang.sel(
                 "Guarantee restore to any point in the last N days — keeps the boundary base too.",
-                "지난 N일 임의 시점 복구를 보장합니다 — 경계가 되는 base까지 보존합니다.",
+                "지난 N일 안의 어느 시점으로든 복구할 수 있게 보장하고, 경계가 되는 base도 보존합니다.",
             ),
         ),
         (
@@ -174,7 +174,7 @@ pub fn plan_body(lang: Lang, plan: &Plan, confirm: Option<Markup>) -> Markup {
     html! {
         (components::page_head(route::PRUNE_TITLE, Some(lang.sel(
             "Nothing has been deleted yet — this is the plan.",
-            "아직 아무것도 지우지 않았습니다 — 이것은 계획입니다.",
+            "아직 아무것도 지우지 않았습니다. 지금 보는 것은 계획입니다.",
         ))))
         (components::meta_list(&[
             ("profile", plan.profile.clone()),
@@ -260,16 +260,16 @@ pub fn plan_changed_notice(lang: Lang) -> Markup {
         Level::Fail,
         lang.sel(
             "The plan changed — nothing was deleted",
-            "계획이 바뀌었습니다 — 아무것도 지우지 않았습니다",
+            "계획이 바뀌어 아무것도 지우지 않았습니다",
         ),
         html! {
             p { (lang.sel(
                 "Between the preview and your approval, this store changed — a backup finished, or another prune ran. The plan you approved is no longer the plan that would run, so nothing was deleted.",
-                "미리보기와 승인 사이에 이 저장소가 바뀌었습니다 — 백업이 끝났거나 다른 prune이 돌았습니다. 승인한 계획과 지금 실행될 계획이 다르므로 아무것도 지우지 않았습니다.",
+                "미리보기와 승인 사이에 백업이 끝났거나 다른 prune이 실행되어 이 저장소가 바뀌었습니다. 승인한 계획과 지금 실행될 계획이 다르므로 아무것도 지우지 않았습니다.",
             )) }
             p { (lang.sel(
                 "The current plan is shown below. Review it and approve again if it is still what you want.",
-                "아래가 지금의 계획입니다. 확인한 뒤 여전히 원하는 것이면 다시 승인하세요.",
+                "아래는 현재 계획입니다. 확인한 뒤 이대로 진행하려면 다시 승인하세요.",
             )) }
         },
     )
@@ -297,10 +297,10 @@ pub fn guard_rejection_notice(lang: Lang, message: &str) -> Markup {
 pub fn malformed_id(lang: Lang) -> Markup {
     components::notice(
         Level::Fail,
-        lang.sel("Malformed job id", "잘못된 잡 id"),
+        lang.sel("Malformed job id", "잘못된 작업 id"),
         html! { p { (lang.sel(
             "That is not a job id this console issued.",
-            "이 콘솔이 발급한 잡 id 형식이 아닙니다.",
+            "이 콘솔이 발급한 작업 id 형식이 아닙니다.",
         )) } },
     )
 }
@@ -309,10 +309,10 @@ pub fn malformed_id(lang: Lang) -> Markup {
 pub fn unknown_job(lang: Lang) -> Markup {
     components::notice(
         Level::Fail,
-        lang.sel("Unknown job", "모르는 잡"),
+        lang.sel("Unknown job", "알 수 없는 작업"),
         html! { p { (lang.sel(
             "No prune job with that id is in this console's history.",
-            "그 id의 prune 잡이 이 콘솔 이력에 없습니다.",
+            "그 id의 prune 작업이 이 콘솔 이력에 없습니다.",
         )) } },
     )
 }
