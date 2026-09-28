@@ -387,9 +387,11 @@ pub const JOB_EVENTS_ROUTE_SUFFIX: &str = "/events";
 /// `axum::routing::get`에 바로 걸 수 있는 완성된 핸들러는 **아니다** — 잡 id로부터
 /// `Arc<JobHub>`를 찾는 일(상태 추출)은 이 모듈이 모르는 레지스트리의 몫이다. 그 레지스트리는
 /// [`crate::web::state::live::LiveJobs`]이고 [`crate::web::ServeConfig::live`]가 들고 있다.
-/// 호출부는 이런 모양이다([`crate::web::routes::backup::events`]가 실제 예):
+/// 호출부는 이런 모양이다([`crate::web::routes::backup::events`]가 실제 예). 문맥 없이
+/// 컴파일되지 않는 설명용 조각이라 `text`로 둔다 — `ignore`는 CI 통합 잡의
+/// `--include-ignored`가 컴파일을 시도해 실패한다.
 ///
-/// ```ignore
+/// ```text
 /// async fn events_handler(
 ///     State(ctx): State<Arc<ServeConfig>>,
 ///     Path(id): Path<JobId>,
