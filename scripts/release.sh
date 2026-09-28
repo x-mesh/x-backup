@@ -79,10 +79,22 @@ case "$(uname -m)" in
     ;;
 esac
 
-# (c) cross는 호스트 rustup의 x86_64-unknown-linux-gnu 툴체인을 컨테이너에 마운트한다.
-#     Apple Silicon rustup은 non-host 툴체인 설치를 거부하므로 미리 깔려 있어야 한다.
-rustup toolchain list 2>/dev/null | grep -q 'x86_64-unknown-linux-gnu' || \
-  die "cross가 마운트할 툴체인 없음 — 먼저: rustup toolchain install stable-x86_64-unknown-linux-gnu --force-non-host --profile minimal"
+# (c) cross는 호스트 rustup에서 **활성 툴체인과 같은 채널**의 x86_64-unknown-linux-gnu
+#     툴체인을 컨테이너에 마운트한다. 채널은 rust-toolchain.toml·override·RUSTUP_TOOLCHAIN이
+#     정한다. 이름에 x86_64-unknown-linux-gnu가 들어간 툴체인이 아무거나 있는지만 보면,
+#     채널이 1.93.0으로 고정된 뒤에도 stable만 깔린 호스트가 여기를 통과하고 cross 단계에서야
+#     실패한다(v0.4.0 릴리스에서 실제로 관측). Apple Silicon rustup은 non-host 툴체인을 자동
+#     설치하지 않으므로 미리 깔려 있어야 한다.
+host_triple="$(rustc -vV | sed -n 's/^host: //p')"
+active_toolchain="$(rustup show active-toolchain | awk '{print $1}')"
+toolchain_channel="${active_toolchain%-"$host_triple"}"
+linux_toolchain="${toolchain_channel}-x86_64-unknown-linux-gnu"
+# 목록을 변수로 받는다 — pipefail 아래에서 `| grep -q`가 먼저 끝나면 앞 명령이 SIGPIPE로
+# 실패해 "없음"으로 오판할 수 있다.
+installed_toolchains="$(rustup toolchain list 2>/dev/null | awk '{print $1}')"
+grep -qxF "$linux_toolchain" <<<"$installed_toolchains" || \
+  die "cross가 마운트할 툴체인 없음(활성 채널: $toolchain_channel) — 먼저: rustup toolchain install $linux_toolchain --force-non-host --profile minimal"
+ok "cross 툴체인 확인: $linux_toolchain"
 
 # clean 트리·원격 태그는 실제 게시에만 필요(dry-run은 빌드·패키징만 검증).
 if [ "$DRY_RUN" = 0 ]; then

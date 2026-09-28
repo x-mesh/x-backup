@@ -47,9 +47,10 @@ scripts/release.sh --skip-tap      # GitHub 릴리스만, tap 갱신 생략
 - `cargo`, `cross`(linux musl 빌드), **실행 중인 `docker`**(cross 백엔드)
 - `gh` 인증(`gh auth status`) — 릴리스 게시 + tap clone/push 권한
 - `shasum`, `tar`, `ruby`(formula 문법 검증), `rustup`
-- **macOS arm64**: cross가 컨테이너에 마운트할 linux 툴체인이 필요하다. 한 번만:
-  `rustup toolchain install stable-x86_64-unknown-linux-gnu --force-non-host --profile minimal`
-  (없으면 스크립트가 이 명령을 알려주고 중단한다). cross 이미지는 amd64 전용이라
+- **macOS arm64**: cross가 컨테이너에 마운트할 linux 툴체인이 필요하다. 채널은 활성 툴체인과
+  같아야 한다(`rust-toolchain.toml`이 1.93.0으로 고정). 채널이 바뀔 때마다 한 번:
+  `rustup toolchain install 1.93.0-x86_64-unknown-linux-gnu --force-non-host --profile minimal`
+  (없으면 스크립트가 활성 채널에 맞는 이 명령을 알려주고 중단한다). cross 이미지는 amd64 전용이라
   linux 빌드는 에뮬레이션으로 돌아 느리다 — 스크립트가 자동 설정한다.
 
 ## 스크립트가 하는 일(단계별)
