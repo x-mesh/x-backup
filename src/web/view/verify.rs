@@ -109,7 +109,7 @@ pub fn form_body(
     html! {
         (components::page_head(route::VERIFY_TITLE, Some(lang.sel(
             "Check a backup's integrity — structural (default), deep (decrypt), or chain (continuity).",
-            "백업 무결성을 확인합니다 — 구조(기본)·심층(복호화)·체인(연속성) 중 선택하세요.",
+            "구조(기본)·심층(복호화)·체인(연속성) 검증으로 백업 무결성을 확인합니다.",
         ))))
         @if let Some(notice) = notice {
             (notice)
@@ -125,7 +125,7 @@ pub fn form_body(
                             value=(prefill_id.unwrap_or_default());
                         p class="field__hint" { (lang.sel(
                             "The backup id to check (UUID). Follow a link from the catalog, or paste one.",
-                            "확인할 백업 id(UUID)입니다. 카탈로그 링크를 따라오거나 직접 붙여넣으세요.",
+                            "확인할 백업 id(UUID)입니다. 카탈로그의 링크로 들어오거나 직접 붙여넣으세요.",
                         )) }
                     }
                     div class="field" {
@@ -135,7 +135,7 @@ pub fn form_body(
                         }
                         p class="field__hint" { (lang.sel(
                             "Decrypt and decompress the backup end to end to confirm it decodes. Needs a decryption key on this host — structural checks below do not.",
-                            "백업을 끝까지 복호화·압축해제해 디코드가 되는지 확인합니다. 이 호스트에 복호화 키가 있어야 합니다 — 아래 구조 검증은 필요 없습니다.",
+                            "백업을 끝까지 복호화·압축해제해 디코드되는지 확인합니다. 이 호스트에 복호화 키가 있어야 하며, 아래 구조 검증에는 키가 필요 없습니다.",
                         )) }
                     }
                     div class="field" {
@@ -170,10 +170,10 @@ pub fn validation_notice(lang: Lang, message: &str) -> Markup {
 pub fn malformed_id(lang: Lang) -> Markup {
     html! {
         (components::page_head(route::VERIFY_TITLE, None))
-        (components::notice(Level::Error, lang.sel("Malformed job id", "잡 id 형식 오류"), html! {
+        (components::notice(Level::Error, lang.sel("Malformed job id", "잘못된 작업 id"), html! {
             p { (lang.sel(
                 "That link does not carry a job id. Start a new verify instead.",
-                "이 링크에는 잡 id가 없습니다. 새 검증을 시작하세요.",
+                "이 링크에는 작업 id가 없습니다. 새 검증을 시작하세요.",
             )) }
         }))
         p class="muted" { a href=(route::VERIFY_PATH) { (lang.sel("Back to verify", "검증으로 돌아가기")) } }
@@ -184,10 +184,10 @@ pub fn malformed_id(lang: Lang) -> Markup {
 pub fn unknown_job(lang: Lang) -> Markup {
     html! {
         (components::page_head(route::VERIFY_TITLE, None))
-        (components::notice(Level::Error, lang.sel("Unknown job", "알 수 없는 잡"), html! {
+        (components::notice(Level::Error, lang.sel("Unknown job", "알 수 없는 작업"), html! {
             p { (lang.sel(
                 "No history was found for this job id.",
-                "이 잡 id에 대한 이력을 찾지 못했습니다.",
+                "이 작업 id의 이력을 찾지 못했습니다.",
             )) }
         }))
         p class="muted" { a href=(route::VERIFY_PATH) { (lang.sel("Back to verify", "검증으로 돌아가기")) } }
@@ -215,7 +215,7 @@ pub fn result_body(
             (components::notice(Level::Error, lang.sel("No summary", "요약 없음"), html! {
                 p { (lang.sel(
                     "This job has a log file but no readable summary.",
-                    "이 잡은 로그 파일은 있지만 읽을 수 있는 요약이 없습니다.",
+                    "이 작업에는 로그 파일은 있지만 읽을 수 있는 요약이 없습니다.",
                 )) }
             }))
         };
@@ -249,7 +249,7 @@ pub fn result_body(
     html! {
         (components::page_head(route::VERIFY_TITLE, Some(lang.sel(
             "Backup integrity check result.",
-            "백업 무결성 검증 결과.",
+            "백업 무결성 검증 결과입니다.",
         ))))
         (meta_row(backup_id, deep_requested, chain_requested))
         @match route::parse_verify_doc(&stdout_text) {
@@ -345,7 +345,7 @@ fn checks_table(lang: Lang, doc: &route::VerifyDoc) -> Markup {
                         doc.manifest_sidecar_ok,
                         lang.sel(
                             "Manifest sidecar checksum matches — the manifest itself was not tampered with.",
-                            "manifest 사이드카 체크섬이 일치합니다 — manifest 자체가 변조되지 않았습니다.",
+                            "manifest 사이드카 체크섬이 일치합니다. manifest 자체는 변조되지 않았습니다.",
                         ),
                     ))
                     (check_row(
@@ -354,12 +354,12 @@ fn checks_table(lang: Lang, doc: &route::VerifyDoc) -> Markup {
                         if doc.empty_slice {
                             lang.sel(
                                 "data.bin absent — expected for an empty incremental slice (no changes to store).",
-                                "data.bin 없음 — 빈 증분 슬라이스(저장할 변경분 없음)라 정상입니다.",
+                                "data.bin 없음: 빈 증분 슬라이스(저장할 변경분 없음)라 정상입니다.",
                             )
                         } else {
                             lang.sel(
                                 "Recomputed checksum of the stored bytes matches the manifest.",
-                                "저장된 바이트의 재계산 체크섬이 manifest와 일치합니다.",
+                                "저장된 바이트로 다시 계산한 체크섬이 manifest와 일치합니다.",
                             )
                         },
                     ))
@@ -501,7 +501,7 @@ fn deep_key_missing_notice(lang: Lang) -> Markup {
             )) }
             p { (lang.sel(
                 "Run this check on the host that holds the private key (age) or the symmetric key (aes-256-gcm) — see the key isolation policy (\u{a7}8.5). Structural verification (without --deep) needs no key and can run anywhere.",
-                "개인키(age) 또는 대칭키(aes-256-gcm)를 보유한 호스트에서 이 검증을 실행하세요 — 키 격리 정책(\u{a7}8.5) 참고. 구조 검증(--deep 없이)은 키가 필요 없어 어디서나 실행할 수 있습니다.",
+                "키 격리 정책(\\u{a7}8.5)을 참고해, 개인키(age)나 대칭키(aes-256-gcm)가 있는 호스트에서 이 검증을 실행하세요. 구조 검증(--deep 없이)은 키가 필요 없어 어디서나 실행할 수 있습니다.",
             )) }
         },
     )
@@ -513,12 +513,12 @@ fn child_diagnostics(lang: Lang, stderr_masked: &str) -> Markup {
     let excerpt = excerpt(stderr_masked);
     components::notice(
         Level::Error,
-        lang.sel("Child diagnostics", "자식 프로세스 진단"),
+        lang.sel("Child diagnostics", "명령의 진단 출력"),
         html! {
             @if excerpt.is_empty() {
                 p class="muted" { (lang.sel(
                     "The child wrote nothing readable to stderr.",
-                    "자식이 stderr에 읽을 수 있는 내용을 남기지 않았습니다.",
+                    "콘솔이 실행한 명령이 stderr에 읽을 수 있는 내용을 남기지 않았습니다.",
                 )) }
             } @else {
                 pre class="logdump" { (excerpt) }
@@ -543,14 +543,14 @@ fn outcome_headline(lang: Lang, label: &str) -> String {
         "failed" => lang.sel("Verification failed.", "검증이 실패했습니다."),
         "rejected" => lang.sel(
             "The console sent a request the job could not accept.",
-            "콘솔이 작업이 받아들일 수 없는 요청을 보냈습니다.",
+            "콘솔이 보낸 요청을 작업이 받아들일 수 없었습니다.",
         ),
         "precheck-failed" => lang.sel("Pre-flight check failed.", "사전 점검이 실패했습니다."),
         "unexpected-exit" => lang.sel(
             "Exited with a code this console does not know.",
             "이 콘솔이 모르는 종료 코드로 끝났습니다.",
         ),
-        "signaled" => lang.sel("Terminated from outside.", "밖에서 종료되었습니다."),
+        "signaled" => lang.sel("Terminated from outside.", "외부에서 종료되었습니다."),
         _ => lang.sel(
             "The result of this check is unknown.",
             "이 검증의 결과를 알 수 없습니다.",
@@ -566,27 +566,27 @@ fn outcome_detail(lang: Lang, label: &str) -> Option<String> {
         "succeeded" => return None,
         "succeeded-with-warnings" => lang.sel(
             "exit 4 — success with caveats, not a failure: the verification finished and produced a report. This is NOT the backup command's exit 4 (an oplog gap promoted to a full backup) — verify's exit 4 means the checks ran to completion and found something worth flagging in THIS backup (an incomplete manifest, a broken chain link, etc). Read the warnings below; nothing here needs a retry.",
-            "exit 4 — 이것은 실패가 아니라 '단서가 붙은 성공'입니다: 검증은 끝났고 보고서가 있습니다. backup 명령의 exit 4(oplog gap이 풀백업으로 승격됨)와는 뜻이 다릅니다 — verify의 exit 4는 검증 자체가 끝까지 실행됐고, 이 백업에서 표시할 문제(불완전한 manifest, 끊긴 체인 등)를 찾았다는 뜻입니다. 아래 경고를 확인하세요 — 다시 돌릴 필요는 없습니다.",
+            "exit 4: backup 명령의 exit 4(oplog gap이 풀백업으로 승격됨)와 달리, verify의 exit 4는 검증이 끝까지 실행되어 보고서를 냈고 이 백업에서 알릴 만한 문제(불완전한 manifest, 끊긴 체인 등)를 찾았다는 뜻입니다. 실패가 아니라 단서가 붙은 성공이니, 다시 실행할 필요 없이 아래 경고를 확인하세요.",
         ),
         "lock-conflict" => lang.sel(
             "exit 5 — not a failure, and nothing changed. Retry the exact same check once the other run finishes.",
-            "exit 5 — 실패가 아니며 아무것도 바뀌지 않았습니다. 다른 실행이 끝난 뒤 같은 검증을 그대로 다시 시도하세요.",
+            "exit 5: 실패가 아니며 아무것도 바뀌지 않았습니다. 다른 실행이 끝난 뒤 같은 검증을 그대로 다시 시도하세요.",
         ),
         "failed" => lang.sel(
             "exit 1 — the report could not confirm this backup's integrity (a checksum mismatch, a missing/corrupt manifest, or a deep-decode failure).",
-            "exit 1 — 이 백업의 무결성을 확인하지 못했습니다(체크섬 불일치, manifest 손상/부재, 또는 심층 디코드 실패).",
+            "exit 1: 이 백업의 무결성을 확인하지 못했습니다(체크섬 불일치, manifest 누락·손상 또는 심층 디코드 실패).",
         ),
         "rejected" => lang.sel(
             "exit 2 — usage/configuration error. Nothing was read, so this is not a statement about the backup's integrity — only about this request.",
-            "exit 2 — 사용법·설정 오류입니다. 아무것도 읽지 않았으므로 이건 백업 무결성에 대한 판정이 아니라 이 요청 자체에 대한 것입니다.",
+            "exit 2: 사용법·설정 오류입니다. 아무것도 읽지 않았으므로 백업 무결성을 판정한 결과가 아니라 이 요청의 문제입니다.",
         ),
         "precheck-failed" => lang.sel(
             "Nothing was read/decoded, so this is not a statement about the backup's integrity.",
-            "아무것도 읽거나 디코드하지 않았으므로 이건 백업 무결성에 대한 판정이 아닙니다.",
+            "아무것도 읽거나 디코드하지 않았으므로 백업 무결성을 판정한 결과가 아닙니다.",
         ),
         "signaled" => lang.sel(
             "The check did not decide its own outcome — it was killed before finishing.",
-            "검증이 스스로 결과를 정하지 못했습니다 — 끝나기 전에 종료됐습니다.",
+            "검증이 스스로 결과를 정하지 못하고 끝나기 전에 종료됐습니다.",
         ),
         _ => return None,
     };

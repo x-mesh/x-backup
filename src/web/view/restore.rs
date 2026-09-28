@@ -104,7 +104,7 @@ pub fn form_body(
     html! {
         (components::page_head(route::RESTORE_TITLE, Some(lang.sel(
             "Restore a backup, or replay to a point in time. By default this writes back into the profile's own source — the production server the backup came from.",
-            "백업을 복구하거나 특정 시점까지 재생합니다. 아무것도 고르지 않으면 백업을 떠온 그 프로파일의 source — 즉 원본 서버에 씁니다.",
+            "백업을 복구하거나 특정 시점까지 재생합니다. 기본 대상은 프로파일의 source, 즉 백업을 떠 온 운영 서버입니다.",
         ))))
         @if let Some(notice) = notice { (notice) }
         (components::panel(
@@ -133,13 +133,13 @@ pub fn form_body(
                             value=(prefill.at.clone().unwrap_or_default());
                         p class="field__hint" { (lang.sel(
                             "RFC 3339 with a timezone (the trailing Z means UTC). Replays increments up to this moment — the console lands on the newest recorded point at or before it.",
-                            "타임존을 포함한 RFC 3339 형식입니다(끝의 Z는 UTC). 이 시각까지 증분을 재생하며, 실제로는 그 시각 이하의 가장 최근 기록 지점에 도달합니다.",
+                            "타임존을 포함한 RFC 3339 형식입니다(끝의 Z는 UTC). 이 시각까지 증분을 재생하며, 실제로는 그 시각이나 그 이전의 가장 최근 기록 지점까지 복구합니다.",
                         )) }
                     }
 
                     (select_field(lang, route::FIELD_TARGET_PROFILE, "restore into", profiles, prefill.target_profile.as_deref(), lang.sel(
                         "Leave unselected to restore in place — back into the profile's own source. Pick another profile to restore somewhere else.",
-                        "고르지 않으면 제자리 복구입니다 — 프로파일 자신의 source로 되돌립니다. 다른 곳으로 복구하려면 프로파일을 고르세요.",
+                        "고르지 않으면 프로파일 자신의 source로 되돌리는 제자리 복구입니다. 다른 프로파일을 고르면 그곳으로 복구합니다.",
                     ), true))
 
                     div class="field" {
@@ -149,7 +149,7 @@ pub fn form_body(
                             value=(prefill.only.clone().unwrap_or_default());
                         p class="field__hint" { (lang.sel(
                             "Optional — restore just this namespace.",
-                            "선택 — 이 네임스페이스만 복구합니다.",
+                            "선택: 이 네임스페이스만 복구합니다.",
                         )) }
                     }
 
@@ -158,7 +158,7 @@ pub fn form_body(
                         input id="f-from" type="text" name=(route::FIELD_FROM) autocomplete="off";
                         p class="field__hint" { (lang.sel(
                             "Optional — which destination to read from when the profile has several. Defaults to the first.",
-                            "선택 — destination이 여러 개인 프로파일에서 어디서 읽을지 고릅니다. 기본은 첫 번째입니다.",
+                            "선택: destination이 여러 개인 프로파일에서 어디서 읽을지 고릅니다. 기본값은 첫 번째입니다.",
                         )) }
                     }
 
@@ -226,7 +226,7 @@ pub fn plan_body(lang: Lang, plan: &Plan, confirm: Option<Markup>) -> Markup {
     html! {
         (components::page_head(route::RESTORE_TITLE, Some(lang.sel(
             "Nothing has been restored yet — this is the plan.",
-            "아직 아무것도 복구하지 않았습니다 — 이것은 계획입니다.",
+            "아직 아무것도 복구하지 않았습니다. 지금 보는 것은 계획입니다.",
         ))))
 
         // **대상이 첫 줄이다** — 이 화면에서 가장 먼저 읽혀야 하는 값이다(모듈 헤더).
@@ -243,7 +243,7 @@ pub fn plan_body(lang: Lang, plan: &Plan, confirm: Option<Markup>) -> Markup {
                 lang.sel("This restores in place", "제자리 복구입니다"),
                 html! { p { (lang.sel(
                     "No separate target was chosen, so this writes back into the profile's own source — the server the backup was taken from. If you meant to restore somewhere else, go back and pick a target profile.",
-                    "별도의 대상을 고르지 않았으므로 프로파일 자신의 source — 즉 이 백업을 떠온 그 서버에 씁니다. 다른 곳으로 복구하려는 것이었다면 돌아가서 대상 프로파일을 고르세요.",
+                    "별도의 대상을 고르지 않았으므로 프로파일 자신의 source, 즉 이 백업을 떠온 서버에 되씁니다. 다른 곳으로 복구하려던 것이라면 돌아가서 대상 프로파일을 고르세요.",
                 )) } },
             ))
         }
@@ -259,7 +259,7 @@ pub fn plan_body(lang: Lang, plan: &Plan, confirm: Option<Markup>) -> Markup {
                     ]))
                     p class="field__hint" { (lang.sel(
                         "The two times differ when nothing was recorded at the exact moment you asked for — the restore lands on the newest recorded point at or before it. That is normal, not an error.",
-                        "요청한 바로 그 순간에 기록된 것이 없으면 두 시각이 다릅니다 — 그 시각 이하의 가장 최근 기록 지점에 도달합니다. 오류가 아니라 정상 동작입니다.",
+                        "요청한 시각에 기록이 없으면 그 시각이나 그 이전의 가장 최근 기록 지점까지 복구하므로 두 시각이 다릅니다. 오류가 아니라 정상 동작입니다.",
                     )) }
                 },
             ))
@@ -302,16 +302,16 @@ pub fn plan_changed_notice(lang: Lang) -> Markup {
         Level::Fail,
         lang.sel(
             "The plan changed — nothing was restored",
-            "계획이 바뀌었습니다 — 아무것도 복구하지 않았습니다",
+            "계획이 바뀌어 아무것도 복구하지 않았습니다",
         ),
         html! {
             p { (lang.sel(
                 "Between the preview and your approval, something changed — a new backup arrived, or the target's contents moved. The plan you approved is no longer the plan that would run, so nothing was restored.",
-                "미리보기와 승인 사이에 무언가 바뀌었습니다 — 새 백업이 도착했거나 대상의 내용이 달라졌습니다. 승인한 계획과 지금 실행될 계획이 다르므로 아무것도 복구하지 않았습니다.",
+                "미리보기와 승인 사이에 새 백업이 생겼거나 대상의 내용이 달라졌습니다. 승인한 계획과 지금 실행될 계획이 다르므로 아무것도 복구하지 않았습니다.",
             )) }
             p { (lang.sel(
                 "The current plan is shown below. Review it and approve again if it is still what you want.",
-                "아래가 지금의 계획입니다. 확인한 뒤 여전히 원하는 것이면 다시 승인하세요.",
+                "아래는 현재 계획입니다. 확인한 뒤 이대로 진행하려면 다시 승인하세요.",
             )) }
         },
     )
@@ -339,10 +339,10 @@ pub fn guard_rejection_notice(lang: Lang, message: &str) -> Markup {
 pub fn malformed_id(lang: Lang) -> Markup {
     components::notice(
         Level::Fail,
-        lang.sel("Malformed job id", "잘못된 잡 id"),
+        lang.sel("Malformed job id", "잘못된 작업 id"),
         html! { p { (lang.sel(
             "That is not a job id this console issued.",
-            "이 콘솔이 발급한 잡 id 형식이 아닙니다.",
+            "이 콘솔이 발급한 작업 id 형식이 아닙니다.",
         )) } },
     )
 }
@@ -351,10 +351,10 @@ pub fn malformed_id(lang: Lang) -> Markup {
 pub fn unknown_job(lang: Lang) -> Markup {
     components::notice(
         Level::Fail,
-        lang.sel("Unknown job", "모르는 잡"),
+        lang.sel("Unknown job", "알 수 없는 작업"),
         html! { p { (lang.sel(
             "No restore job with that id is in this console's history.",
-            "그 id의 restore 잡이 이 콘솔 이력에 없습니다.",
+            "그 id의 restore 작업이 이 콘솔 이력에 없습니다.",
         )) } },
     )
 }

@@ -350,19 +350,19 @@ impl GuardRejection {
             Self::InvalidToken => lang
                 .sel(
                     "This confirmation link is invalid or has expired — nothing was done. Reopen the confirmation screen and try again.",
-                    "이 확인 링크가 유효하지 않거나 만료되었습니다 — 아무 작업도 하지 않았습니다. 확인 화면을 다시 열어 시도하세요.",
+                    "이 확인 링크가 유효하지 않거나 만료되어 아무 작업도 하지 않았습니다. 확인 화면을 다시 열어 시도하세요.",
                 )
                 .to_string(),
             Self::ActionOrTargetMismatch => lang
                 .sel(
                     "This confirmation does not match the requested operation — nothing was done. Reopen the confirmation screen and try again.",
-                    "이 확인이 요청한 작업과 일치하지 않습니다 — 아무 작업도 하지 않았습니다. 확인 화면을 다시 열어 시도하세요.",
+                    "확인 내용이 요청한 작업과 일치하지 않아 아무 작업도 하지 않았습니다. 확인 화면을 다시 열어 시도하세요.",
                 )
                 .to_string(),
             Self::NameMismatch => lang
                 .sel(
                     "The confirmation text did not match the profile name — nothing was done. Type the name exactly as shown.",
-                    "확인 입력이 프로파일 이름과 다릅니다 — 아무 작업도 하지 않았습니다. 표시된 이름을 그대로 입력하세요.",
+                    "입력한 확인 문구가 프로파일 이름과 달라 아무 작업도 하지 않았습니다. 표시된 이름을 그대로 입력하세요.",
                 )
                 .to_string(),
         }

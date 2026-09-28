@@ -309,7 +309,7 @@ pub fn picker_body(lang: Lang, profiles: &[String], error: Option<Markup>) -> Ma
             "Peek",
             Some(lang.sel(
                 "Look at real documents in a collection — masked by default.",
-                "컬렉션의 실제 문서를 들여다봅니다 — 기본은 마스킹됩니다.",
+                "컬렉션의 실제 문서를 봅니다. 기본값은 마스킹입니다.",
             )),
         ))
         @if let Some(err) = error {
@@ -433,7 +433,7 @@ pub fn namespace_body(
         (components::page_head("Peek", Some(&subtitle)))
         @if revealed {
             (components::notice(Level::Warn,
-                lang.sel("Raw values are showing", "원문이 표시 중입니다"),
+                lang.sel("Raw values are showing", "원문 표시 중"),
                 html! {
                     p { (lang.sel(
                         "This view was recorded in the audit log and is never cached (Cache-Control: no-store). Reload to return to the masked view.",
@@ -448,7 +448,7 @@ pub fn namespace_body(
                 html! {
                     p class="field__hint" { (lang.sel(
                         "This shows real document contents and is recorded in the audit log. It is not undoable — anyone who sees your screen sees the raw data.",
-                        "실제 문서 내용을 보여주며 감사 로그에 기록됩니다. 되돌릴 수 없습니다 — 화면을 보는 사람은 원문 데이터를 함께 봅니다.",
+                        "실제 문서 내용을 보여주며 감사 로그에 기록됩니다. 되돌릴 수 없으며, 화면을 보는 사람은 누구나 원문 데이터를 보게 됩니다.",
                     )) }
                     form method="post" action=(reveal_action) {
                         input type="hidden" name="profile" value=(profile);

@@ -73,11 +73,11 @@ fn outcome_headline(lang: Lang, outcome: &str) -> String {
         "succeeded" => lang.sel("Finished successfully.", "성공으로 끝났습니다."),
         "succeeded-with-warnings" => lang.sel(
             "Finished successfully, with warnings — the backup exists.",
-            "경고와 함께 성공으로 끝났습니다 — 산출물은 있습니다.",
+            "경고와 함께 성공으로 끝났고, 백업은 만들어졌습니다.",
         ),
         "lock-conflict" => lang.sel(
             "Nothing ran: another instance held the profile lock.",
-            "아무것도 실행되지 않았습니다: 같은 프로파일의 다른 인스턴스가 락을 들고 있었습니다.",
+            "아무것도 실행되지 않았습니다: 다른 인스턴스가 이 프로파일의 락을 잡고 있었습니다.",
         ),
         "failed" => lang.sel(
             "The job started and then failed.",
@@ -85,7 +85,7 @@ fn outcome_headline(lang: Lang, outcome: &str) -> String {
         ),
         "rejected" => lang.sel(
             "Rejected before starting — the argument combination was not valid.",
-            "시작 전에 거부됐습니다 — 인자 조합이 유효하지 않았습니다.",
+            "인자 조합이 유효하지 않아 시작 전에 거부됐습니다.",
         ),
         "precheck-failed" => lang.sel(
             "Precheck failed, so the job never started.",
@@ -93,15 +93,15 @@ fn outcome_headline(lang: Lang, outcome: &str) -> String {
         ),
         "unexpected-exit" => lang.sel(
             "The child exited with a code this build does not define.",
-            "자식 프로세스가 이 빌드가 정의하지 않은 코드로 끝났습니다.",
+            "콘솔이 실행한 명령이 이 빌드에 정의되지 않은 종료 코드로 끝났습니다.",
         ),
         "signaled" => lang.sel(
             "Killed by a signal — output may be half written.",
-            "시그널로 종료됐습니다 — 산출물이 반쯤 남았을 수 있습니다.",
+            "시그널로 종료됐으며, 산출물이 반쯤 남았을 수 있습니다.",
         ),
         _ => lang.sel(
             "The result of this job is unknown.",
-            "이 잡의 결과를 알 수 없습니다.",
+            "이 작업의 결과를 알 수 없습니다.",
         ),
     }
     .to_string()
@@ -113,7 +113,7 @@ fn outcome_detail(lang: Lang, outcome: &str) -> Option<String> {
         "succeeded" => return None,
         "succeeded-with-warnings" => lang.sel(
             "exit 4 is success with caveats: do not re-run it just because of the colour. Read the warnings in the log below.",
-            "exit 4는 단서가 붙은 성공입니다. 색만 보고 다시 돌리지 마세요 — 아래 로그의 경고를 읽으세요.",
+            "exit 4는 단서가 붙은 성공입니다. 색만 보고 다시 실행하지 말고 아래 로그의 경고를 읽으세요.",
         ),
         "lock-conflict" => lang.sel(
             "exit 5 needs no fix: retry once the other run finishes. A cron-launched CLI shares the same lock.",
@@ -136,7 +136,7 @@ fn outcome_detail(lang: Lang, outcome: &str) -> Option<String> {
 pub fn list_body(lang: Lang, history: &JobHistory, registry: &SecretRegistry) -> Markup {
     let subtitle = lang.sel(
         "Job history recorded by this console. It is a cache: the backups themselves live in the destination.",
-        "이 콘솔이 기록한 잡 이력입니다. 캐시이므로 백업 자체는 destination에 있습니다.",
+        "이 콘솔이 기록한 작업 이력입니다. 이력은 캐시이고, 백업 자체는 destination에 있습니다.",
     );
     html! {
         (components::page_head(JOBS_TITLE, Some(subtitle)))
@@ -163,10 +163,10 @@ pub fn detail_body(lang: Lang, detail: &JobDetail, registry: &SecretRegistry) ->
                 (args_panel(lang, summary, registry))
             }
             None => {
-                (components::notice(Level::Error, lang.sel("Unknown job", "알 수 없는 잡"), html! {
+                (components::notice(Level::Error, lang.sel("Unknown job", "알 수 없는 작업"), html! {
                     p { (lang.sel(
                         "No history was found for this job id. It may have been recorded by a different state directory.",
-                        "이 잡 id에 대한 이력을 찾지 못했습니다. 다른 state 디렉터리에 기록된 잡일 수 있습니다.",
+                        "이 작업 id의 이력을 찾지 못했습니다. 다른 state 디렉터리에 기록된 작업일 수 있습니다.",
                     )) }
                 }))
             }
@@ -184,10 +184,10 @@ pub fn detail_body(lang: Lang, detail: &JobDetail, registry: &SecretRegistry) ->
 pub fn malformed_id(lang: Lang) -> Markup {
     html! {
         (components::page_head(JOBS_TITLE, None))
-        (components::notice(Level::Error, lang.sel("Malformed job id", "잡 id 형식 오류"), html! {
+        (components::notice(Level::Error, lang.sel("Malformed job id", "잘못된 작업 id"), html! {
             p { (lang.sel(
                 "That link does not carry a job id. Job ids are UUIDs, so open the job from the history list instead.",
-                "이 링크에는 잡 id가 없습니다. 잡 id는 UUID이므로 이력 목록에서 잡을 여세요.",
+                "이 링크에는 작업 id가 없습니다. 작업 id는 UUID이므로 이력 목록에서 작업을 여세요.",
             )) }
         }))
         (nav_back(lang))
@@ -214,7 +214,7 @@ fn status_block(lang: Lang, summary: &JobSummary) -> Markup {
             html! {
                 p { (lang.sel(
                     "No end record yet. Either the job is still running, or the console stopped before it could write one.",
-                    "종료 기록이 아직 없습니다. 잡이 계속 돌고 있거나, 콘솔이 기록을 남기기 전에 멈춘 것입니다.",
+                    "종료 기록이 아직 없습니다. 작업이 계속 실행 중이거나, 콘솔이 기록을 남기기 전에 멈춘 것입니다.",
                 )) }
             },
         ),
@@ -271,7 +271,7 @@ fn args_panel(lang: Lang, summary: &JobSummary, registry: &SecretRegistry) -> Ma
             p class="muted" {
                 (lang.sel(
                     "Global flags (--config, --lang) are added by the runner and are not shown here.",
-                    "전역 플래그(--config, --lang)는 러너가 붙이므로 여기에는 나오지 않습니다.",
+                    "전역 플래그(--config, --lang)는 콘솔이 명령을 실행할 때 붙이므로 여기에는 나오지 않습니다.",
                 ))
             }
         },
@@ -288,7 +288,7 @@ fn log_panel(lang: Lang, detail: &JobDetail, registry: &SecretRegistry) -> Marku
         html! {
             @if detail.dropped_leading_logs > 0 {
                 p class="muted" {
-                    (lang.sel("Earlier lines omitted: ", "앞부분 생략된 줄: "))
+                    (lang.sel("Earlier lines omitted: ", "앞에서 생략한 줄: "))
                     (detail.dropped_leading_logs)
                 }
             }
@@ -298,11 +298,11 @@ fn log_panel(lang: Lang, detail: &JobDetail, registry: &SecretRegistry) -> Marku
             @if detail.logs.is_empty() {
                 p class="muted" {
                     @if detail.log_file_present {
-                        (lang.sel("No log lines were recorded for this job.", "이 잡에 기록된 로그 줄이 없습니다."))
+                        (lang.sel("No log lines were recorded for this job.", "이 작업에 기록된 로그 줄이 없습니다."))
                     } @else {
                         (lang.sel(
                             "The log file is gone — it was most likely removed by rotation. The summary above is kept.",
-                            "로그 파일이 없습니다 — 로테이션으로 정리된 것으로 보입니다. 위의 요약은 남아 있습니다.",
+                            "로그 파일이 없습니다. 로테이션으로 정리된 것으로 보이며, 위의 요약은 남아 있습니다.",
                         ))
                     }
                 }
@@ -328,7 +328,7 @@ fn nav_back(lang: Lang) -> Markup {
     html! {
         p class="muted" {
             a href=(crate::web::routes::jobs::JOBS_PATH) {
-                (lang.sel("Back to job history", "잡 이력으로 돌아가기"))
+                (lang.sel("Back to job history", "작업 이력으로 돌아가기"))
             }
         }
     }
@@ -408,12 +408,12 @@ fn empty_history(lang: Lang, index_present: bool) -> Markup {
         div class="card" {
             p { (lang.sel(
                 "No job history yet. Jobs started from this console appear here.",
-                "잡 이력이 아직 없습니다. 이 콘솔에서 시작한 잡이 여기 나타납니다.",
+                "작업 이력이 아직 없습니다. 이 콘솔에서 시작한 작업이 여기에 나타납니다.",
             )) }
             @if !index_present {
                 p class="muted" { (lang.sel(
                     "The history index file does not exist yet — it is created when the first job runs.",
-                    "이력 인덱스 파일이 아직 없습니다 — 첫 잡이 돌 때 만들어집니다.",
+                    "이력 인덱스 파일이 아직 없습니다. 첫 작업을 실행할 때 만들어집니다.",
                 )) }
             }
         }

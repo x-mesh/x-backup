@@ -805,7 +805,7 @@ impl LoadError {
             LoadError::NotWired => lang
                 .sel(
                     "This console was started without a config file, so there is nothing to edit.",
-                    "이 콘솔은 config 파일 없이 기동했습니다 — 편집할 대상이 없습니다.",
+                    "이 콘솔은 config 파일 없이 시작해서 편집할 대상이 없습니다.",
                 )
                 .to_string(),
             LoadError::Read(detail) => format!(
@@ -931,7 +931,7 @@ fn destination_editability(lang: Lang, profile: &Profile) -> (bool, Option<Strin
             Some(
                 lang.sel(
                     "This profile has more than one destination. The form does not rewrite that list: a single missing field on submit would silently drop an offsite copy. Edit the destination list in the config file.",
-                    "이 프로파일에는 destination이 여러 개입니다. 폼은 그 목록을 다시 쓰지 않습니다 — 제출 때 필드 하나가 빠지면 offsite 사본이 조용히 사라집니다. destination 목록은 config 파일에서 편집하세요.",
+                    "이 프로파일에는 destination이 여러 개라서 폼이 그 목록을 다시 쓰지 않습니다. 제출할 때 필드 하나만 빠져도 offsite 사본이 조용히 사라질 수 있으므로 destination 목록은 config 파일에서 편집하세요.",
                 )
                 .to_string(),
             ),
@@ -947,7 +947,7 @@ fn destination_editability(lang: Lang, profile: &Profile) -> (bool, Option<Strin
             Some(
                 lang.sel(
                     "The destination of this profile does not fold into the compact local:/path or s3:bucket/prefix form, so the form has no correct value to pre-fill. Edit it in the config file.",
-                    "이 프로파일의 destination이 compact 표기(local:/path·s3:bucket/prefix)로 접히지 않아 폼에 미리 채울 올바른 값이 없습니다. config 파일에서 편집하세요.",
+                    "이 프로파일의 destination은 compact 표기(local:/path·s3:bucket/prefix)로 나타낼 수 없어 폼에 미리 채울 올바른 값이 없습니다. config 파일에서 편집하세요.",
                 )
                 .to_string(),
             ),
@@ -1069,7 +1069,7 @@ fn uri_credential_warning(lang: Lang, spec: &FieldSpec, profile: &Profile) -> Op
     Some(
         lang.sel(
             "This value carries credentials in the config file. Move the secret into an environment variable and name it in uri_env / read_uri_env — anyone who can read the file can read the password.",
-            "이 값에는 config 파일 안에 자격증명이 들어 있습니다. 시크릿을 환경변수로 옮기고 그 이름을 uri_env·read_uri_env에 적으세요 — 파일을 읽을 수 있는 사람은 누구나 비밀번호를 읽습니다.",
+            "이 값은 config 파일에 자격증명을 그대로 담고 있어, 파일을 읽을 수 있는 사람은 누구나 비밀번호를 읽을 수 있습니다. 시크릿을 환경변수로 옮기고 그 이름을 uri_env·read_uri_env에 적으세요.",
         )
         .to_string(),
     )
@@ -1888,7 +1888,7 @@ pub async fn edit_form(State(ctx): State<Arc<ServeConfig>>, Path(name): Path<Str
             &error.to_string(),
             Some(ctx.lang.sel(
                 "The console only edits profiles whose names are safe to use as file path segments.",
-                "콘솔은 파일 경로 조각으로 쓸 수 있는 이름의 프로파일만 편집합니다.",
+                "콘솔은 이름을 파일 경로의 일부로 안전하게 쓸 수 있는 프로파일만 편집합니다.",
             )),
         );
     }
@@ -1902,7 +1902,7 @@ pub async fn edit_form(State(ctx): State<Arc<ServeConfig>>, Path(name): Path<Str
             StatusCode::NOT_FOUND,
             ctx.lang.sel(
                 "No such profile in this config.",
-                "이 config에 그런 프로파일이 없습니다.",
+                "요청한 프로파일이 이 config에 없습니다.",
             ),
             None,
         ),
@@ -1931,7 +1931,7 @@ pub async fn delete_form(
             StatusCode::NOT_FOUND,
             ctx.lang.sel(
                 "No such profile in this config.",
-                "이 config에 그런 프로파일이 없습니다.",
+                "요청한 프로파일이 이 config에 없습니다.",
             ),
             None,
         ),
@@ -2012,7 +2012,7 @@ pub async fn save(
                     "{} {MAX_PROFILE_NAME_LEN}",
                     ctx.lang.sel(
                         "Names use ASCII letters, digits, underscore and hyphen, start with a letter or digit, and are at most this many bytes:",
-                        "이름은 ASCII 영문/숫자/`_`/`-`를 쓰고 영문 또는 숫자로 시작하며, 최대 바이트 수는:",
+                        "이름은 ASCII 영문/숫자/`_`/`-`로 쓰고 영문 또는 숫자로 시작해야 합니다. 최대 바이트 수:",
                     )
                 )),
             )
@@ -2027,7 +2027,7 @@ pub async fn save(
                 StatusCode::BAD_REQUEST,
                 ctx.lang.sel(
                     "A profile with that name already exists.",
-                    "그 이름의 프로파일이 이미 있습니다.",
+                    "같은 이름의 프로파일이 이미 있습니다.",
                 ),
                 None,
             )
@@ -2038,7 +2038,7 @@ pub async fn save(
                 StatusCode::NOT_FOUND,
                 ctx.lang.sel(
                     "No such profile in this config.",
-                    "이 config에 그런 프로파일이 없습니다.",
+                    "요청한 프로파일이 이 config에 없습니다.",
                 ),
                 None,
             )
@@ -2096,7 +2096,7 @@ pub async fn delete_submit(
             StatusCode::NOT_FOUND,
             ctx.lang.sel(
                 "No such profile in this config.",
-                "이 config에 그런 프로파일이 없습니다.",
+                "요청한 프로파일이 이 config에 없습니다.",
             ),
             None,
         );
@@ -2109,7 +2109,7 @@ pub async fn delete_submit(
             StatusCode::BAD_REQUEST,
             ctx.lang.sel(
                 "The confirmation text did not match the profile name — nothing was deleted.",
-                "확인 입력이 프로파일 이름과 다릅니다 — 아무것도 삭제하지 않았습니다.",
+                "입력한 확인 문구가 프로파일 이름과 달라 아무것도 삭제하지 않았습니다.",
             ),
             Some(ctx.lang.sel(
                 "Type the name exactly as shown.",
@@ -2220,11 +2220,11 @@ pub async fn convert_submit(
             StatusCode::UNPROCESSABLE_ENTITY,
             ctx.lang.sel(
                 "This request did not carry the fingerprint of a conversion preview, so nothing was converted.",
-                "이 요청에는 전환 미리보기의 지문이 실려 있지 않아 아무것도 전환하지 않았습니다.",
+                "이 요청에 전환 미리보기의 지문이 없어 아무것도 전환하지 않았습니다.",
             ),
             Some(ctx.lang.sel(
                 "Open the preview, read the diff, and confirm from that page. If you did, the config file changed in the meantime — the preview you saw is no longer what is on disk.",
-                "미리보기를 열어 diff를 확인한 뒤 그 화면에서 실행하세요. 이미 그렇게 했다면 그 사이 config 파일이 바뀐 것입니다 — 화면에서 본 내용이 더 이상 디스크의 파일과 같지 않습니다.",
+                "미리보기를 열어 diff를 확인한 뒤 그 화면에서 실행하세요. 이미 그렇게 했다면 그사이 config 파일이 바뀌어 화면에서 본 미리보기와 디스크의 파일이 달라진 것입니다.",
             )),
         );
     }
@@ -2246,7 +2246,7 @@ fn reject_non_v1(ctx: &ServeConfig, syntax: ConfigSyntax) -> Option<Response> {
         ),
         Some(ctx.lang.sel(
             "There is no conversion from v2 back to v1: v2 can express [defaults], [base.<name>] and extends, and flattening that shared policy into every profile would scatter one place to edit into many.",
-            "v2에서 v1로 되돌리는 전환은 제공하지 않습니다 — v2는 [defaults]·[base.<name>]·extends를 표현할 수 있고, 그 공용 정책을 모든 프로파일에 펼치면 한 곳에서 고치던 것이 여러 곳으로 흩어집니다.",
+            "v2에서 v1로 되돌리는 전환은 제공하지 않습니다. v2는 [defaults]·[base.<name>]·extends를 표현할 수 있어서, 그 공용 정책을 모든 프로파일에 펼치면 한 곳에서 고치던 것이 여러 곳으로 흩어집니다.",
         )),
     ))
 }
@@ -2407,7 +2407,7 @@ async fn apply_conversion_and_render(
                 StatusCode::SERVICE_UNAVAILABLE,
                 ctx.lang.sel(
                     "The conversion was refused because it could not be written to the audit log.",
-                    "감사 로그에 기록할 수 없어 전환을 거부했습니다 — config 파일은 손대지 않았습니다.",
+                    "감사 로그에 기록할 수 없어 전환을 거부했습니다. config 파일은 손대지 않았습니다.",
                 ),
                 Some(&error.to_string()),
             );
@@ -2601,7 +2601,7 @@ async fn apply_and_render(ctx: &ServeConfig, change: ProfileChange) -> Response 
                 StatusCode::SERVICE_UNAVAILABLE,
                 ctx.lang.sel(
                     "The change was refused because it could not be written to the audit log.",
-                    "감사 로그에 기록할 수 없어 변경을 거부했습니다 — config 파일은 손대지 않았습니다.",
+                    "감사 로그에 기록할 수 없어 변경을 거부했습니다. config 파일은 손대지 않았습니다.",
                 ),
                 Some(&error.to_string()),
             );

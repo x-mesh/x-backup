@@ -71,7 +71,7 @@ pub fn list_body(
     html! {
         (components::page_head(route::SCHEDULE_TITLE, Some(lang.sel(
             "Built-in scheduler for periodic backups. Cron expressions are read in UTC.",
-            "주기 백업을 도는 내장 스케줄러입니다. cron 표현식은 UTC로 해석됩니다.",
+            "주기 백업을 실행하는 내장 스케줄러입니다. cron 표현식은 UTC로 해석됩니다.",
         ))))
         @if let Some(notice) = notice { (notice) }
         @if report.degraded() { (degraded_banner(lang, report)) }
@@ -87,8 +87,7 @@ pub fn list_body(
                     p { (lang.sel(
                         "No schedules yet. Periodic backups only run while this console is up — \
                          if you still have x-backup entries in crontab, move them here one at a time.",
-                        "아직 스케줄이 없습니다. 주기 백업은 이 콘솔이 떠 있는 동안만 돕니다 — \
-                         crontab에 x-backup 항목이 남아 있다면 하나씩 여기로 옮기세요.",
+                        "아직 스케줄이 없으며, 주기 백업은 이 콘솔이 켜져 있을 때만 실행됩니다. crontab에 x-backup 항목이 남아 있다면 하나씩 여기로 옮기세요.",
                     )) }
                 } @else {
                     (schedule_table(lang, schedules, now))
@@ -148,14 +147,14 @@ fn schedule_row(lang: Lang, schedule: &Schedule, now: DateTime<Utc>) -> Markup {
                     None => {
                         span class="muted" { (lang.sel(
                             "never — this expression has no future match",
-                            "없음 — 이 표현식은 앞으로 맞는 시각이 없습니다",
+                            "없음: 앞으로 이 표현식에 맞는 시각이 없습니다",
                         )) }
                     }
                 }
             }
             td { (last_run_cell(lang, schedule, now)) }
             td {
-                a href=(route::edit_href(schedule.id)) { (lang.sel("Edit", "수정")) }
+                a href=(route::edit_href(schedule.id)) { (lang.sel("Edit", "편집")) }
                 " "
                 a href=(route::delete_confirm_href(schedule.id)) { (lang.sel("Delete", "삭제")) }
             }
@@ -177,7 +176,7 @@ fn state_badge(lang: Lang, schedule: &Schedule, next: Option<DateTime<Utc>>) -> 
         return html! {
             span class="badge" data-level=(Level::Fail.token()) title=(lang.sel(
                 "Enabled but this expression never matches — no backup will run.",
-                "활성이지만 이 표현식은 앞으로 맞는 시각이 없습니다 — 백업이 돌지 않습니다.",
+                "켜져 있지만 이 표현식에 맞는 시각이 앞으로 없어 백업이 실행되지 않습니다.",
             )) { "NEVER" }
         };
     }
@@ -215,7 +214,7 @@ fn last_run_cell(lang: Lang, schedule: &Schedule, now: DateTime<Utc>) -> Markup 
                 span class="mono" { (missed_text(missed)) }
                 p class="field__hint" { (lang.sel(
                     "Runs that came due while the console was down are not caught up.",
-                    "콘솔이 꺼져 있는 동안 지나간 실행은 따라잡지 않습니다.",
+                    "콘솔이 꺼져 있던 동안 놓친 실행은 나중에 보충하지 않습니다.",
                 )) }
             }
         }
@@ -261,9 +260,7 @@ pub fn degraded_banner(lang: Lang, report: &LoadReport) -> Markup {
                 "Unlike job history, schedules cannot be rebuilt from anything else — an empty \
                  list here means periodic backups have silently stopped. Re-create the missing \
                  schedules below.",
-                "스케줄은 잡 이력과 달리 어디에서도 재구성할 수 없습니다 — 목록이 비어 있다는 \
-                 것은 예약된 백업이 조용히 멈췄다는 뜻입니다. 아래에서 누락된 스케줄을 다시 \
-                 등록하세요.",
+                "스케줄은 작업 이력과 달리 다른 곳에서 다시 만들어 낼 수 없어서, 여기 목록이 비어 있으면 주기 백업이 조용히 멈춘 것입니다. 아래에서 빠진 스케줄을 다시 등록하세요.",
             )) }
             (components::meta_list(&[
                 ("loaded", report.loaded.to_string()),
@@ -306,9 +303,7 @@ pub fn crontab_notice(lang: Lang, crontab: &CrontabScan) -> Markup {
                 "The same backup may be started twice — once by cron and once by this console. \
                  The file lock keeps your data safe (the later one exits 5), but the history will \
                  fill with warnings. Remove the crontab entry for anything you schedule here.",
-                "같은 백업이 두 번 시작될 수 있습니다 — cron이 한 번, 이 콘솔이 한 번. 파일 \
-                 락이 데이터를 지켜 주지만(뒤에 시작한 쪽이 exit 5) 이력에 경고가 쌓입니다. \
-                 여기에 등록한 스케줄은 crontab에서 제거하세요.",
+                "같은 백업을 cron과 이 콘솔이 각각 한 번씩 시작할 수 있습니다. 파일 락이 데이터를 지키지만(나중에 시작한 쪽은 exit 5) 이력에 경고가 쌓입니다. 여기서 예약한 백업은 crontab 항목을 삭제하세요.",
             )) }
             ul class="logdump" {
                 @for entry in &crontab.entries {
@@ -330,10 +325,7 @@ fn utc_basis_notice(lang: Lang) -> Markup {
                  makes daylight-saving transitions safe — a local-time scheduler would skip a run \
                  in spring and fire twice in autumn. Each next-run time below is shown in UTC and \
                  in server local time so you can check it before saving.",
-                "cron 필드는 서버 로컬 시각이 아니라 UTC로 해석됩니다. 그래야 일광 절약 시간 \
-                 전환이 안전합니다 — 로컬 기준 스케줄러는 봄 전환에서 한 번을 건너뛰고 가을 \
-                 전환에서 두 번 실행합니다. 아래의 다음 실행 시각은 UTC와 서버 로컬 시각을 \
-                 함께 보여 주므로 저장 전에 확인할 수 있습니다.",
+                "cron 필드는 서버 로컬 시간대가 아니라 UTC로 해석하므로, 로컬 시각 기준 스케줄러처럼 일광 절약 시간 전환 때 봄에 실행을 건너뛰거나 가을에 두 번 실행하는 일이 없습니다. 아래의 다음 실행 시각은 UTC와 서버 로컬 시각으로 함께 보여 주므로 저장하기 전에 확인할 수 있습니다.",
             )) }
         },
     )
@@ -400,7 +392,7 @@ pub fn form_body(
 ) -> Markup {
     let title = match mode {
         FormMode::New => lang.sel("New schedule", "스케줄 추가"),
-        FormMode::Edit => lang.sel("Edit schedule", "스케줄 수정"),
+        FormMode::Edit => lang.sel("Edit schedule", "스케줄 편집"),
     };
     html! {
         (components::page_head(route::SCHEDULE_TITLE, Some(title)))
@@ -420,7 +412,7 @@ pub fn form_body(
                                 value=(values.profile) required autocomplete="off";
                             p class="field__hint" { (lang.sel(
                                 "No profiles were found in the config file — type the name.",
-                                "config 파일에서 프로파일을 찾지 못했습니다 — 이름을 직접 적으세요.",
+                                "config 파일에서 프로파일을 찾지 못했습니다. 이름을 직접 입력하세요.",
                             )) }
                         } @else {
                             select id="s-profile" name=(route::FIELD_PROFILE) required {
@@ -442,8 +434,7 @@ pub fn form_body(
                         p class="field__hint" { (lang.sel(
                             "Five fields: minute hour day-of-month month day-of-week. \
                              `@hourly` and `@daily` are the only aliases. Read in UTC.",
-                            "5필드: 분 시 일 월 요일. 별칭은 `@hourly`·`@daily` 둘뿐입니다. \
-                             UTC로 해석됩니다.",
+                            "필드 5개(분 시 일 월 요일)를 UTC로 해석합니다. 별칭은 `@hourly`·`@daily` 둘뿐입니다.",
                         )) }
                         p class="field__hint mono" { "0 3 * * *  ·  */15 * * * *  ·  0 9-17 * * 1-5  ·  @daily" }
                     }
@@ -470,7 +461,7 @@ pub fn form_body(
                         }
                         p class="field__hint" { (lang.sel(
                             "Uncheck to pause without deleting. A paused schedule never fires.",
-                            "삭제하지 않고 잠시 멈추려면 해제하세요. 일시 중지된 스케줄은 실행되지 않습니다.",
+                            "체크를 해제하면 스케줄을 삭제하지 않고 일시 중지합니다. 일시 중지한 스케줄은 실행되지 않습니다.",
                         )) }
                     }
                     @if let Some(at) = preview {
@@ -530,9 +521,7 @@ pub fn delete_confirm_body(
                     "Deleting a schedule removes no files and breaks nothing right now — which is \
                      exactly why it is easy to miss. The next run simply never happens. If you \
                      only want to pause it, edit the schedule and uncheck `enabled` instead.",
-                    "스케줄을 삭제해도 파일이 지워지지 않고 지금 당장 아무것도 깨지지 않습니다 — \
-                     그래서 알아차리기 어렵습니다. 다음 실행이 그냥 일어나지 않을 뿐입니다. \
-                     잠시 멈추려는 것이라면 수정 화면에서 `enabled`를 해제하세요.",
+                    "스케줄을 삭제해도 파일이 지워지거나 당장 문제가 생기지 않고 다음 실행만 일어나지 않아서 알아차리기 어렵습니다. 잠시 멈추려면 삭제하지 말고 수정 화면에서 `enabled`를 해제하세요.",
                 )) }
                 (components::meta_list(&[
                     ("profile", schedule.profile.clone()),
@@ -603,7 +592,7 @@ pub fn saved_notice(lang: Lang, next: Option<DateTime<Utc>>) -> Markup {
                 }
                 None => p { (lang.sel(
                     "This schedule is paused, so it will not run until you enable it.",
-                    "이 스케줄은 일시 중지 상태이므로 활성화할 때까지 실행되지 않습니다.",
+                    "이 스케줄은 일시 중지 상태라 켤 때까지 실행되지 않습니다.",
                 )) }
             }
         },
@@ -635,7 +624,7 @@ pub fn malformed_id(lang: Lang) -> Markup {
         html! {
             p { (lang.sel(
                 "That schedule id is not a valid identifier. Go back to the list and try again.",
-                "그 스케줄 id는 올바른 식별자가 아닙니다. 목록으로 돌아가 다시 시도하세요.",
+                "이 스케줄 id는 올바른 형식이 아닙니다. 목록으로 돌아가 다시 시도하세요.",
             )) }
             p { a href=(route::SCHEDULE_PATH) { (lang.sel("Back to schedules", "스케줄 목록으로")) } }
         },
@@ -646,7 +635,7 @@ pub fn malformed_id(lang: Lang) -> Markup {
 pub fn not_found(lang: Lang) -> Markup {
     components::notice(
         Level::Warn,
-        lang.sel("No such schedule", "그런 스케줄이 없습니다"),
+        lang.sel("No such schedule", "스케줄을 찾을 수 없습니다"),
         html! {
             p { (lang.sel(
                 "It may have been deleted in another tab.",

@@ -229,7 +229,7 @@ impl PlanError {
             PlanError::Empty => lang
                 .sel(
                     "migrate produced no plan. Read the exit code — the child usually stopped before it could connect.",
-                    "migrate가 계획을 내지 않았습니다. 종료 코드를 보세요 — 대개 접속 전에 자식이 멈춘 경우입니다.",
+                    "migrate가 계획을 내지 않았습니다. 대개 명령이 접속하기 전에 멈춘 경우이니 종료 코드를 확인하세요.",
                 )
                 .to_string(),
             PlanError::Malformed(detail) => format!(
@@ -243,7 +243,7 @@ impl PlanError {
                 "{} (schema {found} \u{2260} {expected})",
                 lang.sel(
                     "migrate reported a JSON schema this console does not know — the console and the CLI are probably different builds.",
-                    "migrate가 이 콘솔이 모르는 JSON 스키마를 냈습니다 — 콘솔과 CLI가 서로 다른 빌드일 가능성이 큽니다.",
+                    "migrate가 낸 JSON 스키마를 이 콘솔이 알지 못합니다. 콘솔과 CLI가 서로 다른 빌드일 가능성이 큽니다.",
                 )
             ),
             PlanError::TooDeep { found, max } => format!(
@@ -676,12 +676,12 @@ fn confirm_request<'a>(
         headline: lang
             .sel(
                 "This writes into a live server",
-                "이 작업은 살아 있는 서버에 씁니다",
+                "이 작업은 실행 중인 서버에 씁니다",
             )
             .to_string(),
         irreversible_notice: lang.sel(
             "The target is a running database, not a backup store. Whatever this writes cannot be undone by this console — restoring the target to its previous state needs a backup you took beforehand.",
-            "target은 백업 저장소가 아니라 돌고 있는 데이터베이스입니다. 여기서 쓴 내용은 이 콘솔로 되돌릴 수 없습니다 — 이전 상태로 복구하려면 미리 받아 둔 백업이 필요합니다.",
+            "target은 백업 저장소가 아니라 실행 중인 데이터베이스입니다. 여기서 쓴 내용은 이 콘솔에서 되돌릴 수 없습니다. 이전 상태로 돌아가려면 미리 받아 둔 백업이 필요합니다.",
         ).to_string(),
         summary,
         // 충돌이 있을 때만 drop 토글을 띄운다(모듈 헤더 "`--drop`과 확인 토글").
@@ -689,12 +689,12 @@ fn confirm_request<'a>(
             label: lang
                 .sel(
                     "Drop the target's existing collections first (--drop)",
-                    "target의 기존 컬렉션을 먼저 지운다(--drop)",
+                    "target의 기존 컬렉션을 먼저 삭제(--drop)",
                 )
                 .to_string(),
             hint: lang.sel(
                 "Off by default, matching the CLI. Without it the copy merges into what is already there, which can leave a mix of old and new documents.",
-                "CLI와 같이 기본은 꺼짐입니다. 켜지 않으면 기존 데이터에 섞여 들어가 옛 문서와 새 문서가 뒤섞인 상태가 될 수 있습니다.",
+                "CLI와 마찬가지로 기본값은 꺼짐입니다. 켜지 않으면 복사한 데이터가 기존 데이터에 합쳐져 옛 문서와 새 문서가 섞일 수 있습니다.",
             ).to_string(),
         }),
         extra_hidden: request.as_hidden(&plan.fingerprint),
@@ -734,7 +734,7 @@ async fn run_dry_run(
             ctx.lang
                 .sel(
                     "migrate --dry-run did not finish in time — one of the servers may be unreachable.",
-                    "migrate --dry-run이 제한 시간 안에 끝나지 않았습니다 — 두 서버 중 한쪽에 닿지 못했을 수 있습니다.",
+                    "migrate --dry-run이 제한 시간 안에 끝나지 않았습니다. 두 서버 중 한쪽에 연결하지 못했을 수 있습니다.",
                 )
                 .to_string()
         })?
