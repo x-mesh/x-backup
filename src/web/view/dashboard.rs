@@ -46,11 +46,13 @@
 
 use std::time::Duration;
 
+use chrono::{Datelike, NaiveDate, Weekday};
 use maud::{html, Markup};
 
 use crate::i18n::Lang;
 use crate::web::mask::SecretRegistry;
 use crate::web::routes::dashboard as route;
+use crate::web::routes::dashboard::history::{DayCell, History, HistoryRow, WINDOW_DAYS};
 use crate::web::routes::dashboard::{Cell, Dashboard, ProfileRow, RowCells, RowState};
 use crate::web::view::components::{self, Level};
 
@@ -68,12 +70,27 @@ pub fn body(
     dashboard: &Dashboard,
     registry: &SecretRegistry,
 ) -> Markup {
+    body_with_history(lang, config_present, dashboard, None, registry)
+}
+
+/// [`body`]에 백업 이력 패널을 더한 본문. 이력은 화면 제목 바로 아래, 판정보다 위에 선다 —
+/// 운영자가 가장 먼저 보는 것이 지난 30일의 백업 흐름이 되도록.
+pub fn body_with_history(
+    lang: Lang,
+    config_present: bool,
+    dashboard: &Dashboard,
+    history: Option<&History>,
+    registry: &SecretRegistry,
+) -> Markup {
     let subtitle = lang.sel(
         "Every profile on one screen — connection, topology, replication, last backup age, and destination headroom.",
-        "전 프로파일을 한 화면에 — 연결·토폴로지·복제·마지막 백업 나이·destination 여유.",
+        "전 프로파일 현황: 연결·토폴로지·복제·마지막 백업 이후 시간·destination 여유 공간",
     );
     html! {
         (components::page_head(route::DASHBOARD_TITLE, Some(subtitle)))
+        @if let Some(history) = history {
+            (history_panel(lang, history, registry))
+        }
         @match dashboard {
             Dashboard::Rows { rows, roster_age, roster_hit, ttl, elapsed } => {
                 (verdict(lang, dashboard, rows))
@@ -107,7 +124,7 @@ fn verdict(lang: Lang, dashboard: &Dashboard, rows: &[ProfileRow]) -> Markup {
             .to_string(),
             lang.sel(
                 "The console read the config but found no [profiles.<name>] section, so this screen has nothing to report.",
-                "콘솔이 config를 읽었지만 [profiles.<name>] 섹션을 찾지 못했습니다 — 이 화면이 보고할 것이 없습니다.",
+                "콘솔이 config를 읽었지만 [profiles.<name>] 섹션을 찾지 못해 이 화면에 보고할 내용이 없습니다.",
             )
             .to_string(),
         )
@@ -115,11 +132,11 @@ fn verdict(lang: Lang, dashboard: &Dashboard, rows: &[ProfileRow]) -> Markup {
         (
             format!(
                 "{total} {}",
-                lang.sel("profiles checked — all clear.", "프로파일 점검 완료 — 모두 정상.")
+                lang.sel("profiles checked — all clear.", "프로파일 점검 완료: 모두 정상.")
             ),
             lang.sel(
                 "Connection, topology, replication, last backup age and destination all report ok on every profile.",
-                "모든 프로파일에서 연결·토폴로지·복제·마지막 백업 나이·destination이 정상입니다.",
+                "모든 프로파일에서 연결·토폴로지·복제·마지막 백업 뒤 지난 시간·destination이 정상입니다.",
             )
             .to_string(),
         )
@@ -131,7 +148,7 @@ fn verdict(lang: Lang, dashboard: &Dashboard, rows: &[ProfileRow]) -> Markup {
             ),
             lang.sel(
                 "Rows are ordered by profile name, not by severity — read the badge column. A row marked ERROR means the check itself did not complete, which is different from a check that completed and said no.",
-                "행은 심각도가 아니라 프로파일 이름순입니다 — 배지 열을 보세요. ERROR 행은 점검 자체가 끝나지 않았다는 뜻이고, 점검이 끝나고 '안 된다'고 답한 것과는 다릅니다.",
+                "행을 심각도가 아니라 프로파일 이름순으로 정렬했으니 배지 열을 확인하세요. ERROR 행은 점검 자체가 끝나지 않았다는 뜻이며, 점검이 끝나서 '안 된다'고 답한 것과 다릅니다.",
             )
             .to_string(),
         )
@@ -385,7 +402,7 @@ fn unreadable_cell(
             p class="muted" {
                 (lang.sel(
                     "The child wrote nothing to stderr either.",
-                    "자식이 stderr에도 아무것도 쓰지 않았습니다.",
+                    "명령이 stderr에도 아무것도 쓰지 않았습니다.",
                 ))
             }
         } @else {
@@ -404,7 +421,7 @@ fn empty_roster(lang: Lang) -> Markup {
             p {
                 (lang.sel(
                     "Add a [profiles.<name>] section to the config the console was started with, then reload.",
-                    "콘솔이 함께 기동된 config에 [profiles.<name>] 섹션을 추가한 뒤 새로고침하세요.",
+                    "콘솔을 시작할 때 쓴 config에 [profiles.<name>] 섹션을 추가한 뒤 새로고침하세요.",
                 ))
             }
         },
@@ -421,13 +438,13 @@ fn no_roster_notice(lang: Lang, stderr: &str, registry: &SecretRegistry) -> Mark
             p {
                 (lang.sel(
                     "This screen asks the console's own binary for the profile list before it checks anything. Without that list there is nothing to draw — not even a partial page.",
-                    "이 화면은 무엇을 점검하기 전에 콘솔 자신의 바이너리에게 프로파일 목록을 먼저 묻습니다. 그 목록이 없으면 부분 화면조차 그릴 수 없습니다.",
+                    "이 화면은 점검을 시작하기 전에 콘솔 자신의 바이너리에 프로파일 목록을 먼저 요청합니다. 그 목록이 없으면 화면 일부조차 그릴 수 없습니다.",
                 ))
             }
             p {
                 (lang.sel(
                     "Start the console with --config <PATH> (or XB_CONFIG) so it has something to read, and check that its binary is still readable and executable.",
-                    "콘솔을 --config <PATH>(또는 XB_CONFIG)와 함께 기동해 읽을 대상을 주고, 바이너리가 여전히 읽기·실행 가능한지 확인하세요.",
+                    "콘솔을 --config <PATH>(또는 XB_CONFIG)와 함께 시작해 읽을 대상을 주고, 그 바이너리를 여전히 읽고 실행할 수 있는지 확인하세요.",
                 ))
             }
             @if !masked.is_empty() {
@@ -447,14 +464,163 @@ fn refresh_note(lang: Lang, ttl: Duration) -> Markup {
         p class="muted" {
             (lang.sel(
                 "This screen does not refresh itself — reload to re-check. ",
-                "이 화면은 스스로 갱신하지 않습니다 — 다시 점검하려면 새로고침하세요. ",
+                "이 화면은 스스로 갱신하지 않습니다. 다시 점검하려면 새로고침하세요. ",
             ))
+            // 단위는 언어별 조각에 둔다 — 형식 문자열에 `s`를 박으면 한국어가 "15s초"가 된다.
             (format!(
-                "{}{}s{}",
+                "{}{}{}",
                 lang.sel("Results are reused for ", "결과는 "),
                 ttl.as_secs(),
-                lang.sel(", so reloading sooner shows the same numbers without touching the databases again.", "초 동안 재사용되므로, 그 안에 새로고침하면 DB를 다시 건드리지 않고 같은 값을 보여줍니다."),
+                lang.sel("s, so reloading sooner shows the same numbers without touching the databases again.", "초 동안 재사용되므로, 그 안에 새로고침하면 DB를 다시 조회하지 않고 같은 값을 보여줍니다."),
             ))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 백업 이력 격자
+// ---------------------------------------------------------------------------
+
+/// 백업 이력 패널 — 프로파일 × UTC 날짜 격자.
+///
+/// 칸은 색만이 아니라 모양으로도 상태를 말한다(`app.css`의 `.hm`). 칸마다 날짜·레벨·개수를
+/// `title`과 스크린리더용 문구로 함께 싣는다.
+pub fn history_panel(lang: Lang, history: &History, registry: &SecretRegistry) -> Markup {
+    let first = history.first_day();
+    let days: Vec<NaiveDate> = first
+        .iter_days()
+        .take_while(|d| *d <= history.today)
+        .collect();
+    let undated: usize = history
+        .rows
+        .iter()
+        .map(|row| match row {
+            HistoryRow::Days { undated, .. } => *undated,
+            HistoryRow::Unavailable { .. } => 0,
+        })
+        .sum();
+    html! {
+        (components::panel(
+            html! {
+                h3 class="panel__title" { "Backup history" }
+                span class="counts" {
+                    (first.format("%Y-%m-%d")) " – " (history.today.format("%Y-%m-%d")) " UTC"
+                }
+            },
+            html! {
+                div class="heatmap-scroll" {
+                    table class="heatmap" {
+                        thead {
+                            tr {
+                                th scope="col" { "Profile" }
+                                @for day in &days {
+                                    th scope="col" class=[today_class(*day, history.today)] title=(day.format("%Y-%m-%d")) {
+                                        @if day.weekday() == Weekday::Mon || *day == history.today {
+                                            (day.format("%d"))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        tbody {
+                            @for row in &history.rows {
+                                (history_row(lang, row, history.today, registry))
+                            }
+                        }
+                    }
+                }
+                (history_legend(lang))
+                @if undated > 0 {
+                    p class="field__hint" {
+                        (format!(
+                            "{}{}{}",
+                            lang.sel("", "날짜를 읽을 수 없는 목록 항목 "),
+                            undated,
+                            lang.sel(
+                                " catalog entries have no readable date and are not on the grid — see Catalog.",
+                                "개는 격자에 넣지 않았습니다. Catalog에서 확인하세요.",
+                            ),
+                        ))
+                    }
+                }
+                p class="field__hint" {
+                    (lang.sel(
+                        "Failures appear only for backups started from this console. A run that fails under external cron leaves no record, so its day shows as no record. Days are cut in UTC.",
+                        "실패는 이 콘솔에서 시작한 백업에만 표시되며, 날짜는 UTC 기준으로 나눕니다. 외부 cron에서 실패한 실행은 기록이 남지 않아 그날은 '기록 없음'으로 보입니다.",
+                    ))
+                }
+            },
+        ))
+    }
+}
+
+fn today_class(day: NaiveDate, today: NaiveDate) -> Option<&'static str> {
+    (day == today).then_some("hm-today")
+}
+
+fn history_row(
+    lang: Lang,
+    row: &HistoryRow,
+    today: NaiveDate,
+    registry: &SecretRegistry,
+) -> Markup {
+    match row {
+        HistoryRow::Days { profile, days, .. } => html! {
+            tr {
+                th scope="row" class="mono" { (route::scrub(registry, profile)) }
+                @for cell in days {
+                    td class=[today_class(cell.date, today)] { (day_mark(lang, cell)) }
+                }
+            }
+        },
+        HistoryRow::Unavailable { profile, reason } => html! {
+            tr {
+                th scope="row" class="mono" { (route::scrub(registry, profile)) }
+                td class="muted heatmap__reason" colspan=(WINDOW_DAYS) { (route::scrub(registry, reason)) }
+            }
+        },
+    }
+}
+
+/// 칸 하나. 기록이 없는 날은 `data-level` 없이 빈 칸 모양으로 그린다 — 실패와 섞이지 않게.
+fn day_mark(lang: Lang, cell: &DayCell) -> Markup {
+    let status = match cell.level {
+        Some(level) => level.label().to_string(),
+        None => lang.sel("no record", "기록 없음").to_string(),
+    };
+    let date = cell.date.format("%Y-%m-%d").to_string();
+    let summary = format!(
+        "{} · {}{}{}{}",
+        status,
+        lang.sel("backups ", "백업 "),
+        cell.backups,
+        lang.sel(" · failed runs ", " · 실패한 실행 "),
+        cell.failed_runs,
+    );
+    let label = format!("{date} · {summary}");
+    // 날짜·요약은 `data-*`로 싣고 CSS가 hover 때 곧바로 툴팁으로 그린다(`app.css` `.hm::after`).
+    // 브라우저 기본 `title` 툴팁은 1초가량 늦게 떠서 격자를 훑는 동안 쓸 수 없다.
+    html! {
+        @match cell.level {
+            Some(level) => span class="hm" data-level=(level.token()) data-date=(date) data-summary=(summary) {
+                span class="visually-hidden" { (label) }
+            },
+            None => span class="hm hm--none" data-date=(date) data-summary=(summary) {
+                span class="visually-hidden" { (label) }
+            },
+        }
+    }
+}
+
+/// 칸 모양 범례. 상태 라벨은 영문 고정이고 "기록 없음"만 설명이라 언어를 탄다.
+fn history_legend(lang: Lang) -> Markup {
+    let levels = [Level::Ok, Level::Warn, Level::Fail, Level::Error];
+    html! {
+        ul class="hm-legend" {
+            @for level in levels {
+                li { span class="hm" data-level=(level.token()) {} (level.label()) }
+            }
+            li { span class="hm hm--none" {} (lang.sel("no record", "기록 없음")) }
         }
     }
 }
@@ -853,5 +1019,122 @@ mod tests {
         assert_eq!(fmt_age(Lang::Ko, Duration::from_millis(100)), "방금");
         assert_eq!(fmt_age(Lang::En, Duration::from_secs(9)), "9s");
         assert_eq!(fmt_age(Lang::En, Duration::from_secs(125)), "2m 5s");
+    }
+
+    fn history_fixture() -> History {
+        use crate::web::routes::dashboard::history::build_days;
+        use crate::web::routes::dashboard::history::Event;
+        let today = NaiveDate::parse_from_str("2026-09-28", "%Y-%m-%d").unwrap();
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let backups = [Event {
+            at: at("2026-09-27T01:00:00Z"),
+            level: Level::Ok,
+        }];
+        let failures = [Event {
+            at: at("2026-09-28T01:00:00Z"),
+            level: Level::Fail,
+        }];
+        History {
+            today,
+            rows: vec![
+                HistoryRow::Days {
+                    profile: "<b>prod</b>".to_string(),
+                    days: build_days(today, &backups, &failures),
+                    undated: 1,
+                },
+                HistoryRow::Unavailable {
+                    profile: "restore-target".to_string(),
+                    reason: "No backup list: exit 2".to_string(),
+                },
+            ],
+        }
+    }
+
+    /// 칸은 레벨을 `data-level`로, 기록 없음은 별도 모양으로 싣고, 칸마다 읽을 수 있는
+    /// 설명을 가진다. 목록이 없는 프로파일은 칸 대신 이유를 한 칸에 적는다.
+    #[test]
+    fn history_panel_marks_levels_gaps_and_unavailable_rows() {
+        let html = history_panel(Lang::En, &history_fixture(), &empty_registry()).into_string();
+        assert!(
+            html.contains("2026-08-30 – 2026-09-28 UTC"),
+            "기간 표시 누락: {html}"
+        );
+        assert!(html.contains(
+            r#"class="hm" data-level="ok" data-date="2026-09-27" data-summary="OK · backups 1 · failed runs 0""#
+        ));
+        assert!(html.contains(
+            r#"data-level="fail" data-date="2026-09-28" data-summary="FAIL · backups 0 · failed runs 1""#
+        ));
+        assert!(
+            html.contains(r#"class="hm hm--none" data-date="2026-09-26" data-summary="no record"#),
+            "기록 없음 칸 누락"
+        );
+        assert!(
+            html.contains(r#"<span class="visually-hidden">2026-09-27 · OK · backups 1 · failed runs 0</span>"#),
+            "스크린리더 문구 누락"
+        );
+        assert!(html.contains(&format!(
+            r#"colspan="{WINDOW_DAYS}">No backup list: exit 2"#
+        )));
+        assert_eq!(
+            html.matches(r#"<td class="hm-today">"#).count(),
+            1,
+            "오늘 칸은 행마다 하나"
+        );
+        assert!(
+            html.contains("1 catalog entries have no readable date"),
+            "날짜 없는 항목을 숨겼다"
+        );
+        assert!(
+            !html.contains("<b>prod</b>"),
+            "프로파일 이름이 이스케이프되지 않았다"
+        );
+        for level in ["ok", "warn", "fail", "error"] {
+            assert!(
+                html.contains(&format!(
+                    r#"<li><span class="hm" data-level="{level}"></span>"#
+                )),
+                "범례에 {level} 누락"
+            );
+        }
+    }
+
+    /// 이력 패널은 화면 제목 바로 아래, 판정 배너보다 위에 선다.
+    #[test]
+    fn history_panel_sits_above_the_verdict() {
+        let dashboard = dashboard_of(Vec::new());
+        let history = history_fixture();
+        let html = body_with_history(
+            Lang::En,
+            true,
+            &dashboard,
+            Some(&history),
+            &empty_registry(),
+        )
+        .into_string();
+        let title_at = html.find("page-title").expect("화면 제목 누락");
+        let history_at = html.find("Backup history").expect("이력 패널 누락");
+        let verdict_at = html.find(r#"class="verdict""#).expect("판정 배너 누락");
+        assert!(
+            title_at < history_at && history_at < verdict_at,
+            "순서: 제목 → 이력 → 판정"
+        );
+        let plain = body(Lang::En, true, &dashboard, &empty_registry()).into_string();
+        assert!(
+            !plain.contains("Backup history"),
+            "이력 없이 부르면 패널이 없어야 한다"
+        );
+    }
+
+    #[test]
+    fn history_panel_describes_gaps_in_korean() {
+        let html = history_panel(Lang::Ko, &history_fixture(), &empty_registry()).into_string();
+        assert!(html.contains("기록 없음"));
+        assert!(html.contains("실패는 이 콘솔에서 시작한 백업에만 표시되며"));
+        assert!(html.contains(">Backup history<"), "패널 제목은 영문 고정");
     }
 }

@@ -240,7 +240,12 @@ fn sort_token(sort: ListSort) -> &'static str {
 ///
 /// `--type`/`--engine`/`--limit`은 **의도적으로 붙이지 않는다**(모듈 헤더 "JobSpec이
 /// 표현하지 못하는 것"·"페이지네이션" 참조) — 전체를 받아 이 파일이 직접 거르고 자른다.
-fn list_spec(profile: Option<ProfileName>, sort: ListSort, asc: bool, lang: Lang) -> JobSpec {
+pub(crate) fn list_spec(
+    profile: Option<ProfileName>,
+    sort: ListSort,
+    asc: bool,
+    lang: Lang,
+) -> JobSpec {
     let mut spec = JobSpec::new(JobCommand::List, lang).with_sort(sort);
     if let Some(p) = profile {
         spec = spec.with_profile(p);
@@ -272,7 +277,7 @@ impl RunError {
                 "{} {}",
                 lang.sel(
                     "Spawning the list child failed:",
-                    "list 자식 프로세스를 띄우지 못했습니다:",
+                    "list 명령을 실행하지 못했습니다:",
                 ),
                 excerpt(detail)
             ),
@@ -280,7 +285,7 @@ impl RunError {
                 "{} {}",
                 lang.sel(
                     "Reading the list child's output failed:",
-                    "list 자식 프로세스의 출력을 읽는 중 실패했습니다:",
+                    "list 명령의 출력을 읽지 못했습니다:",
                 ),
                 excerpt(detail)
             ),
@@ -288,7 +293,7 @@ impl RunError {
                 "{} ({}s)",
                 lang.sel(
                     "list did not finish within the time limit and was killed. A very large catalog is the usual cause.",
-                    "list가 상한 시간 안에 끝나지 않아 종료시켰습니다. 카탈로그가 매우 큰 경우가 흔한 원인입니다.",
+                    "list가 제한 시간 안에 끝나지 않아 강제로 종료했습니다. 대개 카탈로그가 매우 커서 생기는 일입니다.",
                 ),
                 limit.as_secs()
             ),
@@ -412,13 +417,13 @@ impl Verdict {
             Verdict::Clean => lang
                 .sel(
                     "Catalog loaded — no problems found.",
-                    "카탈로그를 불러왔습니다 — 문제가 없습니다.",
+                    "카탈로그를 불러왔습니다. 문제가 없습니다.",
                 )
                 .to_string(),
             Verdict::Warned => lang
                 .sel(
                     "Catalog loaded, with warnings — some entries need attention.",
-                    "카탈로그를 불러왔습니다(경고 동반) — 일부 항목을 확인해야 합니다.",
+                    "카탈로그를 불러왔지만 경고가 있습니다. 일부 항목을 확인해야 합니다.",
                 )
                 .to_string(),
             Verdict::Misconfigured => lang
@@ -430,7 +435,7 @@ impl Verdict {
             Verdict::Failed => lang
                 .sel(
                     "list failed while reading the destination.",
-                    "list가 destination을 읽는 중 실패했습니다.",
+                    "list가 destination을 읽지 못했습니다.",
                 )
                 .to_string(),
             Verdict::Unexpected(Some(code)) => format!(
@@ -454,15 +459,15 @@ impl Verdict {
             Verdict::Clean => return None,
             Verdict::Warned => lang.sel(
                 "exit 4 is success with caveats: the catalog below is complete. Rows marked broken/incomplete/orphan/corrupt need a closer look.",
-                "exit 4는 단서가 붙은 성공입니다 — 아래 카탈로그는 완전합니다. broken/incomplete/orphan/corrupt로 표시된 행을 확인하세요.",
+                "exit 4는 단서가 붙은 성공이며, 아래 카탈로그에는 빠진 항목이 없습니다. broken/incomplete/orphan/corrupt로 표시된 행을 자세히 확인하세요.",
             ),
             Verdict::Misconfigured => lang.sel(
                 "exit 2 — check that the profile exists and its destination is configured (type=local).",
-                "exit 2 — 프로파일이 존재하고 destination(type=local)이 설정됐는지 확인하세요.",
+                "exit 2: 프로파일이 있는지, 그 destination(type=local)이 설정됐는지 확인하세요.",
             ),
             Verdict::Failed => lang.sel(
                 "exit 1 — the destination may be unreadable (permissions, missing path). Check the diagnostics below.",
-                "exit 1 — destination을 읽을 수 없을 수 있습니다(권한·경로 부재). 아래 진단을 확인하세요.",
+                "exit 1: 권한이 없거나 경로가 없어 destination을 읽지 못했을 수 있습니다. 아래 진단을 확인하세요.",
             ),
             Verdict::Unexpected(_) => return None,
         };
@@ -498,13 +503,13 @@ impl ReportError {
         match self {
             ReportError::Empty => lang.sel(
                 "list produced no output. This is expected when the exit code is not 0 or 4 — check the diagnostics below.",
-                "list가 아무 출력도 내지 않았습니다. 종료 코드가 0/4가 아닐 때 흔한 모양입니다 — 아래 진단을 확인하세요.",
+                "list가 아무것도 출력하지 않았습니다. 종료 코드가 0이나 4가 아니면 흔히 이렇게 되니 아래 진단을 확인하세요.",
             ).to_string(),
             ReportError::Malformed(detail) => format!(
                 "{} {}",
                 lang.sel(
                     "list output could not be parsed as the expected JSON:",
-                    "list 출력을 기대한 JSON으로 해석할 수 없습니다:",
+                    "list 출력을 예상한 JSON 형식으로 해석하지 못했습니다:",
                 ),
                 excerpt(detail)
             ),
@@ -512,14 +517,14 @@ impl ReportError {
                 "{} (schema {found} ≠ {expected})",
                 lang.sel(
                     "list reported a JSON schema this console does not know — the console and the CLI are probably different builds.",
-                    "list가 이 콘솔이 모르는 JSON 스키마를 냈습니다 — 콘솔과 CLI가 서로 다른 빌드일 가능성이 큽니다.",
+                    "list 출력의 JSON 스키마를 이 콘솔이 알지 못합니다. 콘솔과 CLI가 서로 다른 빌드일 가능성이 큽니다.",
                 )
             ),
             ReportError::TooDeep { found, max } => format!(
                 "{} ({found} > {max})",
                 lang.sel(
                     "list output is nested more deeply than this console parses. A manifest in this store is probably malformed.",
-                    "list 출력의 중첩 깊이가 이 콘솔이 파싱하는 상한을 넘었습니다. 이 저장소의 매니페스트 하나가 깨졌을 가능성이 큽니다.",
+                    "list 출력의 중첩 깊이가 이 콘솔의 해석 한도를 넘었습니다. 이 저장소의 매니페스트 하나가 깨졌을 가능성이 큽니다.",
                 )
             ),
         }
@@ -528,15 +533,15 @@ impl ReportError {
 
 /// 스키마 버전이 확인된 뒤의 최상위 문서.
 #[derive(Debug)]
-struct ListDocument {
-    store: String,
-    backups: Vec<Value>,
+pub(crate) struct ListDocument {
+    pub(crate) store: String,
+    pub(crate) backups: Vec<Value>,
 }
 
 /// stdout을 [`ListDocument`]로 접는다. **스키마 버전을 본문 역직렬화보다 먼저 본다** —
 /// `routes::doctor::parse_report`와 같은 순서 판단(그쪽 doc 참조: 스키마가 다르면
 /// "필드가 이상하다"가 아니라 "버전이 다르다"로 진단되어야 한다).
-fn parse_document(stdout: &str) -> Result<ListDocument, ReportError> {
+pub(crate) fn parse_document(stdout: &str) -> Result<ListDocument, ReportError> {
     let text = stdout.trim();
     if text.is_empty() {
         return Err(ReportError::Empty);
