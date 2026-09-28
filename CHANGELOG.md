@@ -7,8 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-28
+
 ### Added
 
+- `x-backup serve`: a web console for running backups, restores and the rest from a
+  browser. It has no backup logic of its own — every action runs the CLI as
+  `x-backup <command> --json` and relays the result to the page and over SSE, so the
+  console and the terminal cannot disagree. Screens: Dashboard, Monitor, Catalog, Backup,
+  Verify, Peek, Restore, Prune, Migrate, Schedule, Jobs, Lock, Config and Doctor.
+  It binds to loopback by default, refuses to start without an access token
+  (`XB_WEB_TOKEN_FILE` with mode 0600, or `XB_WEB_TOKEN`), keeps secrets out of pages and
+  logs, and puts restore, prune and migrate behind an audit log and a confirmation step.
+  Operations guide: `docs/web-console.ko.md`.
+- A backup history heatmap at the top of the Dashboard: one row per profile, one cell per
+  UTC day (as many days as fit the panel, up to 63), the worst outcome of the day in each
+  cell. Successes come from
+  the destination's manifests; failures come from the console's own job history, so a
+  backup that failed under external cron shows as "no record", not as a failure.
+- `status --watch --json`, which emits one NDJSON frame per refresh. The console's
+  Monitor screen shares a single such child across all viewers.
 - `LICENSE` (MIT). `Cargo.toml` has declared `license = "MIT"` since its first commit,
   but the file itself was never there.
 - `Cargo.toml` metadata: `repository`, `homepage`, `readme`, `keywords`, `categories`.
@@ -19,6 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Linux-only failures that never showed up on macOS: `CARGO_BIN_EXE_*` handling in tests,
+  an `ETXTBSY` race when spawning a freshly written binary, and platform differences in
+  `statvfs` and `c_char`. The MSRV CI job now really builds with Rust 1.88.
+- `scripts/release.sh` builds the linux musl targets on Apple Silicon hosts: it pins the
+  cross images to an Ubuntu 24.04 base, runs them under amd64 emulation, and stops early
+  when the linux toolchain that cross mounts is missing.
 - Output no longer mixes languages under `[output].language = "en"`. Two things leaked
   Korean regardless of the setting: the error-kind prefix, which was baked into each
   variant's `#[error("작업 실패: {0}")]` and therefore fixed at compile time, and fifteen
@@ -29,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- prune checks chains with `ChainVerifier`, measured 2,109 times faster than before on a
+  catalog of 8,000 backups.
 - The docs no longer assume a private repository. `README.md`, `README.ko.md`,
   `install.sh`, the release skill, and the `x-backup update` doc comments all opened by
   telling the reader to set a GitHub token, which no longer buys anything. `update`
@@ -142,5 +168,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - README defaults to English; Korean documentation split into `README.ko.md`.
 
+[0.4.0]: https://github.com/x-mesh/x-backup/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/x-mesh/x-backup/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/x-mesh/x-backup/compare/v0.1.0...v0.2.0
