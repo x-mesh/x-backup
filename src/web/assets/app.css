@@ -959,10 +959,19 @@ table caption {
   }
 }
 
+/* 격자는 패널 폭을 꽉 채운다. 보일 날 수는 스크립트가 폭에 맞춰 고르고
+ * (`view::dashboard::HEATMAP_FIT_SCRIPT`), 남는 몇 픽셀은 날짜 칸이 나눠 가진다. 이름 열은
+ * 내용 폭(1%)으로 두어 남는 폭을 가져가지 않게 한다. */
 .heatmap {
+  width: 100%;
   border-collapse: separate;
   border-spacing: 3px;
   font-size: 12px;
+}
+
+/* 스크립트가 폭을 재기 전(또는 스크립트가 없을 때)에는 기본 창만 보인다. */
+.heatmap:not(.hm-fit) .hm-extra {
+  display: none;
 }
 
 .heatmap th[scope="col"] {
@@ -976,6 +985,7 @@ table caption {
 }
 
 .heatmap th[scope="col"]:first-child {
+  width: 1%;
   padding-right: var(--s-3);
   font-family: var(--f-ui);
   letter-spacing: 0.08em;
@@ -1011,7 +1021,7 @@ table caption {
   /* 칸 안의 스크린리더 문구(absolute)가 스크롤 영역 밖 문서 폭을 늘리지 않게 기준을 잡는다. */
   position: relative;
   display: block;
-  width: 1.25rem;
+  min-width: 1.25rem;
   height: 1.25rem;
   border: 1.5px solid var(--level, var(--c-rule-strong));
   border-radius: var(--radius-sm);
@@ -1020,6 +1030,7 @@ table caption {
 
 .hm-legend .hm {
   display: inline-block;
+  min-width: 0;
   width: 0.95rem;
   height: 0.95rem;
   vertical-align: -0.15em;

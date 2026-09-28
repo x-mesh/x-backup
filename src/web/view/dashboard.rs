@@ -47,12 +47,14 @@
 use std::time::Duration;
 
 use chrono::{Datelike, NaiveDate, Weekday};
-use maud::{html, Markup};
+use maud::{html, Markup, PreEscaped};
 
 use crate::i18n::Lang;
 use crate::web::mask::SecretRegistry;
 use crate::web::routes::dashboard as route;
-use crate::web::routes::dashboard::history::{DayCell, History, HistoryRow, WINDOW_DAYS};
+use crate::web::routes::dashboard::history::{
+    DayCell, History, HistoryRow, DEFAULT_VISIBLE_DAYS, WINDOW_DAYS,
+};
 use crate::web::routes::dashboard::{Cell, Dashboard, ProfileRow, RowCells, RowState};
 use crate::web::view::components::{self, Level};
 
@@ -487,6 +489,10 @@ fn refresh_note(lang: Lang, ttl: Duration) -> Markup {
 /// `title`과 스크린리더용 문구로 함께 싣는다.
 pub fn history_panel(lang: Lang, history: &History, registry: &SecretRegistry) -> Markup {
     let first = history.first_day();
+    let default_first = history
+        .today
+        .checked_sub_days(chrono::Days::new(DEFAULT_VISIBLE_DAYS - 1))
+        .unwrap_or(first);
     let days: Vec<NaiveDate> = first
         .iter_days()
         .take_while(|d| *d <= history.today)
@@ -503,18 +509,18 @@ pub fn history_panel(lang: Lang, history: &History, registry: &SecretRegistry) -
         (components::panel(
             html! {
                 h3 class="panel__title" { "Backup history" }
-                span class="counts" {
-                    (first.format("%Y-%m-%d")) " – " (history.today.format("%Y-%m-%d")) " UTC"
+                span class="counts" id="hm-range" {
+                    (default_first.format("%Y-%m-%d")) " – " (history.today.format("%Y-%m-%d")) " UTC"
                 }
             },
             html! {
                 div class="heatmap-scroll" {
-                    table class="heatmap" {
+                    table class="heatmap" data-default-days=(DEFAULT_VISIBLE_DAYS) {
                         thead {
                             tr {
                                 th scope="col" { "Profile" }
                                 @for day in &days {
-                                    th scope="col" class=[today_class(*day, history.today)] title=(day.format("%Y-%m-%d")) {
+                                    th scope="col" class=[day_class(*day, history.today)] data-age=(age_of(*day, history.today)) title=(day.format("%Y-%m-%d")) {
                                         @if day.weekday() == Weekday::Mon || *day == history.today {
                                             (day.format("%d"))
                                         }
@@ -529,6 +535,7 @@ pub fn history_panel(lang: Lang, history: &History, registry: &SecretRegistry) -
                         }
                     }
                 }
+                script { (PreEscaped(HEATMAP_FIT_SCRIPT)) }
                 (history_legend(lang))
                 @if undated > 0 {
                     p class="field__hint" {
@@ -554,9 +561,59 @@ pub fn history_panel(lang: Lang, history: &History, registry: &SecretRegistry) -
     }
 }
 
-fn today_class(day: NaiveDate, today: NaiveDate) -> Option<&'static str> {
-    (day == today).then_some("hm-today")
+/// 오늘로부터 며칠 전인지. 폭 맞춤 스크립트가 이 값으로 보일 열을 고른다.
+fn age_of(day: NaiveDate, today: NaiveDate) -> i64 {
+    (today - day).num_days()
 }
+
+/// 오늘 열, 또는 기본으로 숨기는 열(스크립트가 폭을 재기 전·스크립트가 없을 때).
+fn day_class(day: NaiveDate, today: NaiveDate) -> Option<&'static str> {
+    if day == today {
+        Some("hm-today")
+    } else if age_of(day, today) >= DEFAULT_VISIBLE_DAYS as i64 {
+        Some("hm-extra")
+    } else {
+        None
+    }
+}
+
+/// 패널 폭에 들어가는 만큼 최근 날짜를 보여 준다.
+///
+/// 서버는 창 폭을 모르므로 최대 [`WINDOW_DAYS`]일을 그리고, 여기서 폭을 재서 넘치는 오래된
+/// 열을 숨긴다. 남는 몇 픽셀은 CSS가 칸을 늘려 채운다(`app.css` `.heatmap`). 격자가 가로
+/// 스크롤하는 좁은 창에서는 기본 날 수를 그대로 둔다. 창 크기가 바뀌면 다시 잰다.
+/// 보간이 없는 컴파일 타임 상수라서 `PreEscaped`로 넣는다(`view::backup`과 같은 규약).
+const HEATMAP_FIT_SCRIPT: &str = r#"
+(function () {
+  var scroll = document.querySelector(".heatmap-scroll");
+  if (!scroll || !window.ResizeObserver) return;
+  var table = scroll.querySelector(".heatmap");
+  var cells = table.querySelectorAll("[data-age]");
+  var heads = table.querySelectorAll("thead th[data-age]");
+  var label = table.querySelector("thead th:first-child");
+  var range = document.getElementById("hm-range");
+  var total = heads.length;
+  var fallback = Number(table.dataset.defaultDays) || total;
+  function fit() {
+    var days = fallback;
+    if (getComputedStyle(scroll).overflowX === "visible") {
+      var rem = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+      var pitch = rem * 1.25 + 3;
+      var room = scroll.clientWidth - label.getBoundingClientRect().width - 6;
+      days = Math.max(7, Math.min(total, Math.floor(room / pitch)));
+    }
+    for (var i = 0; i < cells.length; i++) {
+      cells[i].hidden = Number(cells[i].dataset.age) >= days;
+    }
+    table.classList.add("hm-fit");
+    if (range && total > 0) {
+      range.textContent = heads[total - days].title + " – " + heads[total - 1].title + " UTC";
+    }
+  }
+  fit();
+  new ResizeObserver(fit).observe(scroll);
+})();
+"#;
 
 fn history_row(
     lang: Lang,
@@ -569,7 +626,7 @@ fn history_row(
             tr {
                 th scope="row" class="mono" { (route::scrub(registry, profile)) }
                 @for cell in days {
-                    td class=[today_class(cell.date, today)] { (day_mark(lang, cell)) }
+                    td class=[day_class(cell.date, today)] data-age=(age_of(cell.date, today)) { (day_mark(lang, cell)) }
                 }
             }
         },
@@ -1081,7 +1138,8 @@ mod tests {
             r#"colspan="{WINDOW_DAYS}">No backup list: exit 2"#
         )));
         assert_eq!(
-            html.matches(r#"<td class="hm-today">"#).count(),
+            html.matches(r#"<td class="hm-today" data-age="0">"#)
+                .count(),
             1,
             "오늘 칸은 행마다 하나"
         );
@@ -1101,6 +1159,28 @@ mod tests {
                 "범례에 {level} 누락"
             );
         }
+    }
+
+    /// 서버는 최대 창을 그리고, 기본 창보다 오래된 열은 스크립트가 폭을 재기 전까지 숨긴다.
+    #[test]
+    fn history_panel_renders_the_full_window_and_hides_older_days_by_default() {
+        let html = history_panel(Lang::En, &history_fixture(), &empty_registry()).into_string();
+        assert_eq!(
+            html.matches(r#"<th scope="col" "#).count() as u64,
+            WINDOW_DAYS,
+            "날짜 열 수(속성 없는 Profile 열 머리는 세지 않는다)"
+        );
+        let oldest_default = DEFAULT_VISIBLE_DAYS - 1;
+        assert!(html.contains(&format!(r#"data-age="{oldest_default}" title="#)));
+        assert!(!html.contains(&format!(r#"class="hm-extra" data-age="{oldest_default}""#)));
+        assert!(html.contains(&format!(
+            r#"class="hm-extra" data-age="{DEFAULT_VISIBLE_DAYS}""#
+        )));
+        assert!(html.contains(&format!(r#"data-default-days="{DEFAULT_VISIBLE_DAYS}""#)));
+        assert!(
+            html.contains("new ResizeObserver(fit)"),
+            "폭 맞춤 스크립트 누락"
+        );
     }
 
     /// 이력 패널은 화면 제목 바로 아래, 판정 배너보다 위에 선다.

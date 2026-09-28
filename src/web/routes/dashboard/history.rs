@@ -26,8 +26,16 @@ use crate::web::view::components::Level;
 
 use super::{excerpt, severity};
 
-/// 격자가 보여 주는 날 수(오늘 포함). 주 단위로 반복되는 실패가 네 번 보이는 길이다.
-pub const WINDOW_DAYS: u64 = 30;
+/// 서버가 그리는 최대 날 수(오늘 포함, 9주).
+///
+/// 화면에 실제로 보이는 날 수는 패널 폭에 맞춰 스크립트가 정한다
+/// (`view::dashboard::HEATMAP_FIT_SCRIPT`). 가장 넓은 작업면(82rem)에도 45일 안팎이 들어가므로
+/// 여유를 둔 상한이다. 더 키우면 프로파일 수에 비례해 마크업만 무거워진다.
+pub const WINDOW_DAYS: u64 = 63;
+
+/// 스크립트가 돌지 않거나 좁은 창(가로 스크롤)일 때 보이는 날 수. 주 단위로 반복되는 실패가
+/// 네 번 보이는 길이다.
+pub const DEFAULT_VISIBLE_DAYS: u64 = 30;
 
 /// 날짜가 정해진 결과 하나.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,7 +304,7 @@ mod tests {
     fn window_ends_today_and_spans_the_fixed_length() {
         let days = build_days(day("2026-09-28"), &[], &[]);
         assert_eq!(days.len() as u64, WINDOW_DAYS);
-        assert_eq!(days.first().unwrap().date, day("2026-08-30"));
+        assert_eq!(days.first().unwrap().date, day("2026-07-28"));
         assert_eq!(days.last().unwrap().date, day("2026-09-28"));
         assert!(
             days.iter().all(|d| d.level.is_none()),
@@ -337,7 +345,7 @@ mod tests {
     #[test]
     fn events_outside_the_window_are_dropped() {
         let backups = [
-            event("2026-08-29T12:00:00Z", Level::Ok),
+            event("2026-07-27T12:00:00Z", Level::Ok),
             event("2026-09-29T00:00:00Z", Level::Ok),
         ];
         let days = build_days(day("2026-09-28"), &backups, &[]);
