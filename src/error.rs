@@ -84,6 +84,15 @@ pub enum XBackupError {
 }
 
 impl XBackupError {
+    /// 종류 라벨 없이 **설명 부분만** 돌려준다.
+    ///
+    /// 웹 화면은 종류를 배너 제목(`Could not save the schedule`)과 HTTP 상태로 이미 말한 뒤
+    /// 본문에 설명을 싣는다. `Display`가 라벨을 싣지 않으므로([`Self::kind_label`] 참조) 설명은
+    /// `Display` 그대로다. 본문 안의 콜론(`status: ...`)을 종류 접두로 오인해 자르지 않는다.
+    pub fn detail(&self) -> String {
+        self.to_string()
+    }
+
     /// 에러 종류를 가리키는 짧은 라벨.
     ///
     /// 예전에는 이 라벨이 각 variant의 `#[error("작업 실패: {0}")]`에 박혀 있었다.
@@ -216,6 +225,13 @@ mod tests {
             XBackupError::Warning("heads up".into()).to_string(),
             "heads up"
         );
+    }
+
+    /// 설명 안의 `이름: ` 조각을 종류 접두로 오인해 잘라 내지 않는다.
+    #[test]
+    fn detail_keeps_colon_in_message() {
+        let err = XBackupError::Failure("status: failed to serialize JSON: eof".into());
+        assert_eq!(err.detail(), "status: failed to serialize JSON: eof");
     }
 
     /// 상수 값이 PRD §9 표의 숫자와 일치하는지 고정한다(회귀 방지).

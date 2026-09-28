@@ -33,3 +33,4 @@
 .xbenv-*/
 temp/*
 data/*
+.gstack/

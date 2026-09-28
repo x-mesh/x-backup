@@ -1,0 +1,1535 @@
+/* x-backup 웹 콘솔 스타일시트 — 손으로 쓴 단일 파일(R40: node 툴체인 미도입).
+ *
+ * 컴파일 타임에 `include_str!`로 바이너리에 박힌다(R41). 런타임에 파일을 찾지 않고, 외부
+ * 리소스(웹폰트·CDN)도 없다.
+ *
+ * ==========================================================================
+ * 방향 계약(impeccable direction contract)
+ * ==========================================================================
+ * THESIS: 콘솔은 기록물 보존소의 목록(finding aid)이다. SaaS 대시보드도, 터미널 흉내도
+ *   아니다. 소장 목록은 왼쪽 상자 등(spine)에, 기록은 괘선 친 기록지에, 판정은 도장으로 찍는다.
+ * OWN-WORLD: 보존 상자의 청회색 레일, 서늘한 회색 판지 바탕, 기록지 흰 면, 현재 화면을
+ *   가리키는 마닐라 폴더 탭, 타자 라벨 같은 꼬리표, 대장의 이중 괘선, 녹·황토·빨강·보라
+ *   잉크의 고무 도장. 문장은 시스템 산세리프, 등폭은 식별자·경로·수치에만 쓴다.
+ * STORY: 운영자는 Dashboard에 내려서 도장부터 읽고, 기록 하나로 들어가, 명시적 확인을
+ *   거치는 폼으로 작업한다.
+ * FIRST VIEWPORT: 왼쪽 레일(라벨 카드 + 4개 묶음), 오른쪽에 이중 괘선 아래 화면 제목,
+ *   판정 도장 배너, 요약 띠, 대장형 표.
+ * FORM: 기록물 관리(finding aid·accession register), 자체 후보 목록 6번, seed 8f2202a0.
+ * FINISH: unreviewed and undocumented is unfinished; this build ends with the finish
+ *   review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
+ *
+ * 이전 아이덴티티("터미널 미학", 녹빛 검정·전부 등폭·스캔라인)는 2026-09-28에 폐기했다.
+ *
+ * ==========================================================================
+ * 이 파일의 계약
+ * ==========================================================================
+ * 1. 상태(ok/warn/fail/error)를 색으로 바꾸는 곳은 "레벨 → 잉크" 절 한 군데다. 마크업은
+ *    `data-level`만 싣는다(`src/web/view/components.rs` 헤더). JS도 `data-level`만 바꾼다.
+ * 2. 색은 도장(`.badge`·`.verdict__badge`·`.tag[data-level]`)과 경과 시간에만 칠한다.
+ *    행·배너 전체를 상태색으로 칠하지 않는다 — 수십 행이 칠해지면 어느 것이 신호인지 잃는다.
+ * 3. 선택자 이름(클래스·`data-*`·`id`)은 뷰와 인라인 스크립트가 쓰는 이름 그대로다. 이름을
+ *    바꾸려면 `src/web/view/*.rs`를 함께 바꿔야 한다.
+ */
+
+/* ==========================================================================
+ * 토큰
+ * ========================================================================== */
+
+:root {
+  color-scheme: light;
+
+  /* 보존 상자 판지(레일). 기록지와 대비가 커서 현재 위치가 레일에서 바로 읽힌다. */
+  --c-board: #33424f;
+  --c-board-deep: #27333e;
+  --c-board-ink: #e6ebef;
+  --c-board-muted: #a9b7c3;
+  --c-board-hover: rgba(230, 235, 239, 0.08);
+
+  --c-field: #e8ecef;
+  --c-sheet: #fcfcfb;
+  --c-sheet-2: #f2f4f5;
+  --c-rule: #d3d9de;
+  --c-rule-strong: #aab4bd;
+
+  --c-ink: #1b232b;
+  --c-muted: #56626d;
+  --c-link: #1f4e79;
+  --c-focus: #2463b0;
+
+  /* 마닐라 폴더 — 현재 화면 탭과 텍스트 선택에만 쓴다. */
+  --c-manila: #e6d5a9;
+  --c-manila-ink: #3a2f12;
+
+  /* 도장 잉크. error(점검 자체를 못 했다)는 fail(점검 결과가 안 된다)과 다른 색이어야
+   * 한다 — 운영자가 할 일이 정반대다(`view/components.rs::Level`). */
+  --c-ok: #1e6b40;
+  --c-warn: #8a5800;
+  --c-fail: #b3261e;
+  --c-error: #5b3d99;
+
+  --f-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo",
+    "Noto Sans KR", "Malgun Gothic", system-ui, sans-serif;
+  --f-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
+    "Liberation Mono", monospace;
+
+  --f-size: 14px;
+  --f-size-sm: 12.5px;
+  --f-size-label: 10.5px;
+  --f-line: 1.55;
+  --f-line-dense: 1.4;
+
+  --s-1: 0.25rem;
+  --s-2: 0.5rem;
+  --s-3: 0.75rem;
+  --s-4: 1rem;
+  --s-5: 1.25rem;
+  --s-6: 1.75rem;
+  --s-8: 2.5rem;
+
+  --radius: 4px;
+  --radius-sm: 3px;
+  --shadow-sheet: 0 1px 2px rgba(27, 35, 43, 0.06), 0 2px 6px rgba(27, 35, 43, 0.04);
+  --rail-w: 13.5rem;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* ==========================================================================
+ * 기반 요소
+ * ========================================================================== */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--c-field);
+  scrollbar-color: var(--c-rule-strong) transparent;
+}
+
+body {
+  margin: 0;
+  background: var(--c-field);
+  color: var(--c-ink);
+  font-family: var(--f-ui);
+  font-size: var(--f-size);
+  line-height: var(--f-line);
+  caret-color: var(--c-link);
+  /* 한국어는 어절 단위로 줄을 바꾼다 — 기본값은 "서버/에"처럼 어절 가운데서 꺾는다. 공백
+   * 없는 긴 토큰은 아래 break-word가 받는다. */
+  word-break: keep-all;
+  overflow-wrap: break-word;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: var(--c-manila);
+  color: var(--c-manila-ink);
+}
+
+a {
+  color: var(--c-link);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
+}
+
+a:hover {
+  text-decoration-thickness: 2px;
+}
+
+:focus-visible {
+  outline: 2px solid var(--c-focus);
+  outline-offset: 2px;
+}
+
+code,
+kbd,
+samp,
+pre,
+.mono {
+  font-family: var(--f-mono);
+  font-size: 0.93em;
+}
+
+h3 {
+  margin: var(--s-6) 0 var(--s-2);
+  font-size: 15px;
+  font-weight: 650;
+  line-height: 1.3;
+}
+
+.muted {
+  color: var(--c-muted);
+}
+
+/* 화면에는 없고 스크린리더만 읽는 문구(히트맵 칸 설명 등). */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+ul.plain {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+ul.plain > li + li {
+  margin-top: var(--s-1);
+}
+
+details > summary {
+  cursor: pointer;
+  color: var(--c-link);
+}
+
+/* 스크린리더·키보드 사용자를 위한 본문 바로가기. 초점을 받을 때만 보인다. */
+.skip-link {
+  position: absolute;
+  left: var(--s-3);
+  top: -3rem;
+  z-index: 10;
+  padding: var(--s-2) var(--s-3);
+  background: var(--c-sheet);
+  color: var(--c-ink);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sheet);
+}
+
+.skip-link:focus {
+  top: var(--s-3);
+}
+
+/* ==========================================================================
+ * 껍데기 — 왼쪽 레일(상자 등) + 오른쪽 작업면
+ * ========================================================================== */
+
+.shell {
+  display: grid;
+  grid-template-columns: var(--rail-w) minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.rail {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+  padding: var(--s-5) 0 var(--s-8);
+  background: var(--c-board);
+  color: var(--c-board-ink);
+  scrollbar-color: var(--c-board-muted) transparent;
+}
+
+/* 상자 등에 붙은 타자 라벨 카드. 제품명과 버전이 괘선으로 나뉜다. */
+.rail__mark {
+  display: block;
+  margin: 0 var(--s-4) var(--s-5);
+  padding: var(--s-2) var(--s-3) 0.4rem;
+  background: var(--c-sheet);
+  color: var(--c-ink);
+  text-decoration: none;
+  border-radius: 2px;
+  box-shadow: 0 1px 0 var(--c-board-deep), 0 2px 5px rgba(0, 0, 0, 0.25);
+}
+
+.rail__mark h1 {
+  margin: 0 0 0.3rem;
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid var(--c-rule-strong);
+  font-size: 16px;
+  font-weight: 750;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+}
+
+.rail__ver {
+  display: block;
+  font-family: var(--f-mono);
+  font-size: 11px;
+  color: var(--c-muted);
+}
+
+.rail__group + .rail__group {
+  margin-top: var(--s-5);
+}
+
+.rail__group-label {
+  margin: 0 0 var(--s-1);
+  padding: 0 var(--s-5);
+  font-size: var(--f-size-label);
+  font-weight: 650;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--c-board-muted);
+}
+
+.rail__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.rail__list a {
+  display: block;
+  padding: 0.32rem var(--s-5);
+  color: var(--c-board-ink);
+  text-decoration: none;
+  font-size: 13.5px;
+}
+
+.rail__list a:hover {
+  background: var(--c-board-hover);
+}
+
+/* 현재 화면은 작업면 쪽으로 붙은 마닐라 폴더 탭이다. 색만이 아니라 모양(탭)과 굵기로도
+ * 표시한다 — 색각과 무관하게 읽힌다. */
+.rail__list a[aria-current="page"] {
+  margin-left: var(--s-3);
+  padding-left: calc(var(--s-5) - var(--s-3) + 0.35rem);
+  background: var(--c-manila);
+  color: var(--c-manila-ink);
+  font-weight: 650;
+  /* 앞쪽 모서리를 비스듬히 깎은 폴더 탭 실루엣. 오른쪽은 작업면에 그대로 붙는다. */
+  clip-path: polygon(0.55rem 0, 100% 0, 100% 100%, 0.55rem 100%, 0 70%, 0 30%);
+  box-shadow: inset 0 -1px 0 rgba(58, 47, 18, 0.22);
+}
+
+.stage {
+  min-width: 0;
+  max-width: 82rem;
+  padding: var(--s-6) var(--s-8) var(--s-8);
+}
+
+/* 좁은 창: 레일이 상단 띠로 접히고, 화면 목록은 띠 **안에서만** 가로로 스크롤된다.
+ * 페이지 자체가 옆으로 넘치지 않게 하는 것이 목적이다. */
+@media (max-width: 60rem) {
+  .shell {
+    grid-template-columns: minmax(0, 1fr);
+    /* 남는 높이는 본문 행만 가져간다 — 기본 stretch면 상단 띠도 함께 늘어난다. */
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  /* 화면 목록을 줄바꿈해 전부 보이게 한다 — 가로 스크롤이면 현재 화면 탭이 띠 밖에
+   * 숨는다(14개 중 11개 화면에서 그랬다). 여러 줄이 되므로 상단 고정은 풀고 흘려 둔다. */
+  .rail {
+    position: static;
+    height: auto;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--s-2) var(--s-3);
+    padding: var(--s-2) var(--s-3);
+    overflow: visible;
+  }
+
+  .rail__mark {
+    flex: none;
+    margin: 0;
+    padding: 0.3rem var(--s-2);
+  }
+
+  .rail__mark h1 {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    font-size: 14px;
+  }
+
+  .rail__ver {
+    display: none;
+  }
+
+  .rail__nav,
+  .rail__group,
+  .rail__list {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .rail__group + .rail__group {
+    margin-top: 0;
+    margin-left: var(--s-2);
+    padding-left: var(--s-2);
+    border-left: 1px solid rgba(230, 235, 239, 0.2);
+  }
+
+  .rail__group-label {
+    display: none;
+  }
+
+  .rail__list a,
+  .rail__list a[aria-current="page"] {
+    margin: 0;
+    padding: 0.3rem var(--s-2);
+    white-space: nowrap;
+    border-radius: var(--radius-sm);
+  }
+
+  .stage {
+    padding: var(--s-5) var(--s-4) var(--s-8);
+  }
+}
+
+/* ==========================================================================
+ * 화면 제목 — 대장의 이중 괘선 아래에 앉는다
+ * ========================================================================== */
+
+.page-head {
+  margin-bottom: var(--s-5);
+  padding-bottom: var(--s-3);
+  border-bottom: 3px double var(--c-rule-strong);
+}
+
+.page-title {
+  margin: 0;
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+
+.page-sub {
+  max-width: 76ch;
+  margin: var(--s-1) 0 0;
+  color: var(--c-muted);
+  font-size: 13.5px;
+}
+
+/* ==========================================================================
+ * 레벨 → 잉크: 상태를 색으로 바꾸는 유일한 자리
+ * ========================================================================== */
+
+[data-level="ok"] {
+  --level: var(--c-ok);
+}
+
+[data-level="warn"] {
+  --level: var(--c-warn);
+}
+
+[data-level="fail"] {
+  --level: var(--c-fail);
+}
+
+[data-level="error"] {
+  --level: var(--c-error);
+}
+
+/* 도장 잉크가 번진 옅은 바탕. 표면이 무채색이라 `color-mix`가 탁해지지 않는다. 앞줄은
+ * `color-mix`를 모르는 브라우저의 폴백이다. */
+[data-level] {
+  --level-tint: var(--c-sheet);
+  --level-tint: color-mix(in oklab, var(--level) 8%, var(--c-sheet));
+  --level-line: var(--c-rule-strong);
+  --level-line: color-mix(in oklab, var(--level) 38%, var(--c-sheet));
+}
+
+/* ==========================================================================
+ * 도장 — 상태 라벨. 이 콘솔에서 상태색이 칠해지는 자리다.
+ * ========================================================================== */
+
+.badge,
+.verdict__badge,
+.tag[data-level],
+#monitor-status[data-level] {
+  display: inline-block;
+  min-width: 4.6rem;
+  padding: 0.26rem 0.45rem 0.22rem;
+  border: 1.5px solid var(--level);
+  border-radius: var(--radius-sm);
+  background: var(--level-tint);
+  color: var(--level);
+  font-family: var(--f-ui);
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  line-height: 1.2;
+  text-align: center;
+  text-transform: uppercase;
+  white-space: nowrap;
+  /* 안쪽 가는 괘선 — 고무 도장의 이중 테두리. */
+  box-shadow: inset 0 0 0 1.5px var(--c-sheet), inset 0 0 0 2.5px var(--level-line);
+}
+
+/* 분류 꼬리표(엔진 등). 상태가 아니므로 잉크를 쓰지 않는다 — 타자 라벨 조각이다. */
+.tag {
+  display: inline-block;
+  padding: 0 0.4rem;
+  border: 1px solid var(--c-rule-strong);
+  border-radius: var(--radius-sm);
+  background: var(--c-sheet-2);
+  color: var(--c-muted);
+  font-family: var(--f-mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+
+.counts {
+  color: var(--c-muted);
+  font-size: var(--f-size-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.age {
+  font-family: var(--f-mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 나이는 값 자체가 상태다 — 문제가 있는 나이만 잉크로 적는다. */
+.age[data-level="warn"],
+.age[data-level="fail"],
+.age[data-level="error"] {
+  color: var(--level);
+  font-weight: 650;
+}
+
+/* ==========================================================================
+ * 판정 배너 · 알림
+ * ========================================================================== */
+
+.verdict {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s-3);
+  margin-bottom: var(--s-5);
+  padding: var(--s-3) var(--s-4);
+  background: var(--c-sheet);
+  border: 1px solid var(--c-rule);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sheet);
+}
+
+.verdict__badge {
+  flex: none;
+  margin-top: 0.1rem;
+  animation: stamp-press 260ms var(--ease-out) both;
+}
+
+.verdict__text {
+  min-width: 0;
+}
+
+.verdict__headline {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+  line-height: 1.4;
+}
+
+.verdict__detail {
+  max-width: 90ch;
+  margin: var(--s-1) 0 0;
+  color: var(--c-muted);
+  font-size: 13px;
+}
+
+/* config 문법 배너(v1/v2)는 성공·실패가 아니다 — 잉크 대신 링크색 꼬리표로 표시한다. */
+.verdict[data-syntax] {
+  border-color: var(--c-rule);
+}
+
+.verdict[data-syntax] .verdict__badge {
+  --level: var(--c-link);
+  --level-tint: var(--c-sheet-2);
+  --level-line: var(--c-rule-strong);
+  animation: none;
+}
+
+/* 판정이 찍히는 순간 — 이 콘솔의 유일한 모션. 이미 보이는 상태에서 눌려 자리를 잡는다. */
+@keyframes stamp-press {
+  from {
+    transform: scale(1.14) rotate(-3deg);
+  }
+  to {
+    transform: none;
+  }
+}
+
+/* 알림은 판정이 아니라 안내다 — 계약 2조대로 바탕·제목을 잉크로 칠하지 않고, 테두리에만
+ * 레벨의 옅은 선을 남긴다. */
+.notice {
+  margin-bottom: var(--s-5);
+  padding: var(--s-3) var(--s-4);
+  background: var(--c-sheet);
+  border: 1px solid var(--level-line, var(--c-rule));
+  border-radius: var(--radius);
+}
+
+.notice__title {
+  margin: 0 0 var(--s-1);
+  color: var(--c-ink);
+  font-weight: 650;
+}
+
+.notice__body {
+  font-size: 13px;
+}
+
+.notice__body p {
+  margin: 0 0 var(--s-2);
+}
+
+.notice__body p:last-child {
+  margin-bottom: 0;
+}
+
+/* ==========================================================================
+ * 요약 띠(메타 목록) — 라벨 위, 값 아래로 가로로 늘어선다
+ * ========================================================================== */
+
+.meta {
+  display: grid;
+  grid-auto-flow: column;
+  grid-template-rows: auto auto;
+  grid-auto-columns: max-content;
+  column-gap: var(--s-6);
+  row-gap: 0.1rem;
+  margin: 0 0 var(--s-5);
+  padding: var(--s-3) var(--s-4);
+  overflow-x: auto;
+  background: var(--c-sheet);
+  border: 1px solid var(--c-rule);
+  border-radius: var(--radius);
+}
+
+.meta__k {
+  color: var(--c-muted);
+  font-size: var(--f-size-label);
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.meta__v {
+  margin: 0;
+  font-family: var(--f-mono);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 패널 안의 메타는 세로 목록이다 — 값이 긴 경로·URI라 가로 띠에 들어가지 않는다. */
+.panel .meta,
+.card .meta {
+  grid-auto-flow: row;
+  grid-template-rows: none;
+  grid-template-columns: max-content minmax(0, 1fr);
+  column-gap: var(--s-4);
+  row-gap: 0.2rem;
+  padding: 0;
+  overflow: visible;
+  background: none;
+  border: 0;
+  border-radius: 0;
+}
+
+.panel .meta__k,
+.card .meta__k {
+  font-size: var(--f-size-sm);
+  font-family: var(--f-mono);
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.panel .meta__v,
+.card .meta__v {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* ==========================================================================
+ * 기록지 — 패널·카드
+ * ========================================================================== */
+
+.panel,
+.card {
+  margin-bottom: var(--s-5);
+  background: var(--c-sheet);
+  border: 1px solid var(--c-rule);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sheet);
+}
+
+.card {
+  padding: var(--s-4) var(--s-5);
+}
+
+.card > :first-child {
+  margin-top: 0;
+}
+
+.card > :last-child {
+  margin-bottom: 0;
+}
+
+/* 로그인 카드는 폼 하나만 담는다 — 본문 폭 전체로 늘리지 않는다. */
+.card:has(> form[action="/login"]) {
+  max-width: 34rem;
+}
+
+form[action="/login"] {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s-2) var(--s-3);
+}
+
+form[action="/login"] > label {
+  flex-basis: 100%;
+  font-weight: 650;
+}
+
+form[action="/login"] > br {
+  display: none;
+}
+
+form[action="/login"] > input {
+  flex: 1 1 14rem;
+}
+
+.panel {
+  overflow: hidden;
+}
+
+.panel__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s-2) var(--s-3);
+  padding: 0.6rem var(--s-4);
+  background: var(--c-sheet-2);
+  border-bottom: 1px solid var(--c-rule);
+}
+
+.panel__title {
+  margin: 0;
+  font-size: 14.5px;
+  font-weight: 700;
+  letter-spacing: -0.005em;
+}
+
+/* 제목줄의 상태 도장은 오른쪽 끝으로 — 패널을 여러 장 훑을 때 도장이 한 열에 선다. */
+.panel__head .badge {
+  margin-left: auto;
+}
+
+.panel__body {
+  padding: var(--s-4);
+}
+
+.panel__body > :first-child {
+  margin-top: 0;
+}
+
+.panel__body > :last-child {
+  margin-bottom: 0;
+}
+
+/* 표는 기록지 가장자리까지 닿는다 — 본문 여백을 표만 되돌려 쓴다. */
+.panel__body > .dtable-scroll,
+.panel__body > table {
+  width: calc(100% + 2 * var(--s-4));
+  margin-left: calc(-1 * var(--s-4));
+  margin-right: calc(-1 * var(--s-4));
+}
+
+.panel__body > .dtable-scroll:first-child,
+.panel__body > table:first-child {
+  margin-top: calc(-1 * var(--s-4));
+}
+
+.panel__body > .dtable-scroll:last-child,
+.panel__body > table:last-child {
+  margin-bottom: calc(-1 * var(--s-4));
+}
+
+/* ==========================================================================
+ * 대장 — 데이터 표
+ * ========================================================================== */
+
+/* 표만 따로 가로 스크롤한다 — 긴 메시지 하나가 페이지 전체를 흔들지 않게. */
+.dtable-scroll {
+  overflow-x: auto;
+  margin-bottom: var(--s-5);
+  background: var(--c-sheet);
+  border: 1px solid var(--c-rule);
+  border-radius: var(--radius);
+}
+
+.panel__body > .dtable-scroll {
+  border: 0;
+  border-radius: 0;
+}
+
+/* 스크롤 감싸개 없이 놓인 대장(Monitor)도 기록지 위에 선다. 좁은 창에서는 표 자신이
+ * 가로 스크롤을 맡는다 — 페이지가 옆으로 넘치지 않게. */
+:not(.dtable-scroll):not(.panel__body) > table.dtable {
+  margin-bottom: var(--s-3);
+  background: var(--c-sheet);
+  border: 1px solid var(--c-rule);
+  border-radius: var(--radius);
+}
+
+@media (max-width: 48rem) {
+  :not(.dtable-scroll):not(.panel__body) > table.dtable {
+    display: block;
+    overflow-x: auto;
+  }
+
+  /* 블록이 된 표는 칸 폭을 좁혀 맞추려 든다 — 짧은 한국어 값이 한 글자씩 꺾이지 않게. */
+  :not(.dtable-scroll):not(.panel__body) > table.dtable :is(th, td) {
+    white-space: nowrap;
+  }
+}
+
+.dtable,
+table.grid {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 13px;
+  line-height: var(--f-line-dense);
+  font-variant-numeric: tabular-nums;
+}
+
+.dtable th,
+.dtable td,
+table.grid th,
+table.grid td {
+  padding: 0.55rem var(--s-3);
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--c-rule);
+}
+
+.dtable thead th,
+table.grid thead th,
+table.grid tr > th:only-child {
+  background: var(--c-sheet-2);
+  /* 화면 제목 아래와 같은 대장의 이중 괘선. */
+  border-bottom: 3px double var(--c-rule-strong);
+  color: var(--c-muted);
+  font-size: var(--f-size-label);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+/* 행 머리(tbody 안의 th)는 키 이름이다. */
+.dtable tbody th,
+table.grid tbody th {
+  font-weight: 600;
+}
+
+.dtable tbody tr:hover > *,
+table.grid tbody tr:hover > * {
+  background: var(--c-sheet-2);
+}
+
+.dtable tbody tr:last-child > *,
+table.grid tbody tr:last-child > * {
+  border-bottom: 0;
+}
+
+/* 첫 열은 상태 도장 열이다 — 모든 대장에서 같은 폭으로 서서, 표를 넘나들어도 그 오른쪽
+ * 열이 같은 자리에서 시작한다. */
+.dtable th:first-child,
+.dtable td:first-child {
+  width: 1px;
+  white-space: nowrap;
+}
+
+/* 설명 문단이 든 칸(연결 오류·destination 상태)에서 공백 없는 경로가 칸의 최소 폭을
+ * 키우지 않게 한다. 그래야 표 자동 폭 계산이 긴 글이 든 열에 폭을 몰아준다 — 경로가 최소
+ * 폭을 차지하면 옆의 연결 오류 열이 한 단어씩 꺾였다(Dashboard에서 실제로 12줄이 됐다). */
+.dtable td:not(:first-child):not(.num):has(> p, > div) {
+  overflow-wrap: anywhere;
+}
+
+.dtable .key {
+  width: 10rem;
+  white-space: nowrap;
+}
+
+.dtable .num {
+  text-align: right;
+  font-family: var(--f-mono);
+  white-space: nowrap;
+}
+
+.dtable .msg {
+  min-width: 18rem;
+  overflow-wrap: anywhere;
+}
+
+.dtable td p {
+  margin: 0.2rem 0 0;
+}
+
+/* 캡션은 기록지 안의 절 제목이다(Config의 "시크릿 참조"·"백업 위치"). */
+table caption {
+  padding: var(--s-4) var(--s-3) var(--s-2);
+  caption-side: top;
+  text-align: left;
+  color: var(--c-ink);
+  font-size: 13.5px;
+  font-weight: 650;
+}
+
+/* ==========================================================================
+ * 라이브 모니터 델타
+ * ========================================================================== */
+
+/* 값 옆의 변화량. 증가·감소를 다른 색으로 나누지 않는다 — 어느 쪽이 좋은 일인지는 화면이
+ * 알 수 없다. 색은 "여기가 움직였다"만 말하고, 방향은 부호가 말한다. */
+.monitor-delta {
+  margin-left: 0.3em;
+  font-size: 0.85em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  color: var(--delta, var(--c-muted));
+}
+
+[data-delta="up"],
+[data-delta="down"] {
+  --delta: var(--c-ink);
+  font-weight: 650;
+}
+
+[data-delta="same"],
+[data-delta="none"] {
+  --delta: var(--c-muted);
+}
+
+/* ==========================================================================
+ * 백업 이력 격자(Dashboard) — 계약 2조의 명시적 예외
+ *
+ * 히트맵은 칸 면을 채워야 읽힌다. 그래서 이 절만 칸 면을 잉크로 칠한다. 대신 색 없이도
+ * 읽히게 레벨마다 모양이 다르다: ok 옅은 면, warn 대각선 반쪽, fail 진한 면 + 빗금,
+ * error 진한 면 + 점, 기록 없음 점선 빈 칸. 기록 없음은 실패와 절대 같은 모양이 아니다.
+ * ========================================================================== */
+
+/* 넓은 창에서는 격자가 패널 안에 들어가므로 잘라낼 것이 없다 — 잘림을 풀어 칸 위에 뜨는
+ * 툴팁이 패널 밖으로 나올 수 있게 한다. 제목줄 배경이 둥근 모서리를 넘지 않게 맞춘다. */
+.panel:has(.heatmap) {
+  overflow: visible;
+}
+
+.panel:has(.heatmap) > .panel__head {
+  border-radius: var(--radius) var(--radius) 0 0;
+}
+
+/* 좁은 창에서는 가로 스크롤이 오늘(오른쪽 끝)에서 시작하게 한다 — 가장 먼저 봐야 할 것이
+ * 최근 날짜다. 표 안의 글자 방향은 되돌린다. 스크롤 영역은 툴팁도 잘라내므로 위에 자리를 둔다. */
+@media (max-width: 48rem) {
+  .heatmap-scroll {
+    overflow-x: auto;
+    padding-top: 1.75rem;
+    direction: rtl;
+  }
+
+  .heatmap {
+    direction: ltr;
+  }
+
+  /* 스크롤해도 어느 프로파일의 줄인지 보이게 이름 열을 왼쪽에 붙인다. */
+  .heatmap th[scope="row"],
+  .heatmap th[scope="col"]:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    max-width: 8.5rem;
+    background: var(--c-sheet);
+  }
+}
+
+/* 격자는 패널 폭을 꽉 채운다. 보일 날 수는 스크립트가 폭에 맞춰 고르고
+ * (`view::dashboard::HEATMAP_FIT_SCRIPT`), 남는 몇 픽셀은 날짜 칸이 나눠 가진다. 이름 열은
+ * 내용 폭(1%)으로 두어 남는 폭을 가져가지 않게 한다. */
+.heatmap {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 3px;
+  font-size: 12px;
+}
+
+/* 스크립트가 폭을 재기 전(또는 스크립트가 없을 때)에는 기본 창만 보인다. */
+.heatmap:not(.hm-fit) .hm-extra {
+  display: none;
+}
+
+.heatmap th[scope="col"] {
+  min-width: 1.25rem;
+  padding: 0 0 var(--s-1);
+  color: var(--c-muted);
+  font-family: var(--f-mono);
+  font-size: var(--f-size-label);
+  font-weight: 600;
+  text-align: center;
+}
+
+.heatmap th[scope="col"]:first-child {
+  width: 1%;
+  padding-right: var(--s-3);
+  font-family: var(--f-ui);
+  letter-spacing: 0.08em;
+  text-align: left;
+  text-transform: uppercase;
+}
+
+.heatmap th[scope="row"] {
+  max-width: 14rem;
+  padding: 0 var(--s-3) 0 0;
+  overflow: hidden;
+  font-size: 12.5px;
+  font-weight: 400;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.heatmap td {
+  padding: 0;
+}
+
+.heatmap th.hm-today {
+  color: var(--c-ink);
+}
+
+.heatmap__reason {
+  padding: 0.15rem var(--s-2);
+  font-size: var(--f-size-sm);
+}
+
+.hm {
+  /* 칸 안의 스크린리더 문구(absolute)가 스크롤 영역 밖 문서 폭을 늘리지 않게 기준을 잡는다. */
+  position: relative;
+  display: block;
+  min-width: 1.25rem;
+  height: 1.25rem;
+  border: 1.5px solid var(--level, var(--c-rule-strong));
+  border-radius: var(--radius-sm);
+  background: var(--level-tint, transparent);
+}
+
+.hm-legend .hm {
+  display: inline-block;
+  min-width: 0;
+  width: 0.95rem;
+  height: 0.95rem;
+  vertical-align: -0.15em;
+}
+
+.hm[data-level="ok"] {
+  background: color-mix(in oklab, var(--level) 30%, var(--c-sheet));
+}
+
+.hm[data-level="warn"] {
+  background: linear-gradient(
+    135deg,
+    var(--level) 0 50%,
+    color-mix(in oklab, var(--level) 14%, var(--c-sheet)) 50% 100%
+  );
+}
+
+.hm[data-level="fail"] {
+  background: repeating-linear-gradient(
+      45deg,
+      rgba(255, 255, 255, 0.4) 0 1.5px,
+      transparent 1.5px 4.5px
+    ),
+    var(--level);
+}
+
+.hm[data-level="error"] {
+  background: radial-gradient(circle, rgba(255, 255, 255, 0.75) 0 1.6px, transparent 1.9px) 0 0 / 6px 6px,
+    var(--level);
+}
+
+.hm--none {
+  border: 1px dashed var(--c-rule-strong);
+  background: transparent;
+}
+
+/* hover 툴팁 — 날짜를 첫 줄에, 요약을 둘째 줄에. 격자를 훑는 동안 바로 떠야 하므로 지연과
+ * 모션을 두지 않는다. 격자 양 끝 칸은 툴팁을 안쪽으로 붙여 화면 밖으로 나가지 않게 한다. */
+.hm[data-date]:hover {
+  box-shadow: 0 0 0 2px var(--c-ink);
+}
+
+.hm[data-date]:hover::after {
+  content: attr(data-date) "\A" attr(data-summary);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  z-index: 4;
+  transform: translateX(-50%);
+  padding: 0.3rem 0.55rem;
+  background: var(--c-board-deep);
+  color: var(--c-board-ink);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 2px 8px rgba(27, 35, 43, 0.28);
+  font-family: var(--f-mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+  text-align: left;
+  white-space: pre;
+  pointer-events: none;
+}
+
+.heatmap td:nth-child(-n + 7) .hm:hover::after {
+  left: 0;
+  transform: none;
+}
+
+.heatmap td:nth-last-child(-n + 6) .hm:hover::after {
+  left: auto;
+  right: 0;
+  transform: none;
+}
+
+/* 오늘 칸 — 아직 끝나지 않은 날이다. 도장 잉크가 아니라 먹선 테두리로 가른다. */
+td.hm-today .hm {
+  outline: 1.5px solid var(--c-ink);
+  outline-offset: 1.5px;
+}
+
+.hm-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2) var(--s-5);
+  margin: var(--s-3) 0 var(--s-2);
+  padding: 0;
+  list-style: none;
+  color: var(--c-muted);
+  font-size: var(--f-size-sm);
+}
+
+.hm-legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+/* ==========================================================================
+ * 로그 덤프
+ * ========================================================================== */
+
+.logdump {
+  margin: 0;
+  max-height: 22rem;
+  overflow-y: auto;
+  padding: var(--s-3) var(--s-4);
+  background: var(--c-sheet-2);
+  border: 1px solid var(--c-rule);
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ==========================================================================
+ * 폼 컨트롤 — 한 가지 상태 문법(기본·hover·누름·비활성·초점)을 모든 화면이 공유한다
+ * ========================================================================== */
+
+input:not([type="checkbox"]):not([type="radio"]):not([type="hidden"]),
+select,
+textarea {
+  width: 100%;
+  max-width: 32rem;
+  min-height: 2.15rem;
+  padding: 0.4rem 0.6rem;
+  background: #fff;
+  color: var(--c-ink);
+  border: 1px solid var(--c-rule-strong);
+  border-radius: var(--radius);
+  font-family: var(--f-mono);
+  font-size: 13px;
+  box-shadow: inset 0 1px 1px rgba(27, 35, 43, 0.05);
+}
+
+/* 선택지에는 "(기본 프로파일)" 같은 설명 문장이 섞인다 — 등폭은 직접 입력하는 식별자에만. */
+select {
+  font-family: var(--f-ui);
+}
+
+input:not([type="checkbox"]):not([type="radio"]):hover,
+select:hover,
+textarea:hover {
+  border-color: var(--c-muted);
+}
+
+input:not([type="checkbox"]):not([type="radio"]):focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--c-focus) 35%, transparent);
+  outline-offset: 0;
+  border-color: var(--c-focus);
+}
+
+input:disabled,
+select:disabled,
+textarea:disabled {
+  background: var(--c-sheet-2);
+  color: var(--c-muted);
+  cursor: not-allowed;
+}
+
+input[type="checkbox"],
+input[type="radio"] {
+  width: 1rem;
+  height: 1rem;
+  margin: 0;
+  accent-color: var(--c-board);
+}
+
+button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 2.15rem;
+  padding: 0.45rem 1rem;
+  background: var(--c-board);
+  color: #fff;
+  border: 1px solid var(--c-board-deep);
+  border-radius: var(--radius);
+  font-family: var(--f-ui);
+  font-size: 13.5px;
+  font-weight: 650;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(27, 35, 43, 0.18);
+  transition: background-color 120ms var(--ease-out), transform 120ms var(--ease-out);
+}
+
+button:hover {
+  background: var(--c-board-deep);
+}
+
+button:active {
+  transform: translateY(1px);
+  box-shadow: none;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* 실행 중인 잡 취소 — 되돌릴 수 없는 동작이라 기본 버튼과 모양을 가른다. */
+form[action$="/cancel"] button {
+  background: var(--c-sheet);
+  color: var(--c-fail);
+  border-color: var(--c-fail);
+}
+
+form[action$="/cancel"] button:hover {
+  background: color-mix(in oklab, var(--c-fail) 8%, var(--c-sheet));
+}
+
+progress {
+  display: block;
+  width: 100%;
+  max-width: 40rem;
+  height: 0.5rem;
+  margin: var(--s-2) 0 var(--s-3);
+  appearance: none;
+  background: var(--c-rule);
+  border: 0;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+progress::-webkit-progress-bar {
+  background: var(--c-rule);
+}
+
+progress::-webkit-progress-value {
+  background: var(--c-board);
+}
+
+progress::-moz-progress-bar {
+  background: var(--c-board);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s-3);
+  margin: var(--s-4) 0 0;
+}
+
+/* ==========================================================================
+ * 입력 행 — 라벨 · 컨트롤, 도움말은 컨트롤 아래
+ * ========================================================================== */
+
+.field {
+  display: grid;
+  grid-template-columns: 11rem minmax(0, 32rem);
+  column-gap: var(--s-5);
+  row-gap: 0.3rem;
+  align-items: center;
+  padding: var(--s-3) 0;
+  border-bottom: 1px solid var(--c-rule);
+}
+
+.field:first-child {
+  padding-top: 0;
+}
+
+.field__label {
+  color: var(--c-ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* 체크박스 행: 라벨이 컨트롤 자리에 선다 — 입력칸들과 같은 세로줄에 맞춘다. */
+.field > label:not(.field__label) {
+  grid-column: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  font-family: var(--f-mono);
+  font-size: 13px;
+}
+
+.field__hint,
+.field__warn,
+.field__clear {
+  grid-column: 2;
+  margin: 0;
+  font-size: var(--f-size-sm);
+}
+
+.field__hint {
+  color: var(--c-muted);
+}
+
+.field__warn {
+  color: var(--c-warn);
+}
+
+.field__value {
+  margin: 0;
+  color: var(--c-muted);
+  overflow-wrap: anywhere;
+}
+
+/* config 필드는 4칸이다: 키 · 출처 · 현재 실효값 · 입력. */
+.field[data-origin] {
+  grid-template-columns: 13rem 9rem minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.field[data-origin] > .field__hint,
+.field[data-origin] > .field__warn,
+.field[data-origin] > .field__clear {
+  grid-column: 3 / -1;
+}
+
+/* 출처는 상태가 아니다 — 잉크 대신 대비로만 가른다. 이 프로파일에 직접 적은 값만 세운다. */
+.field__origin {
+  color: var(--c-muted);
+  font-size: var(--f-size-sm);
+  overflow-wrap: anywhere;
+}
+
+.field__origin[data-origin="direct"] {
+  color: var(--c-ink);
+  font-weight: 600;
+}
+
+.field[data-origin="defaults"] .field__label,
+.field[data-origin="inherited"] .field__label,
+.field[data-origin="builtin"] .field__label {
+  color: var(--c-muted);
+  font-weight: 400;
+}
+
+.cfg-form {
+  display: grid;
+}
+
+/* GET 폼은 조회 필터다 — 기록지 한 장 위에 가로로 늘어놓는다. */
+form[method="get"].cfg-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--s-3) var(--s-5);
+  margin-bottom: var(--s-5);
+  padding: var(--s-3) var(--s-4);
+  background: var(--c-sheet);
+  border: 1px solid var(--c-rule);
+  border-radius: var(--radius);
+}
+
+form[method="get"].cfg-form .field {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.3rem;
+  padding: 0;
+  border: 0;
+}
+
+form[method="get"].cfg-form .field__label {
+  color: var(--c-muted);
+  font-family: var(--f-ui);
+  font-size: var(--f-size-label);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+form[method="get"].cfg-form .field__hint {
+  max-width: 16rem;
+}
+
+form[method="get"].cfg-form select,
+form[method="get"].cfg-form input:not([type="checkbox"]) {
+  width: auto;
+  min-width: 9rem;
+}
+
+form[method="get"].cfg-form .actions {
+  margin: 0;
+}
+
+@media (max-width: 48rem) {
+  .field,
+  .field[data-origin] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .field > label:not(.field__label),
+  .field__hint,
+  .field__warn,
+  .field__clear,
+  .field[data-origin] > .field__hint,
+  .field[data-origin] > .field__warn,
+  .field[data-origin] > .field__clear {
+    grid-column: 1;
+  }
+
+  .stage .page-title {
+    font-size: 21px;
+  }
+
+  /* 좁은 창의 요약 띠는 가로 스크롤 안에 값을 숨긴다 — 키·값 세로 목록으로 편다. */
+  .meta {
+    grid-auto-flow: row;
+    grid-template-rows: none;
+    grid-template-columns: max-content minmax(0, 1fr);
+    column-gap: var(--s-4);
+    row-gap: 0.2rem;
+    overflow: visible;
+  }
+
+  .meta__v {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+}
+
+/* ==========================================================================
+ * Peek — 문서 표본
+ * ========================================================================== */
+
+.peek-doclist {
+  display: grid;
+  gap: var(--s-3);
+}
+
+.peek-doc-card {
+  padding: var(--s-3) var(--s-4);
+  background: var(--c-sheet);
+  border: 1px solid var(--c-rule);
+  border-radius: var(--radius);
+}
+
+.peek-doc-index {
+  margin: 0 0 var(--s-2);
+  font-size: var(--f-size-sm);
+}
+
+.peek-doc,
+.peek-shape-obj {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 0.2rem var(--s-4);
+  margin: 0;
+  font-size: 13px;
+}
+
+.peek-doc > dt,
+.peek-shape-obj > dt {
+  color: var(--c-muted);
+  font-family: var(--f-mono);
+}
+
+.peek-doc > dd,
+.peek-shape-obj > dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/* 중첩 문서는 들여 쓴 괘선으로 깊이를 보여 준다. */
+.peek-doc dd > .peek-doc,
+.peek-shape-obj dd > .peek-shape-obj {
+  padding-left: var(--s-3);
+  border-left: 1px solid var(--c-rule);
+}
+
+.peek-val,
+.peek-shape {
+  font-family: var(--f-mono);
+}
+
+.peek-shape {
+  color: var(--c-link);
+}
+
+.peek-array {
+  margin: 0;
+  padding-left: 1.1rem;
+}
+
+.peek-trunc,
+.peek-note {
+  font-size: var(--f-size-sm);
+}
+
+.peek-trunc {
+  color: var(--level, var(--c-warn));
+}
+
+/* ==========================================================================
+ * 모션 줄이기 — 아이덴티티보다 우선한다
+ * ========================================================================== */
+
+@media (prefers-reduced-motion: reduce) {
+  .verdict__badge {
+    animation: none;
+  }
+
+  button {
+    transition: none;
+  }
+}

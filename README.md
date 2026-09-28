@@ -726,6 +726,7 @@ The docs are written in Korean.
 |------|------|
 | [docs/postgres.md](docs/postgres.md) | PostgreSQL engine deep-dive (logical decoding, PITR, schema fidelity) |
 | [docs/mysql.md](docs/mysql.md) | MySQL engine deep-dive (schema fidelity, binlog internals, PITR, dev/CI) |
+| [docs/web-console.ko.md](docs/web-console.ko.md) | Running the web console (`serve`) — systemd unit, binding, auth, age key permissions, audit log, TLS via reverse proxy |
 | [docs/control-server.ko.md](docs/control-server.ko.md) | Central control-server operation (many DBs, one config) — see [examples/control-server.toml](examples/control-server.toml) |
 | [docs/PRD.md](docs/PRD.md) | Product requirements (FR-1–12, incremental design, encryption design) |
 | [docs/prd/](docs/prd/) | Per-feature PRDs (WAL physical PITR, recovery-window retention, RPO status, hooks, standby backup) |

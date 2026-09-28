@@ -721,6 +721,7 @@ gap 가드가 동작하는 것이지 오류가 아니다. churn으로 데이터�
 |------|------|
 | [docs/postgres.md](docs/postgres.md) | PostgreSQL 엔진 상세(logical decoding·PITR·스키마 충실도) |
 | [docs/mysql.md](docs/mysql.md) | MySQL 엔진 상세(스키마 충실도·binlog 내부 구조·PITR·개발/CI) |
+| [docs/web-console.ko.md](docs/web-console.ko.md) | 웹 운영 콘솔(`serve`) 운영 — systemd 유닛·바인딩·인증·age 키 권한·감사 로그·TLS 리버스 프록시 위임 |
 | [docs/control-server.ko.md](docs/control-server.ko.md) | 중앙 control 서버 운영(다중 DB 백업·복구·마이그레이션) — 예시: [examples/control-server.toml](examples/control-server.toml) |
 | [docs/PRD.md](docs/PRD.md) | 제품 요구사항(FR-1~12, 증분 설계, 암호화 설계) |
 | [docs/prd/](docs/prd/) | 기능별 PRD(WAL 물리 PITR·recovery window retention·RPO status·hooks·standby 백업) |
