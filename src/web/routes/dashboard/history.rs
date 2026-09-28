@@ -141,18 +141,24 @@ pub fn manifest_events(entries: &[CatalogEntry]) -> (Vec<Event>, usize) {
 /// 잡 이력에서 이 프로파일의 **성공하지 못한** backup 잡만 고른다.
 ///
 /// 성공한 잡은 넣지 않는다 — 그 백업은 manifest로 이미 격자에 있고, 넣으면 같은 백업이 두 번
-/// 세어진다. 아직 끝나지 않은 잡도 넣지 않는다(결과가 없다).
+/// 세어진다. 경고가 붙은 성공(`succeeded-with-warnings`, exit 4)도 manifest를 남긴 성공이라
+/// 넣지 않는다(넣으면 툴팁이 성공을 "실패한 실행"으로 센다). 아직 끝나지 않은 잡도 넣지
+/// 않는다(결과가 없다).
 pub fn failed_run_events(jobs: &[JobSummary], profile: &str) -> Vec<Event> {
     let backup = JobCommand::Backup.verb();
     jobs.iter()
         .filter(|job| job.command == backup && job.profile.as_deref() == Some(profile))
         .filter_map(|job| {
             let at = job.finished_at?;
-            let level = job_exit::level_for_label(job.outcome.as_deref()?);
-            (level != Level::Ok).then_some(Event { at, level })
+            let label = job.outcome.as_deref()?;
+            let level = job_exit::level_for_label(label);
+            (level != Level::Ok && label != SUCCEEDED_WITH_WARNINGS).then_some(Event { at, level })
         })
         .collect()
 }
+
+/// 경고가 붙은 성공의 결과 라벨([`crate::web::job::JobOutcome::label`] 어휘).
+const SUCCEEDED_WITH_WARNINGS: &str = "succeeded-with-warnings";
 
 /// 결과들을 `today`로 끝나는 [`WINDOW_DAYS`]칸으로 접는다. 창 밖의 결과는 버린다.
 pub fn build_days(today: NaiveDate, backups: &[Event], failed_runs: &[Event]) -> Vec<DayCell> {
@@ -382,6 +388,12 @@ mod tests {
                 "prod",
                 Some("succeeded"),
                 Some("2026-09-28T03:00:00Z"),
+            ),
+            job(
+                "backup",
+                "prod",
+                Some("succeeded-with-warnings"),
+                Some("2026-09-28T03:30:00Z"),
             ),
             job("backup", "prod", None, None),
             job(
