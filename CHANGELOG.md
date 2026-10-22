@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-22
+
+### Added
+
+- A file backup engine. A `file://` source is packed as a tar stream and goes through the
+  same compress, encrypt and store pipeline as a database backup.
+- Incremental file backups. A snapshot index records each run; the next run stores the
+  changed files plus a tombstone list for deleted paths. `restore --id <incremental>`
+  replays the chain in order and needs `verify --chain` to pass. If the head index is
+  lost, the run is promoted to a full backup and exits with code 4.
+- `x-backup daemon`: a foreground scheduler that runs `backup` for each profile that sets
+  `schedule` (five-field cron, local time zone). `--dry-run` (with `--json`) prints the next
+  fire times, and `--print-systemd` prints a unit file. A failed run is logged and
+  reported, and the loop continues. A run missed while the daemon was down is not made up.
+- Webhook notifications. `notify.webhook_url_env` names the environment variable that
+  holds the URL, so the URL is never stored in the config.
+
+### Changed
+
+- PITR replays the MongoDB oplog through the driver (`applyOps`). `restore --at` no longer
+  needs `mongorestore`.
+- The `mongodump` engine is now behind the `legacy-mongodump` Cargo feature. A default
+  build has no code that starts `mongodump` or `mongorestore`, `engine = "mongodump"` is
+  a configuration error, and a backup in the mongodump archive format restores only with a
+  build that enables the feature.
+- `x-backup update` on a Homebrew install prints the `brew upgrade` command and does not
+  run it. The token lookup reads `GITHUB_TOKEN` and `GH_TOKEN` only; it no longer calls
+  `gh auth token`.
+- The CI no-subprocess guard allows process spawning in the web console and the lifecycle
+  hooks, which start processes by design. It still blocks new spawn points elsewhere.
+- Engine detection is now one function (`DbKind::from_archive_format`), and the full
+  backup paths share one storage core.
+
 ## [0.4.0] - 2026-09-28
 
 ### Added
@@ -168,6 +201,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - README defaults to English; Korean documentation split into `README.ko.md`.
 
+[0.5.0]: https://github.com/x-mesh/x-backup/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/x-mesh/x-backup/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/x-mesh/x-backup/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/x-mesh/x-backup/compare/v0.1.0...v0.2.0
