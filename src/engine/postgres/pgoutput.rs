@@ -129,7 +129,8 @@ impl Decoder {
                     tag // 이미 'N'
                 };
                 if tag != b'N' {
-                    return Err(XBackupError::Failure(format!(
+                    return Err(XBackupError::Failure(crate::tr!(
+                        "pgoutput UPDATE: unexpected tuple tag {}",
                         "pgoutput UPDATE: 예기치 못한 튜플 태그 {}",
                         tag as char
                     )));
@@ -164,7 +165,8 @@ impl Decoder {
 
     fn rel(&self, rel_id: i32) -> Result<&RelMeta> {
         self.rels.get(&rel_id).ok_or_else(|| {
-            XBackupError::Failure(format!(
+            XBackupError::Failure(crate::tr!(
+                "pgoutput: no metadata for rel_id {rel_id} (missing Relation message)",
                 "pgoutput: rel_id {rel_id} 메타 없음(Relation 누락)"
             ))
         })
@@ -204,7 +206,10 @@ impl<'a> Cur<'a> {
     }
     fn need(&self, n: usize) -> Result<()> {
         if self.i + n > self.b.len() {
-            return Err(XBackupError::Failure("pgoutput 메시지가 잘렸습니다".into()));
+            return Err(XBackupError::Failure(crate::tr!(
+                "the pgoutput message was truncated",
+                "pgoutput 메시지가 잘렸습니다"
+            )));
         }
         Ok(())
     }
@@ -275,7 +280,8 @@ impl<'a> Cur<'a> {
                     unchanged.push(false);
                 }
                 other => {
-                    return Err(XBackupError::Failure(format!(
+                    return Err(XBackupError::Failure(crate::tr!(
+                        "pgoutput tuple: unknown column kind {}",
                         "pgoutput tuple: 알 수 없는 컬럼 종류 {}",
                         other as char
                     )))

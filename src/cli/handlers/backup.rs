@@ -19,6 +19,7 @@ use crate::config::ResolvedConfig;
 use crate::crypto::build_encrypt_stage;
 use crate::engine::mongo::status::{human_bytes, CheckStatus, StatusChecker};
 use crate::error::{Result, XBackupError};
+use crate::hooks::{HookContext, HookEvent, HookSet};
 use crate::i18n::Lang;
 use crate::manifest::schema::{CompressionMeta, EncryptionMeta, OplogRange, Topology};
 use crate::pipeline::backup::{run_full_backup_with_meta, BackupMeta, BackupRequest, Engine};
@@ -28,24 +29,124 @@ use crate::pipeline::incremental::{
 use crate::pipeline::stage::{StageStack, ENV_AES_KEY_HEX};
 use crate::storage::{from_config, replicate_artifact, Storage};
 
+/// `backup --json` 요약 스키마 버전.
+///
+/// 필드 의미가 바뀌면 올린다 — 소비자(웹 콘솔)가 버전으로 파서를 고르고, 모르는 버전을
+/// 만나면 조용히 오파싱하는 대신 명확히 실패할 수 있게 하기 위함이다.
+pub const BACKUP_JSON_SCHEMA: u32 = 1;
+
+/// `backup --json`이 내보내는 요약.
+///
+/// ## 왜 타입인가
+/// 이 요약은 원래 엔진·백업 유형별로 흩어진 8개의 `serde_json::json!` 리터럴이었다.
+/// 리터럴은 타입이 아니라서 필드 이름을 잘못 적거나 빠뜨려도 컴파일이 통과하고, 그 출력을
+/// 파싱하는 쪽만 조용히 깨진다. 하나의 타입으로 모으면 계약이 컴파일러의 관할로 들어온다.
+///
+/// ## 왜 Option이 많은가
+/// 변형마다 의미 있는 필드가 다르다(풀에는 체크섬, 증분에는 base·변경 건수). `None`은
+/// `skip_serializing_if`로 **키 자체가 생략**되므로, 리터럴 시절과 키 집합이 같다 —
+/// 없는 정보를 `null`로 채워 소비자에게 거짓 필드를 만들지 않는다.
+#[derive(Debug, serde::Serialize)]
+pub struct BackupJsonSummary<'a> {
+    /// 스키마 버전(항상 존재).
+    pub schema: u32,
+    /// "full" | "incremental". 풀 백업 경로 일부는 유형을 표기하지 않는다(기존 동작 유지).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_type: Option<&'a str>,
+    pub backup_id: &'a str,
+    /// 증분이 딛고 선 풀 백업 ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_id: Option<&'a str>,
+    /// MongoDB 증분이 캡처한 oplog 항목 수.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oplog_count: Option<u64>,
+    /// PostgreSQL·MySQL 증분이 캡처한 변경 건수.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_count: Option<u64>,
+    pub stored_size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checksum_sha256: Option<&'a str>,
+    /// oplog/binlog gap 때문에 증분이 풀로 승격됐는지(exit 4 경로).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promoted_from_gap: Option<bool>,
+    /// MongoDB 토폴로지 표기(replica set / standalone).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology: Option<String>,
+    /// "postgresql" | "mysql". MongoDB 경로는 기존대로 표기하지 않는다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database: Option<&'a str>,
+    /// 기록한 destination 개수(멀티 destination).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destinations: Option<usize>,
+    /// 승격 사유 등 사람이 읽는 부연.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'a str>,
+}
+
+impl Default for BackupJsonSummary<'_> {
+    fn default() -> Self {
+        Self {
+            schema: BACKUP_JSON_SCHEMA,
+            backup_type: None,
+            backup_id: "",
+            base_id: None,
+            oplog_count: None,
+            change_count: None,
+            stored_size_bytes: 0,
+            checksum_sha256: None,
+            promoted_from_gap: None,
+            topology: None,
+            database: None,
+            destinations: None,
+            reason: None,
+        }
+    }
+}
+
+impl BackupJsonSummary<'_> {
+    /// 요약을 stdout에 한 줄 JSON으로 내보낸다.
+    ///
+    /// 직렬화는 실패할 수 없는 형태(모든 필드가 원시 타입)라 실패 시 패닉이 정당하다 —
+    /// 조용히 빈 출력을 내보내면 소비자가 성공으로 오인한다.
+    fn emit(&self) {
+        let line = serde_json::to_string(self).expect("요약 직렬화는 실패할 수 없다");
+        println!("{line}");
+    }
+}
+
 /// `backup` 핸들러 진입점.
 pub async fn handle(
     config_path: Option<PathBuf>,
     lang_flag: Option<crate::i18n::Lang>,
     args: BackupArgs,
 ) -> Result<()> {
-    // 동시 실행 잠금(FR-12) — 같은 프로파일의 backup/restore/prune과 직렬화한다.
-    // 가드(_lock)를 함수 끝까지 유지해 작업 동안 lock을 잡는다(충돌 시 exit 5).
-    let _lock = crate::lock::acquire(&args.profile)?;
+    // config를 읽기도 전에 lock 충돌·config 부재/읽기 실패로 끝날 수 있다. 그 경로들의
+    // 에러 라벨·본문이 --lang을 따르도록 config 병합보다 먼저 CLI flag만으로 언어를
+    // 잡아 둔다. config가 성공적으로 읽히면 아래에서 activate_from_toml이 그 안의
+    // [output].language까지 반영해 다시 정한다(Mutex라 재설정 가능).
+    crate::i18n::set_active(lang_flag.unwrap_or_default());
+
+    // 명시 profile은 config·secret 해석 전에 잠근다. 다른 실행이 이미 작업 중이면 URI 설정
+    // 오류보다 lock 충돌을 먼저 보고한다. profile 생략 시에는 default_profile 해석 뒤 잠근다.
+    let explicit_lock = if args.profile.is_empty() {
+        None
+    } else {
+        Some(crate::lock::acquire(&args.profile)?)
+    };
 
     // 1) config 로드 + 레이어 병합(file + ENV; CLI는 아래에서 직접 반영).
     let config_toml = match &config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
-            XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
+            XBackupError::Config(crate::tr_lang!(
+                lang_flag.unwrap_or_default(),
+                "failed to read the config file ({}): {e}",
+                "config 파일 읽기 실패({}): {e}",
+                path.display()
+            ))
         })?),
         None => None,
     };
-    let lang = crate::i18n::resolve_from_toml(lang_flag, config_toml.as_deref());
+    let lang = crate::i18n::activate_from_toml(lang_flag, config_toml.as_deref());
     let overrides = collect_overrides_from_process();
     let resolved = ResolvedConfig::build(MergeInput {
         config_toml: config_toml.as_deref(),
@@ -53,14 +154,17 @@ pub async fn handle(
         overrides: &overrides,
     })?;
 
-    // 2) URI 시크릿(uri_env로 해석된 값) 확보. 이후 build_stages가 &resolved를 쓰므로
-    //    clone으로 꺼내 부분 이동을 피한다(Secret은 Clone).
-    let uri = resolved.resolved_uri.clone().ok_or_else(|| {
-        XBackupError::Config(format!(
-            "프로파일 '{}'에 source.uri_env가 없거나 해석되지 않았습니다",
-            resolved.profile_name
-        ))
-    })?;
+    // 동시 실행 잠금(FR-12) — default_profile까지 해석한 실효 이름으로 같은 프로파일의
+    // backup/restore/prune을 직렬화한다. 가드는 함수 끝까지 유지한다(충돌 시 exit 5).
+    let _lock = match explicit_lock {
+        Some(lock) => lock,
+        None => crate::lock::acquire(&resolved.profile_name)?,
+    };
+
+    // 2) 백업 읽기 소스 URI 확보(PRD-05). 우선순위: CLI --read-source > config read_uri(복제본)
+    //    > 주 소스(uri). 복제본에서 읽으면 primary 부하를 분리한다. build_stages가 &resolved를
+    //    쓰므로 clone으로 꺼내 부분 이동을 피한다(Secret은 Clone).
+    let uri = select_read_uri(args.read_source.as_deref(), &resolved)?;
     // 접속 타임아웃(초) — config source.connect_timeout_secs(미설정이면 None → 기본 5초).
     let timeout_secs = resolved.profile.source.connect_timeout_secs;
 
@@ -74,7 +178,6 @@ pub async fn handle(
         .cloned()
         .collect();
     let primary = from_config(&dests[0])?;
-    let secondaries = &dests[1..];
 
     // 출력 모드 결정(R15) — CLI(--json>--quiet>--progress) > config(mode.output) > TTY 자동.
     // 진행 표시·요약 출력 분기에 일관 사용한다.
@@ -92,172 +195,312 @@ pub async fn handle(
     let db = crate::engine::DbKind::from_uri(uri.expose());
     crate::cli::output::print_run_context(&resolved.profile_name, Some(db), mode);
 
-    // DB 종류 분기 — source URI 스킴이 postgres면 PostgreSQL 경로(드라이버 COPY, oplog/토폴로지
-    //   개념 없음)로 빠진다. 그 외(mongodb)는 아래 Mongo 경로.
-    if db == crate::engine::DbKind::Postgres {
-        return handle_pg_backup(
-            &resolved,
-            &args,
-            uri,
-            timeout_secs,
-            primary.as_ref(),
-            &dests[0],
-            secondaries,
-            dests.len(),
-            mode,
-            backup_type,
-            lang,
-        )
-        .await;
-    }
-    if db == crate::engine::DbKind::Mysql {
-        return handle_mysql_backup(
-            &resolved,
-            &args,
-            uri,
-            timeout_secs,
-            primary.as_ref(),
-            &dests[0],
-            secondaries,
-            dests.len(),
-            mode,
-            backup_type,
-            lang,
-        )
-        .await;
-    }
-    if db == crate::engine::DbKind::File {
-        return handle_file_backup(
-            &resolved,
-            &args,
-            uri,
-            primary.as_ref(),
-            &dests[0],
-            secondaries,
-            dests.len(),
-            mode,
-            backup_type,
-            lang,
-        )
-        .await;
-    }
-
-    // backup 실행 전 status 핵심 점검(연결·권한·토폴로지·도구 존재)을 자동 선행한다(FR-8,
-    //   PRD §9). 전체 status보다 가벼운 서브셋([`StatusChecker::precheck_subset`])으로, 백업을
-    //   *막는* 결함(Fail)만 본다. 하나라도 Fail이면 PrecheckFailed(exit 3)로 백업을 미시작한다.
-    //   --skip-precheck면 우회한다(읽기 전용·무부작용).
-    // 엔진 결정(native | mongodump) — 사전 점검(도구 존재 여부)과 덤프 경로 양쪽이 쓴다.
-    let engine = Engine::parse(&resolved.profile.mode.engine)?;
-    let should_precheck = resolved.profile.mode.precheck && !args.skip_precheck;
-    if should_precheck {
-        run_precheck(&uri, &resolved.profile_name, timeout_secs, engine).await?;
-    } else if args.skip_precheck {
-        tracing::warn!("--skip-precheck 지정 — 백업 사전 점검을 건너뜁니다(FR-8 우회)");
-    } else {
-        tracing::warn!("config mode.precheck=false — 백업 사전 점검을 건너뜁니다");
-    }
-
-    // 증분(--type incr)은 드라이버 oplog 캡처 경로로 분기한다(t8). 선택적 백업
-    //   (--db/--collection)과는 병용 불가(증분은 항상 전체 oplog 슬라이스).
-    if matches!(backup_type, BackupType::Incr) {
-        if args.db.is_some() || args.collection.is_some() {
-            return Err(XBackupError::Usage(
-                "증분 백업(--type incr)은 선택적 백업(--db/--collection)과 병용할 수 없습니다 \
-                 — 증분은 전체 oplog 슬라이스를 캡처합니다(FR-1/FR-2)."
-                    .into(),
-            ));
-        }
-        return handle_incremental(
-            &resolved,
-            &args,
-            &uri,
-            primary.as_ref(),
-            &dests[0],
-            secondaries,
-            mode,
-            lang,
-        )
-        .await;
-    }
-
-    // 4) 파이프라인 단계 구성(t6): compress → encrypt 고정 순서(PRD §8.4). 단계와
-    //    manifest 메타를 함께 만든다(아래 build_stages 참조). --no-encrypt면 암호화 생략.
-    //    진행 표시(R16): 공유 카운터를 만들어 BackupRequest에 주입하고, 백업은 dump 총량을
-    //    사전에 모르므로 부정형(spinner)로 처리 바이트·속도를 stderr에 표시한다(PRD §FR-9).
-    let progress_counter = new_counter();
-    let request = BackupRequest {
-        uri,
-        mongodump_program: "mongodump".to_string(),
-        db: args.db.clone(),
-        collection: args.collection.clone(),
-        timeout_secs,
-        engine,
-        progress_counter: Some(std::sync::Arc::clone(&progress_counter)),
+    // PRD-04 생명주기 훅 — pre_backup 게이트(비-0이면 백업 미시작) → 백업 실행 →
+    //   결과에 따라 post_backup(성공·경고 동반 성공) 또는 on_error(실패) 관측 훅.
+    let hooks = build_hookset(&resolved, args.no_hooks);
+    let mut hook_ctx = HookContext {
+        profile: resolved.profile_name.clone(),
+        engine: Some(db_hook_label(db).to_string()),
+        backup_type: Some(backup_type_label(backup_type).to_string()),
+        started_at: Some(chrono::Utc::now().to_rfc3339()),
+        ..Default::default()
     };
-    let (stages, meta) = build_stages(&resolved, &args)?;
+    hooks.run_gate(HookEvent::PreBackup, &hook_ctx).await?;
 
-    let reporter = ProgressReporter::start(
-        mode,
-        ProgressKind::Indeterminate {
-            label: lang.sel("backup", "백업").into(),
-        },
-        progress_counter,
-    );
-    let result = run_full_backup_with_meta(&request, primary.as_ref(), stages, meta).await;
-    reporter.finish().await;
-    let outcome = result?;
+    // 실제 백업을 async 블록으로 감싸 한 Result로 모은다(pg/mysql/mongo·full/incr의
+    //   여러 early-return을 블록의 반환으로 수렴). uri 등은 여기서 소비된다.
+    let result: Result<()> = async move {
+        let secondaries = &dests[1..];
 
-    // 4.5) 보조 destination으로 순차 복제(멀티 destination). primary는 성공했으므로,
-    //      복제 실패는 경고(exit 4)로만 보고한다("primary 필수 + 나머지 경고" 정책).
-    let replicate_warning = replicate_and_warn(
-        primary.as_ref(),
-        secondaries,
-        &outcome.backup_id,
-        outcome.stored_size_bytes > 0,
-    )
+        // DB 종류 분기 — source URI 스킴이 postgres면 PostgreSQL 경로(드라이버 COPY, oplog/토폴로지
+        //   개념 없음)로 빠진다. 그 외(mongodb)는 아래 Mongo 경로.
+        if db == crate::engine::DbKind::Postgres {
+            return handle_pg_backup(
+                &resolved,
+                &args,
+                uri,
+                timeout_secs,
+                primary.as_ref(),
+                &dests[0],
+                secondaries,
+                dests.len(),
+                mode,
+                backup_type,
+                lang,
+            )
+            .await;
+        }
+        if db == crate::engine::DbKind::Mysql {
+            return handle_mysql_backup(
+                &resolved,
+                &args,
+                uri,
+                timeout_secs,
+                primary.as_ref(),
+                &dests[0],
+                secondaries,
+                dests.len(),
+                mode,
+                backup_type,
+                lang,
+            )
+            .await;
+        }
+        if db == crate::engine::DbKind::File {
+            return handle_file_backup(
+                &resolved,
+                &args,
+                uri,
+                primary.as_ref(),
+                &dests[0],
+                secondaries,
+                dests.len(),
+                mode,
+                backup_type,
+                lang,
+            )
+            .await;
+        }
+
+        // backup 실행 전 status 핵심 점검(연결·권한·토폴로지·도구 존재)을 자동 선행한다(FR-8,
+        //   PRD §9). 전체 status보다 가벼운 서브셋([`StatusChecker::precheck_subset`])으로, 백업을
+        //   *막는* 결함(Fail)만 본다. 하나라도 Fail이면 PrecheckFailed(exit 3)로 백업을 미시작한다.
+        //   --skip-precheck면 우회한다(읽기 전용·무부작용).
+        // 엔진 결정(native | mongodump) — 사전 점검(도구 존재 여부)과 덤프 경로 양쪽이 쓴다.
+        let engine = Engine::parse(&resolved.profile.mode.engine)?;
+        let should_precheck = resolved.profile.mode.precheck && !args.skip_precheck;
+        if should_precheck {
+            run_precheck(&uri, &resolved.profile_name, timeout_secs, engine).await?;
+        } else if args.skip_precheck {
+            tracing::warn!(
+                "{}",
+                crate::tr!(
+                    "--skip-precheck given, so the pre-backup checks are skipped (FR-8 bypass)",
+                    "--skip-precheck가 있어 백업 전 점검을 건너뜁니다(FR-8 우회)",
+                )
+            );
+        } else {
+            tracing::warn!(
+                "{}",
+                crate::tr!(
+                    "config sets mode.precheck=false, so the pre-backup checks are skipped",
+                    "config의 mode.precheck=false라 백업 전 점검을 건너뜁니다",
+                )
+            );
+        }
+
+        // 증분(--type incr)은 드라이버 oplog 캡처 경로로 분기한다(t8). 선택적 백업
+        //   (--db/--collection)과는 병용 불가(증분은 항상 전체 oplog 슬라이스).
+        if matches!(backup_type, BackupType::Incr) {
+            if args.db.is_some() || args.collection.is_some() {
+                return Err(XBackupError::Usage(crate::tr!("an incremental backup (--type incr) cannot be combined with a selective backup (--db/--collection) — an incremental captures the entire oplog slice (FR-1/FR-2).", "증분 백업(--type incr)은 선택적 백업(--db/--collection)과 병용할 수 없습니다 \
+                 — 증분은 전체 oplog 슬라이스를 캡처합니다(FR-1/FR-2).")));
+            }
+            return handle_incremental(
+                &resolved,
+                &args,
+                &uri,
+                primary.as_ref(),
+                &dests[0],
+                secondaries,
+                mode,
+                lang,
+            )
+            .await;
+        }
+
+        // 4) 파이프라인 단계 구성(t6): compress → encrypt 고정 순서(PRD §8.4). 단계와
+        //    manifest 메타를 함께 만든다(아래 build_stages 참조). --no-encrypt면 암호화 생략.
+        //    진행 표시(R16): 공유 카운터를 만들어 BackupRequest에 주입하고, 백업은 dump 총량을
+        //    사전에 모르므로 부정형(spinner)로 처리 바이트·속도를 stderr에 표시한다(PRD §FR-9).
+        let progress_counter = new_counter();
+        let request = BackupRequest {
+            uri,
+            mongodump_program: "mongodump".to_string(),
+            db: args.db.clone(),
+            collection: args.collection.clone(),
+            timeout_secs,
+            engine,
+            progress_counter: Some(std::sync::Arc::clone(&progress_counter)),
+        };
+        let (stages, meta) = build_stages(&resolved, &args)?;
+
+        let reporter = ProgressReporter::start(
+            mode,
+            ProgressKind::Indeterminate {
+                label: lang.sel("backup", "백업").into(),
+            },
+            progress_counter,
+        );
+        let result = run_full_backup_with_meta(&request, primary.as_ref(), stages, meta).await;
+        reporter.finish().await;
+        let outcome = result?;
+
+        // 4.5) 보조 destination으로 순차 복제(멀티 destination). primary는 성공했으므로,
+        //      복제 실패는 경고(exit 4)로만 보고한다("primary 필수 + 나머지 경고" 정책).
+        let replicate_warning = replicate_and_warn(
+            primary.as_ref(),
+            secondaries,
+            &outcome.backup_id,
+            outcome.stored_size_bytes > 0,
+        )
+        .await;
+
+        // 5) 요약 출력(stdout — 결과 전용). 진행은 stderr, 결과/--json은 stdout으로 분리.
+        if mode.emits_json() {
+            BackupJsonSummary {
+                backup_id: &outcome.backup_id,
+                stored_size_bytes: outcome.stored_size_bytes,
+                checksum_sha256: Some(&outcome.checksum_sha256),
+                topology: Some(format!("{:?}", outcome.topology)),
+                destinations: Some(dests.len()),
+                ..Default::default()
+            }
+            .emit();
+        } else if mode.shows_human_summary() {
+            let topo = match outcome.topology {
+                Topology::ReplicaSet => "replica_set",
+                Topology::Standalone => "standalone",
+            };
+            print_backup_summary(
+                &BackupSummary {
+                    kind: "full",
+                    detail: topo,
+                    backup_id: &outcome.backup_id,
+                    primary_dest: &dests[0],
+                    stored_size: outcome.stored_size_bytes,
+                    original_size: Some(outcome.original_size_bytes),
+                    compression: outcome.compression.as_ref(),
+                    encryption: outcome.encryption.as_ref(),
+                    checksum: Some(&outcome.checksum_sha256),
+                    dest_count: dests.len(),
+                    base_id: None,
+                    change: None,
+                    oplog_range: outcome.oplog_range.as_ref(),
+                    note: None,
+                },
+                lang,
+            );
+        }
+
+        // 보조 복제 실패가 있으면 경고로 마감(exit 4) — primary 백업은 이미 성공.
+        if let Some(w) = replicate_warning {
+            return Err(XBackupError::Warning(w));
+        }
+        Ok(())
+    }
     .await;
 
-    // 5) 요약 출력(stdout — 결과 전용). 진행은 stderr, 결과/--json은 stdout으로 분리.
-    if mode.emits_json() {
-        let summary = serde_json::json!({
-            "backup_id": outcome.backup_id,
-            "stored_size_bytes": outcome.stored_size_bytes,
-            "checksum_sha256": outcome.checksum_sha256,
-            "topology": format!("{:?}", outcome.topology),
-            "destinations": dests.len(),
-        });
-        println!("{summary}");
-    } else if mode.shows_human_summary() {
-        let topo = match outcome.topology {
-            Topology::ReplicaSet => "replica_set",
-            Topology::Standalone => "standalone",
-        };
-        print_backup_summary(
-            &BackupSummary {
-                kind: "full",
-                detail: topo,
-                backup_id: &outcome.backup_id,
-                primary_dest: &dests[0],
-                stored_size: outcome.stored_size_bytes,
-                original_size: Some(outcome.original_size_bytes),
-                compression: outcome.compression.as_ref(),
-                encryption: outcome.encryption.as_ref(),
-                checksum: Some(&outcome.checksum_sha256),
-                dest_count: dests.len(),
-                base_id: None,
-                change: None,
-                oplog_range: outcome.oplog_range.as_ref(),
-                note: None,
-            },
-            lang,
+    // 결과에 따라 관측 훅(post_backup / on_error)을 실행한다(작업 판정은 바꾸지 않음).
+    // 성공(exit 0)·경고 동반 성공(exit 4, gap 승격 등)은 백업이 이뤄진 것 → post_backup.
+    let event = post_hook_event(&result);
+    hook_ctx.ended_at = Some(chrono::Utc::now().to_rfc3339());
+    hook_ctx.status = Some(
+        if event == HookEvent::PostBackup {
+            "ok"
+        } else {
+            "failed"
+        }
+        .to_string(),
+    );
+    if let Err(e) = &result {
+        hook_ctx.exit_code = Some(i32::from(e.exit_code()));
+        hook_ctx.error = Some(e.to_string());
+    } else {
+        hook_ctx.exit_code = Some(0);
+    }
+    hooks.run_observe(event, &hook_ctx).await;
+    result
+}
+
+/// 백업 결과를 관측 훅 이벤트로 매핑한다. 성공(exit 0)과 경고 동반 성공(exit 4 —
+/// gap 승격·보조 복제 실패 등 산출물은 존재)은 `post_backup`, 실제 실패는 `on_error`.
+fn post_hook_event(result: &Result<()>) -> HookEvent {
+    match result {
+        Ok(_) => HookEvent::PostBackup,
+        Err(e) if e.is_warning() => HookEvent::PostBackup,
+        Err(_) => HookEvent::OnError,
+    }
+}
+
+/// 백업 읽기 소스 URI를 우선순위로 고른다(PRD-05): `--read-source` > config `read_uri`(복제본)
+/// > 주 소스(`uri`). 복제본에서 읽으면 primary 부하를 분리한다. 아무 소스도 없으면 Config 에러.
+fn select_read_uri(read_source: Option<&str>, resolved: &ResolvedConfig) -> Result<Secret> {
+    if let Some(rs) = read_source.filter(|s| !s.is_empty()) {
+        tracing::info!(
+            "{}",
+            crate::tr!(
+                "--read-source given, so the backup reads from a replica and leaves the primary alone",
+                "--read-source가 있어 복제본에서 읽습니다. primary에는 부하를 주지 않습니다",
+            )
+        );
+        return Ok(Secret::new(rs.to_string()));
+    }
+    let from_replica = resolved.resolved_read_uri.is_some();
+    let uri = resolved.effective_read_uri().cloned().ok_or_else(|| {
+        XBackupError::Config(crate::tr!(
+            "profile '{}' has no source.uri_env/uri, or it did not resolve",
+            "프로파일 '{}'에 source.uri_env/uri가 없거나 해석되지 않았습니다",
+            resolved.profile_name
+        ))
+    })?;
+    if from_replica {
+        tracing::info!(
+            "{}",
+            crate::tr!(
+                "config sets source.read_uri, so the backup reads from a replica and leaves the primary alone",
+                "config의 source.read_uri를 따라 복제본에서 읽습니다. primary에는 부하를 주지 않습니다",
+            )
         );
     }
+    Ok(uri)
+}
 
-    // 보조 복제 실패가 있으면 경고로 마감(exit 4) — primary 백업은 이미 성공.
-    if let Some(w) = replicate_warning {
-        return Err(XBackupError::Warning(w));
+/// 프로파일 훅 설정 + 시크릿 env 목록으로 [`HookSet`]을 만든다(`--no-hooks`면 비활성).
+fn build_hookset(resolved: &ResolvedConfig, no_hooks: bool) -> HookSet {
+    let secret_env = collect_secret_env_names(&resolved.profile);
+    HookSet::new(resolved.profile.hooks.clone(), !no_hooks, secret_env)
+}
+
+/// 훅 env에서 제거할 시크릿 env 변수 이름을 모은다(NFR-2).
+///
+/// source `uri_env`(주 소스) + `read_uri_env`(복제본 — 대개 같은 자격증명) + 각 destination
+/// S3 `credentials_env`. AES 키(env)는 [`HookSet`]이 상수로 함께 제거하므로 여기 포함하지 않는다.
+fn collect_secret_env_names(profile: &crate::config::file::Profile) -> Vec<String> {
+    let mut secret_env = Vec::new();
+    if let Some(name) = &profile.source.uri_env {
+        secret_env.push(name.clone());
     }
-    Ok(())
+    // read_uri_env(복제본 자격증명)도 반드시 제거한다 — 누락되면 복제본 비밀번호가 훅으로 샌다.
+    if let Some(name) = &profile.source.read_uri_env {
+        secret_env.push(name.clone());
+    }
+    for dest in profile.effective_destinations() {
+        if let Some(s3) = &dest.s3 {
+            if let Some(creds) = &s3.credentials_env {
+                secret_env.push(creds.clone());
+            }
+        }
+    }
+    secret_env
+}
+
+/// DB 종류를 훅 컨텍스트용 엔진 라벨(`XB_ENGINE`)로 — mongodb/postgresql/mysql.
+fn db_hook_label(db: crate::engine::DbKind) -> &'static str {
+    match db {
+        crate::engine::DbKind::Mongo => "mongodb",
+        crate::engine::DbKind::Postgres => "postgresql",
+        crate::engine::DbKind::Mysql => "mysql",
+        crate::engine::DbKind::File => "file",
+    }
+}
+
+/// 백업 유형을 훅 컨텍스트용 라벨(`XB_BACKUP_TYPE`)로 — full/incremental.
+fn backup_type_label(bt: BackupType) -> &'static str {
+    match bt {
+        BackupType::Full => "full",
+        BackupType::Incr => "incremental",
+    }
 }
 
 /// 백업이 저장된 위치를 사람이 읽는 한 줄로 만든다(완료 요약 표시용).
@@ -638,28 +881,34 @@ async fn handle_pg_backup(
     if should_precheck {
         crate::engine::postgres::status::precheck(&uri, timeout_secs).await?;
     } else if args.skip_precheck {
-        tracing::warn!("--skip-precheck 지정 — PG 백업 사전 점검을 건너뜁니다(FR-8 우회)");
+        tracing::warn!(
+            "{}",
+            crate::tr!(
+                "--skip-precheck given, so the pre-backup checks are skipped (FR-8 bypass)",
+                "--skip-precheck가 있어 PostgreSQL 백업 전 점검을 건너뜁니다(FR-8 우회)",
+            )
+        );
     } else {
-        tracing::warn!("config mode.precheck=false — PG 백업 사전 점검을 건너뜁니다");
+        tracing::warn!(
+            "{}",
+            crate::tr!(
+                "config sets mode.precheck=false, so the pre-backup checks are skipped",
+                "config의 mode.precheck=false라 PostgreSQL 백업 전 점검을 건너뜁니다",
+            )
+        );
     }
 
     // 증분(--type incr)은 logical decoding 캡처 경로로 분기한다. pg_logical 미활성이면
     //   slot이 없어 캡처 불가하므로 명확히 안내하고 거부한다(선택적 백업과도 병용 불가).
     if matches!(backup_type, BackupType::Incr) {
         if !enable_incremental {
-            return Err(XBackupError::Usage(
-                "PG 증분(--type incr)은 features.incremental.pg_logical=true가 필요합니다 \
+            return Err(XBackupError::Usage(crate::tr!("PostgreSQL incremental (--type incr) requires features.incremental.pg_logical=true (a full backup must have created the replication slot first). Turn it on and run a full backup once before using incremental.", "PG 증분(--type incr)은 features.incremental.pg_logical=true가 필요합니다 \
                  (풀 백업이 replication slot을 만든 상태여야 캡처 가능). 설정을 켜고 풀 백업을 \
-                 한 번 수행한 뒤 증분을 사용하세요."
-                    .into(),
-            ));
+                 한 번 수행한 뒤 증분을 사용하세요.")));
         }
         if args.db.is_some() || args.collection.is_some() {
-            return Err(XBackupError::Usage(
-                "PG 증분(--type incr)은 선택적 백업(--db/--collection)과 병용할 수 없습니다 \
-                 — 증분은 전체 변경 슬라이스를 캡처합니다."
-                    .into(),
-            ));
+            return Err(XBackupError::Usage(crate::tr!("PostgreSQL incremental (--type incr) cannot be combined with a selective backup (--db/--collection) — an incremental captures the entire change slice.", "PG 증분(--type incr)은 선택적 백업(--db/--collection)과 병용할 수 없습니다 \
+                 — 증분은 전체 변경 슬라이스를 캡처합니다.")));
         }
         return handle_pg_incremental(
             resolved,
@@ -710,14 +959,15 @@ async fn handle_pg_backup(
     .await;
 
     if mode.emits_json() {
-        let summary = serde_json::json!({
-            "backup_id": outcome.backup_id,
-            "stored_size_bytes": outcome.stored_size_bytes,
-            "checksum_sha256": outcome.checksum_sha256,
-            "database": "postgresql",
-            "destinations": dest_count,
-        });
-        println!("{summary}");
+        BackupJsonSummary {
+            backup_id: &outcome.backup_id,
+            stored_size_bytes: outcome.stored_size_bytes,
+            checksum_sha256: Some(&outcome.checksum_sha256),
+            database: Some("postgresql"),
+            destinations: Some(dest_count),
+            ..Default::default()
+        }
+        .emit();
     } else if mode.shows_human_summary() {
         print_backup_summary(
             &BackupSummary {
@@ -769,25 +1019,25 @@ async fn handle_mysql_backup(
     if should_precheck {
         crate::engine::mysql::status::precheck(&uri, timeout_secs).await?;
     } else if args.skip_precheck {
-        tracing::warn!("--skip-precheck 지정 — MySQL 백업 사전 점검을 건너뜁니다(FR-8 우회)");
+        tracing::warn!(
+            "{}",
+            crate::tr!(
+                "--skip-precheck given, so the pre-backup checks are skipped (FR-8 bypass)",
+                "--skip-precheck가 있어 MySQL 백업 전 점검을 건너뜁니다(FR-8 우회)",
+            )
+        );
     }
 
     // 증분(--type incr)은 binlog 캡처 경로로 분기한다. mysql_binlog 미활성이면 명확히 거부.
     if matches!(backup_type, BackupType::Incr) {
         if !resolved.profile.features.incremental.mysql_binlog {
-            return Err(XBackupError::Usage(
-                "MySQL 증분(--type incr)은 features.incremental.mysql_binlog=true가 필요합니다 \
+            return Err(XBackupError::Usage(crate::tr!("MySQL incremental (--type incr) requires features.incremental.mysql_binlog=true (the server needs log_bin=ON, binlog_format=ROW, binlog_row_image=FULL). Turn it on and run a full backup once before using incremental.", "MySQL 증분(--type incr)은 features.incremental.mysql_binlog=true가 필요합니다 \
                  (서버 log_bin=ON·binlog_format=ROW·binlog_row_image=FULL 전제). 설정을 켜고 \
-                 풀 백업을 한 번 수행한 뒤 증분을 사용하세요."
-                    .into(),
-            ));
+                 풀 백업을 한 번 수행한 뒤 증분을 사용하세요.")));
         }
         if args.collection.is_some() {
-            return Err(XBackupError::Usage(
-                "MySQL 증분(--type incr)은 선택적 백업(--collection)과 병용할 수 없습니다 \
-                 — 증분은 전체 변경 슬라이스를 캡처합니다."
-                    .into(),
-            ));
+            return Err(XBackupError::Usage(crate::tr!("MySQL incremental (--type incr) cannot be combined with a selective backup (--collection) — an incremental captures the entire change slice.", "MySQL 증분(--type incr)은 선택적 백업(--collection)과 병용할 수 없습니다 \
+                 — 증분은 전체 변경 슬라이스를 캡처합니다.")));
         }
         return handle_mysql_incremental(
             resolved,
@@ -836,14 +1086,15 @@ async fn handle_mysql_backup(
     .await;
 
     if mode.emits_json() {
-        let summary = serde_json::json!({
-            "backup_id": outcome.backup_id,
-            "stored_size_bytes": outcome.stored_size_bytes,
-            "checksum_sha256": outcome.checksum_sha256,
-            "database": "mysql",
-            "destinations": dest_count,
-        });
-        println!("{summary}");
+        BackupJsonSummary {
+            backup_id: &outcome.backup_id,
+            stored_size_bytes: outcome.stored_size_bytes,
+            checksum_sha256: Some(&outcome.checksum_sha256),
+            database: Some("mysql"),
+            destinations: Some(dest_count),
+            ..Default::default()
+        }
+        .emit();
     } else if mode.shows_human_summary() {
         print_backup_summary(
             &BackupSummary {
@@ -923,17 +1174,22 @@ async fn handle_mysql_incremental(
     .await;
 
     if mode.emits_json() {
-        let summary = serde_json::json!({
-            "backup_type": if outcome.promoted { "full" } else { "incremental" },
-            "backup_id": outcome.backup_id,
-            "base_id": outcome.base_id,
-            "change_count": outcome.change_count,
-            "stored_size_bytes": outcome.stored_size_bytes,
-            "promoted_from_gap": outcome.promoted,
-            "database": "mysql",
-            "destinations": dest_count,
-        });
-        println!("{summary}");
+        BackupJsonSummary {
+            backup_type: Some(if outcome.promoted {
+                "full"
+            } else {
+                "incremental"
+            }),
+            backup_id: &outcome.backup_id,
+            base_id: Some(&outcome.base_id),
+            change_count: Some(outcome.change_count as u64),
+            stored_size_bytes: outcome.stored_size_bytes,
+            promoted_from_gap: Some(outcome.promoted),
+            database: Some("mysql"),
+            destinations: Some(dest_count),
+            ..Default::default()
+        }
+        .emit();
     } else if mode.shows_human_summary() {
         let note = if outcome.promoted {
             Some(lang.sel(
@@ -1063,16 +1319,17 @@ async fn handle_pg_incremental(
     .await;
 
     if mode.emits_json() {
-        let summary = serde_json::json!({
-            "backup_type": "incremental",
-            "backup_id": outcome.backup_id,
-            "base_id": outcome.base_id,
-            "change_count": outcome.change_count,
-            "stored_size_bytes": outcome.stored_size_bytes,
-            "database": "postgresql",
-            "destinations": dest_count,
-        });
-        println!("{summary}");
+        BackupJsonSummary {
+            backup_type: Some("incremental"),
+            backup_id: &outcome.backup_id,
+            base_id: Some(&outcome.base_id),
+            change_count: Some(outcome.change_count as u64),
+            stored_size_bytes: outcome.stored_size_bytes,
+            database: Some("postgresql"),
+            destinations: Some(dest_count),
+            ..Default::default()
+        }
+        .emit();
     } else if mode.shows_human_summary() {
         print_backup_summary(
             &BackupSummary {
@@ -1141,7 +1398,13 @@ async fn promote_pg_incremental_to_full(
         ),
         SlotHealth::Active => lang.sel("ok", "정상"),
     };
-    tracing::warn!("PG 증분 gap 감지({reason}) — 풀 백업으로 승격합니다");
+    tracing::warn!(
+        "{}",
+        crate::tr!(
+            "PostgreSQL incremental gap detected ({reason}) — promoting this run to a full backup",
+            "PostgreSQL 증분에서 gap을 발견했습니다({reason}). 이번 실행을 풀 백업으로 올립니다",
+        )
+    );
 
     let (stages, meta) = build_stages(resolved, args)?;
     let progress_counter = new_counter();
@@ -1175,17 +1438,18 @@ async fn promote_pg_incremental_to_full(
         replicate_and_warn(primary, secondaries, &outcome.backup_id, true).await;
 
     if mode.emits_json() {
-        let summary = serde_json::json!({
-            "backup_type": "full",
-            "promoted_from_gap": true,
-            "backup_id": outcome.backup_id,
-            "stored_size_bytes": outcome.stored_size_bytes,
-            "checksum_sha256": outcome.checksum_sha256,
-            "database": "postgresql",
-            "destinations": dest_count,
-            "reason": reason,
-        });
-        println!("{summary}");
+        BackupJsonSummary {
+            backup_type: Some("full"),
+            promoted_from_gap: Some(true),
+            backup_id: &outcome.backup_id,
+            stored_size_bytes: outcome.stored_size_bytes,
+            checksum_sha256: Some(&outcome.checksum_sha256),
+            database: Some("postgresql"),
+            destinations: Some(dest_count),
+            reason: Some(reason),
+            ..Default::default()
+        }
+        .emit();
     } else if mode.shows_human_summary() {
         print_backup_summary(
             &BackupSummary {
@@ -1209,10 +1473,16 @@ async fn promote_pg_incremental_to_full(
     }
 
     // exit 4(경고 동반 성공) — main이 Warning을 exit 4로 매핑한다.
-    let mut msg = format!(
-        "PG 증분이 gap으로 풀 백업({})으로 승격되었습니다: {reason}",
-        outcome.backup_id
-    );
+    let mut msg = match lang {
+        Lang::En => format!(
+            "PostgreSQL incremental promoted to full backup ({}) due to a gap: {reason}",
+            outcome.backup_id
+        ),
+        Lang::Ko => format!(
+            "PG 증분이 gap으로 풀 백업({})으로 승격되었습니다: {reason}",
+            outcome.backup_id
+        ),
+    };
     if let Some(w) = replicate_warning {
         msg.push_str(" / ");
         msg.push_str(&w);
@@ -1252,7 +1522,9 @@ async fn replicate_and_warn(
     if failures.is_empty() {
         None
     } else {
-        Some(format!(
+        Some(crate::tr!(
+            "the primary backup succeeded, but replication to {} secondary destination(s) \
+             failed: {}",
             "primary 백업은 성공했으나 보조 destination {}곳 복제 실패: {}",
             failures.len(),
             failures.join(" / ")
@@ -1304,14 +1576,15 @@ async fn handle_incremental(
             let replicate_warning =
                 replicate_and_warn(primary, secondaries, &backup_id, stored_size_bytes > 0).await;
             if mode.emits_json() {
-                let summary = serde_json::json!({
-                    "backup_type": "incremental",
-                    "backup_id": backup_id,
-                    "base_id": base_id,
-                    "oplog_count": oplog_count,
-                    "stored_size_bytes": stored_size_bytes,
-                });
-                println!("{summary}");
+                BackupJsonSummary {
+                    backup_type: Some("incremental"),
+                    backup_id: &backup_id,
+                    base_id: Some(&base_id),
+                    oplog_count: Some(oplog_count),
+                    stored_size_bytes,
+                    ..Default::default()
+                }
+                .emit();
             } else if mode.shows_human_summary() {
                 print_backup_summary(
                     &BackupSummary {
@@ -1348,15 +1621,16 @@ async fn handle_incremental(
                 replicate_and_warn(primary, secondaries, &outcome.backup_id, true).await;
             // 승격은 데이터상 성공이지만 "증분이 아니라 풀이 됨"을 경고로 알린다(exit 4, SC2).
             if mode.emits_json() {
-                let summary = serde_json::json!({
-                    "backup_type": "full",
-                    "promoted_from_gap": true,
-                    "backup_id": outcome.backup_id,
-                    "stored_size_bytes": outcome.stored_size_bytes,
-                    "checksum_sha256": outcome.checksum_sha256,
-                    "reason": reason,
-                });
-                println!("{summary}");
+                BackupJsonSummary {
+                    backup_type: Some("full"),
+                    promoted_from_gap: Some(true),
+                    backup_id: &outcome.backup_id,
+                    stored_size_bytes: outcome.stored_size_bytes,
+                    checksum_sha256: Some(&outcome.checksum_sha256),
+                    reason: Some(&reason),
+                    ..Default::default()
+                }
+                .emit();
             } else if mode.shows_human_summary() {
                 let topo = match outcome.topology {
                     Topology::ReplicaSet => "replica_set",
@@ -1384,10 +1658,16 @@ async fn handle_incremental(
             }
             // exit 4(경고 동반 성공) — main이 Warning을 exit 4로 매핑한다.
             // 승격 경고에 보조 복제 실패가 있으면 함께 알린다(둘 다 exit 4).
-            let mut msg = format!(
-                "증분이 gap으로 풀 백업({})으로 승격되었습니다: {reason}",
-                outcome.backup_id
-            );
+            let mut msg = match lang {
+                Lang::En => format!(
+                    "incremental promoted to full backup ({}) due to a gap: {reason}",
+                    outcome.backup_id
+                ),
+                Lang::Ko => format!(
+                    "증분이 gap으로 풀 백업({})으로 승격되었습니다: {reason}",
+                    outcome.backup_id
+                ),
+            };
             if let Some(w) = replicate_warning {
                 msg.push_str(" / ");
                 msg.push_str(&w);
@@ -1405,7 +1685,8 @@ fn effective_backup_type(resolved: &ResolvedConfig, args: &BackupArgs) -> Result
     match resolved.profile.mode.backup_type.as_str() {
         "full" => Ok(BackupType::Full),
         "incr" => Ok(BackupType::Incr),
-        other => Err(XBackupError::Config(format!(
+        other => Err(XBackupError::Config(crate::tr!(
+            "unknown mode.backup_type: '{other}' (only full | incr are supported)",
             "알 수 없는 mode.backup_type: '{other}'(full | incr만 지원)"
         ))),
     }
@@ -1426,7 +1707,10 @@ async fn run_precheck(
         .await
         .map_err(|e| {
             // connect 준비 실패(URI 파싱 등)는 사전 점검 실패로 본다(백업 미시작).
-            XBackupError::PrecheckFailed(format!("사전 점검 연결 준비 실패: {e}"))
+            XBackupError::PrecheckFailed(crate::tr!(
+                "failed to prepare the precheck connection: {e}",
+                "사전 점검 연결 준비 실패: {e}"
+            ))
         })?;
     // 네이티브 엔진은 외부 도구 불필요 — mongodump 존재 점검을 생략한다.
     let tool = match engine {
@@ -1452,7 +1736,8 @@ async fn run_precheck(
             .filter(|i| i.status == CheckStatus::Fail)
             .map(|i| format!("{}: {}", i.label, i.message))
             .collect();
-        return Err(XBackupError::PrecheckFailed(format!(
+        return Err(XBackupError::PrecheckFailed(crate::tr!(
+            "backup precheck failed (bypass with --skip-precheck) — {}",
             "백업 사전 점검 실패(--skip-precheck로 우회 가능) — {}",
             failed.join(" / ")
         )));
@@ -1488,7 +1773,8 @@ fn build_stages(resolved: &ResolvedConfig, args: &BackupArgs) -> Result<(StageSt
         });
         stack.push(Box::new(stage));
     } else {
-        return Err(XBackupError::Config(format!(
+        return Err(XBackupError::Config(crate::tr!(
+            "unknown compression algorithm: '{}' (only zstd is supported)",
             "알 수 없는 압축 알고리즘: '{}'(zstd만 지원)",
             comp.algorithm
         )));
@@ -1525,12 +1811,138 @@ mod tests {
     use crate::config::file::Profile;
     use crate::config::merged::ResolvedConfig;
 
+    /// 요약을 직렬화해 키 목록을 정렬해 돌려준다(값이 아니라 계약만 본다).
+    fn keys_of(s: &BackupJsonSummary<'_>) -> Vec<String> {
+        let v: serde_json::Value = serde_json::to_value(s).unwrap();
+        let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        k.sort();
+        k
+    }
+
+    /// None 필드는 키 자체가 생략된다 — 리터럴 시절과 키 집합을 같게 유지하는 근거다.
+    /// 없는 정보를 `null`로 채우면 소비자가 "값이 null인 필드가 있다"로 오독한다.
+    #[test]
+    fn json_omits_absent_fields_instead_of_nulling() {
+        let s = BackupJsonSummary {
+            backup_id: "b1",
+            stored_size_bytes: 10,
+            ..Default::default()
+        };
+        assert_eq!(
+            keys_of(&s),
+            vec!["backup_id", "schema", "stored_size_bytes"],
+            "설정하지 않은 필드는 출력에 나타나지 않아야 한다"
+        );
+    }
+
+    /// MongoDB 풀 백업 변형의 키 집합(리터럴 시절 필드 + schema).
+    #[test]
+    fn json_mongo_full_keys() {
+        let s = BackupJsonSummary {
+            backup_id: "b1",
+            stored_size_bytes: 10,
+            checksum_sha256: Some("abc"),
+            topology: Some("ReplicaSet".to_string()),
+            destinations: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(
+            keys_of(&s),
+            vec![
+                "backup_id",
+                "checksum_sha256",
+                "destinations",
+                "schema",
+                "stored_size_bytes",
+                "topology",
+            ]
+        );
+    }
+
+    /// PostgreSQL 증분 변형 — base_id·change_count가 붙고 checksum·topology는 빠진다.
+    #[test]
+    fn json_pg_incremental_keys() {
+        let s = BackupJsonSummary {
+            backup_type: Some("incremental"),
+            backup_id: "b2",
+            base_id: Some("b1"),
+            change_count: Some(7),
+            stored_size_bytes: 20,
+            database: Some("postgresql"),
+            destinations: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            keys_of(&s),
+            vec![
+                "backup_id",
+                "backup_type",
+                "base_id",
+                "change_count",
+                "database",
+                "destinations",
+                "schema",
+                "stored_size_bytes",
+            ]
+        );
+    }
+
+    /// MongoDB 증분은 change_count가 아니라 oplog_count를 쓴다 — 둘을 섞으면 소비자가 깨진다.
+    #[test]
+    fn json_mongo_incremental_uses_oplog_count() {
+        let s = BackupJsonSummary {
+            backup_type: Some("incremental"),
+            backup_id: "b2",
+            base_id: Some("b1"),
+            oplog_count: Some(42),
+            stored_size_bytes: 20,
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["oplog_count"], 42);
+        assert!(
+            v.get("change_count").is_none(),
+            "MongoDB 경로에 change_count가 새어 나오면 안 된다"
+        );
+        assert!(
+            v.get("destinations").is_none(),
+            "이 경로는 개수를 내지 않는다"
+        );
+    }
+
+    /// gap 승격(exit 4) 변형은 promoted_from_gap과 reason을 함께 낸다.
+    #[test]
+    fn json_gap_promotion_keys() {
+        let s = BackupJsonSummary {
+            backup_type: Some("full"),
+            promoted_from_gap: Some(true),
+            backup_id: "b3",
+            stored_size_bytes: 30,
+            checksum_sha256: Some("def"),
+            reason: Some("oplog gap"),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["promoted_from_gap"], true);
+        assert_eq!(v["reason"], "oplog gap");
+        assert_eq!(v["backup_type"], "full");
+    }
+
+    /// 스키마 버전은 항상 실린다 — 소비자가 파서를 고르는 근거다.
+    #[test]
+    fn json_always_carries_schema_version() {
+        let s = BackupJsonSummary::default();
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["schema"], BACKUP_JSON_SCHEMA);
+    }
+
     /// 테스트용 ResolvedConfig — 주어진 profile로 구성(URI는 비워 둠).
     fn resolved_with(profile: Profile) -> ResolvedConfig {
         ResolvedConfig {
             profile_name: "test".to_string(),
             profile,
             resolved_uri: None,
+            resolved_read_uri: None,
         }
     }
 
@@ -1547,6 +1959,8 @@ mod tests {
             progress: false,
             json: false,
             skip_precheck: false,
+            no_hooks: false,
+            read_source: None,
         }
     }
 
@@ -1623,5 +2037,87 @@ mod tests {
             Err(e) => e.exit_code(),
         };
         assert_eq!(code, 2);
+    }
+
+    /// F1 회귀: 훅 시크릿 스크럽 목록이 uri_env + read_uri_env + s3 credentials_env를 모두 포함.
+    #[test]
+    fn collect_secret_env_includes_read_uri_env() {
+        let mut profile = Profile::default();
+        profile.source.uri_env = Some("MAIN_URI".to_string());
+        profile.source.read_uri_env = Some("REPLICA_URI".to_string());
+        profile.destination.r#type = Some("s3".to_string());
+        profile.destination.s3 = Some(crate::config::file::S3Config {
+            credentials_env: Some("S3_CREDS".to_string()),
+            ..Default::default()
+        });
+        let names = collect_secret_env_names(&profile);
+        assert!(names.contains(&"MAIN_URI".to_string()));
+        assert!(
+            names.contains(&"REPLICA_URI".to_string()),
+            "read_uri_env(복제본 자격증명)가 스크럽 목록에 있어야 함(NFR-2): {names:?}"
+        );
+        assert!(names.contains(&"S3_CREDS".to_string()));
+    }
+
+    /// select_read_uri: --read-source(CLI)가 config read_uri보다 우선한다.
+    #[test]
+    fn read_source_cli_beats_config() {
+        let profile = Profile::default();
+        let mut resolved = resolved_with(profile);
+        resolved.resolved_read_uri = Some(Secret::new("mongodb://replica/db".to_string()));
+        resolved.resolved_uri = Some(Secret::new("mongodb://primary/db".to_string()));
+        let uri = select_read_uri(Some("mongodb://cli/db"), &resolved).unwrap();
+        assert_eq!(uri.expose(), "mongodb://cli/db");
+    }
+
+    /// select_read_uri: CLI 없으면 config read_uri(복제본)를 쓴다.
+    #[test]
+    fn read_source_uses_config_read_uri() {
+        let mut resolved = resolved_with(Profile::default());
+        resolved.resolved_read_uri = Some(Secret::new("mongodb://replica/db".to_string()));
+        resolved.resolved_uri = Some(Secret::new("mongodb://primary/db".to_string()));
+        assert_eq!(
+            select_read_uri(None, &resolved).unwrap().expose(),
+            "mongodb://replica/db"
+        );
+    }
+
+    /// select_read_uri: read 소스가 없으면 주 소스로 폴백한다.
+    #[test]
+    fn read_source_falls_back_to_primary() {
+        let mut resolved = resolved_with(Profile::default());
+        resolved.resolved_uri = Some(Secret::new("mongodb://primary/db".to_string()));
+        assert_eq!(
+            select_read_uri(None, &resolved).unwrap().expose(),
+            "mongodb://primary/db"
+        );
+    }
+
+    /// select_read_uri: 아무 소스도 없으면 Config 에러(exit 2).
+    #[test]
+    fn read_source_none_is_config_error() {
+        let resolved = resolved_with(Profile::default());
+        let err = select_read_uri(None, &resolved).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    /// post_hook_event: 성공(0)·경고 동반 성공(4)은 post_backup, 실패는 on_error.
+    #[test]
+    fn post_hook_event_maps_result_to_event() {
+        assert_eq!(post_hook_event(&Ok(())), HookEvent::PostBackup);
+        assert_eq!(
+            post_hook_event(&Err(XBackupError::Warning(crate::tr!(
+                "gap promotion",
+                "gap 승격"
+            )))),
+            HookEvent::PostBackup
+        );
+        assert_eq!(
+            post_hook_event(&Err(XBackupError::Failure(crate::tr!(
+                "upload failed",
+                "업로드 실패"
+            )))),
+            HookEvent::OnError
+        );
     }
 }

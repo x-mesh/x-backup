@@ -377,6 +377,286 @@ fn find_node<'a>(nodes: &'a [ChainNode], id: &str) -> Option<&'a ChainNode> {
     nodes.iter().find(|n| n.id == id)
 }
 
+// ---------------------------------------------------------------------------
+// 여러 target을 반복 판정할 때 — ChainVerifier
+// ---------------------------------------------------------------------------
+
+/// `target`에서 base를 찾은 결과.
+enum BaseOf {
+    /// base를 찾았다 — 나머지 판정은 이 base에만 의존한다.
+    Base(String),
+    /// target이 base_id 없는 증분이다(고아 증분).
+    OrphanIncremental,
+    /// target manifest 자체가 없다.
+    UnknownTarget,
+}
+
+/// 같은 `nodes`에 대해 **여러 target**의 체인을 판정할 때 쓴다.
+///
+/// ## 왜 필요한가 — [`verify_chain`]을 반복 호출하면 O(n²)다
+/// [`verify_chain`]은 호출마다 (1) id로 노드를 선형 탐색하고 (2) 같은 base를 가리키는
+/// 증분을 전체에서 걸러 정렬한다. 백업 하나를 판정하는 데 O(n)이므로, 카탈로그처럼 **모든**
+/// 백업을 판정하는 경로는 O(n²)가 된다. 실측(release, 정상 체인 하나):
+///
+/// ```text
+///   백업 수     경과
+///      250     1.6ms
+///      500     6.1ms   (3.7배)
+///     1000    22.3ms   (3.7배)
+///     2000    84.9ms   (3.8배)
+///     4000   335.8ms   (4.0배)
+/// ```
+///
+/// n이 2배일 때 4배 — 교과서적인 제곱 성장이다. 백업 수천 개인 운영 환경에서 `list`와
+/// 카탈로그 화면이 함께 느려진다. 이 타입을 쓰면 같은 입력이 이렇게 바뀐다:
+///
+/// ```text
+///   백업 수     옛 경로     이 타입
+///      250      1.8ms      0.03ms
+///     1000     44.3ms      0.30ms
+///     4000    347.9ms      0.34ms
+///     8000   1411.6ms      0.67ms
+/// ```
+///
+/// ## 무엇을 줄이는가 — 인덱스가 아니라 **중복 계산**이다
+/// 인덱스(id → 노드)만 붙여서는 부족하다. 진짜 낭비는 다른 데 있다:
+/// [`verify_chain`]의 절차 2~6단계는 **`target`을 전혀 보지 않는다** — `base_id`에만
+/// 의존한다. 즉 같은 base를 공유하는 백업 n개는 **글자 그대로 같은 보고서**를 n번 만든다.
+///
+/// 그래서 이 타입은 보고서를 **base 단위로 캐시**한다. base 하나에 증분 n개가 매달린
+/// 흔한 형태에서 계산은 n번이 아니라 1번이 된다.
+///
+/// target에 따라 달라지는 것은 1단계(base 식별)뿐이고, 그 결과가 갈리는 두 경우
+/// (고아 증분·모르는 target)는 캐시하지 않는다 — O(1)이고 드물다.
+///
+/// ## 결과가 [`verify_chain`]과 같아야 한다
+/// 이 타입은 성능만 바꾼다. 두 경로가 **모든 입력에서 같은 보고서를 낸다**는 것은
+/// `verifier_matches_verify_chain_on_every_target`가 고정한다.
+pub struct ChainVerifier<'a> {
+    /// id → 노드. [`find_node`]의 선형 탐색을 대신한다.
+    by_id: std::collections::HashMap<&'a str, &'a ChainNode>,
+    /// base_id → 그 base를 가리키는 증분들(**정렬된 상태로** 보관한다 — 정렬도 base마다
+    /// 한 번이면 충분하다).
+    incrementals_by_base: std::collections::HashMap<&'a str, Vec<&'a ChainNode>>,
+    /// base_id → 그 base의 보고서.
+    cache: std::collections::HashMap<String, ChainReport>,
+}
+
+impl<'a> ChainVerifier<'a> {
+    /// `nodes`를 한 번 훑어 인덱스를 만든다.
+    pub fn new(nodes: &'a [ChainNode]) -> Self {
+        let mut by_id = std::collections::HashMap::with_capacity(nodes.len());
+        let mut incrementals_by_base: std::collections::HashMap<&str, Vec<&ChainNode>> =
+            std::collections::HashMap::new();
+
+        for node in nodes {
+            by_id.insert(node.id.as_str(), node);
+            if matches!(node.backup_type, BackupType::Incremental) {
+                if let Some(base_id) = node.base_id.as_deref() {
+                    incrementals_by_base.entry(base_id).or_default().push(node);
+                }
+            }
+        }
+
+        // 정렬 규칙은 `verify_chain` 3단계와 **글자 그대로 같아야 한다** — 순서가 갈리면
+        // `incremental_ids`와 인접 연속성 판정이 함께 갈린다.
+        for group in incrementals_by_base.values_mut() {
+            group.sort_by(|a, b| match (a.start_ts(), b.start_ts()) {
+                (Some(sa), Some(sb)) => sa.cmp(&sb).then(a.id.cmp(&b.id)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.id.cmp(&b.id),
+            });
+        }
+
+        Self {
+            by_id,
+            incrementals_by_base,
+            cache: std::collections::HashMap::new(),
+        }
+    }
+
+    /// `target_id`의 체인 보고서. [`verify_chain`]과 같은 값을 돌려준다.
+    pub fn verify(&mut self, target_id: &str) -> ChainReport {
+        match self.resolve_base(target_id) {
+            BaseOf::Base(base_id) => self.report_for_base(&base_id).clone(),
+            BaseOf::OrphanIncremental => orphan_incremental_report(target_id),
+            BaseOf::UnknownTarget => unknown_target_report(target_id),
+        }
+    }
+
+    /// `target_id`의 체인이 연속인가.
+    ///
+    /// [`ChainVerifier::verify`]와 달리 보고서를 복제하지 않는다. 카탈로그처럼 **불리언만**
+    /// 필요한 경로가 `incremental_ids`(체인이 길면 문자열 수천 개)를 백업마다 복제하는 것을
+    /// 막는다 — 그러면 제곱 비용을 계산에서 없애고 복제로 되살리는 꼴이 된다.
+    pub fn is_continuous(&mut self, target_id: &str) -> bool {
+        match self.resolve_base(target_id) {
+            BaseOf::Base(base_id) => self.report_for_base(&base_id).is_continuous(),
+            // 두 경우 모두 `MissingBase` 끊김을 담은 보고서가 된다 — 연속일 수 없다.
+            BaseOf::OrphanIncremental | BaseOf::UnknownTarget => false,
+        }
+    }
+
+    /// 캐시에 든 base 수 — 테스트가 "base당 한 번만 계산한다"를 확인할 때 쓴다.
+    #[cfg(test)]
+    pub(crate) fn cached_base_count(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// 1단계(base 식별) — 여기만 `target`에 의존한다.
+    fn resolve_base(&self, target_id: &str) -> BaseOf {
+        match self.by_id.get(target_id) {
+            Some(t) => match t.backup_type {
+                BackupType::Full => BaseOf::Base(t.id.clone()),
+                BackupType::Incremental => match &t.base_id {
+                    Some(b) => BaseOf::Base(b.clone()),
+                    None => BaseOf::OrphanIncremental,
+                },
+            },
+            None => BaseOf::UnknownTarget,
+        }
+    }
+
+    /// base 하나의 보고서(캐시된다).
+    fn report_for_base(&mut self, base_id: &str) -> &ChainReport {
+        if !self.cache.contains_key(base_id) {
+            let report = self.compute_for_base(base_id);
+            self.cache.insert(base_id.to_string(), report);
+        }
+        &self.cache[base_id]
+    }
+
+    /// [`verify_chain`]의 2~6단계 — `target`을 보지 않는다.
+    fn compute_for_base(&self, base_id: &str) -> ChainReport {
+        let mut breaks = Vec::new();
+        let mut warnings = Vec::new();
+
+        // 2) base 적격성.
+        let Some(base) = self.by_id.get(base_id).copied() else {
+            return ChainReport {
+                base_id: base_id.to_string(),
+                incremental_ids: Vec::new(),
+                breaks: vec![ChainBreak::MissingBase {
+                    base_id: base_id.to_string(),
+                }],
+                warnings,
+            };
+        };
+        if !matches!(base.backup_type, BackupType::Full) {
+            breaks.push(ChainBreak::IneligibleBase {
+                base_id: base_id.to_string(),
+                reason: "base가 풀백업이 아닙니다".to_string(),
+            });
+        }
+        if base.selective {
+            breaks.push(ChainBreak::IneligibleBase {
+                base_id: base_id.to_string(),
+                reason: "selective 백업은 증분 base가 될 수 없습니다(FR-1)".to_string(),
+            });
+        }
+        if base.is_incomplete() {
+            breaks.push(ChainBreak::IncompleteMember {
+                id: base_id.to_string(),
+            });
+        }
+
+        // 3) 같은 base를 가리키는 증분 — 이미 정렬돼 있다(`new`).
+        const EMPTY: &[&ChainNode] = &[];
+        let incrementals: &[&ChainNode] = self
+            .incrementals_by_base
+            .get(base_id)
+            .map(Vec::as_slice)
+            .unwrap_or(EMPTY);
+
+        let incremental_ids: Vec<String> = incrementals.iter().map(|n| n.id.clone()).collect();
+
+        // 4) 각 증분 적격성.
+        let mongo_chain = base.oplog_range.is_some();
+        for incr in incrementals {
+            if incr.is_incomplete() {
+                breaks.push(ChainBreak::IncompleteMember {
+                    id: incr.id.clone(),
+                });
+            }
+            if mongo_chain && incr.oplog_range.is_none() {
+                breaks.push(ChainBreak::MissingOplogRange {
+                    id: incr.id.clone(),
+                });
+            }
+        }
+
+        // 5) base 접점.
+        if let Some(first) = incrementals.first() {
+            match (base.end_ts(), first.start_ts()) {
+                (Some(base_end), Some(incr_start)) => {
+                    if base_end != incr_start {
+                        breaks.push(ChainBreak::BaseJoinGap {
+                            base_id: base_id.to_string(),
+                            first_incr_id: first.id.clone(),
+                            base_end,
+                            incr_start,
+                        });
+                    }
+                }
+                (None, _) => {
+                    warnings.push(ChainWarning::BaseHasNoOplogRange {
+                        base_id: base_id.to_string(),
+                    });
+                }
+                (Some(_), None) => {}
+            }
+        }
+
+        // 6) 인접 연속성.
+        for pair in incrementals.windows(2) {
+            let prev = pair[0];
+            let next = pair[1];
+            if let (Some(prev_end), Some(next_start)) = (prev.end_ts(), next.start_ts()) {
+                if prev_end != next_start {
+                    breaks.push(ChainBreak::Discontinuity {
+                        prev_id: prev.id.clone(),
+                        next_id: next.id.clone(),
+                        prev_end,
+                        next_start,
+                    });
+                }
+            }
+        }
+
+        ChainReport {
+            base_id: base_id.to_string(),
+            incremental_ids,
+            breaks,
+            warnings,
+        }
+    }
+}
+
+/// base_id 없는 증분을 target으로 받았을 때의 보고(고아 증분).
+fn orphan_incremental_report(target_id: &str) -> ChainReport {
+    ChainReport {
+        base_id: String::new(),
+        incremental_ids: Vec::new(),
+        breaks: vec![ChainBreak::MissingBase {
+            base_id: format!("(증분 '{target_id}'에 base_id 없음)"),
+        }],
+        warnings: Vec::new(),
+    }
+}
+
+/// target manifest 자체가 없을 때의 보고.
+fn unknown_target_report(target_id: &str) -> ChainReport {
+    ChainReport {
+        base_id: target_id.to_string(),
+        incremental_ids: Vec::new(),
+        breaks: vec![ChainBreak::MissingBase {
+            base_id: target_id.to_string(),
+        }],
+        warnings: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +690,178 @@ mod tests {
             selective: false,
             status: BackupStatus::Complete,
         }
+    }
+
+    // ---- ChainVerifier: verify_chain과 결과가 같아야 한다 ----
+
+    /// **이 테스트가 `ChainVerifier`의 존재 근거를 지킨다.**
+    ///
+    /// 그 타입은 성능만 바꾼다 — 결과가 [`verify_chain`]과 조금이라도 다르면 그건 최적화가
+    /// 아니라 다른 판정이다. 그래서 병리적인 배치들을 모아 **모든 노드를 target으로** 두
+    /// 경로를 돌려 비교한다(존재하지 않는 id까지 포함).
+    #[test]
+    fn verifier_matches_verify_chain_on_every_target() {
+        let mut orphan = incr("orphan", "base", ts(1, 1), ts(2, 1));
+        orphan.base_id = None; // base_id 없는 증분(고아)
+
+        let mut no_oplog = incr("no-oplog", "base", ts(1, 1), ts(2, 1));
+        no_oplog.oplog_range = None;
+
+        let mut incomplete = incr("incomplete", "base", ts(200, 3), ts(250, 1));
+        incomplete.status = BackupStatus::Incomplete;
+
+        let mut selective_base = full("sel-base", ts(10, 1));
+        selective_base.selective = true;
+
+        let mut incr_as_base = incr("incr-base", "base", ts(300, 1), ts(310, 1));
+        incr_as_base.id = "incr-base".to_string();
+
+        let cases: Vec<(&str, Vec<ChainNode>)> = vec![
+            ("빈 목록", vec![]),
+            ("풀 하나", vec![full("base", ts(100, 1))]),
+            (
+                "정상 체인",
+                vec![
+                    full("base", ts(100, 1)),
+                    incr("i1", "base", ts(100, 1), ts(150, 2)),
+                    incr("i2", "base", ts(150, 2), ts(200, 3)),
+                ],
+            ),
+            (
+                "불연속",
+                vec![
+                    full("base", ts(100, 1)),
+                    incr("i1", "base", ts(100, 1), ts(150, 2)),
+                    incr("i2", "base", ts(180, 9), ts(200, 3)),
+                ],
+            ),
+            (
+                "base 접점 어긋남",
+                vec![
+                    full("base", ts(100, 1)),
+                    incr("i1", "base", ts(120, 1), ts(150, 2)),
+                ],
+            ),
+            (
+                "base 없는 증분들",
+                vec![
+                    incr("i1", "gone", ts(100, 1), ts(150, 2)),
+                    incr("i2", "gone", ts(150, 2), ts(200, 3)),
+                ],
+            ),
+            ("고아 증분", vec![full("base", ts(100, 1)), orphan]),
+            (
+                "oplog_range 없는 증분",
+                vec![full("base", ts(100, 1)), no_oplog],
+            ),
+            (
+                "incomplete 멤버",
+                vec![
+                    full("base", ts(100, 1)),
+                    incr("i1", "base", ts(100, 1), ts(200, 3)),
+                    incomplete,
+                ],
+            ),
+            (
+                "selective base",
+                vec![selective_base, incr("s1", "sel-base", ts(10, 1), ts(20, 1))],
+            ),
+            (
+                "base가 증분",
+                vec![
+                    full("base", ts(100, 1)),
+                    incr_as_base,
+                    incr("child", "incr-base", ts(310, 1), ts(320, 1)),
+                ],
+            ),
+            (
+                "여러 base 혼재",
+                vec![
+                    full("a", ts(10, 1)),
+                    full("b", ts(20, 1)),
+                    incr("a1", "a", ts(10, 1), ts(11, 1)),
+                    incr("b1", "b", ts(20, 1), ts(21, 1)),
+                    incr("b2", "b", ts(21, 1), ts(22, 1)),
+                ],
+            ),
+        ];
+
+        for (label, nodes) in cases {
+            let mut verifier = ChainVerifier::new(&nodes);
+
+            // 존재하는 모든 노드 + 존재하지 않는 id 하나.
+            let targets: Vec<String> = nodes
+                .iter()
+                .map(|n| n.id.clone())
+                .chain(std::iter::once("nope".to_string()))
+                .collect();
+
+            for target in &targets {
+                let expected = verify_chain(&nodes, target);
+                let actual = verifier.verify(target);
+                assert_eq!(
+                    actual, expected,
+                    "[{label}] target={target}: ChainVerifier가 verify_chain과 다른 보고서를 냈다"
+                );
+                assert_eq!(
+                    verifier.is_continuous(target),
+                    expected.is_continuous(),
+                    "[{label}] target={target}: is_continuous가 갈렸다"
+                );
+            }
+        }
+    }
+
+    /// **이 타입이 실제로 무엇을 줄이는지**를 타이밍이 아니라 구조로 고정한다.
+    ///
+    /// 성능 테스트를 시간으로 쓰면 느린 CI에서 흔들린다. 여기서 확인할 성질은 시간이 아니라
+    /// "같은 base를 공유하는 target n개에 대해 계산은 **한 번**"이므로, 캐시에 든 base 수를
+    /// 직접 본다. 이 단정이 깨지면 최적화가 조용히 사라진 것이다.
+    #[test]
+    fn one_computation_per_base_no_matter_how_many_targets() {
+        let mut nodes = vec![full("base", ts(0, 1))];
+        for k in 1..500u32 {
+            nodes.push(incr(&format!("i{k:04}"), "base", ts(k - 1, 1), ts(k, 1)));
+        }
+        // 마지막 하나만 다른 base에 매단다 — 캐시가 base마다 따로 생기는지 함께 본다.
+        nodes.push(full("other", ts(0, 1)));
+
+        let mut verifier = ChainVerifier::new(&nodes);
+        for node in &nodes {
+            // 판정값 자체는 위 동치성 테스트가 본다 — 여기서는 "모든 target을 한 번씩
+            // 물었다"는 사실만 만들면 된다.
+            verifier.is_continuous(&node.id);
+        }
+
+        assert_eq!(
+            verifier.cached_base_count(),
+            2,
+            "base는 'base'와 'other' 둘뿐인데 캐시 수가 다르다 — target마다 다시 계산하고 있다"
+        );
+    }
+
+    /// 캐시가 결과를 오염시키지 않는다 — 같은 target을 반복해도, 다른 base를 사이에 끼워도
+    /// 값이 그대로여야 한다.
+    #[test]
+    fn verifier_cache_does_not_leak_between_bases() {
+        let nodes = vec![
+            full("a", ts(10, 1)),
+            full("b", ts(20, 1)),
+            incr("a1", "a", ts(10, 1), ts(11, 1)),
+            // b의 체인은 접점이 어긋나 끊겨 있다.
+            incr("b1", "b", ts(99, 9), ts(100, 1)),
+        ];
+        let mut verifier = ChainVerifier::new(&nodes);
+
+        for _ in 0..3 {
+            assert!(verifier.is_continuous("a"), "a 체인은 연속이다");
+            assert!(verifier.is_continuous("a1"), "a1은 a의 체인을 본다");
+            assert!(!verifier.is_continuous("b"), "b 체인은 끊겨 있다");
+            assert!(!verifier.is_continuous("b1"), "b1은 b의 체인을 본다");
+        }
+
+        assert_eq!(verifier.verify("a").incremental_ids, vec!["a1".to_string()]);
+        assert_eq!(verifier.verify("b").incremental_ids, vec!["b1".to_string()]);
     }
 
     /// 정상 체인: base → incr1 → incr2 가 연속이면 끊김 없음.

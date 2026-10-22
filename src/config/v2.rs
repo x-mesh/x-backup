@@ -191,6 +191,7 @@ fn expand_profile(name: &str, flat: &Table) -> Result<Table> {
     let mut encryption = Table::new();
     let mut incremental = Table::new();
     let mut retention = Table::new();
+    let mut hooks = Table::new();
     let mut notify = Table::new();
     let mut schedule: Option<Value> = None;
     let mut destinations: Option<Value> = None;
@@ -200,6 +201,8 @@ fn expand_profile(name: &str, flat: &Table) -> Result<Table> {
             // ── source ──
             "uri" => insert_into(&mut source, "uri", v),
             "uri_env" => insert_into(&mut source, "uri_env", v),
+            "read_uri" => insert_into(&mut source, "read_uri", v),
+            "read_uri_env" => insert_into(&mut source, "read_uri_env", v),
             "prefer_secondary" => insert_into(&mut source, "prefer_secondary", v),
             "connect_timeout_secs" => insert_into(&mut source, "connect_timeout_secs", v),
             // ── mode ── (output_mode → mode.output: 루트 [output]와 혼동 방지)
@@ -240,6 +243,17 @@ fn expand_profile(name: &str, flat: &Table) -> Result<Table> {
             "keep_full" => insert_into(&mut retention, "keep_full", v),
             "keep_days" => insert_into(&mut retention, "keep_days", v),
             "keep_last" => insert_into(&mut retention, "keep_last", v),
+            "recovery_window_days" => insert_into(&mut retention, "recovery_window_days", v),
+            "min_redundancy" => insert_into(&mut retention, "min_redundancy", v),
+            // ── hooks ── (flat `hook_*` → hooks.*)
+            "hook_pre_backup" => insert_into(&mut hooks, "pre_backup", v),
+            "hook_post_backup" => insert_into(&mut hooks, "post_backup", v),
+            "hook_pre_restore" => insert_into(&mut hooks, "pre_restore", v),
+            "hook_post_restore" => insert_into(&mut hooks, "post_restore", v),
+            "hook_pre_prune" => insert_into(&mut hooks, "pre_prune", v),
+            "hook_post_prune" => insert_into(&mut hooks, "post_prune", v),
+            "hook_on_error" => insert_into(&mut hooks, "on_error", v),
+            "hook_timeout_secs" => insert_into(&mut hooks, "hook_timeout_secs", v),
             // ── daemon 스케줄/알림(P3-1/P3-2) ──
             "schedule" => schedule = Some(v.clone()),
             "notify_webhook_env" => insert_into(&mut notify, "webhook_url_env", v),
@@ -285,6 +299,9 @@ fn expand_profile(name: &str, flat: &Table) -> Result<Table> {
     }
     if !retention.is_empty() {
         profile.insert("retention".to_string(), Value::Table(retention));
+    }
+    if !hooks.is_empty() {
+        profile.insert("hooks".to_string(), Value::Table(hooks));
     }
     if let Some(sched) = schedule {
         profile.insert("schedule".to_string(), sched);
@@ -1177,6 +1194,7 @@ mod tests {
                     keep_full: Some(3),
                     keep_days: Some(14),
                     keep_last: None,
+                    ..Default::default()
                 },
                 ..Profile::default()
             },
@@ -1300,5 +1318,20 @@ mod tests {
             mk_target("postgres://xbackup@localhost:5433/db_restore"),
         );
         roundtrip(&cfg);
+    }
+
+    /// v2 flat `hook_*` 키가 hooks.* nested로 정규화되어 파싱된다(PRD-04). 미지의 키로
+    /// 거부되지 않아야 한다.
+    #[test]
+    fn v2_flat_hooks_map_to_nested() {
+        let toml = "[profile.p]\nuri = \"mongodb://h/db\"\n\
+                    hook_pre_backup = \"quiesce.sh\"\nhook_post_backup = \"notify.sh\"\n\
+                    hook_on_error = \"pager.sh\"\nhook_timeout_secs = 15\n";
+        let cfg = crate::config::file::Config::from_toml_str(toml).unwrap();
+        let p = cfg.profile("p").unwrap();
+        assert_eq!(p.hooks.pre_backup.as_deref(), Some("quiesce.sh"));
+        assert_eq!(p.hooks.post_backup.as_deref(), Some("notify.sh"));
+        assert_eq!(p.hooks.on_error.as_deref(), Some("pager.sh"));
+        assert_eq!(p.hooks.hook_timeout_secs, Some(15));
     }
 }

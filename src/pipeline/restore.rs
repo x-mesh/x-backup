@@ -155,13 +155,21 @@ async fn build_plan(
         Some(meta) => {
             let server_meta = meta.server_meta().await.map_err(|e| {
                 // 연결/권한 실패는 사전 점검 실패(exit 3) — 작업 미시작(PRD §FR-3).
-                XBackupError::PrecheckFailed(format!("복구 대상 서버 점검 실패: {e}"))
+                XBackupError::PrecheckFailed(crate::tr!(
+                    "failed to check the restore target server: {e}",
+                    "복구 대상 서버 점검 실패: {e}"
+                ))
             })?;
             let warning = version_compat_warning(&server_meta, &manifest);
             let conflicts = meta
                 .user_namespaces(request.only.as_deref())
                 .await
-                .map_err(|e| XBackupError::PrecheckFailed(format!("기존 데이터 조회 실패: {e}")))?;
+                .map_err(|e| {
+                    XBackupError::PrecheckFailed(crate::tr!(
+                        "failed to query existing data: {e}",
+                        "기존 데이터 조회 실패: {e}"
+                    ))
+                })?;
             (Some(server_meta.server_version), warning, conflicts)
         }
         None => (None, None, Vec::new()),
@@ -204,11 +212,8 @@ where
     //   없어 전체를 복구하면서 계획만 좁게 보여주면 데이터 범위가 거짓 보고된다. 명확히
     //   거부한다(exit 2). 시점 복구(--at) 경로도 동일하게 --only를 거부한다.
     if is_driver && request.only.is_some() {
-        return Err(XBackupError::Usage(
-            "PG/MySQL/파일 복구는 --only(선택적 복구)를 지원하지 않습니다 — 전체 복구만 \
-             가능합니다. 특정 부분만 필요하면 복구 후 정리하거나 별도 도구를 사용하세요."
-                .into(),
-        ));
+        return Err(XBackupError::Usage(crate::tr!("PostgreSQL/MySQL/file restore does not support --only (selective restore) — only a full restore is possible. If you need only part of the data, clean up after the restore or use a separate tool.", "PG/MySQL/파일 복구는 --only(선택적 복구)를 지원하지 않습니다 — 전체 복구만 가능합니다. \
+             특정 부분만 필요하면 복구 후 정리하거나 별도 도구를 사용하세요.")));
     }
 
     // 사전 점검 메타(Mongo): skip-precheck가 아니면 대상에 연결해 점검에 활용한다.
@@ -220,7 +225,12 @@ where
         Some(
             MongoMeta::connect(&request.target_uri, request.timeout_secs)
                 .await
-                .map_err(|e| XBackupError::PrecheckFailed(format!("복구 대상 연결 실패: {e}")))?,
+                .map_err(|e| {
+                    XBackupError::PrecheckFailed(crate::tr!(
+                        "failed to connect to the restore target: {e}",
+                        "복구 대상 연결 실패: {e}"
+                    ))
+                })?,
         )
     };
 
@@ -236,23 +246,46 @@ where
             request.timeout_secs,
         )
         .await
-        .map_err(|e| XBackupError::PrecheckFailed(format!("복구 대상(PG) 연결 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::PrecheckFailed(crate::tr!(
+                "failed to connect to the restore target (PostgreSQL): {e}",
+                "복구 대상(PG) 연결 실패: {e}"
+            ))
+        })?;
         let existing = crate::engine::postgres::meta::list_qualified(pg.client())
             .await
-            .map_err(|e| XBackupError::PrecheckFailed(format!("기존 테이블 조회 실패: {e}")))?;
+            .map_err(|e| {
+                XBackupError::PrecheckFailed(crate::tr!(
+                    "failed to query existing tables: {e}",
+                    "기존 테이블 조회 실패: {e}"
+                ))
+            })?;
         plan.conflicting_namespaces = existing;
     }
     if is_mysql && !request.skip_precheck {
-        let mut my = crate::engine::mysql::conn::MysqlClient::connect(
+        let my = crate::engine::mysql::conn::MysqlClient::connect_restore_target(
             &request.target_uri,
             request.timeout_secs,
+            !request.dry_run,
         )
         .await
-        .map_err(|e| XBackupError::PrecheckFailed(format!("복구 대상(MySQL) 연결 실패: {e}")))?;
-        let existing = crate::engine::mysql::meta::list_qualified(my.conn_mut())
-            .await
-            .map_err(|e| XBackupError::PrecheckFailed(format!("기존 테이블 조회 실패: {e}")))?;
-        plan.conflicting_namespaces = existing;
+        .map_err(|e| {
+            XBackupError::PrecheckFailed(crate::tr!(
+                "failed to connect to the restore target (MySQL): {e}",
+                "복구 대상(MySQL) 연결 실패: {e}"
+            ))
+        })?;
+        if let Some(mut my) = my {
+            let existing = crate::engine::mysql::meta::list_qualified(my.conn_mut())
+                .await
+                .map_err(|e| {
+                    XBackupError::PrecheckFailed(crate::tr!(
+                        "failed to query existing tables: {e}",
+                        "기존 테이블 조회 실패: {e}"
+                    ))
+                })?;
+            plan.conflicting_namespaces = existing;
+        }
     }
     // 파일 대상도 동일 가드레일: 대상 디렉터리가 비어 있지 않으면 충돌로 보고해
     //   --force/대화형 확인을 강제한다. 복구는 기존 트리를 지우지 않고 **위에 덮어쓴다**
@@ -338,19 +371,13 @@ pub async fn export_to_dir(
     // 가드 1: native 포맷만(mongodump archive/PG는 표준 BSON 덤프로 못 푼다).
     let fmt = manifest.tool_versions.archive_format.as_deref();
     if fmt != Some(crate::engine::native::archive::FORMAT_ID) {
-        return Err(XBackupError::Usage(format!(
-            "--to-dir는 native(기본) mongo 백업만 BSON 덤프로 추출합니다(이 백업 포맷: {}). \
-             mongodump/PG 백업은 임시 서버로 복구한 뒤 표준 도구로 추출하세요.",
-            fmt.unwrap_or("unknown")
-        )));
+        return Err(XBackupError::Usage(crate::tr!("--to-dir extracts only native (default) MongoDB backups as a BSON dump (this backup's format: {}). For mongodump/PostgreSQL backups, restore to a temporary server and extract with the standard tools.", "--to-dir는 native(기본) mongo 백업만 BSON 덤프로 추출합니다(이 백업 포맷: {}). \
+             mongodump/PG 백업은 임시 서버로 복구한 뒤 표준 도구로 추출하세요.", fmt.unwrap_or("unknown"))));
     }
     // 가드 2: 풀 백업만(증분은 oplog 슬라이스라 단독 덤프 디렉터리가 아니다).
     if !matches!(manifest.backup_type, BackupType::Full) {
-        return Err(XBackupError::Usage(
-            "증분 백업은 --to-dir로 추출할 수 없습니다 — 풀 백업만 가능합니다(증분은 \
-             서버 복구/PITR로 적용하세요)."
-                .into(),
-        ));
+        return Err(XBackupError::Usage(crate::tr!("an incremental backup cannot be extracted with --to-dir — only a full backup can be (apply an incremental via server restore/PITR instead).", "증분 백업은 --to-dir로 추출할 수 없습니다 — 풀 백업만 가능합니다(증분은 \
+             서버 복구/PITR로 적용하세요).")));
     }
 
     // data.bin → 역스택(복호화→압축해제) → 네이티브 프레임 스트림.
@@ -390,17 +417,15 @@ where
             // 대화형 승인 = force 동등(drop 허용).
             Ok(true)
         } else {
-            Err(XBackupError::Failure(
-                "사용자가 복구를 취소했습니다(기존 데이터 보존)".into(),
-            ))
+            Err(XBackupError::Failure(crate::tr!(
+                "the user cancelled the restore (existing data preserved)",
+                "사용자가 복구를 취소했습니다(기존 데이터 보존)"
+            )))
         }
     } else {
-        Err(XBackupError::Failure(format!(
-            "복원 대상에 기존 데이터가 있습니다({}개 네임스페이스). 비-TTY에서는 \
-             --force 없이 덮어쓰기를 거부합니다 — 충돌: {}",
-            plan.conflicting_namespaces.len(),
-            preview_namespaces(&plan.conflicting_namespaces)
-        )))
+        Err(XBackupError::Failure(crate::tr!("the restore target already has data ({} namespace(s)). Non-TTY refuses to overwrite without --force — conflicts: {}", "복원 대상에 기존 데이터가 있습니다({}개 네임스페이스). 비-TTY에서는 \
+             --force 없이 덮어쓰기를 거부합니다 — 충돌: {}", plan.conflicting_namespaces.len(),
+            preview_namespaces(&plan.conflicting_namespaces))))
     }
 }
 
@@ -463,7 +488,8 @@ async fn stream_restore(
     //    기본 빌드는 서브프로세스 스폰 코드가 없다(로드맵 P0-2).
     #[cfg(not(feature = "legacy-mongodump"))]
     {
-        Err(XBackupError::Failure(format!(
+        Err(XBackupError::Failure(crate::tr!(
+            "backup '{}' uses the mongodump archive format — this build does not include mongorestore orchestration (cargo feature `legacy-mongodump`). Restore with a build that enables the legacy-mongodump feature, or create a new backup with the native engine",
             "백업 '{}'는 mongodump 아카이브 포맷입니다 — 이 빌드에는 mongorestore \
              오케스트레이션이 포함되지 않았습니다(cargo feature `legacy-mongodump`). \
              legacy-mongodump feature를 켠 빌드로 복구하거나, native 엔진으로 새 백업을 \
@@ -496,7 +522,8 @@ async fn stream_restore(
         if let Err(copy_err) = copy_result {
             // 입력/파이프 실패: restore를 kill+wait로 정리(좀비 방지).
             restore.abort().await;
-            return Err(XBackupError::Failure(format!(
+            return Err(XBackupError::Failure(crate::tr!(
+                "restore input streaming failed: {copy_err}",
                 "복구 입력 스트리밍 실패: {copy_err}"
             )));
         }
@@ -635,7 +662,10 @@ async fn native_stream_restore(
         crate::engine::mongo::conn::client_options(&request.target_uri, request.timeout_secs)
             .await?;
     let client = mongodb::Client::with_options(options).map_err(|e| {
-        XBackupError::Failure(format!("복구 대상 MongoDB 클라이언트 생성 실패: {e}"))
+        XBackupError::Failure(crate::tr!(
+            "failed to create the restore target MongoDB client: {e}",
+            "복구 대상 MongoDB 클라이언트 생성 실패: {e}"
+        ))
     })?;
 
     let inserted = crate::engine::native::restore::native_restore(
@@ -698,9 +728,10 @@ async fn latest_full_manifest(storage: &dyn Storage) -> Result<BackupManifest> {
     }
 
     best.ok_or_else(|| {
-        XBackupError::Failure(
-            "복구할 풀 백업이 없습니다 — destination에서 완료된 풀 백업을 찾지 못했습니다".into(),
-        )
+        XBackupError::Failure(crate::tr!(
+            "no full backup to restore — no completed full backup was found at the destination",
+            "복구할 풀 백업이 없습니다 — destination에서 완료된 풀 백업을 찾지 못했습니다"
+        ))
     })
 }
 
@@ -738,7 +769,8 @@ fn preview_namespaces(namespaces: &[String]) -> String {
         return namespaces.join(", ");
     }
     let shown = namespaces[..MAX].join(", ");
-    format!("{shown}, … (+{}개)", namespaces.len() - MAX)
+    let more = namespaces.len() - MAX;
+    crate::tr!("{shown}, … (+{more} more)", "{shown}, … (+{more}개)")
 }
 
 #[cfg(test)]
@@ -921,7 +953,11 @@ mod tests {
         let plan = plan_with_conflicts(vec!["testdb.items".into()]);
         let err = decide_guard(&plan, false, false, |_| true).unwrap_err();
         assert_eq!(err.exit_code(), 1);
-        assert!(err.to_string().contains("기존 데이터"), "메시지: {err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already has data") || msg.contains("기존 데이터"),
+            "message: {err}"
+        );
     }
 
     /// 가드: --force면 충돌이 있어도 통과하고 drop을 켠다(true).
@@ -953,14 +989,21 @@ mod tests {
         // 거부.
         let err = decide_guard(&plan, false, true, |_| false).unwrap_err();
         assert_eq!(err.exit_code(), 1);
-        assert!(err.to_string().contains("취소"), "메시지: {err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cancelled") || msg.contains("취소"),
+            "message: {err}"
+        );
     }
 
     #[test]
     fn preview_namespaces_truncates() {
         let many: Vec<String> = (0..8).map(|i| format!("db.c{i}")).collect();
         let preview = preview_namespaces(&many);
-        assert!(preview.contains("(+3개)"), "preview: {preview}");
+        assert!(
+            preview.contains("(+3 more)") || preview.contains("(+3개)"),
+            "preview: {preview}"
+        );
         let few = vec!["db.a".to_string(), "db.b".to_string()];
         assert_eq!(preview_namespaces(&few), "db.a, db.b");
     }
@@ -1014,6 +1057,8 @@ mod tests {
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
+        // Linux 전용 `ETXTBSY` 경합을 피한다 — 근거는 그 함수 문서.
+        crate::testutil::wait_until_executable(&path);
         path
     }
 
@@ -1390,6 +1435,8 @@ mod tests {
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
+        // Linux 전용 `ETXTBSY` 경합을 피한다 — 근거는 그 함수 문서.
+        crate::testutil::wait_until_executable(&path);
 
         let request = RestoreRequest {
             target_uri: crate::config::secret::Secret::new("mongodb://unused/db"),

@@ -9,6 +9,8 @@
 //! - [`error`]: 에러 모델과 exit code 매핑.
 //! - [`engine`]/[`storage`]/[`crypto`]/[`compress`]/[`pipeline`]/[`manifest`]/[`lock`]:
 //!   도메인 계층(스캐폴드 단계에서는 스텁).
+//! - [`web`]: 웹 운영 콘솔(`serve`). 도메인 계층을 직접 부르지 않고 CLI 자식 프로세스를
+//!   띄운다 — 근거는 [`web`] 모듈 헤더.
 
 pub mod cli;
 pub mod compress;
@@ -16,6 +18,7 @@ pub mod config;
 pub mod crypto;
 pub mod engine;
 pub mod error;
+pub mod hooks;
 pub mod i18n;
 pub mod lock;
 pub mod manifest;
@@ -23,7 +26,10 @@ pub mod notify;
 pub mod pipeline;
 pub mod schedule;
 pub mod storage;
+#[cfg(test)]
+pub(crate) mod testutil;
 pub mod update;
+pub mod web;
 
 pub use error::{Result, XBackupError};
 

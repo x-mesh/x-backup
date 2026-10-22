@@ -1,0 +1,526 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-09-28T01:39:40Z",
+  "title": "Design System: x-backup web console",
+  "extensions": {
+    "colorMeta": {
+      "board": {
+        "role": "primary",
+        "displayName": "Archive Box Slate",
+        "canonical": "#33424f",
+        "tonalRamp": [
+          "oklch(15% 0.030 244.9)",
+          "oklch(27% 0.030 244.9)",
+          "oklch(39% 0.030 244.9)",
+          "oklch(51% 0.030 244.9)",
+          "oklch(63% 0.030 244.9)",
+          "oklch(75% 0.030 244.9)",
+          "oklch(85% 0.030 244.9)",
+          "oklch(95% 0.030 244.9)"
+        ]
+      },
+      "board-deep": {
+        "role": "primary",
+        "displayName": "Deep Box Slate",
+        "canonical": "#27333e",
+        "tonalRamp": [
+          "oklch(15% 0.026 246.4)",
+          "oklch(27% 0.026 246.4)",
+          "oklch(39% 0.026 246.4)",
+          "oklch(51% 0.026 246.4)",
+          "oklch(63% 0.026 246.4)",
+          "oklch(75% 0.026 246.4)",
+          "oklch(85% 0.026 246.4)",
+          "oklch(95% 0.026 246.4)"
+        ]
+      },
+      "board-ink": {
+        "role": "primary",
+        "displayName": "Board Label Ink",
+        "canonical": "#e6ebef",
+        "tonalRamp": [
+          "oklch(15% 0.008 241.7)",
+          "oklch(27% 0.008 241.7)",
+          "oklch(39% 0.008 241.7)",
+          "oklch(51% 0.008 241.7)",
+          "oklch(63% 0.008 241.7)",
+          "oklch(75% 0.008 241.7)",
+          "oklch(85% 0.008 241.7)",
+          "oklch(95% 0.008 241.7)"
+        ]
+      },
+      "board-muted": {
+        "role": "primary",
+        "displayName": "Board Muted",
+        "canonical": "#a9b7c3",
+        "tonalRamp": [
+          "oklch(15% 0.023 243.9)",
+          "oklch(27% 0.023 243.9)",
+          "oklch(39% 0.023 243.9)",
+          "oklch(51% 0.023 243.9)",
+          "oklch(63% 0.023 243.9)",
+          "oklch(75% 0.023 243.9)",
+          "oklch(85% 0.023 243.9)",
+          "oklch(95% 0.023 243.9)"
+        ]
+      },
+      "manila": {
+        "role": "secondary",
+        "displayName": "Manila Folder",
+        "canonical": "#e6d5a9",
+        "tonalRamp": [
+          "oklch(15% 0.061 89.4)",
+          "oklch(27% 0.061 89.4)",
+          "oklch(39% 0.061 89.4)",
+          "oklch(51% 0.061 89.4)",
+          "oklch(63% 0.061 89.4)",
+          "oklch(75% 0.061 89.4)",
+          "oklch(85% 0.061 89.4)",
+          "oklch(95% 0.061 89.4)"
+        ]
+      },
+      "manila-ink": {
+        "role": "secondary",
+        "displayName": "Manila Ink",
+        "canonical": "#3a2f12",
+        "tonalRamp": [
+          "oklch(15% 0.047 88.7)",
+          "oklch(27% 0.047 88.7)",
+          "oklch(39% 0.047 88.7)",
+          "oklch(51% 0.047 88.7)",
+          "oklch(63% 0.047 88.7)",
+          "oklch(75% 0.047 88.7)",
+          "oklch(85% 0.047 88.7)",
+          "oklch(95% 0.047 88.7)"
+        ]
+      },
+      "ok": {
+        "role": "status",
+        "displayName": "Stamp Green",
+        "canonical": "#1e6b40",
+        "tonalRamp": [
+          "oklch(15% 0.102 154.5)",
+          "oklch(27% 0.102 154.5)",
+          "oklch(39% 0.102 154.5)",
+          "oklch(51% 0.102 154.5)",
+          "oklch(63% 0.102 154.5)",
+          "oklch(75% 0.102 154.5)",
+          "oklch(85% 0.102 154.5)",
+          "oklch(95% 0.102 154.5)"
+        ]
+      },
+      "warn": {
+        "role": "status",
+        "displayName": "Stamp Ochre",
+        "canonical": "#8a5800",
+        "tonalRamp": [
+          "oklch(15% 0.108 71.5)",
+          "oklch(27% 0.108 71.5)",
+          "oklch(39% 0.108 71.5)",
+          "oklch(51% 0.108 71.5)",
+          "oklch(63% 0.108 71.5)",
+          "oklch(75% 0.108 71.5)",
+          "oklch(85% 0.108 71.5)",
+          "oklch(95% 0.108 71.5)"
+        ]
+      },
+      "fail": {
+        "role": "status",
+        "displayName": "Stamp Red",
+        "canonical": "#b3261e",
+        "tonalRamp": [
+          "oklch(15% 0.178 28.7)",
+          "oklch(27% 0.178 28.7)",
+          "oklch(39% 0.178 28.7)",
+          "oklch(51% 0.178 28.7)",
+          "oklch(63% 0.178 28.7)",
+          "oklch(75% 0.178 28.7)",
+          "oklch(85% 0.178 28.7)",
+          "oklch(95% 0.120 28.7)"
+        ]
+      },
+      "error": {
+        "role": "status",
+        "displayName": "Stamp Violet",
+        "canonical": "#5b3d99",
+        "tonalRamp": [
+          "oklch(15% 0.144 294.9)",
+          "oklch(27% 0.144 294.9)",
+          "oklch(39% 0.144 294.9)",
+          "oklch(51% 0.144 294.9)",
+          "oklch(63% 0.144 294.9)",
+          "oklch(75% 0.144 294.9)",
+          "oklch(85% 0.144 294.9)",
+          "oklch(95% 0.120 294.9)"
+        ]
+      },
+      "field": {
+        "role": "neutral",
+        "displayName": "Cool Board Field",
+        "canonical": "#e8ecef",
+        "tonalRamp": [
+          "oklch(15% 0.006 239.8)",
+          "oklch(27% 0.006 239.8)",
+          "oklch(39% 0.006 239.8)",
+          "oklch(51% 0.006 239.8)",
+          "oklch(63% 0.006 239.8)",
+          "oklch(75% 0.006 239.8)",
+          "oklch(85% 0.006 239.8)",
+          "oklch(95% 0.006 239.8)"
+        ]
+      },
+      "sheet": {
+        "role": "neutral",
+        "displayName": "Record Sheet",
+        "canonical": "#fcfcfb",
+        "tonalRamp": [
+          "oklch(15% 0.001 106.4)",
+          "oklch(27% 0.001 106.4)",
+          "oklch(39% 0.001 106.4)",
+          "oklch(51% 0.001 106.4)",
+          "oklch(63% 0.001 106.4)",
+          "oklch(75% 0.001 106.4)",
+          "oklch(85% 0.001 106.4)",
+          "oklch(95% 0.001 106.4)"
+        ]
+      },
+      "sheet-2": {
+        "role": "neutral",
+        "displayName": "Sheet Shade",
+        "canonical": "#f2f4f5",
+        "tonalRamp": [
+          "oklch(15% 0.003 228.8)",
+          "oklch(27% 0.003 228.8)",
+          "oklch(39% 0.003 228.8)",
+          "oklch(51% 0.003 228.8)",
+          "oklch(63% 0.003 228.8)",
+          "oklch(75% 0.003 228.8)",
+          "oklch(85% 0.003 228.8)",
+          "oklch(95% 0.003 228.8)"
+        ]
+      },
+      "rule": {
+        "role": "neutral",
+        "displayName": "Ledger Rule",
+        "canonical": "#d3d9de",
+        "tonalRamp": [
+          "oklch(15% 0.009 242.9)",
+          "oklch(27% 0.009 242.9)",
+          "oklch(39% 0.009 242.9)",
+          "oklch(51% 0.009 242.9)",
+          "oklch(63% 0.009 242.9)",
+          "oklch(75% 0.009 242.9)",
+          "oklch(85% 0.009 242.9)",
+          "oklch(95% 0.009 242.9)"
+        ]
+      },
+      "rule-strong": {
+        "role": "neutral",
+        "displayName": "Strong Rule",
+        "canonical": "#aab4bd",
+        "tonalRamp": [
+          "oklch(15% 0.017 245.2)",
+          "oklch(27% 0.017 245.2)",
+          "oklch(39% 0.017 245.2)",
+          "oklch(51% 0.017 245.2)",
+          "oklch(63% 0.017 245.2)",
+          "oklch(75% 0.017 245.2)",
+          "oklch(85% 0.017 245.2)",
+          "oklch(95% 0.017 245.2)"
+        ]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Record Ink",
+        "canonical": "#1b232b",
+        "tonalRamp": [
+          "oklch(15% 0.019 248.6)",
+          "oklch(27% 0.019 248.6)",
+          "oklch(39% 0.019 248.6)",
+          "oklch(51% 0.019 248.6)",
+          "oklch(63% 0.019 248.6)",
+          "oklch(75% 0.019 248.6)",
+          "oklch(85% 0.019 248.6)",
+          "oklch(95% 0.019 248.6)"
+        ]
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "Faded Ink",
+        "canonical": "#56626d",
+        "tonalRamp": [
+          "oklch(15% 0.023 245.9)",
+          "oklch(27% 0.023 245.9)",
+          "oklch(39% 0.023 245.9)",
+          "oklch(51% 0.023 245.9)",
+          "oklch(63% 0.023 245.9)",
+          "oklch(75% 0.023 245.9)",
+          "oklch(85% 0.023 245.9)",
+          "oklch(95% 0.023 245.9)"
+        ]
+      },
+      "link": {
+        "role": "neutral",
+        "displayName": "Archive Blue",
+        "canonical": "#1f4e79",
+        "tonalRamp": [
+          "oklch(15% 0.088 249.1)",
+          "oklch(27% 0.088 249.1)",
+          "oklch(39% 0.088 249.1)",
+          "oklch(51% 0.088 249.1)",
+          "oklch(63% 0.088 249.1)",
+          "oklch(75% 0.088 249.1)",
+          "oklch(85% 0.088 249.1)",
+          "oklch(95% 0.088 249.1)"
+        ]
+      },
+      "focus": {
+        "role": "neutral",
+        "displayName": "Focus Blue",
+        "canonical": "#2463b0",
+        "tonalRamp": [
+          "oklch(15% 0.138 255.6)",
+          "oklch(27% 0.138 255.6)",
+          "oklch(39% 0.138 255.6)",
+          "oklch(51% 0.138 255.6)",
+          "oklch(63% 0.138 255.6)",
+          "oklch(75% 0.138 255.6)",
+          "oklch(85% 0.138 255.6)",
+          "oklch(95% 0.120 255.6)"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "화면 제목. 이중 괘선 위에 앉는다. 48rem 이하 21px."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "패널 제목. 판정 헤드라인·소제목은 15px/650."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "설명 문장."
+      },
+      "body-small": {
+        "displayName": "Body Small",
+        "purpose": "힌트, 카운트."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "레일 묶음 라벨, 표 머리, 요약 띠 키에만 쓰는 대문자 라벨."
+      },
+      "stamp": {
+        "displayName": "Stamp",
+        "purpose": "상태 도장 글자."
+      },
+      "mono": {
+        "displayName": "Mono",
+        "purpose": "식별자, 경로, 수치, 입력값."
+      }
+    },
+    "shadows": [
+      {
+        "name": "shadow-sheet",
+        "value": "0 1px 2px rgba(27, 35, 43, 0.06), 0 2px 6px rgba(27, 35, 43, 0.04)",
+        "purpose": "기록지(패널·카드·판정 배너) 한 장 높이."
+      },
+      {
+        "name": "rail-mark",
+        "value": "0 1px 0 #27333e, 0 2px 5px rgba(0, 0, 0, 0.25)",
+        "purpose": "레일에 붙은 타자 라벨 카드."
+      },
+      {
+        "name": "current-tab",
+        "value": "inset 0 -1px 0 rgba(58, 47, 18, 0.22)",
+        "purpose": "현재 화면 마닐라 탭의 아래 괘선(높이가 아니라 테두리)."
+      },
+      {
+        "name": "button",
+        "value": "0 1px 2px rgba(27, 35, 43, 0.18)",
+        "purpose": "버튼. 누르면 사라진다."
+      },
+      {
+        "name": "stamp-ring",
+        "value": "inset 0 0 0 1.5px #fcfcfb, inset 0 0 0 2.5px var(--level-line)",
+        "purpose": "고무 도장의 안쪽 괘선. 높이가 아니라 테두리다."
+      },
+      {
+        "name": "input-inset",
+        "value": "inset 0 1px 1px rgba(27, 35, 43, 0.05)",
+        "purpose": "입력칸 안쪽 음영."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease-out",
+        "value": "cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "모든 전이의 이징."
+      },
+      {
+        "name": "stamp-press",
+        "value": "260ms ease-out, scale(1.14) rotate(-3deg) → none",
+        "purpose": "판정 도장이 찍히는 순간. 유일한 장식 모션. reduced-motion에서 끈다."
+      },
+      {
+        "name": "button-press",
+        "value": "120ms ease-out (background-color, transform)",
+        "purpose": "버튼 hover·누름. reduced-motion에서 끈다."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "rail-collapse",
+        "value": "60rem"
+      },
+      {
+        "name": "single-column",
+        "value": "48rem"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "모든 폼의 실행 버튼. 레일과 같은 청회색이다.",
+      "html": "<button class=\"ds-btn\">복구 미리보기</button>",
+      "css": ".ds-btn { display: inline-flex; align-items: center; justify-content: center; min-height: 2.15rem; padding: 0.45rem 1rem; background: var(--c-board, #33424f); color: #fff; border: 1px solid var(--c-board-deep, #27333e); border-radius: 4px; font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", \"Apple SD Gothic Neo\", \"Noto Sans KR\", \"Malgun Gothic\", system-ui, sans-serif; font-size: 13.5px; font-weight: 650; cursor: pointer; box-shadow: 0 1px 2px rgba(27, 35, 43, 0.18); transition: background-color 120ms cubic-bezier(0.16, 1, 0.3, 1), transform 120ms cubic-bezier(0.16, 1, 0.3, 1); } .ds-btn:hover { background: var(--c-board-deep, #27333e); } .ds-btn:active { transform: translateY(1px); box-shadow: none; } .ds-btn:focus-visible { outline: 2px solid var(--c-focus, #2463b0); outline-offset: 2px; } .ds-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }"
+    },
+    {
+      "name": "Cancel Button",
+      "kind": "button",
+      "refersTo": "button-cancel",
+      "description": "실행 중인 잡 취소. 되돌릴 수 없는 동작이라 기본 버튼과 모양을 가른다.",
+      "html": "<button class=\"ds-btn-cancel\">Cancel</button>",
+      "css": ".ds-btn-cancel { display: inline-flex; align-items: center; min-height: 2.15rem; padding: 0.45rem 1rem; background: var(--c-sheet, #fcfcfb); color: var(--c-fail, #b3261e); border: 1px solid var(--c-fail, #b3261e); border-radius: 4px; font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", \"Apple SD Gothic Neo\", \"Noto Sans KR\", \"Malgun Gothic\", system-ui, sans-serif; font-size: 13.5px; font-weight: 650; cursor: pointer; box-shadow: 0 1px 2px rgba(27, 35, 43, 0.18); } .ds-btn-cancel:hover { background: color-mix(in oklab, var(--c-fail, #b3261e) 8%, #fcfcfb); } .ds-btn-cancel:active { transform: translateY(1px); box-shadow: none; } .ds-btn-cancel:focus-visible { outline: 2px solid var(--c-focus, #2463b0); outline-offset: 2px; }"
+    },
+    {
+      "name": "Input",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "텍스트·선택 입력. 값은 등폭으로 적는다.",
+      "html": "<input class=\"ds-input\" placeholder=\"2026-06-12T13:00:00Z\">",
+      "css": ".ds-input { width: 100%; max-width: 32rem; min-height: 2.15rem; padding: 0.4rem 0.6rem; background: #fff; color: var(--c-ink, #1b232b); border: 1px solid var(--c-rule-strong, #aab4bd); border-radius: 4px; font-family: ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, Consolas, \"Liberation Mono\", monospace; font-size: 13px; box-shadow: inset 0 1px 1px rgba(27, 35, 43, 0.05); } .ds-input:hover { border-color: var(--c-muted, #56626d); } .ds-input:focus-visible { outline: 2px solid color-mix(in oklab, var(--c-focus, #2463b0) 35%, transparent); outline-offset: 0; border-color: var(--c-focus, #2463b0); } .ds-input:disabled { background: var(--c-sheet-2, #f2f4f5); color: var(--c-muted, #56626d); }"
+    },
+    {
+      "name": "Rail Navigation",
+      "kind": "nav",
+      "refersTo": "nav-item",
+      "description": "보존 상자 등의 레일. 묶음 라벨과 마닐라 폴더 탭으로 현재 화면을 표시한다.",
+      "html": "<nav class=\"ds-rail\"><a class=\"ds-rail-mark\" href=\"#\"><strong>x-backup</strong><span>v0.3.0</span></a><p class=\"ds-rail-group\">Overview</p><a class=\"ds-rail-link\" href=\"#\" aria-current=\"page\">Dashboard</a><a class=\"ds-rail-link\" href=\"#\">Monitor</a><a class=\"ds-rail-link\" href=\"#\">Catalog</a></nav>",
+      "css": ".ds-rail { width: 13.5rem; padding: 1.25rem 0 1.25rem; background: var(--c-board, #33424f); font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", \"Apple SD Gothic Neo\", \"Noto Sans KR\", \"Malgun Gothic\", system-ui, sans-serif; } .ds-rail-mark { display: block; margin: 0 1rem 1.25rem; padding: 0.5rem 0.75rem 0.4rem; background: var(--c-sheet, #fcfcfb); color: var(--c-ink, #1b232b); text-decoration: none; border-radius: 2px; box-shadow: 0 1px 0 var(--c-board-deep, #27333e), 0 2px 5px rgba(0, 0, 0, 0.25); } .ds-rail-mark strong { display: block; padding-bottom: 0.3rem; margin-bottom: 0.3rem; border-bottom: 1px solid var(--c-rule-strong, #aab4bd); font-size: 16px; font-weight: 750; letter-spacing: -0.01em; } .ds-rail-mark span { font-family: ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, Consolas, \"Liberation Mono\", monospace; font-size: 11px; color: var(--c-muted, #56626d); } .ds-rail-group { margin: 0 0 0.25rem; padding: 0 1.25rem; font-size: 10.5px; font-weight: 650; letter-spacing: 0.1em; text-transform: uppercase; color: var(--c-board-muted, #a9b7c3); } .ds-rail-link { display: block; padding: 0.32rem 1.25rem; color: var(--c-board-ink, #e6ebef); text-decoration: none; font-size: 13.5px; } .ds-rail-link:hover { background: rgba(230, 235, 239, 0.08); } .ds-rail-link:focus-visible { outline: 2px solid var(--c-focus, #2463b0); outline-offset: 2px; } .ds-rail-link[aria-current=\"page\"] { margin-left: 0.75rem; padding-left: 0.85rem; background: var(--c-manila, #e6d5a9); color: var(--c-manila-ink, #3a2f12); font-weight: 650; clip-path: polygon(0.55rem 0, 100% 0, 100% 100%, 0.55rem 100%, 0 70%, 0 30%); box-shadow: inset 0 -1px 0 rgba(58, 47, 18, 0.22); }"
+    },
+    {
+      "name": "Status Stamp",
+      "kind": "chip",
+      "refersTo": "badge-ok",
+      "description": "상태 도장. 색은 data-level 규칙 한 곳에서만 정하고, 글자로도 상태를 말한다.",
+      "html": "<span class=\"ds-stamp\" data-level=\"ok\">OK</span> <span class=\"ds-stamp\" data-level=\"warn\">WARN</span> <span class=\"ds-stamp\" data-level=\"fail\">FAIL</span> <span class=\"ds-stamp\" data-level=\"error\">ERROR</span>",
+      "css": ".ds-stamp[data-level=\"ok\"] { --level: var(--c-ok, #1e6b40); } .ds-stamp[data-level=\"warn\"] { --level: var(--c-warn, #8a5800); } .ds-stamp[data-level=\"fail\"] { --level: var(--c-fail, #b3261e); } .ds-stamp[data-level=\"error\"] { --level: var(--c-error, #5b3d99); } .ds-stamp { --level-tint: #fcfcfb; --level-tint: color-mix(in oklab, var(--level) 8%, #fcfcfb); --level-line: #aab4bd; --level-line: color-mix(in oklab, var(--level) 38%, #fcfcfb); display: inline-block; min-width: 4.6rem; padding: 0.26rem 0.45rem 0.22rem; border: 1.5px solid var(--level); border-radius: 3px; background: var(--level-tint); color: var(--level); font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", \"Apple SD Gothic Neo\", \"Noto Sans KR\", \"Malgun Gothic\", system-ui, sans-serif; font-size: 11px; font-weight: 750; letter-spacing: 0.08em; line-height: 1.2; text-align: center; text-transform: uppercase; white-space: nowrap; box-shadow: inset 0 0 0 1.5px #fcfcfb, inset 0 0 0 2.5px var(--level-line); } "
+    },
+    {
+      "name": "Tag",
+      "kind": "chip",
+      "refersTo": "tag",
+      "description": "엔진 같은 분류 꼬리표. 상태가 아니므로 잉크를 쓰지 않는다.",
+      "html": "<span class=\"ds-tag\">mysql</span>",
+      "css": ".ds-tag { display: inline-block; padding: 0 0.4rem; border: 1px solid var(--c-rule-strong, #aab4bd); border-radius: 3px; background: var(--c-sheet-2, #f2f4f5); color: var(--c-muted, #56626d); font-family: ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, Consolas, \"Liberation Mono\", monospace; font-size: 11.5px; line-height: 1.6; white-space: nowrap; }"
+    },
+    {
+      "name": "Verdict Banner",
+      "kind": "custom",
+      "description": "화면 최상단 판정. 도장 · 헤드라인 · 근거 3층이고, 잉크는 테두리 괘선에만 번진다.",
+      "html": "<section class=\"ds-verdict\" data-level=\"fail\"><span class=\"ds-stamp\">FAIL</span><div><p class=\"ds-verdict-head\">2/2 프로파일에 주의가 필요합니다.</p><p class=\"ds-verdict-detail\">ERROR 행은 점검 자체가 끝나지 않았다는 뜻입니다.</p></div></section>",
+      "css": ".ds-verdict[data-level=\"ok\"] { --level: var(--c-ok, #1e6b40); } .ds-verdict[data-level=\"warn\"] { --level: var(--c-warn, #8a5800); } .ds-verdict[data-level=\"fail\"] { --level: var(--c-fail, #b3261e); } .ds-verdict[data-level=\"error\"] { --level: var(--c-error, #5b3d99); } .ds-verdict { --level-tint: color-mix(in oklab, var(--level) 8%, #fcfcfb); --level-line: color-mix(in oklab, var(--level) 38%, #fcfcfb); display: flex; align-items: flex-start; gap: 0.75rem; padding: 0.75rem 1rem; background: var(--c-sheet, #fcfcfb); border: 1px solid var(--c-rule, #d3d9de); border-radius: 4px; box-shadow: 0 1px 2px rgba(27, 35, 43, 0.06), 0 2px 6px rgba(27, 35, 43, 0.04); font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", \"Apple SD Gothic Neo\", \"Noto Sans KR\", \"Malgun Gothic\", system-ui, sans-serif; } .ds-verdict .ds-stamp { flex: none; margin-top: 0.1rem; animation: ds-stamp-press 260ms cubic-bezier(0.16, 1, 0.3, 1) both; } .ds-verdict .ds-stamp { display: inline-block; min-width: 4.6rem; padding: 0.26rem 0.45rem 0.22rem; border: 1.5px solid var(--level); border-radius: 3px; background: var(--level-tint); color: var(--level); font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", \"Apple SD Gothic Neo\", \"Noto Sans KR\", \"Malgun Gothic\", system-ui, sans-serif; font-size: 11px; font-weight: 750; letter-spacing: 0.08em; line-height: 1.2; text-align: center; text-transform: uppercase; white-space: nowrap; box-shadow: inset 0 0 0 1.5px #fcfcfb, inset 0 0 0 2.5px var(--level-line); } .ds-verdict-head { margin: 0; font-size: 15px; font-weight: 650; line-height: 1.4; color: var(--c-ink, #1b232b); } .ds-verdict-detail { margin: 0.25rem 0 0; max-width: 90ch; font-size: 13px; color: var(--c-muted, #56626d); } @keyframes ds-stamp-press { from { transform: scale(1.14) rotate(-3deg); } to { transform: none; } } @media (prefers-reduced-motion: reduce) { .ds-verdict .ds-stamp { animation: none; } }"
+    },
+    {
+      "name": "Panel",
+      "kind": "card",
+      "refersTo": "panel",
+      "description": "기록지 한 장. 제목줄 오른쪽 끝에 상태 도장이 선다.",
+      "html": "<section class=\"ds-panel\"><div class=\"ds-panel-head\"><h3>local-mariadb</h3><span class=\"ds-panel-count\">5 direct · 11 inherited</span></div><div class=\"ds-panel-body\"><p>source · engine · encrypt</p></div></section>",
+      "css": ".ds-panel { background: var(--c-sheet, #fcfcfb); border: 1px solid var(--c-rule, #d3d9de); border-radius: 4px; box-shadow: 0 1px 2px rgba(27, 35, 43, 0.06), 0 2px 6px rgba(27, 35, 43, 0.04); overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", \"Apple SD Gothic Neo\", \"Noto Sans KR\", \"Malgun Gothic\", system-ui, sans-serif; color: var(--c-ink, #1b232b); } .ds-panel-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; padding: 0.6rem 1rem; background: var(--c-sheet-2, #f2f4f5); border-bottom: 1px solid var(--c-rule, #d3d9de); } .ds-panel-head h3 { margin: 0; font-size: 14.5px; font-weight: 700; letter-spacing: -0.005em; } .ds-panel-count { color: var(--c-muted, #56626d); font-size: 12.5px; font-variant-numeric: tabular-nums; } .ds-panel-body { padding: 1rem; font-size: 14px; } .ds-panel-body > :first-child { margin-top: 0; } .ds-panel-body > :last-child { margin-bottom: 0; }"
+    },
+    {
+      "name": "Meta Strip",
+      "kind": "custom",
+      "refersTo": "meta-strip",
+      "description": "요약 띠. 대문자 라벨 위, 등폭 값 아래로 가로로 늘어선다.",
+      "html": "<dl class=\"ds-meta\"><dt>PROFILES</dt><dd>2</dd><dt>PROBE</dt><dd>0 ms</dd><dt>CACHE TTL</dt><dd>15s</dd></dl>",
+      "css": ".ds-meta { display: grid; grid-auto-flow: column; grid-template-rows: auto auto; grid-auto-columns: max-content; column-gap: 1.75rem; row-gap: 0.1rem; margin: 0; padding: 0.75rem 1rem; overflow-x: auto; background: var(--c-sheet, #fcfcfb); border: 1px solid var(--c-rule, #d3d9de); border-radius: 4px; } .ds-meta dt { color: var(--c-muted, #56626d); font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", \"Apple SD Gothic Neo\", \"Noto Sans KR\", \"Malgun Gothic\", system-ui, sans-serif; font-size: 10.5px; font-weight: 650; letter-spacing: 0.08em; text-transform: uppercase; } .ds-meta dd { margin: 0; font-family: ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, Consolas, \"Liberation Mono\", monospace; font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--c-ink, #1b232b); }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Finding Aid",
+    "overview": "콘솔은 기록물 보존소의 목록(finding aid)이다. 소장 목록은 왼쪽 보존 상자의 등(레일)에 붙고, 기록은 괘선 친 흰 기록지에 적히며, 판정은 고무 도장으로 찍힌다. 서늘한 회색 판지 바탕 위에 기록지가 한 장씩 놓이고, 현재 화면은 마닐라 폴더 탭으로 튀어나온다.\n\n밀도는 운영 대장 수준이다. 본문 14px, 표 13px, 촘촘한 괘선 행으로 여러 프로파일을 한 화면에 싣는다. 색은 거의 무채색이고, 상태 잉크는 도장·글자·괘선에만 묻는다. 문장은 시스템 산세리프, 식별자·경로·수치는 등폭으로 적는다.\n\nSaaS 대시보드와 터미널 흉내는 이 세계가 아니다. 이전 \"터미널 미학\" 아이덴티티는 폐기했다.",
+    "keyCharacteristics": [
+      "청회색 레일 + 회색 판지 바탕 + 흰 기록지의 3층 재질",
+      "상태는 이중 테두리 고무 도장으로 말하고, 도장에는 늘 영문 글자가 찍힌다",
+      "대장의 이중 괘선 아래에 화면 제목이 앉는다",
+      "장식 모션은 판정 도장이 찍히는 순간 하나뿐이다",
+      "웹폰트·외부 리소스 없이 시스템 서체만 쓴다"
+    ],
+    "rules": [
+      {
+        "name": "The One Mapping Rule",
+        "body": "상태를 색으로 바꾸는 곳은 `app.css`의 `[data-level]` 규칙 한 곳이다. 마크업과 스크립트는 `data-level`(`ok`/`warn`/`fail`/`error`)만 싣는다.",
+        "section": "colors"
+      },
+      {
+        "name": "The Ink-Not-Fill Rule",
+        "body": "상태 잉크는 도장, 글자(문제 있는 경과 시간·취소 버튼·입력 경고 `.field__warn`·Peek 생략 표시 `.peek-trunc`), 알림의 테두리 괘선에만 묻는다. config 문법 도장은 성공·실패가 아니어서 잉크 대신 `link` 색을 쓴다. 행, 배너, 패널의 면을 상태색으로 채우지 않는다. 면에 허용되는 것은 잉크 8% 번짐뿐이다.",
+        "section": "colors"
+      },
+      {
+        "name": "The Heatmap Exception",
+        "body": "Dashboard의 백업 이력 격자만 칸 면을 잉크로 채운다. 히트맵은 면이 채워져야 읽히기 때문이다. 대신 레벨마다 모양이 다르다: ok 옅은 면, warn 대각선 반쪽, fail 진한 면 + 빗금, error 진한 면 + 점, 기록 없음 점선 빈 칸. 기록 없음은 실패와 같은 모양이 될 수 없다. 이 예외를 다른 컴포넌트로 넓히지 않는다.",
+        "section": "colors"
+      },
+      {
+        "name": "The Two Reds Rule",
+        "body": "`fail`(점검 결과가 안 된다)과 `error`(점검 자체를 못 했다)는 다른 색상이다. 운영자가 할 일이 반대이기 때문이다.",
+        "section": "colors"
+      },
+      {
+        "name": "The Mono-For-Data Rule",
+        "body": "등폭은 기계가 만든 값(식별자·경로·수치·입력)에만 쓴다. 문장과 제목은 산세리프다.",
+        "section": "typography"
+      },
+      {
+        "name": "The Fixed Labels Rule",
+        "body": "라벨과 기술용어(도장, 표 머리, 레일, 제품명 `x-backup`)는 영문 고정이다. 설명 문장만 ko/en을 고른다.",
+        "section": "typography"
+      },
+      {
+        "name": "The Stamp Column Rule",
+        "body": "대장의 첫 열은 상태 도장 열이다. 모든 표에서 최소 폭으로 서서, 표를 넘나들어도 다음 열이 같은 자리에서 시작한다.",
+        "section": "layout"
+      },
+      {
+        "name": "The One Sheet Rule",
+        "body": "기록지는 한 장 높이만 뜬다. 높이를 쌓아 위계를 만들지 않는다.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "**Do** 상태는 `data-level` 토큰으로만 싣고, 도장에는 늘 `OK`/`WARN`/`FAIL`/`ERROR` 글자를 함께 찍는다.",
+      "**Do** 새 화면을 레일의 네 묶음 중 한 곳에만 등록하고, 화면 제목과 레일 라벨을 같은 상수로 맞춘다.",
+      "**Do** 색·간격·모서리는 `:root` 변수(`--c-*`, `--s-*`, `--radius*`)를 거쳐 쓴다.",
+      "**Do** 식별자·경로·수치는 등폭 tabular 숫자로 적는다.",
+      "**Do** 키보드 초점 윤곽(2px `focus`)을 유지하고 `prefers-reduced-motion`을 따른다."
+    ],
+    "donts": [
+      "**Don't** 웹폰트, CDN, 외부 이미지 같은 외부 리소스를 들이지 않는다.",
+      "**Don't** 마크업에 `PreEscaped`, 인라인 `style=`, 색 리터럴을 두지 않는다.",
+      "**Don't** 아이콘을 더하지 않는다. 현재 콘솔에는 아이콘이 없고, 상태는 글자 도장으로 말한다.",
+      "**Don't** 행, 배너, 패널의 면을 상태색으로 채우지 않는다.",
+      "**Don't** `fail`과 `error`를 같은 색으로 합치지 않는다.",
+      "**Don't** 라벨과 기술용어를 번역하지 않는다.",
+      "**Don't** 대문자 라벨 층을 레일 묶음·표 머리·요약 띠 키 밖으로 가져가지 않는다. 화면 제목이나 패널 제목 위에 얹는 머리글로 쓰지 않는다.",
+      "**Don't** 판정 도장 외에 장식 모션을 더하지 않는다."
+    ]
+  }
+}

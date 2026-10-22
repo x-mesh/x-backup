@@ -26,6 +26,12 @@ use crate::manifest::chain::ChainReport;
 use crate::pipeline::verify::{verify_backup, verify_chain_for, VerifyReport};
 use crate::storage::{LocalFs, Storage};
 
+/// `verify --json` 출력 스키마 버전.
+///
+/// 필드 의미가 바뀌면 올린다 — 소비자(웹 콘솔)가 버전으로 파서를 고르고, 모르는 버전을
+/// 만나면 조용히 오파싱하는 대신 명확히 실패할 수 있게 하기 위함이다.
+const VERIFY_JSON_SCHEMA: u32 = 1;
+
 /// `verify` 핸들러 진입점.
 ///
 /// `--profile`이 없을 때 destination을 알아내기 위해 config가 필요하다. verify는 프로파일
@@ -35,13 +41,21 @@ pub async fn handle(
     lang_flag: Option<crate::i18n::Lang>,
     args: VerifyArgs,
 ) -> Result<()> {
+    // config 부재/읽기 실패로 activate 전에 끝날 수 있는 경로들도 --lang을 따르도록
+    // 미리 잡아 둔다(§tr_lang! 주석 참고). config가 읽히면 아래에서 다시 정한다.
+    crate::i18n::set_active(lang_flag.unwrap_or_default());
     let config_toml = match &config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
-            XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
+            XBackupError::Config(crate::tr_lang!(
+                lang_flag.unwrap_or_default(),
+                "failed to read the config file ({}): {e}",
+                "config 파일 읽기 실패({}): {e}",
+                path.display()
+            ))
         })?),
         None => None,
     };
-    let lang = crate::i18n::resolve_from_toml(lang_flag, config_toml.as_deref());
+    let lang = crate::i18n::activate_from_toml(lang_flag, config_toml.as_deref());
     let storage = open_storage(&config_path).await?;
     run(storage.as_ref(), &args, lang).await
 }
@@ -54,9 +68,7 @@ async fn run(storage: &dyn Storage, args: &VerifyArgs, lang: Lang) -> Result<()>
         Err(e) if args.deep && e.exit_code() == 2 => {
             // deep인데 키가 없어 Config(exit 2)가 났다 — 검증 실패(exit 1)로 보정하되
             // 키 격리 안내 메시지를 보존한다(§8.5).
-            return Err(XBackupError::Failure(format!(
-                "{e} — verify --deep은 개인키 보유 호스트에서 실행하세요(§8.5 키 격리)"
-            )));
+            return Err(XBackupError::Failure(crate::tr!("{e} — run verify --deep on a host that holds the private key (key isolation, §8.5)", "{e} — verify --deep은 개인키 보유 호스트에서 실행하세요(§8.5 키 격리)")));
         }
         Err(e) => return Err(e),
     };
@@ -81,7 +93,8 @@ async fn run(storage: &dyn Storage, args: &VerifyArgs, lang: Lang) -> Result<()>
     //    - 모두 정상: exit 0.
     let chain_broken = chain.as_ref().is_some_and(|c| !c.is_continuous());
     if chain_broken {
-        return Err(XBackupError::VerifyWarning(format!(
+        return Err(XBackupError::VerifyWarning(crate::tr!(
+            "chain '{}' has broken points and cannot be used for PITR ({} break(s))",
             "체인 '{}'에 끊어진 지점이 있어 PITR에 사용할 수 없습니다({}건)",
             args.id,
             chain.as_ref().map(|c| c.breaks.len()).unwrap_or(0)
@@ -97,7 +110,11 @@ async fn run(storage: &dyn Storage, args: &VerifyArgs, lang: Lang) -> Result<()>
 async fn open_storage(config_path: &Option<PathBuf>) -> Result<Box<dyn Storage>> {
     let config_toml = match config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
-            XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
+            XBackupError::Config(crate::tr!(
+                "failed to read the config file ({}): {e}",
+                "config 파일 읽기 실패({}): {e}",
+                path.display()
+            ))
         })?),
         None => None,
     };
@@ -115,23 +132,29 @@ async fn open_storage(config_path: &Option<PathBuf>) -> Result<Box<dyn Storage>>
     match dest.r#type.as_deref() {
         Some("local") => {}
         Some("s3") => {
-            return Err(XBackupError::Usage(
-                "destination type=s3는 아직 미지원입니다(t7) — type=local만 동작".into(),
-            ))
+            return Err(XBackupError::Usage(crate::tr!(
+                "destination type=s3 is not supported yet (t7) — only type=local works",
+                "destination type=s3는 아직 미지원입니다(t7) — type=local만 동작"
+            )))
         }
         Some(other) => {
-            return Err(XBackupError::Config(format!(
+            return Err(XBackupError::Config(crate::tr!(
+                "unknown destination type: '{other}' (only local is supported)",
                 "알 수 없는 destination type: '{other}'(local만 지원)"
             )))
         }
         None => {
-            return Err(XBackupError::Config(
-                "destination.type이 지정되지 않았습니다(local 필요)".into(),
-            ))
+            return Err(XBackupError::Config(crate::tr!(
+                "destination.type is not set (local is required)",
+                "destination.type이 지정되지 않았습니다(local 필요)"
+            )))
         }
     }
     let root = dest.path.as_deref().ok_or_else(|| {
-        XBackupError::Config("destination.path가 지정되지 않았습니다(local 경로)".into())
+        XBackupError::Config(crate::tr!(
+            "destination.path is not set (a local path)",
+            "destination.path가 지정되지 않았습니다(local 경로)"
+        ))
     })?;
     Ok(Box::new(LocalFs::new(root)?))
 }
@@ -245,6 +268,12 @@ fn print_human(report: &VerifyReport, chain: Option<&ChainReport>, lang: Lang) {
 
 /// 기계 판독 JSON 출력(stdout).
 fn print_json(report: &VerifyReport, chain: Option<&ChainReport>) {
+    let value = build_json(report, chain);
+    println!("{value}");
+}
+
+/// JSON 출력 값을 만든다(순수 — 출력 부작용 없음).
+fn build_json(report: &VerifyReport, chain: Option<&ChainReport>) -> serde_json::Value {
     let chain_json = chain.map(|c| {
         serde_json::json!({
             "base_id": c.base_id,
@@ -254,7 +283,8 @@ fn print_json(report: &VerifyReport, chain: Option<&ChainReport>) {
             "warnings": c.warnings.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
         })
     });
-    let value = serde_json::json!({
+    serde_json::json!({
+        "schema": VERIFY_JSON_SCHEMA,
         "backup_id": report.backup_id,
         "manifest_sidecar_ok": report.manifest_sidecar_ok,
         "data_checksum_ok": report.data_checksum_ok,
@@ -263,8 +293,7 @@ fn print_json(report: &VerifyReport, chain: Option<&ChainReport>) {
         "warnings": report.warnings,
         "ok": report.is_ok(),
         "chain": chain_json,
-    });
-    println!("{value}");
+    })
 }
 
 /// 불리언을 색 입힌 OK/FAIL 마크로(상태 토큰 — 항상 영문).
@@ -384,7 +413,10 @@ mod tests {
             .unwrap_err();
         // §8.5: 키 부재 deep은 검증 실패(exit 1)로 보정.
         assert_eq!(err.exit_code(), 1, "키 부재 deep은 exit 1: {err}");
-        assert!(err.to_string().contains("개인키"), "격리 안내 누락: {err}");
+        assert!(
+            err.to_string().contains("private key"),
+            "missing key-isolation guidance: {err}"
+        );
     }
 
     /// incomplete 백업은 exit 4(경고 동반 성공).
@@ -430,6 +462,43 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.exit_code(), 4, "broken chain은 exit 4: {err}");
+    }
+
+    fn report(id: &str) -> VerifyReport {
+        VerifyReport {
+            backup_id: id.to_string(),
+            manifest_sidecar_ok: true,
+            data_checksum_ok: true,
+            deep_decode_ok: None,
+            warnings: Vec::new(),
+            empty_slice: false,
+        }
+    }
+
+    /// 최상위 JSON 문서는 스키마 버전을 달고 나간다 — 소비자가 파서를 고르는 근거다.
+    #[test]
+    fn build_json_stamps_schema_at_top_level() {
+        let v = build_json(&report("bk"), None);
+        assert_eq!(v["schema"], VERIFY_JSON_SCHEMA);
+        assert_eq!(v["backup_id"], "bk");
+        assert!(v["chain"].is_null(), "--chain 없으면 chain은 null");
+    }
+
+    /// `--chain`이 붙어도 schema는 최상위에만 있다(중첩 객체는 버전을 갖지 않는다).
+    #[test]
+    fn build_json_schema_is_not_nested_into_chain() {
+        let chain = ChainReport {
+            base_id: "base".into(),
+            incremental_ids: vec!["i1".into()],
+            breaks: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let v = build_json(&report("i1"), Some(&chain));
+        assert_eq!(v["schema"], VERIFY_JSON_SCHEMA);
+        assert!(
+            v["chain"].get("schema").is_none(),
+            "중첩 객체는 독립 문서가 아니므로 버전을 갖지 않는다"
+        );
     }
 
     /// default_profile_name은 config의 default_profile을 읽는다.

@@ -51,10 +51,15 @@ type Key = [u8; 32];
 
 /// hex 문자열(64자)을 32바이트 AES 키로 디코드한다.
 fn decode_hex_key(hex_key: &str) -> Result<Key> {
-    let bytes = hex::decode(hex_key.trim())
-        .map_err(|e| XBackupError::Config(format!("AES 키 hex 디코드 실패: {e}")))?;
+    let bytes = hex::decode(hex_key.trim()).map_err(|e| {
+        XBackupError::Config(crate::tr!(
+            "failed to hex-decode the AES key: {e}",
+            "AES 키 hex 디코드 실패: {e}"
+        ))
+    })?;
     if bytes.len() != 32 {
-        return Err(XBackupError::Config(format!(
+        return Err(XBackupError::Config(crate::tr!(
+            "an AES-256 key must be 32 bytes (64 hex chars) — got {} bytes",
             "AES-256 키는 32바이트(hex 64자)여야 합니다(got {}바이트)",
             bytes.len()
         )));

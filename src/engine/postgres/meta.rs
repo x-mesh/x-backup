@@ -31,7 +31,12 @@ async fn list_tables(
     let rows = client
         .query(sql.as_str(), &[&schema_filter])
         .await
-        .map_err(|e| XBackupError::Failure(format!("테이블 목록 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to list tables: {e}",
+                "테이블 목록 조회 실패: {e}"
+            ))
+        })?;
     Ok(rows
         .into_iter()
         .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
@@ -64,13 +69,21 @@ pub async fn table_counts_exact(client: &Client) -> Result<Vec<(String, u64)>> {
             .await
             .map(|r| r.get(0))
             .map_err(|e| {
-                XBackupError::Failure(format!("{schema}.{table} 식별자 조회 실패: {e}"))
+                XBackupError::Failure(crate::tr!(
+                    "{schema}.{table}: failed to query the identifier: {e}",
+                    "{schema}.{table} 식별자 조회 실패: {e}"
+                ))
             })?;
         let count: i64 = client
             .query_one(&format!("SELECT count(*) FROM {quoted}"), &[])
             .await
             .map(|r| r.get(0))
-            .map_err(|e| XBackupError::Failure(format!("{schema}.{table} count 실패: {e}")))?;
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "{schema}.{table}: count failed: {e}",
+                    "{schema}.{table} count 실패: {e}"
+                ))
+            })?;
         out.push((format!("{schema}.{table}"), count.max(0) as u64));
     }
     Ok(out)
@@ -84,10 +97,12 @@ pub async fn table_counts_estimated(client: &Client) -> Result<Vec<(String, u64)
          WHERE c.relkind = 'r' AND n.nspname NOT IN ({SYSTEM_SCHEMAS}) \
          ORDER BY 1"
     );
-    let rows = client
-        .query(sql.as_str(), &[])
-        .await
-        .map_err(|e| XBackupError::Failure(format!("행 수 추정 조회 실패: {e}")))?;
+    let rows = client.query(sql.as_str(), &[]).await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to estimate the row count: {e}",
+            "행 수 추정 조회 실패: {e}"
+        ))
+    })?;
     Ok(rows
         .into_iter()
         .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1).max(0) as u64))
@@ -100,7 +115,12 @@ pub async fn data_size_bytes(client: &Client) -> Result<u64> {
         .query_one("SELECT pg_database_size(current_database())::bigint", &[])
         .await
         .map(|r| r.get(0))
-        .map_err(|e| XBackupError::Failure(format!("DB 크기 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to query the database size: {e}",
+                "DB 크기 조회 실패: {e}"
+            ))
+        })?;
     Ok(sz.max(0) as u64)
 }
 
@@ -110,7 +130,10 @@ pub async fn data_size_bytes(client: &Client) -> Result<u64> {
 /// (append 패턴 가정 — 정확한 시간순은 아님). 각 행은 `to_jsonb` 텍스트.
 pub async fn latest_rows(client: &Client, ns: &str, limit: i64) -> Result<Vec<String>> {
     let (schema, table) = ns.split_once('.').ok_or_else(|| {
-        XBackupError::Usage(format!("네임스페이스 형식 오류: '{ns}'(schema.table)"))
+        XBackupError::Usage(crate::tr!(
+            "malformed namespace: '{ns}' (schema.table)",
+            "네임스페이스 형식 오류: '{ns}'(schema.table)"
+        ))
     })?;
     let quoted: String = client
         .query_one(
@@ -119,12 +142,19 @@ pub async fn latest_rows(client: &Client, ns: &str, limit: i64) -> Result<Vec<St
         )
         .await
         .map(|r| r.get(0))
-        .map_err(|e| XBackupError::Failure(format!("{ns} 식별자 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "{ns}: failed to query the identifier: {e}",
+                "{ns} 식별자 조회 실패: {e}"
+            ))
+        })?;
     let sql =
         format!("SELECT to_jsonb(t)::text FROM {quoted} t ORDER BY t.ctid DESC LIMIT {limit}");
-    let rows = client
-        .query(sql.as_str(), &[])
-        .await
-        .map_err(|e| XBackupError::Failure(format!("{ns} 최신 행 조회 실패: {e}")))?;
+    let rows = client.query(sql.as_str(), &[]).await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "{ns}: failed to query the latest row: {e}",
+            "{ns} 최신 행 조회 실패: {e}"
+        ))
+    })?;
     Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
 }

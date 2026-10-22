@@ -27,21 +27,37 @@ pub struct UriConfigFile {
 impl UriConfigFile {
     /// URI 시크릿을 담은 0600 임시 YAML config를 만든다.
     pub fn create(uri: &Secret) -> Result<Self> {
-        let mut file = NamedTempFile::with_prefix("x-backup-uri-")
-            .map_err(|e| XBackupError::Failure(format!("임시 config 생성 실패: {e}")))?;
+        let mut file = NamedTempFile::with_prefix("x-backup-uri-").map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to create the temp config: {e}",
+                "임시 config 생성 실패: {e}"
+            ))
+        })?;
 
         // 생성 직후 권한을 0600으로 좁힌다(기본 tempfile도 0600이나 명시적으로 보장).
         let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(file.path(), perms)
-            .map_err(|e| XBackupError::Failure(format!("임시 config 권한 설정 실패: {e}")))?;
+        std::fs::set_permissions(file.path(), perms).map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to set permissions on the temp config: {e}",
+                "임시 config 권한 설정 실패: {e}"
+            ))
+        })?;
 
         // Database Tools --config YAML: `uri: <connection-string>`.
         // 값에 특수문자가 있을 수 있으므로 작은따옴표로 감싸고 내부 ' 를 '' 로 이스케이프.
         let escaped = uri.expose().replace('\'', "''");
-        writeln!(file, "uri: '{escaped}'")
-            .map_err(|e| XBackupError::Failure(format!("임시 config 쓰기 실패: {e}")))?;
-        file.flush()
-            .map_err(|e| XBackupError::Failure(format!("임시 config flush 실패: {e}")))?;
+        writeln!(file, "uri: '{escaped}'").map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to write the temp config: {e}",
+                "임시 config 쓰기 실패: {e}"
+            ))
+        })?;
+        file.flush().map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to flush the temp config: {e}",
+                "임시 config flush 실패: {e}"
+            ))
+        })?;
 
         Ok(Self { file })
     }

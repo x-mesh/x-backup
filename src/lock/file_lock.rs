@@ -143,7 +143,8 @@ pub fn acquire_in(dir: &Path, profile: &str) -> Result<LockGuard> {
     // lock 디렉터리를 준비한다(없으면 생성).
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
-            XBackupError::Failure(format!(
+            XBackupError::Failure(crate::tr!(
+                "failed to prepare the lock directory ({}): {e}",
                 "lock 디렉터리 준비 실패({}): {e}",
                 parent.display()
             ))
@@ -189,12 +190,17 @@ fn try_create(path: &Path, profile: &str) -> Result<Option<LockGuard>> {
     match opts.open(path) {
         Ok(mut file) => {
             let data = LockData::for_current(profile);
-            let bytes = serde_json::to_vec_pretty(&data)
-                .map_err(|e| XBackupError::Failure(format!("lock 메타 직렬화 실패: {e}")))?;
+            let bytes = serde_json::to_vec_pretty(&data).map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "failed to serialize lock metadata: {e}",
+                    "lock 메타 직렬화 실패: {e}"
+                ))
+            })?;
             // 기록에 실패하면 막 만든 파일을 정리하고 에러를 올린다(부분 lock 방지).
             if let Err(e) = file.write_all(&bytes).and_then(|_| file.flush()) {
                 let _ = std::fs::remove_file(path);
-                return Err(XBackupError::Failure(format!(
+                return Err(XBackupError::Failure(crate::tr!(
+                    "failed to write the lock metadata ({}): {e}",
                     "lock 메타 기록 실패({}): {e}",
                     path.display()
                 )));
@@ -206,7 +212,8 @@ fn try_create(path: &Path, profile: &str) -> Result<Option<LockGuard>> {
             }))
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
-        Err(e) => Err(XBackupError::Failure(format!(
+        Err(e) => Err(XBackupError::Failure(crate::tr!(
+            "failed to create the lock file ({}): {e}",
             "lock 파일 생성 실패({}): {e}",
             path.display()
         ))),
@@ -233,17 +240,20 @@ fn classify(holder: &Option<LockData>) -> StaleDecision {
     let Some(h) = holder else {
         // lock 파일은 있는데 메타를 못 읽었다(손상/경쟁). 보수적으로 충돌 처리하되
         // 손상 가능성을 안내한다 — 운영자가 직접 확인·삭제하도록.
-        return StaleDecision::Conflict(Some(
+        return StaleDecision::Conflict(Some(crate::tr!(
+            "the lock file could not be read (it may be corrupt, or another process is \
+             writing it right now). Check it by hand and delete the lock file if it's safe to",
             "lock 파일을 읽을 수 없습니다(손상되었거나 다른 프로세스가 쓰는 중일 수 있음). \
              직접 확인 후 안전하다면 lock 파일을 삭제하세요"
-                .to_string(),
-        ));
+        )));
     };
 
     // 다른 호스트의 lock은 이 호스트에서 PID 생존을 판정할 수 없다(같은 pid가 다른
     // 호스트의 다른 프로세스일 수 있음). 보수적으로 회수하지 않는다.
     if h.hostname != hostname() {
-        return StaleDecision::Conflict(Some(format!(
+        return StaleDecision::Conflict(Some(crate::tr!(
+            "this is another host's ('{}') lock — this host will not reclaim it \
+             automatically. Check whether that host's operation has finished",
             "다른 호스트('{}')의 lock입니다 — 이 호스트에서는 자동 회수하지 않습니다. \
              해당 호스트에서 작업이 끝났는지 확인하세요",
             h.hostname
@@ -252,7 +262,8 @@ fn classify(holder: &Option<LockData>) -> StaleDecision {
 
     // 정책 1: PID 부재가 확실하면 자동 회수.
     if !pid_alive(h.pid) {
-        return StaleDecision::Reclaim(format!(
+        return StaleDecision::Reclaim(crate::tr!(
+            "the process holding the lock (pid {}) no longer exists",
             "lock 보유 프로세스(pid {})가 더 이상 존재하지 않습니다",
             h.pid
         ));
@@ -260,7 +271,11 @@ fn classify(holder: &Option<LockData>) -> StaleDecision {
 
     // 정책 3: 살아있으나 24h 초과 — 자동 해제 금지, 안내만.
     if lock_age_secs(&h.started_at).is_some_and(|age| age > STALE_AGE_SECS) {
-        return StaleDecision::Conflict(Some(format!(
+        return StaleDecision::Conflict(Some(crate::tr!(
+            "the lock has been held for over 24 hours (pid {} is still alive) — it may be \
+             abnormally old, but since the process is alive it will not be released \
+             automatically. If that operation is stuck, kill the process and then delete \
+             the lock file",
             "lock이 24시간 넘게(pid {} 생존 중) 유지되고 있습니다 — 비정상적으로 오래된 \
              lock일 수 있으나 프로세스가 살아 있어 자동 해제하지 않습니다. 해당 작업이 \
              멈춰 있다면 프로세스를 종료한 뒤 lock 파일을 삭제하세요",
@@ -275,12 +290,17 @@ fn classify(holder: &Option<LockData>) -> StaleDecision {
 /// 충돌 에러를 만든다(pid·시작 시각·추가 안내 포함, exit 5).
 fn conflict_error(path: &Path, holder: &Option<LockData>, extra: Option<String>) -> XBackupError {
     let mut msg = match holder {
-        Some(h) => format!(
+        Some(h) => crate::tr!(
+            "another instance of the same profile '{}' is running (pid {}, started {}). \
+             Wait for it to finish, or stop that operation",
             "동일 프로파일 '{}'의 다른 인스턴스가 실행 중입니다(pid {}, 시작 {}). \
              완료를 기다리거나 해당 작업을 종료하세요",
-            h.profile, h.pid, h.started_at
+            h.profile,
+            h.pid,
+            h.started_at
         ),
-        None => format!(
+        None => crate::tr!(
+            "another instance holds the lock '{}'",
             "lock '{}'을 다른 인스턴스가 점유하고 있습니다",
             path.display()
         ),
@@ -289,7 +309,11 @@ fn conflict_error(path: &Path, holder: &Option<LockData>, extra: Option<String>)
         msg.push_str(". ");
         msg.push_str(&extra);
     }
-    msg.push_str(&format!(" (lock 파일: {})", path.display()));
+    msg.push_str(&crate::tr!(
+        " (lock file: {})",
+        " (lock 파일: {})",
+        path.display()
+    ));
     XBackupError::LockConflict(msg)
 }
 
@@ -299,7 +323,12 @@ fn conflict_error(path: &Path, holder: &Option<LockData>, extra: Option<String>)
 /// - `ESRCH`: 그런 프로세스 없음 → 죽음.
 ///
 /// `kill(.., 0)`은 시그널을 보내지 않고 권한/존재만 검사한다(POSIX). 따라서 안전하다.
-fn pid_alive(pid: u32) -> bool {
+///
+/// `pub(crate)`인 이유: [`crate::web::routes::lock`](t13)가 락을 잡거나 회수하지 않고
+/// **읽기 전용으로 생존만 재확인**하는 데 이 함수를 그대로 재사용한다. 판정 로직(이
+/// 함수)을 두 곳에 복제하면 한쪽만 고쳐졌을 때 조용히 어긋나므로, 로직은 여기 하나만
+/// 두고 가시성만 넓힌다 — 동작은 한 글자도 바뀌지 않는다.
+pub(crate) fn pid_alive(pid: u32) -> bool {
     // pid 0/1 등 경계: 0은 "프로세스 그룹 전체"라 오판 위험 → 살아있는 것으로 본다.
     if pid == 0 {
         return true;
@@ -335,7 +364,12 @@ fn lock_path(dir: &Path, profile: &str) -> PathBuf {
 }
 
 /// 기본 lock 디렉터리: `$XDG_RUNTIME_DIR/x-backup`, 없으면 `/tmp/x-backup`.
-fn lock_dir() -> PathBuf {
+///
+/// `pub(crate)`인 이유: [`crate::web::routes::lock`](t13)가 이 디렉터리를 스캔해 현재
+/// 잡힌 락을 **읽기 전용으로** 보여준다(락을 만들거나 지우지 않는다). 경로 계산 규칙이
+/// 두 곳에 있으면 한쪽만 바뀌었을 때 화면이 엉뚱한 디렉터리를 본다 — 그래서 계산은 여기
+/// 하나만 하고 결과만 빌려 쓴다.
+pub(crate) fn lock_dir() -> PathBuf {
     match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(rt) if !rt.is_empty() => PathBuf::from(rt).join("x-backup"),
         _ => std::env::temp_dir().join("x-backup"),
@@ -343,7 +377,13 @@ fn lock_dir() -> PathBuf {
 }
 
 /// 호스트명을 얻는다(실패 시 "unknown"). 다른 호스트 lock 회수 방지에 쓴다.
-fn hostname() -> String {
+///
+/// `pub(crate)`인 이유: [`crate::web::routes::lock`](t13)가 락 파일에 적힌 호스트명과
+/// **이 서버의** 호스트명을 비교해 "이 호스트에서 생존 여부를 판정할 수 있는가"를
+/// 가른다. 비교 기준이 여기와 다른 방식(예: env만 보고 uname 폴백을 빠뜨림)으로 새로
+/// 계산되면, 실제로는 같은 호스트인데 값을 얻는 경로가 달라 "다른 호스트"로 오판할 수
+/// 있다 — 그래서 값 산출은 이 함수 하나만 쓴다.
+pub(crate) fn hostname() -> String {
     // std에 hostname API가 없어 환경변수·uname 폴백을 쓴다. 정확한 호스트명이
     // 아니어도(같은 호스트에서 일관되기만 하면) 자동 회수 안전성에는 충분하다.
     if let Some(h) = std::env::var_os("HOSTNAME").filter(|h| !h.is_empty()) {
@@ -353,6 +393,20 @@ fn hostname() -> String {
 }
 
 /// `uname(2)`의 nodename(호스트명)을 읽는다.
+///
+/// ## `as u8`을 `allow`로 남기는 이유 — `c_char` 부호가 타깃마다 다르다
+/// `libc::c_char`는 x86_64 Linux와 macOS에서 `i8`, aarch64 Linux에서 `u8`이다. 그래서 이
+/// 캐스트는 **어느 타깃에서는 필요하고 어느 타깃에서는 불필요**하다: 지우면 i8 타깃에서
+/// `Vec<u8>`로 모을 수 없어 컴파일이 깨지고, 두면 u8 타깃에서 `unnecessary_cast`가 뜬다
+/// (aarch64 Linux 컨테이너로 실측 확인 — 우리가 배포하는 `aarch64-unknown-linux-musl`이
+/// 그 타깃이다).
+///
+/// `i8 as u8`은 비트 패턴을 그대로 두므로 ASCII 호스트명에서 값을 잃지 않고, 비 ASCII가
+/// 섞이면 아래 `from_utf8`이 거부한다.
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "c_char 부호가 타깃마다 달라 캐스트 유무를 한쪽으로 고정할 수 없다"
+)]
 fn read_uname_nodename() -> Option<String> {
     // SAFETY: uname은 호출자가 준 buf에 구조체를 채울 뿐 별도 부작용이 없다.
     unsafe {
@@ -458,9 +512,10 @@ mod tests {
 
         let err = acquire_in(dir.path(), "prof").unwrap_err();
         assert_eq!(err.exit_code(), 5);
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("다른 호스트"),
-            "다른 호스트 안내 누락: {err}"
+            msg.contains("another host") || msg.contains("다른 호스트"),
+            "missing other-host guidance: {err}"
         );
     }
 
@@ -481,9 +536,10 @@ mod tests {
 
         let err = acquire_in(dir.path(), "prof").unwrap_err();
         assert_eq!(err.exit_code(), 5);
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("24시간"),
-            "오래된 lock 안내 누락: {err}"
+            msg.contains("24 hours") || msg.contains("24시간"),
+            "missing stale-lock guidance: {err}"
         );
     }
 
@@ -497,9 +553,10 @@ mod tests {
 
         let err = acquire_in(dir.path(), "prof").unwrap_err();
         assert_eq!(err.exit_code(), 5);
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("읽을 수 없"),
-            "손상 안내 누락: {err}"
+            msg.contains("could not be read") || msg.contains("읽을 수 없"),
+            "missing corruption guidance: {err}"
         );
     }
 

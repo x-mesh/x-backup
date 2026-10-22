@@ -88,19 +88,27 @@ impl DumpProcess {
             .kill_on_drop(true);
 
         let mut child = cmd.spawn().map_err(|e| {
-            XBackupError::Failure(format!("'{}' 실행 실패(설치/PATH 확인): {e}", spec.program))
+            XBackupError::Failure(crate::tr!(
+                "failed to run '{}' (check install/PATH): {e}",
+                "'{}' 실행 실패(설치/PATH 확인): {e}",
+                spec.program
+            ))
         })?;
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| XBackupError::Failure("mongodump stdout 파이프 획득 실패".into()))?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            XBackupError::Failure(crate::tr!(
+                "failed to get the mongodump stdout pipe",
+                "mongodump stdout 파이프 획득 실패"
+            ))
+        })?;
 
         // stderr를 spawn 직후 독립 task로 끝까지 읽는다(pitfall 6-2 데드락 방지).
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| XBackupError::Failure("mongodump stderr 파이프 획득 실패".into()))?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            XBackupError::Failure(crate::tr!(
+                "failed to get the mongodump stderr pipe",
+                "mongodump stderr 파이프 획득 실패"
+            ))
+        })?;
         let stderr_drain = tokio::spawn(drain_stderr(stderr));
 
         Ok(Self {
@@ -113,9 +121,12 @@ impl DumpProcess {
 
     /// archive stdout 스트림을 꺼낸다(파이프라인 소스). 한 번만 호출 가능.
     pub fn take_stdout(&mut self) -> Result<ChildStdout> {
-        self.stdout
-            .take()
-            .ok_or_else(|| XBackupError::Failure("mongodump stdout이 이미 소비됨".into()))
+        self.stdout.take().ok_or_else(|| {
+            XBackupError::Failure(crate::tr!(
+                "mongodump stdout was already consumed",
+                "mongodump stdout이 이미 소비됨"
+            ))
+        })
     }
 
     /// 프로세스 종료를 기다리고 **exit code로만** 성공/실패를 판정한다.
@@ -123,11 +134,12 @@ impl DumpProcess {
     /// stdout을 끝까지 소비한 뒤 호출해야 한다(EOF = dump 종료 신호). stderr drain
     /// task도 함께 join해 마지막 로그를 회수하고 좀비를 남기지 않는다(pitfall 6-1/6-4).
     pub async fn wait(mut self) -> Result<()> {
-        let status = self
-            .child
-            .wait()
-            .await
-            .map_err(|e| XBackupError::Failure(format!("mongodump wait 실패: {e}")))?;
+        let status = self.child.wait().await.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to wait for mongodump: {e}",
+                "mongodump wait 실패: {e}"
+            ))
+        })?;
 
         // stderr drain을 join — 마지막 로그 회수 + task 정리.
         let tail = self.join_stderr().await;
@@ -146,7 +158,8 @@ impl DumpProcess {
             } else {
                 format!(" — 마지막 stderr: {}", tail.join(" | "))
             };
-            Err(XBackupError::Failure(format!(
+            Err(XBackupError::Failure(crate::tr!(
+                "mongodump exited abnormally (exit {code}){detail}",
                 "mongodump 비정상 종료(exit {code}){detail}"
             )))
         }
@@ -220,6 +233,8 @@ mod tests {
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
+        // Linux 전용 `ETXTBSY` 경합을 피한다 — 근거는 그 함수 문서.
+        crate::testutil::wait_until_executable(&path);
         path
     }
 
@@ -263,10 +278,13 @@ mod tests {
         let err = proc.wait().await.unwrap_err();
         assert_eq!(err.exit_code(), 1);
         let msg = err.to_string();
-        assert!(msg.contains("비정상 종료"), "메시지: {msg}");
+        assert!(
+            msg.contains("exited abnormally") || msg.contains("비정상 종료"),
+            "message: {msg}"
+        );
         assert!(
             msg.contains("connection refused"),
-            "stderr 첨부 누락: {msg}"
+            "stderr not attached: {msg}"
         );
     }
 
@@ -298,6 +316,8 @@ mod tests {
         let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&script_path, perms).unwrap();
+        // Linux 전용 `ETXTBSY` 경합을 피한다 — 근거는 그 함수 문서.
+        crate::testutil::wait_until_executable(&script_path);
 
         // 시크릿 URI를 담은 0600 config 파일을 만들어 --config로 전달.
         let secret = crate::config::secret::Secret::new(

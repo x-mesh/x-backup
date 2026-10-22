@@ -34,8 +34,12 @@ impl NativeDumper {
     /// URI 시크릿으로 연결한다([`MongoMeta::connect`](super::super::mongo::meta::MongoMeta::connect)와 동일 정책).
     pub async fn connect(uri: &Secret, timeout_secs: Option<u64>) -> Result<Self> {
         let options = super::super::mongo::conn::client_options(uri, timeout_secs).await?;
-        let client = Client::with_options(options)
-            .map_err(|e| XBackupError::Failure(format!("MongoDB 클라이언트 생성 실패: {e}")))?;
+        let client = Client::with_options(options).map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to create the MongoDB client: {e}",
+                "MongoDB 클라이언트 생성 실패: {e}"
+            ))
+        })?;
         Ok(Self { client })
     }
 
@@ -74,10 +78,12 @@ async fn write_archive(
 ) -> Result<()> {
     archive::write_header(writer, &Utc::now().to_rfc3339()).await?;
 
-    let db_names = client
-        .list_database_names()
-        .await
-        .map_err(|e| XBackupError::Failure(format!("데이터베이스 목록 조회 실패: {e}")))?;
+    let db_names = client.list_database_names().await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "failed to list databases: {e}",
+            "데이터베이스 목록 조회 실패: {e}"
+        ))
+    })?;
 
     for db_name in db_names {
         if SYSTEM_DBS.contains(&db_name.as_str()) {
@@ -90,16 +96,19 @@ async fn write_archive(
         }
         let db = client.database(&db_name);
         // 컬렉션 명세(옵션 포함) — view/timeseries는 1차 미커버(건너뜀, 경고).
-        let mut specs = db
-            .list_collections()
-            .await
-            .map_err(|e| XBackupError::Failure(format!("컬렉션 명세 조회 실패({db_name}): {e}")))?;
+        let mut specs = db.list_collections().await.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to query collection specs ({db_name}): {e}",
+                "컬렉션 명세 조회 실패({db_name}): {e}"
+            ))
+        })?;
 
-        while let Some(spec) = specs
-            .try_next()
-            .await
-            .map_err(|e| XBackupError::Failure(format!("컬렉션 명세 순회 실패({db_name}): {e}")))?
-        {
+        while let Some(spec) = specs.try_next().await.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to iterate collection specs ({db_name}): {e}",
+                "컬렉션 명세 순회 실패({db_name}): {e}"
+            ))
+        })? {
             let coll_name = spec.name;
             if coll_name.starts_with("system.") {
                 continue;
@@ -128,15 +137,18 @@ async fn write_archive(
 
             // 문서를 raw로 스트리밍(재직렬화 없이 바이트 그대로).
             let raw_coll = db.collection::<RawDocumentBuf>(&coll_name);
-            let mut cursor = raw_coll
-                .find(doc! {})
-                .await
-                .map_err(|e| XBackupError::Failure(format!("{ns} 문서 조회 실패: {e}")))?;
-            while cursor
-                .advance()
-                .await
-                .map_err(|e| XBackupError::Failure(format!("{ns} 커서 진행 실패: {e}")))?
-            {
+            let mut cursor = raw_coll.find(doc! {}).await.map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "{ns}: failed to query documents: {e}",
+                    "{ns} 문서 조회 실패: {e}"
+                ))
+            })?;
+            while cursor.advance().await.map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "{ns}: cursor advance failed: {e}",
+                    "{ns} 커서 진행 실패: {e}"
+                ))
+            })? {
                 archive::write_raw_document(writer, cursor.current()).await?;
             }
             tracing::debug!(ns = %ns, indexes = indexes.len(), "네이티브 백업: 컬렉션 직렬화 완료");
@@ -152,14 +164,20 @@ async fn collect_indexes(db: &mongodb::Database, coll: &str) -> Result<Vec<Docum
         .collection::<Document>(coll)
         .list_indexes()
         .await
-        .map_err(|e| XBackupError::Failure(format!("{coll} 인덱스 조회 실패: {e}")))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "{coll}: failed to query indexes: {e}",
+                "{coll} 인덱스 조회 실패: {e}"
+            ))
+        })?;
 
     let mut out = Vec::new();
-    while let Some(model) = cursor
-        .try_next()
-        .await
-        .map_err(|e| XBackupError::Failure(format!("{coll} 인덱스 순회 실패: {e}")))?
-    {
+    while let Some(model) = cursor.try_next().await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "{coll}: index iteration failed: {e}",
+            "{coll} 인덱스 순회 실패: {e}"
+        ))
+    })? {
         // 옵션(name/unique/sparse/...)을 평탄화하고 key를 더해 createIndexes 스펙을 만든다.
         let mut spec = model
             .options

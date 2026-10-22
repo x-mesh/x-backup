@@ -116,8 +116,13 @@ where
     }
 
     // 3) 종료 ts 내림 매핑 + 마지막(limit) 슬라이스 결정.
-    let base_node = find_node(&nodes, &report.base_id)
-        .ok_or_else(|| XBackupError::Failure(format!("base '{}' 노드 소실", report.base_id)))?;
+    let base_node = find_node(&nodes, &report.base_id).ok_or_else(|| {
+        XBackupError::Failure(crate::tr!(
+            "base '{}' node missing",
+            "base '{}' 노드 소실",
+            report.base_id
+        ))
+    })?;
     let slices = ordered_slices(&nodes, &report.incremental_ids);
     let mapping = map_target_to_end(base_node, &slices, target_unix);
 
@@ -185,11 +190,8 @@ where
 /// 어떤 작업도 시작하기 전에 호출한다.
 pub fn reject_pitr_with_only(only: Option<&str>) -> Result<()> {
     if only.is_some() {
-        return Err(XBackupError::Usage(
-            "PITR(--at)은 --only(선택적 복구)와 함께 쓸 수 없습니다 — oplog 재생은 전체 복구를 \
-             전제하므로 네임스페이스 필터와 병용할 수 없습니다"
-                .into(),
-        ));
+        return Err(XBackupError::Usage(crate::tr!("PITR (--at) cannot be combined with --only (selective restore) — oplog replay assumes a full restore, so it cannot be combined with a namespace filter", "PITR(--at)은 --only(선택적 복구)와 함께 쓸 수 없습니다 — oplog 재생은 전체 복구를 \
+             전제하므로 네임스페이스 필터와 병용할 수 없습니다")));
     }
     Ok(())
 }
@@ -199,9 +201,7 @@ fn parse_at(at: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(at)
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|e| {
-            XBackupError::Usage(format!(
-                "--at 시각 파싱 실패('{at}'): {e} — RFC3339 형식이 필요합니다(예: 2026-06-12T13:00:00Z)"
-            ))
+            XBackupError::Usage(crate::tr!("failed to parse --at ('{at}'): {e} — RFC3339 is required (e.g. 2026-06-12T13:00:00Z)", "--at 시각 파싱 실패('{at}'): {e} — RFC3339 형식이 필요합니다(예: 2026-06-12T13:00:00Z)"))
         })
 }
 
@@ -262,11 +262,8 @@ fn select_base_before(nodes: &[ChainNode], target_unix: i64) -> Result<String> {
         }
     }
     best.map(|n| n.id.clone()).ok_or_else(|| {
-        XBackupError::Failure(format!(
-            "목표 시점({}) 이전의 base 풀백업을 찾지 못했습니다 — PITR에는 목표 시각보다 \
-             앞선 풀백업이 필요합니다",
-            wall_clock_of_unix(target_unix)
-        ))
+        XBackupError::Failure(crate::tr!("no base full backup found before the target time ({}) — PITR needs a full backup earlier than the target time", "목표 시점({}) 이전의 base 풀백업을 찾지 못했습니다 — PITR에는 목표 시각보다 \
+             앞선 풀백업이 필요합니다", wall_clock_of_unix(target_unix)))
     })
 }
 
@@ -278,11 +275,8 @@ fn chain_rejection_error(report: &ChainReport) -> XBackupError {
         .map(|b| b.to_string())
         .collect::<Vec<_>>()
         .join("; ");
-    XBackupError::Failure(format!(
-        "증분 체인이 연속적이지 않아 PITR을 거부합니다(base '{}'): {breaks} \
-         — `x-backup verify --id <id> --chain`으로 체인 무결성을 확인하세요",
-        report.base_id
-    ))
+    XBackupError::Failure(crate::tr!("refusing PITR because the incremental chain is not continuous (base '{}'): {breaks} — check chain integrity with `x-backup verify --id <id> --chain`", "증분 체인이 연속적이지 않아 PITR을 거부합니다(base '{}'): {breaks} \
+         — `x-backup verify --id <id> --chain`으로 체인 무결성을 확인하세요", report.base_id))
 }
 
 /// `incremental_ids`(verify_chain이 정렬한 순서)에 대응하는 노드를 그 순서로 모은다.
@@ -423,7 +417,13 @@ async fn replay_one_slice(
     let stats = applier
         .apply_stream(&mut decoded, oplog_limit)
         .await
-        .map_err(|e| XBackupError::Failure(format!("슬라이스 '{}' 재생 실패: {e}", manifest.id)))?;
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to replay slice '{}': {e}",
+                "슬라이스 '{}' 재생 실패: {e}",
+                manifest.id
+            ))
+        })?;
 
     tracing::info!(
         slice = %manifest.id,

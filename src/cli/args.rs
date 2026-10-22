@@ -72,6 +72,8 @@ pub enum Command {
     Migrate(MigrateArgs),
     /// x-backup 자신을 최신 릴리스로 갱신한다(설치 소스 자동 감지).
     Update(UpdateArgs),
+    /// 웹 운영 콘솔을 띄운다(상주 HTTP 서버 — 기본 루프백).
+    Serve(ServeArgs),
     /// 내장 스케줄러 — config의 profile.schedule(cron)에 따라 백업을 상주 실행한다.
     Daemon(DaemonArgs),
 }
@@ -90,6 +92,31 @@ pub struct DaemonArgs {
     /// 진행/결과를 기계 판독 JSON으로 출력한다(dry-run 전용).
     #[arg(long)]
     pub json: bool,
+}
+
+/// `serve` — 웹 운영 콘솔 상주 서버.
+///
+/// 이 서버는 복호화 개인키와 프로덕션 접속 정보를 상시 보유하므로 인자 표면도 fail-closed다:
+/// 기본 바인딩은 루프백이고, 루프백 밖으로 열려면 `--allow-remote`를 명시해야 한다
+/// (검증 규칙과 근거는 [`crate::web`] 모듈 헤더).
+///
+/// `--bind`/`--allow-remote`에는 env 대체를 두지 않는다 — 노출 범위를 정하는 값이 셸 환경에
+/// 남은 변수로 조용히 바뀌면 안 된다. state 경로는 표준 `XDG_STATE_HOME`을 이미 따르므로
+/// 별도 env 노브를 더하지 않는다.
+#[derive(Debug, Args)]
+pub struct ServeArgs {
+    /// 수신 주소(`<IP>:<PORT>`). IP 리터럴 또는 `localhost`만 받는다(호스트명 불가).
+    /// 루프백이 아닌 주소는 `--allow-remote`가 함께 있어야 한다.
+    #[arg(long, value_name = "ADDR", default_value = crate::web::DEFAULT_BIND)]
+    pub bind: String,
+    /// 잡 이력·감사 로그·스케줄이 쌓이는 디렉터리.
+    /// 미지정 시 `$XDG_STATE_HOME/x-backup` → 없으면 `~/.local/state/x-backup`.
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+    /// 루프백 밖(예: `0.0.0.0:8787`) 바인딩을 명시적으로 허용한다.
+    /// TLS 종단·접근 제한은 앞단 리버스 프록시가 맡아야 한다.
+    #[arg(long)]
+    pub allow_remote: bool,
 }
 
 /// `migrate` — source(프로파일) → target으로 파일 없이 직접 복사.
@@ -155,8 +182,8 @@ pub struct InitArgs {
 /// `backup` — PRD §9 backup 플래그 전체.
 #[derive(Debug, Args)]
 pub struct BackupArgs {
-    /// 사용할 프로파일 이름.
-    #[arg(long, value_name = "NAME", env = "XB_PROFILE")]
+    /// 사용할 프로파일 이름. 생략하면 config의 `default_profile`을 사용한다.
+    #[arg(long, value_name = "NAME", env = "XB_PROFILE", default_value = "")]
     pub profile: String,
     /// 백업 유형(full/incr). 미지정 시 config의 기본값을 따른다.
     #[arg(long = "type", value_enum)]
@@ -186,6 +213,13 @@ pub struct BackupArgs {
     /// 백업 전 사전 점검(status)을 건너뛴다.
     #[arg(long)]
     pub skip_precheck: bool,
+    /// 생명주기 훅(pre/post/on_error)을 이번 실행에서 비활성화한다(PRD-04).
+    #[arg(long)]
+    pub no_hooks: bool,
+    /// 백업 읽기 소스(복제본) URI를 이번 실행에서 지정한다(config source.read_uri 오버라이드,
+    /// PRD-05). primary 부하 분리용. 미지정 시 config read_uri → 주 소스 순으로 폴백.
+    #[arg(long, value_name = "URI")]
+    pub read_source: Option<String>,
 }
 
 /// `restore` — PRD §9 restore 플래그 전체.
@@ -311,12 +345,21 @@ pub struct PruneArgs {
     /// 최신 백업 N벌을 보존한다(체인 단위 누적). 미지정 시 config retention.keep_last.
     #[arg(long, value_name = "N")]
     pub keep_last: Option<u32>,
+    /// 복구 보장 윈도우(일) — 지난 N일 임의 시점 복구를 보장한다(경계 base까지 보존, PRD-02).
+    #[arg(long, value_name = "N")]
+    pub recovery_window_days: Option<u32>,
+    /// 최소 이중화 — 어떤 규칙이든 최소 M개 풀 체인은 남긴다(PRD-02).
+    #[arg(long, value_name = "M")]
+    pub min_redundancy: Option<u32>,
     /// 실제 삭제 없이 삭제 대상 목록만 출력한다.
     #[arg(long)]
     pub dry_run: bool,
     /// 대화형 확인 없이 삭제를 진행한다.
     #[arg(long)]
     pub force: bool,
+    /// 계획·결과를 기계 판독 JSON으로 출력한다(stdout 한 덩어리). 사람용 출력은 억제된다.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `status` — 대상 서버 상태 점검(FR-8, R14).
@@ -388,16 +431,39 @@ mod tests {
         Cli::command().debug_assert();
     }
 
-    /// 7개 서브커맨드가 모두 등록되어 있는지 확인한다.
+    /// 핵심 서브커맨드가 모두 등록되어 있는지 확인한다.
     #[test]
     fn all_subcommands_present() {
         let cmd = Cli::command();
         let names: Vec<_> = cmd.get_subcommands().map(|c| c.get_name()).collect();
         for expected in [
-            "init", "backup", "restore", "list", "verify", "prune", "status",
+            "init", "backup", "restore", "list", "verify", "prune", "status", "serve",
         ] {
             assert!(names.contains(&expected), "서브커맨드 누락: {expected}");
         }
+    }
+
+    /// `serve --help`가 운영자가 알아야 할 세 옵션을 노출한다(`--config`는 전역 플래그라
+    /// 서브커맨드 도움말에도 함께 나타나야 한다).
+    #[test]
+    fn serve_help_exposes_bind_state_dir_and_config() {
+        let mut cmd = Cli::command();
+        // 전역 플래그(`--config` 등)는 build 시점에 서브커맨드로 전파된다 — build 없이
+        // 하위 커맨드를 꺼내면 도움말에 전역 플래그가 빠진 상태로 보인다.
+        cmd.build();
+        let help = cmd
+            .find_subcommand_mut("serve")
+            .expect("serve 서브커맨드 없음")
+            .render_help()
+            .to_string();
+        for flag in ["--bind", "--state-dir", "--config", "--allow-remote"] {
+            assert!(help.contains(flag), "serve --help에 {flag} 누락:\n{help}");
+        }
+        // 기본값이 도움말에 보여야 한다 — 어디에 뜨는지 실행 전에 알 수 있어야 한다.
+        assert!(
+            help.contains(crate::web::DEFAULT_BIND),
+            "기본 bind가 도움말에 없다:\n{help}"
+        );
     }
 
     /// backup 서브커맨드가 핵심 플래그를 파싱하는지 검증한다.
@@ -421,6 +487,16 @@ mod tests {
                 assert!(args.no_encrypt);
                 assert!(args.quiet);
             }
+            other => panic!("backup이 아님: {other:?}"),
+        }
+    }
+
+    /// backup은 --profile 없이 파싱하며 config의 default_profile 해석을 핸들러에 맡긴다.
+    #[test]
+    fn backup_allows_default_profile() {
+        let cli = Cli::try_parse_from(["x-backup", "backup"]).expect("파싱 실패");
+        match cli.command {
+            Command::Backup(args) => assert!(args.profile.is_empty()),
             other => panic!("backup이 아님: {other:?}"),
         }
     }

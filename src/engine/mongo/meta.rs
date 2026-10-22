@@ -55,8 +55,12 @@ impl MongoMeta {
     /// 기본 5초). URI에 `serverSelectionTimeoutMS`가 있으면 URI가 우선한다([`client_options`]).
     pub async fn connect(uri: &Secret, timeout_secs: Option<u64>) -> Result<Self> {
         let options = super::conn::client_options(uri, timeout_secs).await?;
-        let client = Client::with_options(options)
-            .map_err(|e| XBackupError::Failure(format!("MongoDB 클라이언트 생성 실패: {e}")))?;
+        let client = Client::with_options(options).map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to create the MongoDB client: {e}",
+                "MongoDB 클라이언트 생성 실패: {e}"
+            ))
+        })?;
         Ok(Self { client })
     }
 
@@ -64,10 +68,12 @@ impl MongoMeta {
     pub async fn server_meta(&self) -> Result<ServerMeta> {
         let admin = self.client.database("admin");
 
-        let hello = admin
-            .run_command(doc! { "hello": 1 })
-            .await
-            .map_err(|e| XBackupError::Failure(format!("hello 명령 실패: {e}")))?;
+        let hello = admin.run_command(doc! { "hello": 1 }).await.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "the hello command failed: {e}",
+                "hello 명령 실패: {e}"
+            ))
+        })?;
         // setName이 있으면 replica set. mongos(sharded)는 msg="isdbgrid"로 구분되나,
         // 샤딩 거부는 status(t14) 소유 — 여기서는 oplog 가능 여부만 본다.
         let repl_set_name = hello.get_str("setName").ok().map(|s| s.to_string());
@@ -75,10 +81,20 @@ impl MongoMeta {
         let build_info = admin
             .run_command(doc! { "buildInfo": 1 })
             .await
-            .map_err(|e| XBackupError::Failure(format!("buildInfo 명령 실패: {e}")))?;
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "the buildInfo command failed: {e}",
+                    "buildInfo 명령 실패: {e}"
+                ))
+            })?;
         let server_version = build_info
             .get_str("version")
-            .map_err(|e| XBackupError::Failure(format!("서버 버전 조회 실패: {e}")))?
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "failed to query the server version: {e}",
+                    "서버 버전 조회 실패: {e}"
+                ))
+            })?
             .to_string();
 
         Ok(ServerMeta {
@@ -99,11 +115,12 @@ impl MongoMeta {
         // 충돌 범위를 특정 db로 좁힐 수 있으면(--only db.coll) 그 db만 본다.
         let only_db = ns_filter.and_then(|ns| ns.split('.').next());
 
-        let db_names = self
-            .client
-            .list_database_names()
-            .await
-            .map_err(|e| XBackupError::Failure(format!("데이터베이스 목록 조회 실패: {e}")))?;
+        let db_names = self.client.list_database_names().await.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to list databases: {e}",
+                "데이터베이스 목록 조회 실패: {e}"
+            ))
+        })?;
 
         let mut namespaces = Vec::new();
         for db_name in db_names {
@@ -117,7 +134,10 @@ impl MongoMeta {
             }
             let db = self.client.database(&db_name);
             let colls = db.list_collection_names().await.map_err(|e| {
-                XBackupError::Failure(format!("컬렉션 목록 조회 실패({db_name}): {e}"))
+                XBackupError::Failure(crate::tr!(
+                    "failed to list collections ({db_name}): {e}",
+                    "컬렉션 목록 조회 실패({db_name}): {e}"
+                ))
             })?;
             for coll in colls {
                 // system.* 컬렉션은 사용자 데이터가 아니므로 제외.
@@ -158,7 +178,12 @@ impl MongoMeta {
                 .collection::<bson::Document>(coll)
                 .estimated_document_count()
                 .await
-                .map_err(|e| XBackupError::Failure(format!("문서 수 조회 실패({ns}): {e}")))?;
+                .map_err(|e| {
+                    XBackupError::Failure(crate::tr!(
+                        "failed to count documents ({ns}): {e}",
+                        "문서 수 조회 실패({ns}): {e}"
+                    ))
+                })?;
             out.push((ns, count));
         }
         Ok(out)
@@ -170,11 +195,12 @@ impl MongoMeta {
     /// 통계 조회 실패한 DB는 0으로 건너뛴다(라이브 갱신을 끊지 않도록).
     pub async fn data_size_bytes(&self) -> Result<u64> {
         const SYSTEM_DBS: [&str; 3] = ["admin", "config", "local"];
-        let db_names = self
-            .client
-            .list_database_names()
-            .await
-            .map_err(|e| XBackupError::Failure(format!("데이터베이스 목록 조회 실패: {e}")))?;
+        let db_names = self.client.list_database_names().await.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to list databases: {e}",
+                "데이터베이스 목록 조회 실패: {e}"
+            ))
+        })?;
         let mut total: i64 = 0;
         for name in db_names {
             if SYSTEM_DBS.contains(&name.as_str()) {
@@ -221,11 +247,18 @@ impl MongoMeta {
             .find(doc! {})
             .with_options(options)
             .await
-            .map_err(|e| XBackupError::Failure(format!("{db}.{coll} 조회 실패: {e}")))?;
-        cursor
-            .try_collect()
-            .await
-            .map_err(|e| XBackupError::Failure(format!("{db}.{coll} 문서 수집 실패: {e}")))
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "{db}.{coll}: query failed: {e}",
+                    "{db}.{coll} 조회 실패: {e}"
+                ))
+            })?;
+        cursor.try_collect().await.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "{db}.{coll}: failed to collect documents: {e}",
+                "{db}.{coll} 문서 수집 실패: {e}"
+            ))
+        })
     }
 
     /// `local.oplog.rs`의 최신 엔트리 ts를 반환한다(natural order 내림차순 1건).
@@ -246,7 +279,12 @@ impl MongoMeta {
             .find_one(doc! {})
             .with_options(options)
             .await
-            .map_err(|e| XBackupError::Failure(format!("oplog 최신 ts 조회 실패: {e}")))?;
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "failed to query the latest oplog ts: {e}",
+                    "oplog 최신 ts 조회 실패: {e}"
+                ))
+            })?;
 
         match latest {
             Some(entry) => match entry.get_timestamp("ts") {

@@ -31,20 +31,36 @@ use crate::storage::{from_config, BoxAsyncRead, Storage};
 /// backup 자동 사전 점검에서 쓰는 mongodump 실행파일 이름(backup 핸들러와 동일 기본값).
 pub const DEFAULT_MONGODUMP: &str = "mongodump";
 
+/// `status --json` 출력 스키마 버전.
+///
+/// 필드 의미가 바뀌면 올린다 — 소비자(웹 콘솔)가 버전으로 파서를 고르고, 모르는 버전을
+/// 만나면 조용히 오파싱하는 대신 명확히 실패할 수 있게 하기 위함이다. 단일 프로파일
+/// 보고서와 `--all` 묶음은 모양이 다르지만 같은 명령의 출력이라 버전은 하나로 묶는다.
+pub const STATUS_JSON_SCHEMA: u32 = 1;
+
 /// `status` 핸들러 진입점.
 pub async fn handle(
     config_path: Option<PathBuf>,
     lang_flag: Option<crate::i18n::Lang>,
     args: StatusArgs,
 ) -> Result<()> {
+    // config 부재/읽기 실패로 activate 전에 끝날 수 있는 경로들도 --lang을 따르도록
+    // 미리 잡아 둔다(§tr_lang! 주석 참고). config가 읽히면 아래에서 다시 정한다.
+    crate::i18n::set_active(lang_flag.unwrap_or_default());
+
     // config 파일은 한 번만 읽는다(--all은 여러 프로파일에 재사용).
     let config_toml = match &config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
-            XBackupError::Config(format!("config 파일 읽기 실패({}): {e}", path.display()))
+            XBackupError::Config(crate::tr_lang!(
+                lang_flag.unwrap_or_default(),
+                "failed to read the config file ({}): {e}",
+                "config 파일 읽기 실패({}): {e}",
+                path.display()
+            ))
         })?),
         None => None,
     };
-    let lang = crate::i18n::resolve_from_toml(lang_flag, config_toml.as_deref());
+    let lang = crate::i18n::activate_from_toml(lang_flag, config_toml.as_deref());
 
     // 참조 중인 config 위치를 stderr에 한 줄 알린다(다중 DB 툴 + xbenv 자동 XB_CONFIG 환경에서
     // "지금 어느 config를 보는지"를 분명히). json은 기계 판독 오염 방지로 생략.
@@ -105,15 +121,16 @@ pub async fn handle(
             let counts = collect_ns_counts(config_toml.as_deref(), profile)
                 .await
                 .unwrap_or_default();
-            let mut v = serde_json::to_value(&report)
-                .map_err(|e| XBackupError::Failure(format!("status JSON 직렬화 실패: {e}")))?;
+            let mut v = report_json(&report)?;
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("namespaces".to_string(), ns_counts_json(&counts));
             }
             println!(
                 "{}",
-                serde_json::to_string_pretty(&v)
-                    .map_err(|e| XBackupError::Failure(format!("status JSON 직렬화 실패: {e}")))?
+                serde_json::to_string_pretty(&v).map_err(|e| XBackupError::Failure(crate::tr!(
+                    "status: failed to serialize JSON: {e}",
+                    "status JSON 직렬화 실패: {e}"
+                )))?
             );
         } else {
             render_json(&report)?;
@@ -129,7 +146,7 @@ pub async fn handle(
     }
 
     // 신호등 → 종료 코드. fail이면 PrecheckFailed(exit 3), warn이면 Warning(exit 4), ok면 0.
-    report_to_result(&report)
+    report_to_result(&report, lang)
 }
 
 /// `--all` — config의 모든 프로파일을 점검한다. 사람용 출력은 **프로파일별 전체 상세**
@@ -142,15 +159,19 @@ async fn handle_all(
     lang: Lang,
 ) -> Result<()> {
     let raw = config_toml.ok_or_else(|| {
-        XBackupError::Usage("--all에는 config 파일이 필요합니다(프로파일 목록)".into())
+        XBackupError::Usage(crate::tr!(
+            "--all requires a config file (for the profile list)",
+            "--all에는 config 파일이 필요합니다(프로파일 목록)"
+        ))
     })?;
     let config = crate::config::file::Config::from_toml_str(raw)?;
     let mut names: Vec<String> = config.profiles.keys().cloned().collect();
     names.sort();
     if names.is_empty() {
-        return Err(XBackupError::Usage(
-            "config에 프로파일이 없습니다([profiles.<name>])".into(),
-        ));
+        return Err(XBackupError::Usage(crate::tr!(
+            "the config has no profiles ([profiles.<name>])",
+            "config에 프로파일이 없습니다([profiles.<name>])"
+        )));
     }
 
     // --json은 기계 판독 안정성을 위해 언어를 En으로 고정한다.
@@ -205,7 +226,7 @@ async fn handle_all(
                 obj
             })
             .collect();
-        println!("{}", serde_json::json!({ "profiles": items }));
+        println!("{}", profiles_json(items));
     } else if reports.len() == 1 {
         // 프로파일이 하나면 비교 의미가 없다 — 단일 status 상세 표 그대로.
         render_human(&reports[0], lang);
@@ -235,7 +256,10 @@ async fn handle_all(
             CheckStatus::Fail => 2,
         })
         .unwrap_or(CheckStatus::Ok);
-    report_to_result(&StatusReport::new("(전체)", overall_placeholder(worst)))
+    report_to_result(
+        &StatusReport::new("(전체)", overall_placeholder(worst)),
+        lang,
+    )
 }
 
 /// 한 프로파일의 점검 보고서를 만든다(connect 실패도 보고서로 표현 — Err로 끊지 않음).
@@ -251,7 +275,8 @@ async fn build_report(
         overrides: &overrides,
     })?;
     let uri = resolved.resolved_uri.clone().ok_or_else(|| {
-        XBackupError::Config(format!(
+        XBackupError::Config(crate::tr!(
+            "profile '{}' has no source.uri/uri_env",
             "프로파일 '{}'에 source.uri/uri_env가 없습니다",
             resolved.profile_name
         ))
@@ -325,6 +350,17 @@ async fn build_report(
         );
         items.push(
             CheckItem::ok(
+                "recoverable",
+                "PITR recoverable",
+                lang.sel(
+                    "n/a — endpoint-only profile",
+                    "해당 없음 — endpoint 전용 프로파일",
+                ),
+            )
+            .with_value(lang.sel("n/a", "해당없음")),
+        );
+        items.push(
+            CheckItem::ok(
                 "destination",
                 "destination",
                 lang.sel(
@@ -336,6 +372,7 @@ async fn build_report(
         );
     } else {
         items.push(last_backup_item(&resolved.profile, lang).await);
+        items.push(recoverable_item(&resolved.profile, lang).await);
         items.push(destination_item(&resolved.profile, lang).await);
     }
     Ok(StatusReport::new(name, items))
@@ -407,6 +444,102 @@ async fn last_backup_item(
         )
         .with_value(lang.sel("none", "없음")),
     }
+}
+
+/// 카탈로그(manifest)만으로 **현재 복구 가능한 최신 시점**과 **RPO 갭**을 보고한다(PRD-03 P1).
+///
+/// - `recoverable_until` = 최신 백업의 실효 복구 시점: oplog_range가 있으면 그 `end_ts`(정밀),
+///   없으면(PG/MySQL 풀 등) `created_at`으로 근사한다([`recoverable_until_rfc3339`]).
+/// - `rpo_gap` = now − recoverable_until. 값 컬럼(`--json`의 items[key=recoverable].value)에는
+///   RFC3339 시점을, 메시지에는 갭을 함께 담는다.
+///
+/// 서버 접속 없이 destination 카탈로그만 읽으므로 오프라인에서도 동작한다. base가 없으면
+/// "복구 불가"로 표시한다. 서버 대비 아카이빙 지연(archive_lag)·임계 경고는 P2다.
+async fn recoverable_item(
+    profile: &Profile,
+    lang: crate::i18n::Lang,
+) -> crate::engine::mongo::status::CheckItem {
+    use crate::engine::mongo::status::CheckItem;
+    let dests = profile.effective_destinations();
+    let dest = match dests.first() {
+        Some(d) => *d,
+        None => {
+            return CheckItem::warn(
+                "recoverable",
+                "PITR recoverable",
+                lang.sel("destination not configured", "destination 미설정"),
+            )
+            .with_value(lang.sel("not configured", "미설정"))
+        }
+    };
+    let storage = match from_config(dest) {
+        Ok(s) => s,
+        Err(e) => {
+            return CheckItem::warn(
+                "recoverable",
+                "PITR recoverable",
+                lang.sel(
+                    format!("destination access failed: {e}").as_str(),
+                    format!("destination 접근 실패: {e}").as_str(),
+                ),
+            )
+            .with_value(lang.sel("access failed", "접근 실패"))
+        }
+    };
+    // 복구 가능 base는 실제 복원 가능한 것만 — Complete만 본다(Incomplete 최신이 복구 시점을
+    // 낙관 과대보고하는 것을 막는다; 실제 restore base 선택기와 동일 기준).
+    match latest_manifest_where(storage.as_ref(), |m| {
+        m.status == crate::manifest::schema::BackupStatus::Complete
+    })
+    .await
+    {
+        Some(m) => match recoverable_until_rfc3339(&m) {
+            Some(until) => {
+                let gap = format_age_rfc3339(&until, lang);
+                CheckItem::ok(
+                    "recoverable",
+                    "PITR recoverable",
+                    lang.sel(
+                        format!("recoverable until {until} (RPO gap {gap})").as_str(),
+                        format!("복구가능 ~{until} (RPO 갭 {gap})").as_str(),
+                    ),
+                )
+                .with_value(until)
+            }
+            // manifest는 있으나 시점 산출 불가(잘린 데이터 등).
+            None => CheckItem::warn(
+                "recoverable",
+                "PITR recoverable",
+                lang.sel(
+                    "backup present but recovery point undetermined",
+                    "백업은 있으나 복구 시점을 산출할 수 없습니다",
+                ),
+            )
+            .with_value(lang.sel("unknown", "알수없음")),
+        },
+        None => CheckItem::warn(
+            "recoverable",
+            "PITR recoverable",
+            lang.sel(
+                "not recoverable — no backup base",
+                "복구 불가 — 백업 base가 없습니다",
+            ),
+        )
+        .with_value(lang.sel("none", "없음")),
+    }
+}
+
+/// manifest에서 복구 가능 시점(RFC3339 UTC)을 산출한다.
+///
+/// `oplog_range`가 있으면 그 `end_ts`(마지막으로 캡처한 변경 시각, unix 초)를 정밀 시점으로
+/// 쓰고, 없으면(PG/MySQL 풀 등 시간범위 미보유) `created_at`으로 근사한다. `end_ts` 변환이
+/// 실패하면 `None`.
+fn recoverable_until_rfc3339(m: &BackupManifest) -> Option<String> {
+    if let Some(range) = &m.oplog_range {
+        return chrono::DateTime::<chrono::Utc>::from_timestamp(i64::from(range.end_ts.t), 0)
+            .map(|dt| dt.to_rfc3339());
+    }
+    Some(m.created_at.clone())
 }
 
 /// destination 쓰기 가능 여부를 작은 객체 put→delete로 점검한다(+ local 여유 공간).
@@ -490,8 +623,19 @@ async fn destination_item(
     }
 }
 
-/// destination의 모든 백업 중 **created_at 최신** manifest를 고른다(타입 무관). 없으면 None.
+/// destination의 모든 백업 중 **created_at 최신** manifest를 고른다(타입·상태 무관). 없으면 None.
 async fn latest_manifest_any(storage: &dyn Storage) -> Option<BackupManifest> {
+    latest_manifest_where(storage, |_| true).await
+}
+
+/// `pred`를 만족하는 백업 중 **created_at 최신** manifest를 고른다. 없으면 None.
+///
+/// recoverable은 실제 복원 가능한 base만 봐야 하므로 `status == Complete` 필터로 쓴다(Incomplete
+/// 최신이 복구 시점을 낙관 과대보고하는 것을 막는다). last-backup 표시는 `|_| true`로 쓴다.
+async fn latest_manifest_where<P>(storage: &dyn Storage, pred: P) -> Option<BackupManifest>
+where
+    P: Fn(&BackupManifest) -> bool,
+{
     let store = ManifestStore::new(storage);
     let entries = storage.list("").await.ok()?;
     let suffix = "/manifest.json";
@@ -510,6 +654,9 @@ async fn latest_manifest_any(storage: &dyn Storage) -> Option<BackupManifest> {
     let mut best: Option<BackupManifest> = None;
     for id in ids {
         if let Ok(m) = store.read(&id).await {
+            if !pred(&m) {
+                continue;
+            }
             // created_at은 RFC3339(UTC, 동일 오프셋)라 문자열 비교가 시간순과 일치한다.
             let newer = best
                 .as_ref()
@@ -555,6 +702,20 @@ fn short_id(id: &str) -> &str {
 }
 
 /// 경로가 속한 파일시스템의 여유 바이트(local destination 전용). 실패 시 None.
+///
+/// ## `as u64`를 `allow`로 남기는 이유 — 폭이 플랫폼마다 다르다
+/// `statvfs`의 `f_bavail`·`f_frsize`는 타깃에 따라 u32이거나 u64다(이 호스트에서는 각각
+/// u32·u64). 그래서 **어떤 표현식도 모든 타깃에서 린트를 통과할 수 없다**: 캐스트를 두면
+/// 이미 u64인 쪽에서 `unnecessary_cast`가 뜨고, 지우면 u32인 쪽에서 `saturating_mul`의
+/// 타입이 어긋나 컴파일이 깨진다. `try_from`도 마찬가지로 u64 쪽에서
+/// `useless_conversion`이 뜬다(실측 확인).
+///
+/// 우리가 배포하는 네 타깃(darwin/linux × amd64/arm64)은 전부 64비트이므로 캐스트가
+/// 값을 잃지 않는다. 이식성 있는 쪽을 남기고 린트만 끈다.
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "statvfs 필드 폭이 타깃마다 달라 캐스트 유무를 한쪽으로 고정할 수 없다"
+)]
 fn free_space_bytes(path: &str) -> Option<u64> {
     use std::ffi::CString;
     let c = CString::new(path).ok()?;
@@ -563,7 +724,15 @@ fn free_space_bytes(path: &str) -> Option<u64> {
     if rc != 0 {
         return None;
     }
-    Some(st.f_bavail.saturating_mul(st.f_frsize))
+    // `f_bavail`의 너비는 플랫폼마다 다르다 — macOS는 u32, Linux glibc는 u64다.
+    // 그래서 어떤 변환을 써도 한쪽에서는 항등 변환이 되고, clippy가 그걸 문다:
+    // `as u64`는 Linux에서 `unnecessary_cast`, `u64::from`은 Linux에서
+    // `useless_conversion`이다. `-D warnings`로 도는 lint 잡은 Linux에서만 돌므로
+    // 둘 중 어느 쪽을 골라도 로컬(macOS)에서는 멀쩡한 코드가 CI에서만 깨진다.
+    // 잘림이 절대 없는 `u64::from`을 쓰고, 항등이 되는 플랫폼의 린트만 끈다.
+    #[allow(clippy::useless_conversion)]
+    let avail = u64::from(st.f_bavail);
+    Some(avail.saturating_mul(st.f_frsize))
 }
 
 /// 신호등 합산을 [`report_to_result`]에 태우기 위한 단일 항목 보고서(--all 종합용).
@@ -766,26 +935,69 @@ fn fmt_cell(text: &str, status: CheckStatus, differs: bool, width: usize, color:
 }
 
 /// 신호등 합산을 [`Result`]로 변환한다 — main의 exit code 매핑에 태운다.
-fn report_to_result(report: &StatusReport) -> Result<()> {
+///
+/// 이 메시지는 점검 표 바로 아래에 찍히므로 표와 같은 언어여야 한다. `lang`을 받는
+/// 이유가 그것이다 — 예전에는 한국어로 고정돼 있어서 `language = "en"` 설정에서도
+/// 영어 표 끝에 한국어 한 줄이 붙었다.
+fn report_to_result(report: &StatusReport, lang: Lang) -> Result<()> {
+    let profile = &report.profile;
     match report.overall {
         CheckStatus::Ok => Ok(()),
-        CheckStatus::Warn => Err(XBackupError::Warning(format!(
-            "프로파일 '{}' 점검에 경고가 있습니다(백업 가능하나 주의)",
-            report.profile
-        ))),
-        CheckStatus::Fail => Err(XBackupError::PrecheckFailed(format!(
-            "프로파일 '{}' 점검 실패 — 백업 불가 항목이 있습니다",
-            report.profile
-        ))),
+        CheckStatus::Warn => Err(XBackupError::Warning(match lang {
+            Lang::En => {
+                format!("profile '{profile}' — backup can run, but review the checks above")
+            }
+            Lang::Ko => {
+                format!("프로파일 '{profile}' — 백업은 가능하지만 위 점검 결과를 확인하세요")
+            }
+        })),
+        CheckStatus::Fail => Err(XBackupError::PrecheckFailed(match lang {
+            Lang::En => format!("profile '{profile}' failed its checks — backup cannot run"),
+            Lang::Ko => format!("프로파일 '{profile}' 점검 실패 — 백업 불가 항목이 있습니다"),
+        })),
     }
 }
 
 /// 점검 결과를 `--json`(항목 배열 + overall)으로 stdout에 출력한다.
 fn render_json(report: &StatusReport) -> Result<()> {
-    let json = serde_json::to_string_pretty(report)
-        .map_err(|e| XBackupError::Failure(format!("status JSON 직렬화 실패: {e}")))?;
+    let json = serde_json::to_string_pretty(&report_json(report)?).map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "status: failed to serialize JSON: {e}",
+            "status JSON 직렬화 실패: {e}"
+        ))
+    })?;
     println!("{json}");
     Ok(())
+}
+
+/// 점검 보고서를 최상위 JSON 문서 값으로 만든다(스키마 버전 포함).
+///
+/// [`StatusReport`]는 serde 타입이라 필드는 컴파일러가 지켜주지만 버전은 타입 밖의 계약이다.
+/// 직렬화한 뒤 최상위에 한 번만 찍어서 `--ns-detail` 유무와 관계없이 같은 자리에 오게 한다
+/// (두 경로가 각자 찍으면 한쪽만 갱신되는 사고가 난다).
+fn report_json(report: &StatusReport) -> Result<serde_json::Value> {
+    let mut v = serde_json::to_value(report).map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "status: failed to serialize JSON: {e}",
+            "status JSON 직렬화 실패: {e}"
+        ))
+    })?;
+    // StatusReport는 구조체라 직렬화 결과는 항상 객체다.
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("schema".to_string(), STATUS_JSON_SCHEMA.into());
+    }
+    Ok(v)
+}
+
+/// `--all` 묶음 문서 — 프로파일별 보고서를 한 배열에 담는다.
+///
+/// 원소는 독립 문서가 아니므로 버전을 갖지 않는다. 버전은 stdout에 통째로 나가는
+/// 이 바깥 문서에만 붙는다.
+fn profiles_json(items: Vec<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({
+        "schema": STATUS_JSON_SCHEMA,
+        "profiles": items,
+    })
 }
 
 /// `--ns-detail`: 한 프로파일의 ns별(컬렉션/테이블) 문서 수를 모은다(엔진 자동 분기, 읽기 전용).
@@ -802,7 +1014,8 @@ async fn collect_ns_counts(config_toml: Option<&str>, profile: &str) -> Result<V
         overrides: &overrides,
     })?;
     let uri = resolved.resolved_uri.clone().ok_or_else(|| {
-        XBackupError::Config(format!(
+        XBackupError::Config(crate::tr!(
+            "profile '{}' has no source.uri/uri_env",
             "프로파일 '{}'에 source.uri/uri_env가 없습니다",
             resolved.profile_name
         ))
@@ -1097,7 +1310,8 @@ fn build_monitors(config_toml: Option<&str>, profiles: &[String]) -> Result<Vec<
             overrides: &overrides,
         })?;
         let uri = resolved.resolved_uri.clone().ok_or_else(|| {
-            XBackupError::Config(format!(
+            XBackupError::Config(crate::tr!(
+                "profile '{}' has no source.uri/uri_env",
                 "프로파일 '{}'에 source.uri/uri_env가 없습니다",
                 resolved.profile_name
             ))
@@ -1126,35 +1340,39 @@ fn build_monitors(config_toml: Option<&str>, profiles: &[String]) -> Result<Vec<
 
 /// 라이브 모드 진입 — 주기 갱신하며 변경량(Δ)을 추적한다. Ctrl-C 또는 `--count` 도달 시 종료(exit 0).
 async fn handle_watch(config_toml: Option<&str>, args: &StatusArgs, lang: Lang) -> Result<()> {
-    if args.json {
-        return Err(XBackupError::Usage(
-            "--watch는 --json과 함께 쓸 수 없습니다(라이브 표시 전용)".into(),
-        ));
-    }
     // 대상 프로파일 — --all이면 config의 모든 프로파일, 아니면 단일.
     let profiles: Vec<String> = if args.all {
-        let raw = config_toml
-            .ok_or_else(|| XBackupError::Usage("--all에는 config 파일이 필요합니다".into()))?;
+        let raw = config_toml.ok_or_else(|| {
+            XBackupError::Usage(crate::tr!(
+                "--all requires a config file",
+                "--all에는 config 파일이 필요합니다"
+            ))
+        })?;
         let config = crate::config::file::Config::from_toml_str(raw)?;
         let mut names: Vec<String> = config.profiles.keys().cloned().collect();
         names.sort();
         if names.is_empty() {
-            return Err(XBackupError::Usage(
-                "config에 프로파일이 없습니다([profiles.<name>])".into(),
-            ));
+            return Err(XBackupError::Usage(crate::tr!(
+                "the config has no profiles ([profiles.<name>])",
+                "config에 프로파일이 없습니다([profiles.<name>])"
+            )));
         }
         names
     } else {
-        let p = args
-            .profile
-            .clone()
-            .ok_or_else(|| XBackupError::Usage("--profile 또는 --all이 필요합니다".into()))?;
+        let p = args.profile.clone().ok_or_else(|| {
+            XBackupError::Usage(crate::tr!(
+                "--profile or --all is required",
+                "--profile 또는 --all이 필요합니다"
+            ))
+        })?;
         vec![p]
     };
 
     let interval = Duration::from_secs_f64(args.interval.max(0.2));
     let color = use_color();
-    let tty = std::io::stdout().is_terminal();
+    // `--json`이면 커서 숨김·화면 지우기 같은 터미널 장식을 쓰지 않는다 — 그 이스케이프가
+    // stdout에 섞이면 기계가 읽을 수 없다.
+    let tty = std::io::stdout().is_terminal() && !args.json;
     let mut monitors = build_monitors(config_toml, &profiles)?;
 
     if tty {
@@ -1172,12 +1390,19 @@ async fn handle_watch(config_toml: Option<&str>, args: &StatusArgs, lang: Lang) 
             snaps.push(m.poll().await);
         }
 
-        let frame = render_watch_frame(&snaps, &prev, args.all, tick, args.interval, color, lang);
-        if tty {
-            // 화면 지우고 홈으로 — watch처럼 제자리 갱신.
-            print!("\x1b[2J\x1b[H{frame}");
+        if args.json {
+            // 틱 하나 = NDJSON 한 줄. 줄 단위로 흘려야 읽는 쪽이 프레임 경계를 알 수 있다
+            // (`build_watch_json` doc).
+            println!("{}", build_watch_json(&snaps, &prev, tick, args.interval));
         } else {
-            println!("{frame}");
+            let frame =
+                render_watch_frame(&snaps, &prev, args.all, tick, args.interval, color, lang);
+            if tty {
+                // 화면 지우고 홈으로 — watch처럼 제자리 갱신.
+                print!("\x1b[2J\x1b[H{frame}");
+            } else {
+                println!("{frame}");
+            }
         }
         let _ = std::io::stdout().flush();
 
@@ -1197,6 +1422,59 @@ async fn handle_watch(config_toml: Option<&str>, args: &StatusArgs, lang: Lang) 
         let _ = std::io::stdout().flush();
     }
     Ok(())
+}
+
+/// `--watch --json`의 프레임 한 장 — **틱 하나 = NDJSON 한 줄**.
+///
+/// ## 왜 줄 단위인가
+/// 이 출력은 끝나지 않는 스트림이다(`--count` 없이는 Ctrl-C까지 돈다). 그래서 "문서 하나를
+/// 다 읽고 파싱한다"가 성립하지 않는다 — 읽는 쪽은 **프레임 경계를 알아야** 하고, 개행이
+/// 그 경계다. 웹 콘솔의 라이브 모니터가 이 줄들을 그대로 SSE로 중계한다
+/// ([`crate::web::routes::monitor`]).
+///
+/// ## 스키마를 새로 만들지 않는다
+/// [`STATUS_JSON_SCHEMA`]를 그대로 쓰고 `watch: true`로 가른다 — 같은 명령의 다른 모양이라
+/// 버전을 둘로 나눌 이유가 없다(`migrate`의 계획/요약이 `dry_run`으로 갈리는 것과 같은 판단).
+///
+/// ## 델타는 숫자이고, 기준이 없으면 `null`이다
+/// 사람용 프레임은 첫 틱에 `—`를 찍지만([`delta_docs`]), 여기서는 `null`이다. 0으로 찍으면
+/// "변화가 없었다"와 "비교할 이전 값이 없다"가 같은 값이 되어 읽는 쪽이 구분할 수 없다 —
+/// 첫 틱을 "아무 일도 없었다"로 그리는 화면이 만들어진다.
+fn build_watch_json(
+    snaps: &[LiveSnapshot],
+    prev: &std::collections::HashMap<String, LiveSnapshot>,
+    tick: u64,
+    interval: f64,
+) -> serde_json::Value {
+    let profiles: Vec<serde_json::Value> = snaps
+        .iter()
+        .map(|s| {
+            let before = prev.get(&s.profile);
+            let namespaces: Vec<serde_json::Value> = s
+                .namespaces
+                .iter()
+                .map(|(ns, docs)| serde_json::json!({ "ns": ns, "docs": docs }))
+                .collect();
+            serde_json::json!({
+                "profile": s.profile,
+                "connected": s.connected,
+                "total_docs": s.total_docs,
+                "data_size_bytes": s.data_size,
+                "delta_docs": before.map(|b| s.total_docs as i64 - b.total_docs as i64),
+                "delta_bytes": before.map(|b| s.data_size as i64 - b.data_size as i64),
+                "namespaces": namespaces,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "schema": STATUS_JSON_SCHEMA,
+        "watch": true,
+        "tick": tick,
+        "interval_secs": interval,
+        "at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "profiles": profiles,
+    })
 }
 
 /// 문서 수 변화량 셀 텍스트와 색 — 첫 틱(기준 없음)은 `—`(흐림).
@@ -1472,16 +1750,119 @@ mod tests {
     use super::*;
     use crate::engine::mongo::status::CheckItem;
 
+    /// 단일 프로파일 보고서는 최상위에 스키마 버전을 달고 나간다 — `--ns-detail` 경로도
+    /// 같은 함수를 거치므로 두 경로가 갈라질 수 없다.
+    #[test]
+    fn report_json_stamps_schema_at_top_level() {
+        let report = StatusReport::new("p", vec![CheckItem::ok("conn", "connection", "ok")]);
+        let v = report_json(&report).expect("직렬화");
+        assert_eq!(v["schema"], STATUS_JSON_SCHEMA);
+        assert_eq!(v["profile"], "p");
+        // 항목 배열 원소는 독립 문서가 아니므로 버전을 갖지 않는다.
+        assert!(v["items"][0].get("schema").is_none());
+    }
+
+    /// `--all` 묶음도 최상위에만 버전을 단다(원소는 그대로).
+    #[test]
+    fn profiles_json_stamps_schema_only_at_top_level() {
+        let v = profiles_json(vec![serde_json::json!({ "profile": "p", "overall": "ok" })]);
+        assert_eq!(v["schema"], STATUS_JSON_SCHEMA);
+        assert!(v["profiles"].is_array());
+        assert!(v["profiles"][0].get("schema").is_none());
+    }
+
+    /// 최소 필드 manifest를 serde로 구성한다(recoverable 시점 산출 테스트용).
+    fn manifest_with_oplog_end(oplog_end: Option<u32>) -> BackupManifest {
+        let mut v = serde_json::json!({
+            "format_version": 1,
+            "id": "0190-test",
+            "created_at": "2026-06-12T13:00:00+00:00",
+            "backup_type": "full",
+            "topology": "replica_set",
+            "server_version": "7.0.0",
+            "selective": false,
+            "original_size_bytes": 0,
+            "stored_size_bytes": 0,
+            "checksum_sha256": "abc",
+            "status": "complete"
+        });
+        if let Some(t) = oplog_end {
+            v["oplog_range"] = serde_json::json!({
+                "start_ts": { "t": t, "i": 1 },
+                "end_ts": { "t": t, "i": 5 }
+            });
+        }
+        serde_json::from_value(v).expect("manifest 역직렬화")
+    }
+
+    /// oplog_range가 있으면 end_ts(정밀 시점)를 복구 시점으로 쓴다.
+    #[test]
+    fn recoverable_uses_oplog_end_when_present() {
+        let m = manifest_with_oplog_end(Some(1_781_272_133));
+        let got = recoverable_until_rfc3339(&m).unwrap();
+        let expected = chrono::DateTime::<chrono::Utc>::from_timestamp(1_781_272_133, 0)
+            .unwrap()
+            .to_rfc3339();
+        assert_eq!(got, expected);
+    }
+
+    /// oplog_range가 없으면(PG/MySQL 풀 등) created_at으로 근사한다.
+    #[test]
+    fn recoverable_falls_back_to_created_at() {
+        let m = manifest_with_oplog_end(None);
+        assert_eq!(
+            recoverable_until_rfc3339(&m).as_deref(),
+            Some("2026-06-12T13:00:00+00:00")
+        );
+    }
+
+    /// F2 회귀: recoverable은 Complete만 골라야 한다 — 더 최신인 Incomplete가 있어도
+    /// 복구 시점으로 오보하지 않는다(latest_manifest_where(Complete)).
+    #[tokio::test]
+    async fn recoverable_where_skips_newer_incomplete() {
+        fn manifest(id: &str, created: &str, status: &str) -> BackupManifest {
+            let v = serde_json::json!({
+                "format_version": 1, "id": id, "created_at": created,
+                "backup_type": "full", "topology": "replica_set", "server_version": "7.0.0",
+                "selective": false, "original_size_bytes": 0, "stored_size_bytes": 0,
+                "checksum_sha256": "abc", "status": status
+            });
+            serde_json::from_value(v).unwrap()
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fs = crate::storage::LocalFs::new(dir.path()).unwrap();
+        let store = crate::manifest::store::ManifestStore::new(&fs);
+        // Complete는 과거(10:00), Incomplete는 더 최신(12:00).
+        store
+            .write(&manifest("c1", "2026-06-12T10:00:00+00:00", "complete"))
+            .await
+            .unwrap();
+        store
+            .write(&manifest("i1", "2026-06-12T12:00:00+00:00", "incomplete"))
+            .await
+            .unwrap();
+
+        // Complete 필터: 더 최신 Incomplete를 건너뛰고 Complete(c1)를 고른다.
+        let complete = latest_manifest_where(&fs, |m| {
+            m.status == crate::manifest::schema::BackupStatus::Complete
+        })
+        .await
+        .unwrap();
+        assert_eq!(complete.id, "c1");
+        // 무필터(last-backup 표시용)는 최신 Incomplete(i1)를 고른다 — 기존 동작 유지.
+        assert_eq!(latest_manifest_any(&fs).await.unwrap().id, "i1");
+    }
+
     #[test]
     fn ok_report_maps_to_ok_result() {
         let report = StatusReport::new("p", vec![CheckItem::ok("a", "A", "")]);
-        assert!(report_to_result(&report).is_ok());
+        assert!(report_to_result(&report, Lang::En).is_ok());
     }
 
     #[test]
     fn warn_report_maps_to_exit_4() {
         let report = StatusReport::new("p", vec![CheckItem::warn("a", "A", "")]);
-        let err = report_to_result(&report).unwrap_err();
+        let err = report_to_result(&report, Lang::En).unwrap_err();
         assert_eq!(err.exit_code(), 4);
     }
 
@@ -1491,7 +1872,7 @@ mod tests {
             "p",
             vec![CheckItem::fail("topology", "토폴로지", "샤딩 감지")],
         );
-        let err = report_to_result(&report).unwrap_err();
+        let err = report_to_result(&report, Lang::En).unwrap_err();
         assert_eq!(err.exit_code(), 3);
     }
 
@@ -1548,6 +1929,100 @@ mod tests {
         let s = fmt_cell("wiredTiger", CheckStatus::Ok, false, 12, false);
         assert!(!s.contains('*'));
         assert!(!s.contains('\x1b'));
+    }
+
+    fn snap(profile: &str, docs: u64, bytes: u64) -> LiveSnapshot {
+        LiveSnapshot {
+            profile: profile.to_string(),
+            connected: true,
+            namespaces: vec![("db.coll".to_string(), docs)],
+            total_docs: docs,
+            data_size: bytes,
+        }
+    }
+
+    /// `--watch --json` 프레임의 키 집합을 고정한다 — 웹 라이브 모니터가 읽는 계약이다.
+    #[test]
+    fn watch_json_frame_keys_are_stable() {
+        let snaps = vec![snap("prod", 10, 100)];
+        let prev = std::collections::HashMap::new();
+        let v = build_watch_json(&snaps, &prev, 1, 1.0);
+
+        assert_eq!(v["schema"], STATUS_JSON_SCHEMA);
+        assert_eq!(v["watch"], true, "watch 프레임임을 밝혀야 한다");
+        assert_eq!(v["tick"], 1);
+        assert_eq!(v["interval_secs"], 1.0);
+        assert!(v["at"].is_string(), "시각이 없다");
+
+        let p = &v["profiles"][0];
+        for key in [
+            "profile",
+            "connected",
+            "total_docs",
+            "data_size_bytes",
+            "delta_docs",
+            "delta_bytes",
+            "namespaces",
+        ] {
+            assert!(p.get(key).is_some(), "profiles[] 원소에 {key}가 없다");
+        }
+        assert_eq!(p["namespaces"][0]["ns"], "db.coll");
+        assert_eq!(p["namespaces"][0]["docs"], 10);
+    }
+
+    /// **첫 틱의 델타는 `null`이다** — 0으로 찍으면 "변화 없음"과 "기준 없음"이 같아진다.
+    #[test]
+    fn the_first_tick_has_null_deltas_not_zero() {
+        let snaps = vec![snap("prod", 10, 100)];
+        let prev = std::collections::HashMap::new();
+        let v = build_watch_json(&snaps, &prev, 1, 1.0);
+
+        assert!(
+            v["profiles"][0]["delta_docs"].is_null(),
+            "첫 틱이 0으로 찍혔다"
+        );
+        assert!(v["profiles"][0]["delta_bytes"].is_null());
+    }
+
+    /// 두 번째 틱부터는 부호 있는 숫자다(줄어든 경우 포함).
+    #[test]
+    fn later_ticks_carry_signed_numeric_deltas() {
+        let mut prev = std::collections::HashMap::new();
+        prev.insert("prod".to_string(), snap("prod", 10, 100));
+
+        let grew = build_watch_json(&[snap("prod", 25, 180)], &prev, 2, 1.0);
+        assert_eq!(grew["profiles"][0]["delta_docs"], 15);
+        assert_eq!(grew["profiles"][0]["delta_bytes"], 80);
+
+        let shrank = build_watch_json(&[snap("prod", 4, 60)], &prev, 2, 1.0);
+        assert_eq!(
+            shrank["profiles"][0]["delta_docs"], -6,
+            "감소가 음수로 안 나온다"
+        );
+        assert_eq!(shrank["profiles"][0]["delta_bytes"], -40);
+
+        let same = build_watch_json(&[snap("prod", 10, 100)], &prev, 2, 1.0);
+        assert_eq!(same["profiles"][0]["delta_docs"], 0, "변화 없음은 0이다");
+    }
+
+    /// 처음 보는 프로파일은 이전 값이 없으므로 델타가 `null`이다 — 다른 프로파일의
+    /// 기준을 빌려 쓰지 않는다.
+    #[test]
+    fn a_newly_seen_profile_does_not_borrow_another_baseline() {
+        let mut prev = std::collections::HashMap::new();
+        prev.insert("prod".to_string(), snap("prod", 10, 100));
+
+        let v = build_watch_json(
+            &[snap("prod", 12, 110), snap("stage", 7, 70)],
+            &prev,
+            2,
+            1.0,
+        );
+        assert_eq!(v["profiles"][0]["delta_docs"], 2);
+        assert!(
+            v["profiles"][1]["delta_docs"].is_null(),
+            "처음 보는 프로파일에 델타가 붙었다"
+        );
     }
 
     #[test]

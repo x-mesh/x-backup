@@ -142,9 +142,7 @@ pub fn reverse_stack_for(manifest: &BackupManifest) -> Result<StageStack> {
                 stack.push(Box::new(ZstdDecompressStage::new()));
             }
             other => {
-                return Err(XBackupError::Failure(format!(
-                    "알 수 없는 압축 알고리즘: '{other}'(zstd만 지원) — 복구 불가"
-                )));
+                return Err(XBackupError::Failure(crate::tr!("unknown compression algorithm: '{other}' (only zstd is supported) — cannot restore", "알 수 없는 압축 알고리즘: '{other}'(zstd만 지원) — 복구 불가")));
             }
         }
     }
@@ -157,23 +155,20 @@ fn resolve_decrypt_key(algorithm: &str) -> Result<DecryptKeySource> {
     match algorithm {
         crate::crypto::ALGORITHM_AGE => {
             let path = std::env::var(ENV_AGE_IDENTITY_FILE).map_err(|_| {
-                XBackupError::Config(format!(
-                    "age 암호화 백업의 복호화에는 개인키가 필요합니다 — \
-                     {ENV_AGE_IDENTITY_FILE}에 identity 파일 경로를 지정하세요(§8.5 키 격리)"
-                ))
+                XBackupError::Config(crate::tr!("decrypting an age-encrypted backup requires the private key — set the identity file path in {ENV_AGE_IDENTITY_FILE} (key isolation, §8.5)", "age 암호화 백업의 복호화에는 개인키가 필요합니다 — \
+                     {ENV_AGE_IDENTITY_FILE}에 identity 파일 경로를 지정하세요(§8.5 키 격리)"))
             })?;
             Ok(DecryptKeySource::AgeIdentityFile(path))
         }
         crate::crypto::ALGORITHM_AES_GCM => {
             let hex = std::env::var(ENV_AES_KEY_HEX).map_err(|_| {
-                XBackupError::Config(format!(
-                    "aes-256-gcm 백업의 복호화에는 대칭 키가 필요합니다 — \
-                     {ENV_AES_KEY_HEX}에 32바이트 hex 키를 지정하세요"
-                ))
+                XBackupError::Config(crate::tr!("decrypting an aes-256-gcm backup requires the symmetric key — set a 32-byte hex key in {ENV_AES_KEY_HEX}", "aes-256-gcm 백업의 복호화에는 대칭 키가 필요합니다 — \
+                     {ENV_AES_KEY_HEX}에 32바이트 hex 키를 지정하세요"))
             })?;
             Ok(DecryptKeySource::AesHexKey(hex))
         }
-        other => Err(XBackupError::Config(format!(
+        other => Err(XBackupError::Config(crate::tr!(
+            "unknown encryption algorithm: '{other}' (age | aes-256-gcm) — cannot restore",
             "알 수 없는 암호화 알고리즘: '{other}'(age | aes-256-gcm) — 복구 불가"
         ))),
     }

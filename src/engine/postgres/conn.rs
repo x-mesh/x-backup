@@ -31,10 +31,18 @@ impl PgClient {
         let (client, connection) = tokio::time::timeout(dur, fut)
             .await
             .map_err(|_| {
-                XBackupError::Failure(format!("PostgreSQL 연결 타임아웃({}s)", dur.as_secs()))
+                XBackupError::Failure(crate::tr!(
+                    "PostgreSQL connection timed out ({}s)",
+                    "PostgreSQL 연결 타임아웃({}s)",
+                    dur.as_secs()
+                ))
             })?
             .map_err(|e| {
-                XBackupError::Failure(format!("PostgreSQL 연결 실패: {}", describe(&e)))
+                XBackupError::Failure(crate::tr!(
+                    "failed to connect to PostgreSQL: {}",
+                    "PostgreSQL 연결 실패: {}",
+                    describe(&e)
+                ))
             })?;
         tokio::spawn(async move {
             if let Err(e) = connection.await {
