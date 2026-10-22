@@ -99,15 +99,18 @@ jobs:
       - name: cargo test (E2E exit codes, no DB)
         run: cargo test --test exit_codes_e2e
 
-      # ── 런타임 외부 바이너리 의존 0 가드(로드맵 P0-4) ──
-      # src/에서 서브프로세스 스폰(std/tokio process)은 레거시 mongodump 엔진
-      # 3개 파일에서만 허용한다 — 이들은 legacy-mongodump feature에서만 컴파일되므로
-      # (P0-2) **기본 빌드 산출물에는 스폰 코드가 0이다**. 새 스폰 지점이 생기면 이
-      # 스텝이 실패한다 — 외부 의존을 추가하려면 허용 목록을 의도적으로 고쳐야 한다.
-      - name: no-subprocess guard (zero external runtime deps)
+      # ── DB 도구 외부 바이너리 의존 0 가드(로드맵 P0-4) ──
+      # src/에서 서브프로세스 스폰(std/tokio process)은 아래 허용 목록에서만 허용한다.
+      # - 레거시 mongodump 엔진 3개 파일: legacy-mongodump feature에서만 컴파일되므로
+      #   (P0-2) 백업·복구 경로의 DB 도구(mongodump 등) 호출은 기본 빌드에 0이다.
+      # - web/: 웹 콘솔이 작업 실행(자기 자신 exe)·crontab·ps를 설계상 스폰한다.
+      # - hooks/: 사용자가 config에 적은 생명주기 훅 명령을 실행한다.
+      # - testutil.rs: 테스트 전용(cfg(test))이라 산출물에 들어가지 않는다.
+      # 새 스폰 지점이 생기면 이 스텝이 실패한다 — 의도한 추가면 허용 목록을 고친다.
+      - name: no-subprocess guard (no external DB tool deps)
         run: |
           # process::id()/ExitCode는 스폰이 아니다 — 스폰 표면(Command/Stdio/Child)만 잡는다.
-          allow='^src/engine/mongo/(dump|restore|status)\.rs:'
+          allow='^src/(engine/mongo/(dump|restore|status)\.rs|testutil\.rs|(web|hooks)/[^:]+\.rs):'
           hits=$(grep -rnE 'tokio::process|std::process::(Command|Stdio|Child)' src/ | grep -vE "$allow" || true)
           if [ -n "$hits" ]; then
             echo "허용 목록 밖의 서브프로세스 사용이 발견됐습니다:" >&2
