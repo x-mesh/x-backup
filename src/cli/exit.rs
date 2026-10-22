@@ -47,6 +47,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         // serve는 핸들러가 `src/cli/handlers`가 아니라 `src/web`에 있다 — 웹 계층이 자체
         // 모듈 트리(라우터·뷰·에셋)를 갖고, CLI 핸들러들과 달리 상주 프로세스이기 때문이다.
         Command::Serve(args) => crate::web::handle(config, lang, args).await,
+        Command::Daemon(args) => handlers::daemon::handle(config, lang, args).await,
     }
 }
 

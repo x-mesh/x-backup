@@ -22,7 +22,9 @@ pub mod hooks;
 pub mod i18n;
 pub mod lock;
 pub mod manifest;
+pub mod notify;
 pub mod pipeline;
+pub mod schedule;
 pub mod storage;
 #[cfg(test)]
 pub(crate) mod testutil;

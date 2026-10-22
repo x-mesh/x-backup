@@ -192,6 +192,8 @@ fn expand_profile(name: &str, flat: &Table) -> Result<Table> {
     let mut incremental = Table::new();
     let mut retention = Table::new();
     let mut hooks = Table::new();
+    let mut notify = Table::new();
+    let mut schedule: Option<Value> = None;
     let mut destinations: Option<Value> = None;
 
     for (k, v) in flat {
@@ -252,6 +254,9 @@ fn expand_profile(name: &str, flat: &Table) -> Result<Table> {
             "hook_post_prune" => insert_into(&mut hooks, "post_prune", v),
             "hook_on_error" => insert_into(&mut hooks, "on_error", v),
             "hook_timeout_secs" => insert_into(&mut hooks, "hook_timeout_secs", v),
+            // ── daemon 스케줄/알림(P3-1/P3-2) ──
+            "schedule" => schedule = Some(v.clone()),
+            "notify_webhook_env" => insert_into(&mut notify, "webhook_url_env", v),
             "extends" => {} // 이미 소비됨
             other => {
                 return Err(cfg_err(format!(
@@ -297,6 +302,12 @@ fn expand_profile(name: &str, flat: &Table) -> Result<Table> {
     }
     if !hooks.is_empty() {
         profile.insert("hooks".to_string(), Value::Table(hooks));
+    }
+    if let Some(sched) = schedule {
+        profile.insert("schedule".to_string(), sched);
+    }
+    if !notify.is_empty() {
+        profile.insert("notify".to_string(), Value::Table(notify));
     }
 
     Ok(profile)
@@ -897,6 +908,19 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.exit_code(), 2);
+    }
+
+    /// daemon 스케줄/알림 키(P3-1/P3-2) — v1 트리로 정규화된다.
+    #[test]
+    fn schedule_and_notify_keys() {
+        let v = norm(
+            "[profile.p]\nuri=\"mongodb://h/db\"\nschedule = \"0 3 * * *\"\n\
+             notify_webhook_env = \"XB_HOOK\"\n",
+        )
+        .unwrap();
+        let p = v["profiles"]["p"].as_table().unwrap();
+        assert_eq!(p["schedule"].as_str(), Some("0 3 * * *"));
+        assert_eq!(p["notify"]["webhook_url_env"].as_str(), Some("XB_HOOK"));
     }
 
     /// 알 수 없는 키는 거부(오타 보호).

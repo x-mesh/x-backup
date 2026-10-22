@@ -87,11 +87,10 @@ pub async fn full_backup_choices(storage: &dyn Storage) -> Result<Vec<BackupChoi
 }
 
 fn format_choice(manifest: &BackupManifest) -> BackupChoice {
-    let engine = match manifest.tool_versions.archive_format.as_deref() {
-        Some(format) if format.starts_with("xb-mysql") => "mysql",
-        Some(format) if format.starts_with("xb-pg") => "postgresql",
-        _ => "mongodb",
-    };
+    let engine = crate::engine::DbKind::from_archive_format(
+        manifest.tool_versions.archive_format.as_deref(),
+    )
+    .label();
     let kind = if manifest.promoted_from_gap {
         "full (gap)"
     } else {

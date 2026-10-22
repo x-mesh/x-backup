@@ -3,7 +3,10 @@
 //! 여기 있는 것은 제품 동작이 아니라 **테스트 하네스의 환경 문제**를 다룬다. 제품 코드가
 //! 이 모듈을 부르는 일은 없어야 한다(그럴 수도 없다 — `cfg(test)`로 막혀 있다).
 
+// 호출처가 legacy-mongodump 테스트뿐이라, 기본 빌드에서는 미사용 경고(-D warnings)가 난다.
+#[cfg(feature = "legacy-mongodump")]
 use std::path::Path;
+#[cfg(feature = "legacy-mongodump")]
 use std::time::Duration;
 
 /// 방금 만든 실행 파일이 실제로 `exec` 가능해질 때까지 잠깐 기다린다.
@@ -36,6 +39,7 @@ use std::time::Duration;
 /// 이 창을 없애려면 다른 테스트가 fork하지 않도록 전량을 직렬화해야 하는데
 /// (`--test-threads=1`), 그건 1400개 테스트의 실행 시간을 대가로 낸다. 창이 매우 짧으므로
 /// (다른 쪽 자식이 execve에 도달할 때까지) 몇 번 기다리는 편이 싸다.
+#[cfg(feature = "legacy-mongodump")]
 pub fn wait_until_executable(path: &Path) {
     /// 재시도 상한 — 넘기면 그냥 돌려준다(진짜 문제라면 호출부가 그 실패를 보게 한다).
     const ATTEMPTS: usize = 50;
