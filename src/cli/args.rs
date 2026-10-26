@@ -52,6 +52,8 @@ pub enum BackupType {
 pub enum Command {
     /// 대화형 마법사로 config.toml을 생성한다.
     Init(InitArgs),
+    /// 기존 config.toml의 프로파일을 방향키 TUI로 편집한다(연결 테스트 포함).
+    Config,
     /// 백업을 실행한다(풀/증분).
     Backup(BackupArgs),
     /// 백업을 복구한다(풀/PITR/선택적).

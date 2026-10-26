@@ -254,6 +254,29 @@ impl DestinationConfig {
             None => format!("{}#{idx}", self.r#type.as_deref().unwrap_or("dest")),
         }
     }
+
+    /// 같은 백업 저장소인지 비교하는 키. 위치가 덜 채워져 있으면 `None`이다.
+    ///
+    /// 이미 있는 로컬 디렉터리는 심볼릭 링크까지 풀어 비교하고, 없으면 `a//b/`·`./a` 같은
+    /// 표기 차이만 접는다. S3는 엔드포인트·버킷·prefix가 같으면 같은 저장소다.
+    pub fn location_key(&self) -> Option<String> {
+        match self.r#type.as_deref()? {
+            "local" => {
+                let path = Path::new(self.path.as_deref()?);
+                let normalized = std::fs::canonicalize(path)
+                    .unwrap_or_else(|_| path.components().collect::<std::path::PathBuf>());
+                Some(format!("local:{}", normalized.display()))
+            }
+            "s3" => {
+                let s3 = self.s3.as_ref()?;
+                let bucket = s3.bucket.as_deref()?;
+                let prefix = s3.prefix.as_deref().unwrap_or("").trim_matches('/');
+                let endpoint = s3.endpoint.as_deref().unwrap_or("").trim_end_matches('/');
+                Some(format!("s3:{endpoint}|{bucket}/{prefix}"))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// S3 호환 스토리지 설정 — `[profiles.<name>.destination.s3]`.
@@ -424,6 +447,50 @@ impl Config {
         Self::from_toml_str(&raw)
     }
 
+    /// `name` 프로파일과 같은 백업 위치를 쓰는 다른 프로파일 이름(이름순).
+    ///
+    /// 백업은 `<위치>/<백업 ID>/`에 쌓이고 어느 프로파일 것인지 기록하지 않는다. 그래서 위치를
+    /// 나눠 쓰면 증분이 다른 프로파일의 체인에 붙고, `prune`이 남의 백업을 지우고, 목록이
+    /// 섞인다. 다른 프로파일의 백업을 읽기만 하는 복구 전용 프로파일은 정당하게 공유할 수
+    /// 있으므로 호출부는 이것을 경고로만 다룬다.
+    pub fn profiles_sharing_destination(&self, name: &str) -> Vec<String> {
+        let Some(profile) = self.profiles.get(name) else {
+            return Vec::new();
+        };
+        let mine: Vec<String> = profile
+            .effective_destinations()
+            .into_iter()
+            .filter_map(DestinationConfig::location_key)
+            .collect();
+        self.profiles
+            .iter()
+            .filter(|(other, _)| other.as_str() != name)
+            .filter(|(_, other_profile)| {
+                other_profile
+                    .effective_destinations()
+                    .into_iter()
+                    .filter_map(DestinationConfig::location_key)
+                    .any(|key| mine.contains(&key))
+            })
+            .map(|(other, _)| other.clone())
+            .collect()
+    }
+
+    /// [`Self::profiles_sharing_destination`] 결과를 경고 한 문장으로 만든다.
+    pub fn shared_destination_warning(
+        shared: &[String],
+        lang: crate::i18n::Lang,
+    ) -> Option<String> {
+        if shared.is_empty() {
+            return None;
+        }
+        let others = shared.join(", ");
+        Some(lang.sel_string(
+            format!("same backup location as {others} — incremental chains, prune and backup lists will mix. Use a separate directory unless one profile only restores from the other's backups."),
+            format!("{others}와(과) 백업 위치가 같습니다 — 증분 체인·보존 정리·백업 목록이 섞입니다. 한쪽이 복구 전용으로 읽기만 하는 경우가 아니면 디렉터리를 나누세요."),
+        ))
+    }
+
     /// 이름으로 프로파일을 조회한다. 없으면 [`XBackupError::Config`](exit 2).
     pub fn profile(&self, name: &str) -> Result<&Profile> {
         self.profiles.get(name).ok_or_else(|| {
@@ -438,6 +505,66 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sharing(text: &str, name: &str) -> Vec<String> {
+        Config::from_toml_str(text)
+            .unwrap()
+            .profiles_sharing_destination(name)
+    }
+
+    #[test]
+    fn profiles_on_the_same_local_directory_are_reported_both_ways() {
+        let text = r#"
+[profile.a]
+uri_env = "A_URI"
+dest = "local:/srv/x-backup-share-test"
+
+[profile.b]
+uri_env = "B_URI"
+dest = "local:/srv//x-backup-share-test/"
+
+[profile.c]
+uri_env = "C_URI"
+dest = "local:/srv/x-backup-share-test/c"
+
+[profile.restore]
+uri_env = "R_URI"
+"#;
+        assert_eq!(sharing(text, "a"), vec!["b".to_string()]);
+        assert_eq!(sharing(text, "b"), vec!["a".to_string()]);
+        assert!(sharing(text, "c").is_empty(), "하위 디렉터리는 다른 위치다");
+        assert!(
+            sharing(text, "restore").is_empty(),
+            "destination 없는 프로파일은 비교하지 않는다"
+        );
+    }
+
+    #[test]
+    fn s3_locations_match_on_bucket_and_prefix() {
+        let text = r#"
+[profile.a]
+uri_env = "A_URI"
+dest = "s3:backups/mongo"
+
+[profile.b]
+uri_env = "B_URI"
+dest = "s3:backups/mongo/"
+
+[profile.c]
+uri_env = "C_URI"
+dest = "s3:backups/pg"
+"#;
+        assert_eq!(sharing(text, "a"), vec!["b".to_string()]);
+        assert!(sharing(text, "c").is_empty());
+    }
+
+    #[test]
+    fn shared_destination_warning_names_the_other_profile() {
+        let shared = vec!["staging".to_string()];
+        let ko = Config::shared_destination_warning(&shared, crate::i18n::Lang::Ko).unwrap();
+        assert!(ko.contains("staging"));
+        assert!(Config::shared_destination_warning(&[], crate::i18n::Lang::Ko).is_none());
+    }
 
     const SAMPLE: &str = r#"
 default_profile = "prod"

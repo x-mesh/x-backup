@@ -19,27 +19,27 @@ use crate::manifest::store::ManifestStore;
 use crate::pipeline::verify::collect_manifest_ids;
 use crate::storage::Storage;
 
-const ACCENT: AdaptiveColor = AdaptiveColor {
+pub(crate) const ACCENT: AdaptiveColor = AdaptiveColor {
     Light: "#087F72",
     Dark: "#5EEAD4",
 };
-const TEXT: AdaptiveColor = AdaptiveColor {
+pub(crate) const TEXT: AdaptiveColor = AdaptiveColor {
     Light: "#17202A",
     Dark: "#E6EDF3",
 };
-const MUTED: AdaptiveColor = AdaptiveColor {
+pub(crate) const MUTED: AdaptiveColor = AdaptiveColor {
     Light: "#5A6772",
     Dark: "#8B9AAA",
 };
-const RULE: AdaptiveColor = AdaptiveColor {
+pub(crate) const RULE: AdaptiveColor = AdaptiveColor {
     Light: "#C9D3DC",
     Dark: "#33404D",
 };
-const SELECTED_BG: AdaptiveColor = AdaptiveColor {
+pub(crate) const SELECTED_BG: AdaptiveColor = AdaptiveColor {
     Light: "#C8F3EC",
     Dark: "#123F3A",
 };
-const SELECTED_FG: AdaptiveColor = AdaptiveColor {
+pub(crate) const SELECTED_FG: AdaptiveColor = AdaptiveColor {
     Light: "#063C36",
     Dark: "#E9FFFB",
 };
