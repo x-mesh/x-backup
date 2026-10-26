@@ -44,6 +44,8 @@
 //! 배지에 **글자로도** 적는다([`Origin::label`]) — `app.css`에 `[data-origin="…"]` 규칙이
 //! 아직 없어도(그 파일은 이 태스크 소관 밖이다) 상속/직접 구분이 화면에서 읽힌다.
 
+use std::collections::BTreeMap;
+
 use maud::{html, Markup};
 
 use super::components::{self, Level};
@@ -545,12 +547,21 @@ pub enum FormMode {
 // 렌더 — 전부 순수 함수(파일시스템·env를 건드리지 않는다)
 // ---------------------------------------------------------------------------
 
-/// 프로파일 목록 화면.
+/// `/config` 목록 — 프로파일 한 줄씩과 doctor 전체 판정.
+///
+/// 프로파일마다 시크릿·destination 표를 다 펼치면 프로파일이 늘수록 화면이 끝없이 길어진다.
+/// 목록에는 고를 때 필요한 것(소스·첫 백업 위치·점검 상태·시크릿 누락)만 두고, 나머지는
+/// 프로파일 상세([`detail_page`])로 보낸다. `checks_banner`·`checks_details`·`levels`는 라우트가
+/// `doctor`를 돌려 채운다. 배너 한 줄만 표 위에 두고 경고 상세는 표 아래에 둔다 — 고를 목록이
+/// 경고 표에 밀려 화면 아래로 내려가지 않게 하기 위해서다.
 pub fn list_page(
     lang: Lang,
     syntax: ConfigSyntax,
     default_profile: Option<&str>,
     profiles: &[ProfileView],
+    checks_banner: Markup,
+    checks_details: Markup,
+    levels: &BTreeMap<String, Level>,
 ) -> Markup {
     let subtitle = lang.sel(
         "Profiles are read from the config file. Secret values never appear here — only the environment variable names that hold them.",
@@ -558,14 +569,9 @@ pub fn list_page(
     );
     html! {
         (components::page_head(route::CONFIG_TITLE, Some(subtitle)))
-        (syntax_banner(lang, syntax))
-        (components::meta_list(&[
-            ("profiles", profiles.len().to_string()),
-            ("default_profile", default_profile.unwrap_or("(unset)").to_string()),
-            ("syntax", syntax.label().to_string()),
-        ]))
-        @for profile in profiles {
-            (profile_summary_panel(lang, profile))
+        (checks_banner)
+        p class="actions" {
+            a href=(route::NEW_PATH) { (lang.sel("New profile", "새 프로파일")) }
         }
         @if profiles.is_empty() {
             (components::notice(Level::Warn, lang.sel("No profiles", "프로파일 없음"), html! {
@@ -574,22 +580,141 @@ pub fn list_page(
                     "이 config에는 표시할 프로파일이 없습니다. 아래에서 하나 만드세요.",
                 )) }
             }))
+        } @else {
+            (profiles_table(lang, default_profile, profiles, levels))
         }
+        (checks_details)
+        (syntax_banner(lang, syntax))
+        (components::meta_list(&[
+            ("profiles", profiles.len().to_string()),
+            ("default_profile", default_profile.unwrap_or("(unset)").to_string()),
+            ("syntax", syntax.label().to_string()),
+        ]))
         (conversion_panel(lang, syntax))
-        (components::panel(
-            html! { h3 class="panel__title" { (lang.sel("New profile", "새 프로파일")) } },
-            html! {
-                p class="muted" {
-                    (lang.sel(
-                        "A new profile needs a name and a source — either a plain uri or the name of an environment variable that holds it (uri_env).",
-                        "새 프로파일에는 이름과 소스가 필요합니다. 소스는 평문 uri나 그 값을 담은 환경변수 이름(uri_env)입니다.",
-                    ))
+    }
+}
+
+/// 프로파일 목록 표. 편집할 수 있는 이름만 상세 링크가 된다(경로에 쓸 수 없는 이름은
+/// 이유를 같은 칸에 적는다).
+fn profiles_table(
+    lang: Lang,
+    default_profile: Option<&str>,
+    profiles: &[ProfileView],
+    levels: &BTreeMap<String, Level>,
+) -> Markup {
+    html! {
+        div class="dtable-scroll" {
+            table class="dtable" {
+                thead {
+                    tr {
+                        th scope="col" { "Profile" }
+                        th scope="col" { "Source" }
+                        th scope="col" { "Backup location" }
+                        th scope="col" { "Checks" }
+                        th scope="col" { "Secrets" }
+                    }
                 }
-                p {
-                    a href=(route::NEW_PATH) { (lang.sel("Open the create form", "생성 폼 열기")) }
+                tbody {
+                    @for profile in profiles {
+                        tr {
+                            td class="mono key" {
+                                @if profile.editable {
+                                    a href=(route::profile_href(&profile.name)) { (profile.name) }
+                                } @else {
+                                    (profile.name)
+                                }
+                                @if default_profile == Some(profile.name.as_str()) {
+                                    " " span class="tag" { "default" }
+                                }
+                                @if profile.endpoint_only {
+                                    " " span class="tag" { "endpoint-only" }
+                                }
+                                @if let Some(reason) = profile.name_error.as_deref().filter(|_| !profile.editable) {
+                                    div class="muted" { (reason) }
+                                }
+                            }
+                            td class="mono" { (source_text(lang, profile)) }
+                            td class="mono" { (location_text(lang, profile)) }
+                            td {
+                                @match levels.get(&profile.name) {
+                                    Some(level) => (components::badge(*level)),
+                                    None => span class="muted" { "—" },
+                                }
+                            }
+                            td {
+                                @if profile.secrets.is_empty() {
+                                    span class="muted" { "—" }
+                                } @else if profile.has_missing_secret() {
+                                    (components::badge(Level::Warn))
+                                    " "
+                                    span class="muted" { (lang.sel("not set", "미설정")) }
+                                } @else {
+                                    (components::badge(Level::Ok))
+                                }
+                            }
+                        }
+                    }
                 }
-            },
-        ))
+            }
+        }
+    }
+}
+
+/// 소스 한 줄 — 평문 uri(이미 가린 표기)나 그 값을 담은 env 이름.
+fn source_text(lang: Lang, profile: &ProfileView) -> String {
+    match profile.effective_of("uri") {
+        Some(uri) => uri.to_string(),
+        None => match profile.effective_of("uri_env") {
+            Some(env) => format!("env:{env}"),
+            None => lang.sel("(unset)", "(미설정)").to_string(),
+        },
+    }
+}
+
+/// 첫 백업 위치 한 줄. destination이 여럿이면 나머지 개수를 붙인다.
+fn location_text(lang: Lang, profile: &ProfileView) -> String {
+    let Some(first) = profile.destinations.first() else {
+        return if profile.endpoint_only {
+            lang.sel("(restore/migrate target)", "(복구·이관 대상)")
+                .to_string()
+        } else {
+            lang.sel("(unset)", "(미설정)").to_string()
+        };
+    };
+    let location = match (&first.kind, &first.location) {
+        (Some(kind), Some(location)) => format!("{kind}:{location}"),
+        (Some(kind), None) => kind.clone(),
+        (None, Some(location)) => location.clone(),
+        (None, None) => first.label.clone(),
+    };
+    match profile.destinations.len() {
+        1 => location,
+        n => format!("{location} (+{})", n - 1),
+    }
+}
+
+/// 프로파일 상세 — 목록에서 고른 프로파일의 설정 요약, 시크릿, destination, doctor 항목.
+///
+/// `checks`는 라우트가 이 프로파일의 `doctor` 결과로 채운다.
+pub fn detail_page(
+    lang: Lang,
+    default_profile: Option<&str>,
+    profile: &ProfileView,
+    checks: Markup,
+) -> Markup {
+    html! {
+        (components::page_head(&profile.name, None))
+        p class="actions" {
+            a href=(route::CONFIG_PATH) { (lang.sel("All profiles", "프로파일 목록")) }
+            @if profile.editable {
+                " · "
+                a href=(route::edit_href(&profile.name)) { (lang.sel("Edit", "편집")) }
+                " · "
+                a href=(route::delete_href(&profile.name)) { (lang.sel("Delete", "삭제")) }
+            }
+        }
+        (checks)
+        (profile_settings_panel(lang, default_profile, profile))
     }
 }
 
@@ -611,10 +736,17 @@ fn syntax_banner(lang: Lang, syntax: ConfigSyntax) -> Markup {
     }
 }
 
-/// 목록에 들어가는 프로파일 카드 — 요약 + 시크릿·destination 표.
-fn profile_summary_panel(lang: Lang, profile: &ProfileView) -> Markup {
+/// 상세 화면의 설정 카드 — 요약 + 시크릿·destination 표.
+fn profile_settings_panel(
+    lang: Lang,
+    default_profile: Option<&str>,
+    profile: &ProfileView,
+) -> Markup {
     let head = html! {
-        h3 class="panel__title mono" { (profile.name) }
+        h3 class="panel__title" { (lang.sel("Settings", "설정")) }
+        @if default_profile == Some(profile.name.as_str()) {
+            span class="tag" { "default" }
+        }
         @if profile.endpoint_only {
             span class="tag" { "endpoint-only" }
         }
@@ -645,18 +777,11 @@ fn profile_summary_panel(lang: Lang, profile: &ProfileView) -> Markup {
         (summary_meta(lang, profile))
         (secret_table(lang, &profile.secrets))
         (destination_table(lang, profile))
-        @if profile.editable {
-            p class="actions" {
-                a href=(route::edit_href(&profile.name)) { (lang.sel("Edit", "편집")) }
-                " · "
-                a href=(route::delete_href(&profile.name)) { (lang.sel("Delete", "삭제")) }
-            }
-        }
     };
     components::panel(head, body)
 }
 
-/// 목록 카드의 요약 메타 — "이 프로파일이 무엇에 붙어 무엇을 하는가"를 한눈에.
+/// 설정 카드의 요약 메타 — "이 프로파일이 무엇에 붙어 무엇을 하는가"를 한눈에.
 ///
 /// 프로파일이 대여섯 개 있으면 이름만으로는 구분이 안 된다. `uri`는 [`RedactedUri`]가 이미
 /// 가린 표기이므로 그대로 실을 수 있다(라우트가 그 타입을 거쳐 넣는다).
@@ -1494,6 +1619,24 @@ pub fn problem_page(lang: Lang, level: Level, headline: &str, detail: Option<&st
 mod tests {
     use super::*;
 
+    /// 점검 결과 없이 목록을 그린다(점검 배너·상태는 라우트가 채운다).
+    fn list(
+        lang: Lang,
+        syntax: ConfigSyntax,
+        default_profile: Option<&str>,
+        profiles: &[ProfileView],
+    ) -> Markup {
+        list_page(
+            lang,
+            syntax,
+            default_profile,
+            profiles,
+            html! {},
+            html! {},
+            &BTreeMap::new(),
+        )
+    }
+
     fn field(
         key: &'static str,
         kind: FieldKind,
@@ -1584,7 +1727,7 @@ mod tests {
     #[test]
     fn markup_carries_no_presentation() {
         let rendered = [
-            list_page(
+            list(
                 Lang::En,
                 ConfigSyntax::V2,
                 Some("prod"),
@@ -1598,6 +1741,7 @@ mod tests {
                 &sample_profile(),
             )
             .into_string(),
+            detail_page(Lang::En, Some("prod"), &sample_profile(), html! {}).into_string(),
             form_page(
                 Lang::Ko,
                 ConfigSyntax::V1,
@@ -1740,7 +1884,7 @@ mod tests {
     /// 설정된 env와 미설정 env가 불리언으로 구분 표시된다.
     #[test]
     fn secret_presence_is_shown_as_a_boolean_state() {
-        let out = list_page(Lang::En, ConfigSyntax::V2, None, &[sample_profile()]).into_string();
+        let out = detail_page(Lang::En, None, &sample_profile(), html! {}).into_string();
         assert!(out.contains("MONGO_URI"), "설정된 env 이름 누락");
         assert!(out.contains("S3_CREDS"), "미설정 env 이름 누락");
         assert!(
@@ -1808,7 +1952,7 @@ mod tests {
             warning: Some(hostile.to_string()),
         }];
         let rendered = [
-            list_page(
+            list(
                 Lang::En,
                 ConfigSyntax::V1,
                 Some(hostile),
@@ -1816,6 +1960,7 @@ mod tests {
             )
             .into_string(),
             form_page(Lang::En, ConfigSyntax::V1, FormMode::Update, &profile).into_string(),
+            detail_page(Lang::En, Some(hostile), &profile, html! {}).into_string(),
             delete_page(Lang::Ko, &profile).into_string(),
             result_page(
                 Lang::En,
@@ -1845,10 +1990,14 @@ mod tests {
         profile.name = "../etc".to_string();
         profile.editable = false;
         profile.name_error = Some("경로 구분자가 있습니다".to_string());
-        let out = list_page(Lang::En, ConfigSyntax::V1, None, &[profile]).into_string();
+        let out = list(Lang::En, ConfigSyntax::V1, None, &[profile]).into_string();
         assert!(
             !out.contains(route::CONFIG_EDIT_PREFIX),
             "편집 링크가 남았다: {out}"
+        );
+        assert!(
+            !out.contains(route::CONFIG_PROFILE_PREFIX),
+            "상세 링크가 남았다: {out}"
         );
         assert!(out.contains("경로 구분자가 있습니다"), "이유 누락: {out}");
     }
@@ -1856,8 +2005,8 @@ mod tests {
     /// 문법 배너가 v1/v2를 서로 다르게 말한다 — 저장이 무엇을 보존하는지 알려야 한다.
     #[test]
     fn syntax_banner_distinguishes_v1_and_v2() {
-        let v1 = list_page(Lang::Ko, ConfigSyntax::V1, None, &[]).into_string();
-        let v2 = list_page(Lang::Ko, ConfigSyntax::V2, None, &[]).into_string();
+        let v1 = list(Lang::Ko, ConfigSyntax::V1, None, &[]).into_string();
+        let v2 = list(Lang::Ko, ConfigSyntax::V2, None, &[]).into_string();
         assert!(v1.contains(r#"data-syntax="v1""#), "v1 토큰 누락");
         assert!(v2.contains(r#"data-syntax="v2""#), "v2 토큰 누락");
         assert!(v1.contains("v1 중첩 문법"), "v1 설명 누락: {v1}");
@@ -2115,13 +2264,13 @@ mod tests {
     /// 목록 화면은 v1이면 전환 링크를, v2면 역방향이 없는 이유를 보여준다.
     #[test]
     fn list_page_offers_conversion_only_for_v1() {
-        let v1 = list_page(Lang::En, ConfigSyntax::V1, None, &[]).into_string();
+        let v1 = list(Lang::En, ConfigSyntax::V1, None, &[]).into_string();
         assert!(
             v1.contains(&format!(r#"href="{}""#, route::CONVERT_PATH)),
             "v1에 전환 링크가 없다: {v1}"
         );
 
-        let v2 = list_page(Lang::En, ConfigSyntax::V2, None, &[]).into_string();
+        let v2 = list(Lang::En, ConfigSyntax::V2, None, &[]).into_string();
         assert!(
             !v2.contains(&format!(r#"href="{}""#, route::CONVERT_PATH)),
             "v2에 전환 링크가 생겼다: {v2}"
@@ -2187,6 +2336,62 @@ mod tests {
         assert!(
             !out.contains(route::CLEAR_SUFFIX),
             "clear가 엉뚱한 필드에 붙었다: {out}"
+        );
+    }
+
+    /// 목록은 프로파일마다 한 줄이고, 시크릿·destination 표는 상세에만 있다.
+    #[test]
+    fn list_shows_one_row_per_profile_and_links_to_detail() {
+        let mut levels = BTreeMap::new();
+        levels.insert("prod".to_string(), Level::Warn);
+        let mut profile = sample_profile();
+        profile.name = "prod".to_string();
+        let out = list_page(
+            Lang::En,
+            ConfigSyntax::V2,
+            Some("prod"),
+            &[profile.clone()],
+            html! { p { "doctor-banner" } },
+            html! { p { "doctor-details" } },
+            &levels,
+        )
+        .into_string();
+        assert!(out.contains("doctor-banner"), "점검 배너 누락: {out}");
+        let banner = out.find("doctor-banner").unwrap();
+        let table = out.find("Backup location").unwrap();
+        let details = out.find("doctor-details").unwrap();
+        assert!(
+            banner < table && table < details,
+            "배너 → 프로파일 표 → 점검 상세 순서가 아니다"
+        );
+        assert!(
+            out.contains(&format!(r#"href="{}""#, route::profile_href("prod"))),
+            "상세 링크 누락: {out}"
+        );
+        assert!(
+            out.contains(r#"data-level="warn""#),
+            "점검 상태 누락: {out}"
+        );
+        assert!(
+            !out.contains("Credentials env"),
+            "destination 표가 목록에 남았다: {out}"
+        );
+
+        let detail = detail_page(
+            Lang::En,
+            Some("prod"),
+            &profile,
+            html! { p { "doctor-items" } },
+        )
+        .into_string();
+        assert!(detail.contains("doctor-items"), "점검 항목 누락: {detail}");
+        assert!(
+            detail.contains("Credentials env"),
+            "destination 표 누락: {detail}"
+        );
+        assert!(
+            detail.contains(&format!(r#"href="{}""#, route::edit_href("prod"))),
+            "편집 링크 누락: {detail}"
         );
     }
 }

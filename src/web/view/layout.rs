@@ -69,10 +69,8 @@ fn nav_groups() -> [(&'static str, &'static [(&'static str, &'static str)]); 4] 
         (routes::jobs::JOBS_TITLE, routes::jobs::JOBS_PATH),
         (routes::lock::LOCK_TITLE, routes::lock::LOCK_PATH),
     ];
-    const SETUP: &[(&str, &str)] = &[
-        (routes::config::CONFIG_TITLE, routes::config::CONFIG_PATH),
-        (routes::doctor::DOCTOR_TITLE, routes::doctor::DOCTOR_PATH),
-    ];
+    // doctor 점검 결과는 config 화면에 합쳤다(`/doctor`는 `/config`로 보낸다).
+    const SETUP: &[(&str, &str)] = &[(routes::config::CONFIG_TITLE, routes::config::CONFIG_PATH)];
     [
         ("Overview", OVERVIEW),
         ("Operate", OPERATE),
@@ -191,7 +189,7 @@ mod tests {
     /// 현재 화면이 하나만 강조되는지 확인한다.
     #[test]
     fn nav_lists_every_screen_and_marks_current() {
-        let out = shell(Lang::En, "Doctor", html! {}).into_string();
+        let out = shell(Lang::En, "Config", html! {}).into_string();
         for (label, href) in nav_items() {
             assert!(
                 out.contains(&format!(r#"href="{href}""#)),
@@ -206,9 +204,9 @@ mod tests {
         assert!(
             out.contains(&format!(
                 r#"href="{}" aria-current="page""#,
-                crate::web::routes::doctor::DOCTOR_PATH
+                crate::web::routes::config::CONFIG_PATH
             )),
-            "Doctor가 현재 화면으로 표시되지 않았다: {out}"
+            "Config가 현재 화면으로 표시되지 않았다: {out}"
         );
     }
 
@@ -243,8 +241,8 @@ mod tests {
             "dashboard 화면 라벨 드리프트: {labels:?}"
         );
         assert!(
-            labels.contains(&crate::web::routes::doctor::DOCTOR_TITLE),
-            "doctor 화면 라벨 드리프트: {labels:?}"
+            labels.contains(&crate::web::routes::config::CONFIG_TITLE),
+            "config 화면 라벨 드리프트: {labels:?}"
         );
     }
 

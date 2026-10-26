@@ -1,4 +1,9 @@
-//! `GET /doctor` — config 정적 점검 결과 화면.
+//! config 정적 점검(`doctor --json`) 실행과, 그 결과를 config 화면에 싣는 조각.
+//!
+//! ## 화면은 config에 합쳤다
+//! 점검 결과는 `/config` 목록(전체 판정과 경고·실패 항목, [`summary`])과 프로파일 상세
+//! (항목 표, [`profile_section`])에 나온다. 같은 프로파일을 두 화면에 나눠 보지 않게 하려는
+//! 것이다. `GET /doctor`는 북마크가 깨지지 않게 `/config`로 보내는 303만 남겼다.
 //!
 //! ## 왜 이 화면이 첫 화면인가
 //! `doctor`는 **DB에 연결하지 않고 config만 읽는 오프라인 점검**이다(`src/cli/handlers/doctor.rs`
@@ -73,10 +78,10 @@
 //!   config가 연결되지 않았다"이므로 별도 판정([`Verdict::Misconfigured`])으로 가른다.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+
 use std::time::Duration;
 
-use axum::extract::{Extension, State};
+use axum::response::Redirect;
 use maud::{html, Markup};
 use serde::Deserialize;
 
@@ -88,15 +93,10 @@ use crate::web::job::{JobCommand, JobRunner, JobSpec, RunningJob};
 use crate::web::jsonguard;
 use crate::web::mask::SecretRegistry;
 use crate::web::view::components::{self, Level};
-use crate::web::view::layout;
 use crate::web::ServeConfig;
 
-/// 화면 경로. 라우터·마크업·테스트가 이 상수를 공유한다.
+/// 예전 화면 경로. 지금은 `/config`로 보내는 리다이렉트만 남았다([`page`]).
 pub const DOCTOR_PATH: &str = "/doctor";
-
-/// `<title>`·화면 제목·내비게이션 라벨이 공유하는 이름. 기술용어이므로 영문 고정
-/// ([`crate::i18n`] 규약). [`crate::web::view::layout`]이 현재 화면 판정에 이 값을 쓴다.
-pub const DOCTOR_TITLE: &str = "Doctor";
 
 /// 자식 프로세스 실행 상한.
 ///
@@ -608,7 +608,7 @@ pub enum Outcome {
 /// `--config`를 여기서 붙이지 않는다 — 러너가 기동 시점의 경로로 붙인다(모듈 헤더). 그
 /// 경로가 없으면 자식이 exit 2로 끝나고 [`Verdict::Misconfigured`]가 상황을 화면에 설명한다.
 /// 임의의 기본 경로를 추측해 넣지 않는다(엉뚱한 config를 점검해 보여주는 것이 최악이다).
-async fn collect(cfg: &ServeConfig) -> Outcome {
+pub(crate) async fn collect(cfg: &ServeConfig) -> Outcome {
     let run = match run_doctor(&cfg.jobs, DOCTOR_TIMEOUT, cfg.lang).await {
         Ok(r) => r,
         Err(e) => return Outcome::Unavailable { error: e },
@@ -642,7 +642,7 @@ async fn collect(cfg: &ServeConfig) -> Outcome {
 /// `XB_DESTINATION__PATH=/srv/backups/...` 같은 무해한 값까지 `[REDACTED]`로 덮여 정작 점검
 /// 결과를 읽을 수 없게 된다 — 마스킹이 판독성을 잡아먹는 순간 운영자는 화면을 안 보고
 /// CLI로 돌아간다(그게 더 나쁘다).
-fn request_registry(ctx: &ServeConfig, auth: Option<&AuthState>) -> SecretRegistry {
+pub(crate) fn request_registry(ctx: &ServeConfig, auth: Option<&AuthState>) -> SecretRegistry {
     let mut registry = ctx.jobs.secret_registry().clone();
     if let Some(auth) = auth {
         auth.register_session_secret(&mut registry);
@@ -650,93 +650,159 @@ fn request_registry(ctx: &ServeConfig, auth: Option<&AuthState>) -> SecretRegist
     registry
 }
 
-/// `GET /doctor` 핸들러.
+/// `GET /doctor` — `/config`로 보낸다(303).
 ///
-/// `Extension<Arc<AuthState>>`는 세션 토큰을 마스킹 대상으로 등록하기 위한 것이다
-/// ([`request_registry`]). 라우터 전체에 걸린 Extension이므로 라우터 등록
-/// (`src/web/server.rs`)은 손대지 않는다.
-pub async fn page(
-    State(ctx): State<Arc<ServeConfig>>,
-    Extension(auth): Extension<Arc<AuthState>>,
-) -> Markup {
-    let outcome = collect(&ctx).await;
-    let body = render(
-        ctx.lang,
-        ctx.config_path.is_some(),
-        &outcome,
-        &request_registry(&ctx, Some(&auth)),
-    );
-    layout::shell(ctx.lang, DOCTOR_TITLE, body)
+/// 점검 결과는 config 화면에 합쳤다. 전체 판정과 경고·실패 항목은 `/config` 목록에,
+/// 프로파일별 항목 표는 프로파일 상세에 나온다. 북마크와 외부 링크가 깨지지 않게 경로만 남긴다.
+pub async fn page() -> Redirect {
+    Redirect::to(crate::web::routes::config::CONFIG_PATH)
 }
 
-/// 화면 본문을 만든다 — **순수 함수**(자식도, 파일시스템도 건드리지 않는다).
-///
-/// `config_present`는 config 파일의 **존재 여부만** 받는다. 경로 자체는 서버 내부 정보이므로
-/// 마크업에 싣지 않는다(모듈 헤더 "시크릿" 참조).
-pub fn render(
-    lang: Lang,
-    config_present: bool,
-    outcome: &Outcome,
-    registry: &SecretRegistry,
-) -> Markup {
-    let subtitle = lang.sel(
-        "Offline configuration check — no database connection is made.",
-        "DB에 연결하지 않는 오프라인 설정 점검입니다.",
-    );
-    html! {
-        (components::page_head(DOCTOR_TITLE, Some(subtitle)))
-        @match outcome {
-            Outcome::Reported { verdict, report } => {
-                (components::verdict_banner(verdict.level(), &verdict.headline(lang), verdict.detail(lang).as_deref()))
-                (report_meta(lang, config_present, report))
-                @for profile in &report.profiles {
-                    (profile_panel(lang, profile, registry))
-                }
-            }
-            Outcome::Unreadable { verdict, error, stderr } => {
-                (components::verdict_banner(Level::Error, &error.explain(lang), verdict.detail(lang).as_deref()))
-                (unreadable_notice(lang, *verdict, stderr, registry))
-            }
-            Outcome::Unavailable { error } => {
-                (components::verdict_banner(Level::Error, &error.explain(lang), None))
-                (components::notice(Level::Error, lang.sel("What to check", "확인할 것"), html! {
-                    p { (lang.sel(
-                        "The console runs checks with its own executable. Verify that the binary is still readable and executable, then retry.",
-                        "콘솔은 자기 실행 파일로 점검합니다. 그 바이너리를 여전히 읽고 실행할 수 있는지 확인한 뒤 다시 시도하세요.",
-                    )) }
-                }))
-            }
+/// `/config` 목록 맨 위의 점검 판정 배너 한 줄.
+pub(crate) fn summary_banner(lang: Lang, outcome: &Outcome) -> Markup {
+    match outcome {
+        Outcome::Reported { verdict, .. } => components::verdict_banner(
+            verdict.level(),
+            &verdict.headline(lang),
+            verdict.detail(lang).as_deref(),
+        ),
+        Outcome::Unreadable { verdict, error, .. } => components::verdict_banner(
+            Level::Error,
+            &error.explain(lang),
+            verdict.detail(lang).as_deref(),
+        ),
+        Outcome::Unavailable { error } => {
+            components::verdict_banner(Level::Error, &error.explain(lang), None)
         }
     }
 }
 
-/// 보고서 상단 메타 — "몇 개를 봤고, 어떤 엔진이 섞여 있는가".
-fn report_meta(lang: Lang, config_present: bool, report: &Report) -> Markup {
-    let mut engines: Vec<&str> = report
+/// `/config` 목록의 프로파일 표 아래에 싣는 점검 상세 — 경고·실패 항목, 또는 점검을 읽지
+/// 못한 이유.
+///
+/// **순수 함수**다(자식도, 파일시스템도 건드리지 않는다). 정상 항목은 싣지 않는다 — 목록은
+/// 무엇을 고쳐야 하는지만 보여 주고, 프로파일별 전체 항목은 상세([`profile_section`])에 있다.
+pub(crate) fn summary_details(lang: Lang, outcome: &Outcome, registry: &SecretRegistry) -> Markup {
+    match outcome {
+        Outcome::Reported { report, .. } => issues_table(lang, report, registry),
+        Outcome::Unreadable {
+            verdict, stderr, ..
+        } => unreadable_notice(lang, *verdict, stderr, registry),
+        Outcome::Unavailable { .. } => components::notice(
+            Level::Error,
+            lang.sel("What to check", "확인할 것"),
+            html! {
+                p { (lang.sel(
+                    "The console runs checks with its own executable. Verify that the binary is still readable and executable, then retry.",
+                    "콘솔은 자기 실행 파일로 점검합니다. 그 바이너리를 여전히 읽고 실행할 수 있는지 확인한 뒤 다시 시도하세요.",
+                )) }
+            },
+        ),
+    }
+}
+
+/// 경고·실패 항목만 모은 표. 프로파일 이름은 상세 화면 링크가 된다(경로에 쓸 수 없는 이름은
+/// 글자로만 둔다).
+fn issues_table(lang: Lang, report: &Report, registry: &SecretRegistry) -> Markup {
+    let issues: Vec<(&str, &Item)> = report
         .profiles
         .iter()
-        .filter_map(|p| p.db.as_deref())
+        .flat_map(|profile| {
+            profile
+                .items
+                .iter()
+                .filter(|item| level_from_status(&item.status) != Level::Ok)
+                .map(move |item| (profile.profile.as_str(), item))
+        })
         .collect();
-    engines.sort_unstable();
-    engines.dedup();
-    let engine_text = if engines.is_empty() {
-        lang.sel("(none resolved)", "(해석된 것 없음)").to_string()
-    } else {
-        engines.join(", ")
+    if issues.is_empty() {
+        return html! {};
+    }
+    let head = html! {
+        h3 class="panel__title" { (lang.sel("Checks to review", "확인할 점검 항목")) }
     };
-    // config 경로가 아니라 존재 여부만 말한다 — 경로는 서버 내부 정보다.
-    let config_text = if config_present {
-        lang.sel("wired", "연결됨")
-    } else {
-        lang.sel("not wired", "연결 안 됨")
+    components::panel(
+        head,
+        html! {
+            div class="dtable-scroll" {
+                table class="dtable" {
+                    thead {
+                        tr {
+                            th scope="col" { "Status" }
+                            th scope="col" { "Profile" }
+                            th scope="col" { "Check" }
+                            th scope="col" { "Detail" }
+                        }
+                    }
+                    tbody {
+                        @for (profile, item) in issues {
+                            @let level = level_from_status(&item.status);
+                            tr data-level=(level.token()) {
+                                td { (components::badge(level)) }
+                                td class="mono" {
+                                    @if crate::web::job::args::ProfileName::parse(profile, lang).is_ok() {
+                                        a href=(crate::web::routes::config::profile_href(profile)) { (profile) }
+                                    } @else {
+                                        (profile)
+                                    }
+                                }
+                                td class="mono key" { (item.label) }
+                                td class="msg" { (registry.mask(&item.message)) }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+
+/// 프로파일 하나의 가장 나쁜 점검 상태. 보고서가 없거나 그 프로파일이 빠졌으면 `None`.
+pub(crate) fn profile_level(outcome: &Outcome, profile: &str) -> Option<Level> {
+    match outcome {
+        Outcome::Reported { report, .. } => report
+            .profiles
+            .iter()
+            .find(|candidate| candidate.profile == profile)
+            .map(|candidate| worst_level(&candidate.items)),
+        _ => None,
+    }
+}
+
+/// 프로파일 상세에 싣는 점검 카드. 점검을 돌리지 못했으면 그 사유를 짧게 알린다.
+pub(crate) fn profile_section(
+    lang: Lang,
+    outcome: &Outcome,
+    profile: &str,
+    registry: &SecretRegistry,
+) -> Markup {
+    let unavailable = |reason: String| {
+        components::notice(
+            Level::Error,
+            lang.sel("Checks unavailable", "점검 결과 없음"),
+            html! { p { (registry.mask(&reason)) } },
+        )
     };
-    components::meta_list(&[
-        ("profiles", report.profiles.len().to_string()),
-        ("engines", engine_text),
-        ("overall", report.overall.clone()),
-        ("schema", report.schema.to_string()),
-        ("config", config_text.to_string()),
-    ])
+    match outcome {
+        Outcome::Reported { report, .. } => {
+            match report
+                .profiles
+                .iter()
+                .find(|candidate| candidate.profile == profile)
+            {
+                Some(found) => profile_panel(lang, found, registry),
+                None => unavailable(
+                    lang.sel(
+                        "doctor did not report this profile.",
+                        "doctor가 이 프로파일을 보고하지 않았습니다.",
+                    )
+                    .to_string(),
+                ),
+            }
+        }
+        Outcome::Unreadable { error, .. } => unavailable(error.explain(lang)),
+        Outcome::Unavailable { error } => unavailable(error.explain(lang)),
+    }
 }
 
 /// 프로파일 카드 하나 — 제목줄(이름·엔진·요약·최악 상태) + 항목 표.
@@ -752,7 +818,7 @@ fn profile_panel(lang: Lang, profile: &ProfileReport, registry: &SecretRegistry)
         counts[2]
     );
     let head = html! {
-        h3 class="panel__title mono" { (profile.profile) }
+        h3 class="panel__title" { "doctor" }
         span class="tag" {
             @match &profile.db {
                 Some(db) => (db),
@@ -830,6 +896,14 @@ fn unreadable_notice(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 목록이 쓰는 두 조각(배너 + 상세)을 이어 붙인 결과 — 렌더 성질을 한 번에 본다.
+    fn summary(lang: Lang, outcome: &Outcome, registry: &SecretRegistry) -> Markup {
+        html! {
+            (summary_banner(lang, outcome))
+            (summary_details(lang, outcome, registry))
+        }
+    }
 
     /// 실제 `doctor --json` 출력을 그대로 박아 둔 표본(프로파일 5개 · 항목 19개).
     ///
@@ -924,7 +998,7 @@ mod tests {
                 verdict,
                 report: sample(),
             };
-            let out = render(Lang::En, true, &outcome, &empty_registry()).into_string();
+            let out = summary(Lang::En, &outcome, &empty_registry()).into_string();
             let marker = format!(
                 r#"class="verdict" data-level="{}""#,
                 verdict.level().token()
@@ -1065,7 +1139,7 @@ mod tests {
             error: ReportError::Empty,
             stderr: "ERROR 사전 점검 실패: config 없음".to_string(),
         };
-        let out = render(Lang::En, false, &outcome, &empty_registry()).into_string();
+        let out = summary(Lang::En, &outcome, &empty_registry()).into_string();
         assert!(out.contains(r#"data-level="error""#), "오류 레벨 누락");
         assert!(out.contains("produced no output"), "설명 문장 누락: {out}");
         assert!(out.contains("exit 2"), "종료 코드 근거 누락: {out}");
@@ -1078,7 +1152,7 @@ mod tests {
         let outcome = Outcome::Unavailable {
             error: RunError::Timeout(DOCTOR_TIMEOUT),
         };
-        let out = render(Lang::Ko, true, &outcome, &empty_registry()).into_string();
+        let out = summary(Lang::Ko, &outcome, &empty_registry()).into_string();
         assert!(out.contains(r#"data-level="error""#));
         assert!(out.contains("제한 시간"), "타임아웃 설명 누락: {out}");
         assert!(
@@ -1124,7 +1198,7 @@ mod tests {
             verdict: Verdict::Blocked,
             report,
         };
-        let out = render(Lang::En, true, &outcome, &empty_registry()).into_string();
+        let out = summary(Lang::En, &outcome, &empty_registry()).into_string();
         assert!(!out.contains("<script>"), "스크립트 태그가 살아 있다");
         assert!(out.contains("&lt;script&gt;"), "이스케이프 형태가 아니다");
         // 알 수 없는 status는 error 레벨로 그려진다.
@@ -1152,28 +1226,24 @@ mod tests {
         };
         let mut registry = SecretRegistry::new();
         assert!(registry.register(FAKE), "표본 시크릿 등록 실패");
-        let out = render(Lang::En, true, &outcome, &registry).into_string();
+        let out = summary(Lang::En, &outcome, &registry).into_string();
         assert!(!out.contains(FAKE), "시크릿 원문이 화면에 남았다");
         assert!(out.contains(crate::web::mask::REDACTED_PLACEHOLDER));
     }
 
-    /// 렌더 결과에 서버 내부 경로가 새지 않는다 — `render`는 경로를 받지도 않으므로
+    /// 요약에 서버 내부 경로가 새지 않는다 — `summary`는 경로를 받지도 않으므로
     /// 구조적으로 불가능하다는 것을 시그니처와 함께 고정한다(t5의
     /// `markup_does_not_leak_server_paths`와 같은 취지).
     #[test]
-    fn render_cannot_leak_server_paths() {
+    fn summary_cannot_leak_server_paths() {
         let outcome = Outcome::Reported {
             verdict: Verdict::Clean,
             report: sample(),
         };
-        for present in [true, false] {
-            let out = render(Lang::En, present, &outcome, &empty_registry()).into_string();
-            assert!(!out.contains("/nonexistent/state"), "state 경로 노출");
-            assert!(!out.contains(".local/state"), "state 경로 노출");
-            assert!(!out.contains("doctor-demo.toml"), "config 경로 노출");
-            // config는 존재 여부만 말한다.
-            assert!(out.contains(if present { "wired" } else { "not wired" }));
-        }
+        let out = summary(Lang::En, &outcome, &empty_registry()).into_string();
+        assert!(!out.contains("/nonexistent/state"), "state 경로 노출");
+        assert!(!out.contains(".local/state"), "state 경로 노출");
+        assert!(!out.contains("doctor-demo.toml"), "config 경로 노출");
     }
 
     /// 프로파일 카드가 밀도 있는 요약과 최악 상태 배지를 함께 낸다.
@@ -1200,6 +1270,7 @@ mod tests {
     // -- 자식 실행 -------------------------------------------------------
 
     use crate::web::job::{JobRunner, JobSecrets};
+    use std::sync::Arc;
 
     /// `/usr/bin/env`처럼 자식 환경을 그대로 찍어 주는 프로그램으로 러너를 만든다.
     fn runner_with(exe: &str, secrets: JobSecrets) -> JobRunner {
