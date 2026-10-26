@@ -94,7 +94,7 @@ pub async fn handle(
         rows.truncate(lim);
     }
 
-    let store_loc = store_location(config_toml.as_deref(), &profile);
+    let store_loc = store_location(config_toml.as_deref(), &profile, args.from.as_deref());
     if args.json {
         print_json(&rows, &store_loc);
     } else {
@@ -170,28 +170,30 @@ fn normalize_engine_filter(f: Option<&str>) -> Result<Option<String>> {
 /// destination(store) 위치를 사람용 문자열로 — 표시용(local 경로 또는 s3).
 ///
 /// `prune --json`도 같은 표기를 쓰므로 크레이트 내부에 공개한다(표기 이원화 방지).
-pub(crate) fn store_location(config_toml: Option<&str>, profile: &str) -> String {
+pub(crate) fn store_location(
+    config_toml: Option<&str>,
+    profile: &str,
+    from: Option<&str>,
+) -> String {
     ResolvedConfig::build(MergeInput {
         config_toml,
         profile_name: profile,
         overrides: &collect_overrides_from_process(),
     })
     .ok()
-    .map(|r| {
-        let d = &r.profile.destination;
-        match d.r#type.as_deref() {
-            Some("local") => d
-                .path
-                .clone()
-                .unwrap_or_else(|| "local(경로 미설정)".to_string()),
-            Some("s3") => {
-                d.s3.as_ref()
-                    .and_then(|s| s.bucket.clone())
-                    .map(|b| format!("s3://{b}"))
-                    .unwrap_or_else(|| "s3".to_string())
-            }
-            _ => "(미설정)".to_string(),
+    .and_then(|r| r.profile.select_destination(from).ok().cloned())
+    .map(|d| match d.r#type.as_deref() {
+        Some("local") => d
+            .path
+            .clone()
+            .unwrap_or_else(|| "local(경로 미설정)".to_string()),
+        Some("s3") => {
+            d.s3.as_ref()
+                .and_then(|s| s.bucket.clone())
+                .map(|b| format!("s3://{b}"))
+                .unwrap_or_else(|| "s3".to_string())
         }
+        _ => "(미설정)".to_string(),
     })
     .unwrap_or_else(|| "(해석 불가)".to_string())
 }
@@ -350,7 +352,7 @@ async fn open_storage(config_path: &Option<PathBuf>, args: &ListArgs) -> Result<
         overrides: &overrides,
     })?;
 
-    let dest = &resolved.profile.destination;
+    let dest = resolved.profile.select_destination(args.from.as_deref())?;
     match dest.r#type.as_deref() {
         Some("local") => {}
         Some("s3") => {
@@ -768,5 +770,66 @@ mod tests {
             "cfg"
         );
         assert_eq!(resolve_profile_name(None, None), "default");
+    }
+
+    fn multi_dest_config(dir: &std::path::Path) -> String {
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        format!(
+            "[profile.p]\nuri = \"mongodb://127.0.0.1:1/app\"\n\
+             [[profile.p.dest]]\nname = \"primary\"\ndest = \"local:{a}\"\n\
+             [[profile.p.dest]]\nname = \"offsite\"\ndest = \"local:{b}\"\n",
+            a = dir.join("a").display(),
+            b = dir.join("b").display(),
+        )
+    }
+
+    fn list_args(from: Option<&str>) -> ListArgs {
+        ListArgs {
+            profile: Some("p".to_string()),
+            sort: ListSort::Created,
+            asc: false,
+            type_filter: None,
+            engine: None,
+            limit: None,
+            json: false,
+            from: from.map(str::to_string),
+        }
+    }
+
+    /// 위치를 여럿 둔 프로파일은 단일 `destination` 필드가 비어 있다. 그 필드만 읽던 판본은
+    /// "destination.type이 없다"로 실패했다 — primary를 읽고, `--from`으로 다른 위치를 고른다.
+    #[tokio::test]
+    async fn multi_destination_profile_reads_primary_or_the_chosen_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let text = multi_dest_config(dir.path());
+        std::fs::write(&config_path, &text).unwrap();
+
+        assert!(open_storage(&Some(config_path.clone()), &list_args(None))
+            .await
+            .is_ok());
+        assert!(
+            open_storage(&Some(config_path.clone()), &list_args(Some("offsite")))
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            store_location(Some(&text), "p", None),
+            dir.path().join("a").display().to_string()
+        );
+        assert_eq!(
+            store_location(Some(&text), "p", Some("offsite")),
+            dir.path().join("b").display().to_string()
+        );
+
+        let err = open_storage(&Some(config_path), &list_args(Some("nope")))
+            .await
+            .err()
+            .expect("없는 위치 이름은 거부해야 함");
+        assert!(
+            err.to_string().contains("primary, offsite"),
+            "고를 수 있는 이름을 알려야 함: {err}"
+        );
     }
 }
