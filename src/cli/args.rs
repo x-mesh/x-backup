@@ -313,6 +313,10 @@ pub struct ListArgs {
     /// 결과를 JSON으로 출력한다.
     #[arg(long)]
     pub json: bool,
+    /// 어느 destination을 읽을지(멀티 destination일 때). 이름 또는 `type#idx`.
+    /// 미지정 시 primary(첫 destination).
+    #[arg(long, value_name = "NAME")]
+    pub from: Option<String>,
 }
 
 /// `verify` — 무결성 검증(FR-7, R12/R13).
@@ -362,6 +366,10 @@ pub struct PruneArgs {
     /// 계획·결과를 기계 판독 JSON으로 출력한다(stdout 한 덩어리). 사람용 출력은 억제된다.
     #[arg(long)]
     pub json: bool,
+    /// 어느 destination을 읽을지(멀티 destination일 때). 이름 또는 `type#idx`.
+    /// 미지정 시 primary(첫 destination).
+    #[arg(long, value_name = "NAME")]
+    pub from: Option<String>,
 }
 
 /// `status` — 대상 서버 상태 점검(FR-8, R14).

@@ -155,6 +155,33 @@ impl Profile {
     pub fn is_endpoint_only(&self) -> bool {
         self.destinations.is_empty() && self.destination.r#type.is_none()
     }
+
+    /// `from`(destination `name` 또는 `type#idx` 라벨)으로 백업 위치를 고른다. 미지정이면
+    /// 첫(primary) 위치다.
+    ///
+    /// `restore`·`list`·`prune`의 `--from`이 같은 규칙으로 고르도록 한 곳에 둔다. 단일 필드
+    /// `destination`만 읽으면 `[[profile.x.dest]]`로 위치를 여럿 둔 프로파일에서 그 필드가 비어
+    /// 있어 명령이 "destination.type이 없다"로 실패한다.
+    pub fn select_destination(&self, from: Option<&str>) -> Result<&DestinationConfig> {
+        let dests = self.effective_destinations();
+        match from {
+            None => Ok(dests[0]),
+            Some(name) => dests
+                .iter()
+                .enumerate()
+                .find(|(i, d)| d.name.as_deref() == Some(name) || d.label(*i) == name)
+                .map(|(_, d)| *d)
+                .ok_or_else(|| {
+                    let avail: Vec<String> =
+                        dests.iter().enumerate().map(|(i, d)| d.label(i)).collect();
+                    XBackupError::Config(crate::tr!(
+                        "no destination matches --from '{name}' (available: {})",
+                        "--from '{name}'에 해당하는 destination이 없습니다(가용: {})",
+                        avail.join(", ")
+                    ))
+                }),
+        }
+    }
 }
 
 /// 동작 모드 — `[profiles.<name>.mode]`.
@@ -505,6 +532,48 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn select_destination_defaults_to_primary_and_matches_name_or_label() {
+        let cfg = Config::from_toml_str(
+            r#"
+[profile.p]
+uri_env = "P_URI"
+
+[[profile.p.dest]]
+name = "primary"
+dest = "local:/srv/a"
+
+[[profile.p.dest]]
+dest = "local:/srv/b"
+"#,
+        )
+        .unwrap();
+        let profile = cfg.profile("p").unwrap();
+        assert_eq!(
+            profile.select_destination(None).unwrap().path.as_deref(),
+            Some("/srv/a")
+        );
+        assert_eq!(
+            profile
+                .select_destination(Some("primary"))
+                .unwrap()
+                .path
+                .as_deref(),
+            Some("/srv/a")
+        );
+        // 이름이 없는 위치는 `type#idx` 라벨로 고른다.
+        assert_eq!(
+            profile
+                .select_destination(Some("local#1"))
+                .unwrap()
+                .path
+                .as_deref(),
+            Some("/srv/b")
+        );
+        let err = profile.select_destination(Some("nope")).unwrap_err();
+        assert!(err.to_string().contains("primary, local#1"), "{err}");
+    }
 
     fn sharing(text: &str, name: &str) -> Vec<String> {
         Config::from_toml_str(text)

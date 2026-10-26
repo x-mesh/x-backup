@@ -62,7 +62,11 @@ pub async fn handle(
 
     // store 위치 표기는 list와 같은 함수를 쓴다(표기 이원화 방지). json일 때만 필요하다.
     let store_loc = if args.json {
-        crate::cli::handlers::list::store_location(config_toml.as_deref(), &args.profile)
+        crate::cli::handlers::list::store_location(
+            config_toml.as_deref(),
+            &args.profile,
+            args.from.as_deref(),
+        )
     } else {
         String::new()
     };
@@ -518,7 +522,7 @@ async fn open_storage(config_path: &Option<PathBuf>, args: &PruneArgs) -> Result
         overrides: &overrides,
     })?;
 
-    let dest = &resolved.profile.destination;
+    let dest = resolved.profile.select_destination(args.from.as_deref())?;
     match dest.r#type.as_deref() {
         Some("local") => {}
         Some("s3") => {

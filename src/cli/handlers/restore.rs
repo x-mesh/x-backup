@@ -119,7 +119,7 @@ pub async fn handle(
     );
     // 백업을 읽어올 store 위치(list의 `store:`와 동일 의미) — 선택 대상이 어느 저장소인지 명시.
     let store_label =
-        store_location_label(choose_destination(&resolved.profile, args.from.as_deref())?);
+        store_location_label(resolved.profile.select_destination(args.from.as_deref())?);
     crate::cli::output::print_backup_store(&store_label, mode);
     // 복구가 어느 host로 들어가는지 명시(자격증명 마스킹) — in-place 기본값이라 운영 DB
     // 오버라이트 사고를 막는다. 대상 출처(--target / --target-profile / 프로파일 source)도 함께 보인다.
@@ -1288,7 +1288,7 @@ fn select_restore_storage(
     profile_name: &str,
     from: Option<&str>,
 ) -> Result<Box<dyn Storage>> {
-    let dest = choose_destination(profile, from)?;
+    let dest = profile.select_destination(from)?;
     if dest.r#type.is_none() {
         return Err(XBackupError::Usage(crate::tr!("profile '{profile_name}' has no backup store (dest), so it cannot be a restore source (it is endpoint-only — for a restore/migration target). To restore onto this server, name the profile that has backups as the source and this profile as the target:
  x-backup restore --profile <backup-profile> --target-profile {profile_name}", "프로파일 '{profile_name}'은(는) 백업 store(dest)가 없어 복구 소스가 될 수 없습니다\
@@ -1297,33 +1297,6 @@ fn select_restore_storage(
              x-backup restore --profile <백업프로파일> --target-profile {profile_name}")));
     }
     from_config(dest)
-}
-
-/// `--from`(이름/라벨)으로 복구에 쓸 destination을 고른다 — 미지정이면 첫(primary) destination.
-/// 스토리지 생성([`select_restore_storage`])과 표시용 라벨([`store_location_label`])이 **같은**
-/// 대상을 가리키도록 선택 로직을 한 곳에 둔다.
-fn choose_destination<'a>(
-    profile: &'a Profile,
-    from: Option<&str>,
-) -> Result<&'a DestinationConfig> {
-    let dests = profile.effective_destinations();
-    match from {
-        None => Ok(dests[0]),
-        Some(name) => dests
-            .iter()
-            .enumerate()
-            .find(|(i, d)| d.name.as_deref() == Some(name) || d.label(*i) == name)
-            .map(|(_, d)| *d)
-            .ok_or_else(|| {
-                let avail: Vec<String> =
-                    dests.iter().enumerate().map(|(i, d)| d.label(i)).collect();
-                XBackupError::Config(crate::tr!(
-                    "no destination matches --from '{name}' (available: {})",
-                    "--from '{name}'에 해당하는 destination이 없습니다(가용: {})",
-                    avail.join(", ")
-                ))
-            }),
-    }
 }
 
 /// destination의 사람용 위치 라벨(local 경로 / s3 버킷) — `list`의 `store:` 표기와 일관.
