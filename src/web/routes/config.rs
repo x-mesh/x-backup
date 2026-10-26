@@ -2717,7 +2717,7 @@ async fn apply_and_render(ctx: &ServeConfig, change: ProfileChange) -> Response 
                 ctx.lang,
                 change.name.as_str(),
                 change.op.label(),
-                &change.set_rows(),
+                &masked_set_rows(&change),
                 &change.unset_rows(),
                 &change.broke_inheritance,
                 view::SaveOutcome {
