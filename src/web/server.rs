@@ -24,23 +24,37 @@
 //! 처리하면 배포마다 진행 중인 응답이 끊긴다. 두 시그널 모두를 종료 신호로 받고, axum이
 //! 진행 중인 요청을 마무리할 시간을 준다.
 //!
+//! 다만 SSE 응답(`/monitor/events`, 잡 진행 스트림)은 스스로 끝나지 않는다. axum의 drain은
+//! 열린 연결이 모두 끝나기를 기한 없이 기다리므로, 그대로 두면 브라우저 탭 하나만 열려
+//! 있어도 종료가 영원히 미뤄진다. 그래서 [`end_event_streams_on_shutdown`]이 종료 신호가 오면 SSE 본문을
+//! 끝내고, 그 밖의 연결이 응답을 붙잡고 있어도 [`SHUTDOWN_GRACE`]가 지나거나 종료 신호가
+//! 한 번 더 오면 기다리지 않고 반환한다.
+//!
 //! **자식 프로세스는 이 종료를 따라 죽지 않는다.** 백업 자식은 스스로 락을 들고 계속
 //! 돌아가고, 서버가 다시 뜨면 pid+시작시각+프로파일 3중 일치로 재부착한다. 그래서
 //! 여기서 자식을 정리하려 들면 안 된다 — 2시간짜리 백업이 배포 때마다 죽는다. 그 재부착을
 //! 실제로 수행하는 것이 [`serve`]가 포트를 잡기 전에 부르는
 //! [`crate::web::reattach::run_at_startup`]이다(그 배치의 근거는 [`serve`] doc 참조).
 
+use std::future::{Future, IntoFuture};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
+use axum::body::Body;
+use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};
-use axum::middleware;
-use axum::response::{IntoResponse, Redirect};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Router};
+use futures::StreamExt;
+use tokio::net::TcpListener;
+use tokio::sync::watch;
 
 use crate::cli::output::{config_source_label, field_line, style, Tone};
 use crate::error::{Result, XBackupError};
+use crate::i18n::Lang;
 use crate::web::auth::{self, AuthState};
 use crate::web::state::jobs as job_state;
 use crate::web::{reattach, routes, view, ServeConfig};
@@ -53,6 +67,9 @@ const HEALTHZ_BODY: &str = "ok\n";
 
 /// 기동 배너의 라벨 열 폭(`config:` 포함 표시 폭).
 const BANNER_WIDTH: usize = 9;
+
+/// 종료 신호 뒤 SSE가 아닌 연결이 응답을 마치기를 기다리는 상한. 넘으면 응답을 끊고 종료한다.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 /// 검증된 [`ServeConfig`]로 포트를 잡고 서버를 종료 신호까지 돌린다.
 ///
@@ -92,7 +109,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<()> {
     // (`state::jobs` 헤더 "쓰기 경로는 인스턴스 하나를 공유해야 한다").
     reattach::run_at_startup(&job_state::shared(&cfg.state_dir), cfg.lang).await;
 
-    let listener = tokio::net::TcpListener::bind(cfg.bind).await.map_err(|e| {
+    let listener = TcpListener::bind(cfg.bind).await.map_err(|e| {
         XBackupError::Config(format!(
             "{}에 바인딩할 수 없습니다: {e} — 포트가 이미 쓰이고 있거나 권한이 없습니다. \
              `--bind`로 다른 포트를 지정하세요.",
@@ -105,11 +122,113 @@ pub async fn serve(cfg: ServeConfig) -> Result<()> {
 
     print_banner(&cfg, bound);
 
+    let lang = cfg.lang;
     let app = router(Arc::new(cfg), auth_state);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(|e| XBackupError::Failure(format!("웹 서버가 비정상 종료했습니다: {e}")))
+    serve_until_shutdown(
+        listener,
+        app,
+        shutdown_signal(),
+        shutdown_signal(),
+        SHUTDOWN_GRACE,
+        lang,
+    )
+    .await
+}
+
+/// `shutdown`이 끝나면 graceful drain을 시작하고, drain이 끝나거나 `grace`가 지나거나
+/// `force`가 끝나면 반환한다.
+///
+/// `force`는 drain을 시작한 뒤에야 poll한다. 시그널 리스너는 등록 이후의 신호만 보므로,
+/// 첫 신호가 `force`까지 끝내지 않는다.
+async fn serve_until_shutdown(
+    listener: TcpListener,
+    app: Router,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    force: impl Future<Output = ()>,
+    grace: Duration,
+    lang: Lang,
+) -> Result<()> {
+    let (fired_tx, fired_rx) = watch::channel(false);
+    let app = app.layer(middleware::from_fn_with_state(
+        fired_rx.clone(),
+        end_event_streams_on_shutdown,
+    ));
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            fired_tx.send_replace(true);
+        })
+        .into_future();
+    tokio::pin!(server);
+    let failed =
+        |e: std::io::Error| XBackupError::Failure(format!("웹 서버가 비정상 종료했습니다: {e}"));
+
+    tokio::select! {
+        res = &mut server => return res.map_err(failed),
+        () = shutdown_fired(fired_rx) => {}
+    }
+
+    eprintln!(
+        "{}",
+        crate::cli::output::style_stderr(
+            &format!(
+                "{} {}",
+                lang.sel("shutting down —", "종료 중 —"),
+                lang.sel_string(
+                    format!(
+                        "waiting up to {}s for open requests. Press Ctrl+C again to exit now.",
+                        grace.as_secs()
+                    ),
+                    format!(
+                        "진행 중인 요청을 최대 {}초 기다립니다. 바로 종료하려면 Ctrl+C를 한 번 더 누르세요.",
+                        grace.as_secs()
+                    ),
+                )
+            ),
+            Tone::Muted
+        )
+    );
+
+    tokio::select! {
+        res = &mut server => res.map_err(failed),
+        () = tokio::time::sleep(grace) => {
+            tracing::warn!(
+                grace_secs = grace.as_secs(),
+                "열린 연결이 상한 안에 끝나지 않아 기다리지 않고 종료합니다"
+            );
+            Ok(())
+        }
+        () = force => Ok(()),
+    }
+}
+
+/// 종료 신호가 오면 SSE 응답 본문을 끝낸다(모듈 헤더 "graceful shutdown" 참조).
+///
+/// SSE가 아닌 응답은 건드리지 않는다. 일반 응답을 같은 방식으로 자르면 drain이 마무리해
+/// 줘야 할 진행 중인 응답까지 중간에 끊긴다.
+async fn end_event_streams_on_shutdown(
+    State(fired): State<watch::Receiver<bool>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let res = next.run(req).await;
+    let is_event_stream = res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/event-stream"));
+    if !is_event_stream {
+        return res;
+    }
+    let (parts, body) = res.into_parts();
+    let body = body.into_data_stream().take_until(shutdown_fired(fired));
+    Response::from_parts(parts, Body::from_stream(body))
+}
+
+/// 종료 신호가 이미 왔거나 올 때 끝난다.
+async fn shutdown_fired(mut fired: watch::Receiver<bool>) {
+    // 송신측은 `true`를 보낸 뒤에만 drop되므로 Err도 "이미 종료 중"이라는 뜻이다.
+    let _ = fired.wait_for(|fired| *fired).await;
 }
 
 /// 전체 라우터를 조립한다. 인증 계층은 [`app_routes`] 안에 붙는다(모듈 헤더 참조).
@@ -443,7 +562,6 @@ async fn shutdown_signal() {
         () = ctrl_c => {}
         () = terminate => {}
     }
-    tracing::info!("종료 신호 수신 — 진행 중인 요청을 마무리합니다");
 }
 
 #[cfg(test)]
@@ -879,5 +997,151 @@ mod tests {
     /// 전용으로 값을 복제해 만든다(`ServeConfig`는 `Clone`).
     fn ctx_owned() -> ServeConfig {
         (*ctx()).clone()
+    }
+
+    /// 실제 포트(`127.0.0.1:0`)에 `serve_until_shutdown`을 띄운다. 첫 종료 신호와 두 번째
+    /// 신호를 시그널 대신 oneshot으로 보낸다(시그널 핸들러를 테스트 프로세스에 설치하지 않는다).
+    struct TestServer {
+        addr: SocketAddr,
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        force: tokio::sync::oneshot::Sender<()>,
+        task: tokio::task::JoinHandle<Result<()>>,
+    }
+
+    async fn spawn_server(app: Router, grace: Duration) -> TestServer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind 실패");
+        let addr = listener.local_addr().expect("주소 조회 실패");
+        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (force, force_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(serve_until_shutdown(
+            listener,
+            app,
+            async {
+                let _ = shutdown_rx.await;
+            },
+            async {
+                let _ = force_rx.await;
+            },
+            grace,
+            Lang::default(),
+        ));
+        TestServer {
+            addr,
+            shutdown,
+            force,
+            task,
+        }
+    }
+
+    /// 끝나지 않는 일반(SSE가 아닌) 응답 라우트.
+    fn never_ending_route() -> Router {
+        Router::new().route(
+            "/slow",
+            get(|| async {
+                Body::from_stream(futures::stream::pending::<
+                    std::result::Result<Vec<u8>, std::io::Error>,
+                >())
+            }),
+        )
+    }
+
+    /// 요청을 보내고 응답 헤더까지 읽은 연결을 돌려준다. 본문은 끝나지 않으므로 연결은 열려 있다.
+    async fn open_request(addr: SocketAddr, path: &str) -> (tokio::net::TcpStream, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("접속 실패");
+        client
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .await
+            .expect("요청 전송 실패");
+        let mut buf = [0u8; 1024];
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("응답 헤더가 와야 함")
+            .expect("읽기 실패");
+        (client, String::from_utf8_lossy(&buf[..n]).into_owned())
+    }
+
+    /// 브라우저가 SSE를 열어 둔 채 종료 신호가 와도 grace를 기다리지 않고 곧바로 끝난다.
+    /// 이 보장이 없으면 탭 하나가 Ctrl+C를 무기한 막는다(모듈 헤더 "graceful shutdown").
+    #[tokio::test]
+    async fn shutdown_ends_open_event_streams_without_waiting_for_grace() {
+        use axum::response::sse::{Event, Sse};
+        use tokio::io::AsyncReadExt;
+
+        let app = Router::new().route(
+            "/sse",
+            get(|| async {
+                Sse::new(futures::stream::pending::<
+                    std::result::Result<Event, std::convert::Infallible>,
+                >())
+            }),
+        );
+        let server = spawn_server(app, Duration::from_secs(60)).await;
+        let (mut client, head) = open_request(server.addr, "/sse").await;
+        assert!(
+            head.contains("text/event-stream"),
+            "SSE 응답이어야 함: {head}"
+        );
+
+        server.shutdown.send(()).expect("서버가 살아 있어야 함");
+        tokio::time::timeout(Duration::from_secs(5), server.task)
+            .await
+            .expect("grace(60초)보다 훨씬 빨리 끝나야 함")
+            .expect("서버 태스크 panic")
+            .expect("정상 종료여야 함");
+
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut rest))
+            .await
+            .expect("서버가 SSE 연결을 닫아야 함")
+            .expect("읽기 실패");
+    }
+
+    /// SSE가 아닌 응답이 끝나지 않아도 종료는 grace에서 멈춘다. 일반 응답은 자르지 않으므로
+    /// grace보다 일찍 끝나서도 안 된다.
+    #[tokio::test]
+    async fn shutdown_stops_waiting_for_other_responses_after_grace() {
+        let grace = Duration::from_millis(300);
+        let server = spawn_server(never_ending_route(), grace).await;
+        let (_client, head) = open_request(server.addr, "/slow").await;
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "응답 헤더가 와야 함: {head}"
+        );
+
+        let started = tokio::time::Instant::now();
+        server.shutdown.send(()).expect("서버가 살아 있어야 함");
+        tokio::time::timeout(Duration::from_secs(5), server.task)
+            .await
+            .expect("grace가 지나면 끝나야 함")
+            .expect("서버 태스크 panic")
+            .expect("정상 종료여야 함");
+        assert!(
+            started.elapsed() >= grace,
+            "일반 응답은 grace 전에 자르지 않아야 함"
+        );
+    }
+
+    /// drain 중 두 번째 종료 신호가 오면 grace를 기다리지 않고 바로 반환한다.
+    #[tokio::test]
+    async fn second_signal_during_drain_returns_immediately() {
+        let server = spawn_server(never_ending_route(), Duration::from_secs(60)).await;
+        let (_client, _head) = open_request(server.addr, "/slow").await;
+
+        server.shutdown.send(()).expect("서버가 살아 있어야 함");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !server.task.is_finished(),
+            "첫 신호만으로는 끝나지 않는 일반 응답을 기다려야 함"
+        );
+
+        server.force.send(()).expect("서버가 살아 있어야 함");
+        tokio::time::timeout(Duration::from_secs(1), server.task)
+            .await
+            .expect("두 번째 신호 뒤 바로 끝나야 함")
+            .expect("서버 태스크 panic")
+            .expect("정상 종료여야 함");
     }
 }
