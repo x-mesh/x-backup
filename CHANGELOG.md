@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-26
+
+### Added
+
+- `x-backup config`: a terminal editor for the profiles in `config.toml`. Use the arrow
+  keys to select a profile, edit its fields, review the changes, run a connection test and
+  save. Each field opens with its current value. The editor uses the same field rules and
+  save path as the web `/config` page: a save runs the `doctor` checks, keeps `.bak.N`
+  copies of the previous file and replaces the file atomically. The connection test
+  checks the draft and does not write the file.
+- `list --from <NAME>` and `prune --from <NAME>` select one destination of a profile that
+  has several destinations. Without `--from`, they use the primary destination.
+- `doctor` and the config editor warn when two or more profiles use the same destination.
+  The backup path and the manifest do not record the profile, so the incremental base,
+  `prune` and the backup list of these profiles mix.
+
+### Changed
+
+- The web `/config` page shows one row per profile with its `doctor` result. A profile
+  name opens a detail page at `/config/profile/{name}`. `/doctor` redirects to `/config`,
+  and the Setup menu no longer has a Doctor entry.
+- A plain `uri` or `read_uri` can contain `user:pass@` credentials. The web pages, the
+  audit log and the editor show the value masked.
+
+### Fixed
+
+- `x-backup serve` stops on Ctrl+C or SIGTERM when a browser holds an SSE stream open.
+  Other connections get up to 10 seconds, and a second signal stops the server at once.
+- `list` and `prune` failed with `destination.type is not set (local is required)` for a
+  profile with several destinations (`[[profile.x.dest]]`). They now read the primary
+  destination.
+
 ## [0.5.0] - 2026-10-22
 
 ### Added
