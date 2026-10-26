@@ -83,7 +83,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path as FsPath;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use maud::Markup;
@@ -93,7 +93,9 @@ use crate::config::file::{Config, Profile};
 use crate::error::{Result, XBackupError};
 use crate::i18n::Lang;
 use crate::web::audit::{AuditEvent, AuditOutcome, AuditReceipt};
+use crate::web::auth::AuthState;
 use crate::web::job::args::{ProfileName, MAX_PROFILE_NAME_LEN};
+use crate::web::routes::doctor;
 use crate::web::view::components::Level;
 use crate::web::view::config as view;
 use crate::web::view::config::{
@@ -113,6 +115,10 @@ pub const CONFIG_PATH: &str = "/config";
 pub const CONFIG_TITLE: &str = "Config";
 /// 생성 폼 경로.
 pub const NEW_PATH: &str = "/config/new";
+/// 프로파일 상세 경로 접두(뒤에 `/<profile>`이 붙는다).
+pub const CONFIG_PROFILE_PREFIX: &str = "/config/profile";
+/// 프로파일 상세 라우트 패턴(axum 0.8 `{param}` 문법).
+pub const PROFILE_ROUTE: &str = "/config/profile/{profile}";
 /// 편집 폼 경로 접두(뒤에 `/<profile>`이 붙는다).
 pub const CONFIG_EDIT_PREFIX: &str = "/config/edit";
 /// 삭제 확인 화면 경로 접두(뒤에 `/<profile>`이 붙는다).
@@ -175,6 +181,11 @@ const KEY_EXTENDS: &str = "extends";
 /// ([`ProfileName`] 규칙).
 pub fn edit_href(profile: &str) -> String {
     format!("{CONFIG_EDIT_PREFIX}/{profile}")
+}
+
+/// 프로파일 상세 링크. [`edit_href`]와 같은 전제.
+pub fn profile_href(profile: &str) -> String {
+    format!("{CONFIG_PROFILE_PREFIX}/{profile}")
 }
 
 /// 삭제 확인 화면 링크. [`edit_href`]와 같은 전제.
@@ -1808,7 +1819,10 @@ fn load_document(ctx: &ServeConfig) -> std::result::Result<ConfigDocument, LoadE
 }
 
 /// `GET /config` — 프로파일 목록.
-pub async fn list(State(ctx): State<Arc<ServeConfig>>) -> Response {
+pub async fn list(
+    State(ctx): State<Arc<ServeConfig>>,
+    Extension(auth): Extension<Arc<AuthState>>,
+) -> Response {
     let document = match load_document(&ctx) {
         Ok(doc) => doc,
         Err(error) => return load_problem(&ctx, error),
@@ -1827,11 +1841,60 @@ pub async fn list(State(ctx): State<Arc<ServeConfig>>) -> Response {
             )
         })
         .collect();
+    // 점검은 캐시하지 않는다 — 웹에서 config를 저장한 직후 목록이 이전 결과를 보여 주면 안 된다.
+    // doctor는 DB에 연결하지 않아 수십 ms에 끝난다.
+    let checks = doctor::collect(&ctx).await;
+    let registry = doctor::request_registry(&ctx, Some(&auth));
+    let levels: BTreeMap<String, Level> = profiles
+        .iter()
+        .filter_map(|view| {
+            doctor::profile_level(&checks, &view.name).map(|level| (view.name.clone(), level))
+        })
+        .collect();
     let body = view::list_page(
         ctx.lang,
         document.syntax,
         document.config.default_profile.as_deref(),
         &profiles,
+        doctor::summary_banner(ctx.lang, &checks),
+        doctor::summary_details(ctx.lang, &checks, &registry),
+        &levels,
+    );
+    layout::shell(ctx.lang, CONFIG_TITLE, body).into_response()
+}
+
+/// `GET /config/profile/{profile}` — 프로파일 상세(설정 요약·시크릿·destination·점검 항목).
+pub async fn detail(
+    State(ctx): State<Arc<ServeConfig>>,
+    Extension(auth): Extension<Arc<AuthState>>,
+    Path(name): Path<String>,
+) -> Response {
+    let document = match load_document(&ctx) {
+        Ok(doc) => doc,
+        Err(error) => return load_problem(&ctx, error),
+    };
+    // 경로에서 온 이름을 먼저 검증한다 — 검증되지 않은 문자열로 맵을 조회하지 않는다.
+    if let Err(error) = ProfileName::parse(&name, ctx.lang) {
+        return problem(&ctx, StatusCode::BAD_REQUEST, &error.to_string(), None);
+    }
+    let Some(profile) = profile_view_of(&ctx, &document, &name) else {
+        return problem(
+            &ctx,
+            StatusCode::NOT_FOUND,
+            ctx.lang.sel(
+                "No such profile in this config.",
+                "요청한 프로파일이 이 config에 없습니다.",
+            ),
+            None,
+        );
+    };
+    let checks = doctor::collect(&ctx).await;
+    let registry = doctor::request_registry(&ctx, Some(&auth));
+    let body = view::detail_page(
+        ctx.lang,
+        document.config.default_profile.as_deref(),
+        &profile,
+        doctor::profile_section(ctx.lang, &checks, &name, &registry),
     );
     layout::shell(ctx.lang, CONFIG_TITLE, body).into_response()
 }
@@ -2815,6 +2878,9 @@ pub fn render_list(lang: Lang, document: &ConfigDocument, probe: &dyn Fn(&str) -
         document.syntax,
         document.config.default_profile.as_deref(),
         &profiles,
+        maud::html! {},
+        maud::html! {},
+        &BTreeMap::new(),
     )
 }
 
@@ -2910,6 +2976,7 @@ uri_env = "MONGO_URI_T28"
             .route(CONFIG_PATH, get(list))
             .route(SAVE_PATH, post(save))
             .route(DELETE_PATH, post(delete_submit))
+            .layer(axum::Extension(auth.clone()))
             .route_layer(middleware::from_fn_with_state(
                 auth,
                 crate::web::auth::require_auth,
@@ -3189,14 +3256,26 @@ uri_env = "MONGO_URI_T28"
             !markup.contains(FAKE_ENV_SECRET),
             "env 값이 화면에 들어갔다(애초에 읽지 않아야 한다)"
         );
-        // 이름과 호스트는 남아야 진단이 된다.
-        assert!(markup.contains("S3_CREDS_T26"), "env 이름이 사라졌다");
+        // 호스트는 남아야 진단이 된다.
         assert!(markup.contains("db.internal"), "호스트가 사라졌다");
 
-        // 편집 폼에서도 같다 — 가린 표기가 입력 칸 value로 새지 않는다.
+        // 상세 화면도 같다 — env 이름은 남고 값과 비밀번호는 없다.
         let profile = doc.config.profile("leaky").unwrap();
         let profile_view =
             build_profile_view(Lang::En, "leaky", profile, &doc.origins_of("leaky"), &probe);
+        let detail_markup =
+            view::detail_page(Lang::En, None, &profile_view, maud::html! {}).into_string();
+        assert!(
+            detail_markup.contains("S3_CREDS_T26"),
+            "env 이름이 사라졌다"
+        );
+        assert!(detail_markup.contains("db.internal"), "호스트가 사라졌다");
+        assert!(
+            !detail_markup.contains(FAKE_URI_SECRET) && !detail_markup.contains("admin"),
+            "상세 화면에 URI 자격증명이 남았다: {detail_markup}"
+        );
+
+        // 편집 폼에서도 같다 — 가린 표기가 입력 칸 value로 새지 않는다.
         let form_markup =
             view::form_page(Lang::En, doc.syntax, FormMode::Update, &profile_view).into_string();
         assert!(
@@ -4350,11 +4429,13 @@ uri_env = "MONGO_URI_T28"
 
         let app = Router::new()
             .route(CONFIG_PATH, get(list))
+            .route(PROFILE_ROUTE, get(detail))
             .route(NEW_PATH, get(new_form))
             .route(EDIT_ROUTE, get(edit_form))
             .route(DELETE_CONFIRM_ROUTE, get(delete_form))
             .route(SAVE_PATH, post(save))
             .route(DELETE_PATH, post(delete_submit))
+            .layer(axum::Extension(auth.clone()))
             .route_layer(middleware::from_fn_with_state(
                 auth,
                 crate::web::auth::require_auth,
@@ -4381,6 +4462,7 @@ uri_env = "MONGO_URI_T28"
 
         for uri in [
             CONFIG_PATH,
+            &profile_href("prod"),
             NEW_PATH,
             &edit_href("prod"),
             &delete_href("prod"),
@@ -4457,7 +4539,11 @@ uri_env = "MONGO_URI_T28"
     #[tokio::test]
     async fn missing_config_renders_an_explanation() {
         let ctx = Arc::new(ServeConfig::for_test());
-        let response = list(State(ctx)).await;
+        let response = list(
+            State(ctx),
+            Extension(crate::web::auth::AuthState::for_test("t-config-list")),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await

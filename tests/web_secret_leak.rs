@@ -134,10 +134,6 @@ fn known_routes() -> Vec<String> {
         // `/`는 싣지 않는다 — 본문 없이 고정 `Location`(대시보드)만 내는 303이라 검사할
         // 화면이 없고, 그 목적지는 아래 DASHBOARD_PATH가 덮는다.
         server::HEALTHZ_PATH.to_string(),
-        // doctor 화면(t9). 인증 쿠키를 싣게 된 뒤로는 자식 프로세스가 **실제로** 뜬다 —
-        // 자기 자신(`current_exe()`)이 이 테스트 바이너리라 doctor로서 동작하지는 않지만,
-        // 그 실패 화면까지가 이 하네스의 검사 대상이다(자식 stderr 발췌가 본문에 실린다).
-        x_backup::web::routes::doctor::DOCTOR_PATH.to_string(),
         // 락 현황 화면(t13). pid·hostname·프로파일명을 보여주는 화면이라 시크릿이 섞일
         // 여지가 특히 없어야 한다 — 락 파일 절대 경로를 노출하지 않는 것도 t13의 결정이다
         // (`XDG_RUNTIME_DIR` 실제 값이 드러나는 것을 막는다).
@@ -149,7 +145,13 @@ fn known_routes() -> Vec<String> {
         // config 편집(t26). 시크릿을 **값이 아니라 env 이름만** 다루는 화면이라 이 하네스의
         // 핵심 대상이다 — 값 필드가 응답 스키마에 아예 없다는 것이 1차 방어이고, 이 테스트가
         // 그 방어가 실제로 성립하는지를 끝단에서 확인한다.
+        // 목록과 프로파일 상세는 doctor 점검 결과(t9에서 옮겨 왔다)를 함께 렌더한다. 인증
+        // 쿠키를 싣으면 자식 프로세스가 **실제로** 뜬다 — 자기 자신(`current_exe()`)이 이 테스트
+        // 바이너리라 doctor로서 동작하지는 않지만, 그 실패 배너까지가 이 하네스의 검사 대상이다
+        // (자식 stderr 발췌가 본문에 실린다). `/doctor`는 이제 `/config`로 보내는 303이라 싣지
+        // 않는다.
         x_backup::web::routes::config::CONFIG_PATH.to_string(),
+        x_backup::web::routes::config::profile_href(CANARY_PROFILE),
         x_backup::web::routes::config::NEW_PATH.to_string(),
         // 백업 실행 폼(t15). 프로파일 목록을 렌더하는 화면이라 source URI가 스치는 자리다.
         // 실행 중 화면·SSE·취소는 job_id가 필요해 이 목록에 넣지 않는다 — 그 경로들의
@@ -212,7 +214,7 @@ fn is_public(route: &str) -> bool {
 /// 라우트는 값을 env에서 다시 읽을 수 없고, 자식에게만 주입된다).
 ///
 /// **이 하네스는 잡을 실행하지 않는다** — 라우터가 state를 요구하기 때문에 채우는 것뿐이다.
-/// (`/doctor`만 예외적으로 자식을 띄운다 — [`known_routes`]의 주석 참조.)
+/// (`/config` 목록과 프로파일 상세만 예외적으로 doctor 자식을 띄운다 — [`known_routes`]의 주석 참조.)
 fn ctx(config_path: &Path) -> Arc<ServeConfig> {
     let text = std::fs::read_to_string(config_path).expect("테스트 config를 읽을 수 없다");
     let parsed = Config::from_toml_str(&text).expect("테스트 config가 파싱되지 않는다");

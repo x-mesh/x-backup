@@ -277,6 +277,7 @@ fn app_routes(auth: Arc<AuthState>) -> Router<Arc<ServeConfig>> {
         // 만들되 디스크를 바꾸지 않는다(`default_store_does_not_persist` 테스트로 고정).
         .route(routes::config::CONFIG_PATH, get(routes::config::list))
         .route(routes::config::NEW_PATH, get(routes::config::new_form))
+        .route(routes::config::PROFILE_ROUTE, get(routes::config::detail))
         .route(routes::config::EDIT_ROUTE, get(routes::config::edit_form))
         .route(
             routes::config::DELETE_CONFIRM_ROUTE,
@@ -736,42 +737,44 @@ mod tests {
         );
     }
 
-    /// 유효한 세션 쿠키가 있으면 `GET /doctor`가 200 + 껍데기를 렌더한다.
-    ///
-    /// ## 이 테스트에서 실제로 무엇이 실행되는가
-    /// 핸들러는 [`std::env::current_exe`]로 자기 자신을 부른다 — 단위 테스트에서 그건
-    /// **테스트 바이너리**다. libtest는 `--config`/`--json`을 모르는 옵션으로 즉시 거부하고
-    /// exit 101로 끝나므로(테스트가 재귀 실행되지 않는다), 이 테스트는
-    /// `Verdict::Unexpected(101)` 경로 — 즉 "자식이 이상하게 끝났을 때도 읽을 수 있는 오류
-    /// 화면이 200으로 나간다"를 검증한다. 실제 보고서 렌더는
-    /// `routes::doctor`의 순수 함수 테스트가 실제 `doctor --json` 표본으로 다룬다.
+    /// 유효한 세션 쿠키가 있으면 `GET /doctor`는 `/config`로 303 리다이렉트한다 — 점검 결과는
+    /// config 화면에 합쳤고, 북마크가 깨지지 않게 경로만 남겼다.
     #[tokio::test]
-    async fn doctor_with_cookie_renders_page() {
-        let (status, headers, body) = call_authed(routes::doctor::DOCTOR_PATH).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(headers[header::CONTENT_TYPE]
-            .to_str()
-            .unwrap()
-            .starts_with("text/html"));
-        assert!(body.starts_with("<!DOCTYPE html>"), "문서 골격 누락");
+    async fn doctor_with_cookie_redirects_to_config() {
+        let (status, headers, _) = call_authed(routes::doctor::DOCTOR_PATH).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers[header::LOCATION], routes::config::CONFIG_PATH);
+    }
+
+    /// config 목록은 doctor 판정 배너를 함께 렌더한다.
+    ///
+    /// 핸들러는 [`std::env::current_exe`]로 자기 자신을 doctor로 부른다 — 단위 테스트에서
+    /// 그건 **테스트 바이너리**라 libtest가 모르는 옵션으로 즉시 끝난다. 그래서 이 테스트는
+    /// "점검이 이상하게 끝나도 읽을 수 있는 판정 배너가 200으로 나간다"를 확인한다. 실제
+    /// 보고서 렌더는 `routes::doctor`의 순수 함수 테스트가 실제 `doctor --json` 표본으로 다룬다.
+    #[tokio::test]
+    async fn config_list_renders_the_doctor_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[profile.prod]\nuri_env = \"PROD_URI\"\n").unwrap();
+        let ctx = Arc::new(ServeConfig {
+            config_path: Some(config_path),
+            ..ServeConfig::for_test()
+        });
+        let state = ctx.state_dir.display().to_string();
+        let body = call_authed_with(ctx, routes::config::CONFIG_PATH).await;
         assert!(
-            body.contains("<title>x-backup — Doctor</title>"),
+            body.contains("<title>x-backup — Config</title>"),
             "화면 제목 누락: {body}"
         );
-        // 자식이 어떻게 끝났든 사람이 읽을 수 있는 판정 배너가 있어야 한다.
         assert!(
             body.contains(r#"class="verdict""#),
             "판정 배너 누락: {body}"
         );
-        assert!(body.contains(&view::app_css_url()), "스타일시트 링크 누락");
-    }
-
-    /// doctor 화면도 서버 내부 경로(state 디렉터리)를 흘리지 않는다.
-    #[tokio::test]
-    async fn doctor_markup_does_not_leak_server_paths() {
-        let ctx = ctx();
-        let state = ctx.state_dir.display().to_string();
-        let body = call_authed_with(ctx, routes::doctor::DOCTOR_PATH).await;
+        assert!(
+            body.contains(&routes::config::profile_href("prod")),
+            "상세 링크 누락: {body}"
+        );
         assert!(
             !body.contains(&state),
             "state 경로가 HTML로 노출됐다: {state}"
