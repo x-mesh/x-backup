@@ -34,6 +34,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
     }
     match command {
         Command::Init(args) => handlers::init::handle(config, lang, args).await,
+        Command::Config => handlers::config::handle(config, lang).await,
         Command::Backup(args) => handlers::backup::handle(config, lang, args).await,
         Command::Restore(args) => handlers::restore::handle(config, lang, args).await,
         Command::List(args) => handlers::list::handle(config, lang, args).await,
@@ -72,6 +73,15 @@ mod tests {
     async fn init_handler_routes_and_guards_non_tty() {
         let result = dispatch(cli_with(Command::Init(InitArgs { force: false }))).await;
         let err = result.expect_err("비-TTY에서는 마법사 가드로 에러여야 함");
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    /// config 편집기도 대화형 전용이다 — 비-TTY에서는 TUI를 띄우지 않고 Usage(exit 2)다.
+    #[tokio::test]
+    async fn config_editor_routes_and_guards_non_tty() {
+        let err = dispatch(cli_with(Command::Config))
+            .await
+            .expect_err("비-TTY에서는 편집기 가드로 에러여야 함");
         assert_eq!(err.exit_code(), 2);
     }
 

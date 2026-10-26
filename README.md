@@ -70,6 +70,7 @@ x-backup update --check   # check only, no install
 
 ```bash
 x-backup init                                   # interactive wizard → config.toml
+x-backup config                                 # edit profiles in a TUI (arrow keys, connection test)
 x-backup doctor                                 # offline config check: all profiles, no DB connection
 x-backup status  --profile prod                 # is the server ready to back up?
 x-backup status  --all                          # side-by-side diff of every profile (source vs target)

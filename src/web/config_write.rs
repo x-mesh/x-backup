@@ -1208,21 +1208,13 @@ impl FileConfigStore {
     }
 }
 
-impl ConfigStore for FileConfigStore {
-    /// `audit`를 값으로 받아 **소비만 한다** — 읽을 것이 없다(필드가 없는 증표 타입이다).
-    /// 이 파라미터의 존재가 곧 "이 호출 직전에 감사 로그 append가 성공했다"는 전제조건이고,
-    /// 그 전제를 문법 수준에서 강제하는 것이 목적이다([`ConfigStore`] doc). 이 함수 안에서는
-    /// 감사 로그를 다시 만지지 않는다 — 기록의 주체는 요청 핸들러 하나여야 한다.
-    fn apply(&self, change: &ProfileChange, audit: AuditReceipt) -> Result<ChangeReceipt> {
-        let _audit: AuditReceipt = audit;
-        if change.is_noop() {
-            // 바뀌는 것이 없다 — 파일도, 백업도, doctor 자식도 건드리지 않는다. 파일은
-            // 이미 요청받은 상태와 일치하므로 Persisted를 돌려준다(그러지 않으면 "무변경
-            // 저장"을 눌렀을 때 화면이 "config 파일은 아직 쓰이지 않았습니다"라는 혼란스러운
-            // 경고를 낸다 — 사실 쓸 것이 없을 뿐 검증 미배선 상태가 아니다).
-            return Ok(ChangeReceipt::Persisted);
-        }
-
+impl FileConfigStore {
+    /// 변경을 적용한 config 텍스트를 만든다. 파일은 쓰지 않는다.
+    ///
+    /// CLI `config` 편집기가 저장 전 초안으로 연결 테스트를 돌릴 때 쓴다. 저장 경로
+    /// ([`Self::apply_from_terminal`])도 같은 함수로 텍스트를 만들므로, 테스트한 초안과 실제로
+    /// 기록되는 내용이 갈라지지 않는다.
+    pub(crate) fn render(&self, change: &ProfileChange) -> Result<String> {
         let original = std::fs::read_to_string(&self.config_path)?;
         let mut root: Value = toml::from_str(&original).map_err(|e| {
             XBackupError::Config(format!(
@@ -1235,10 +1227,26 @@ impl ConfigStore for FileConfigStore {
             })?;
             apply_change_to_table(table, change)?;
         }
-        let new_text = toml::to_string(&root).map_err(|e| {
-            XBackupError::Config(format!("변경을 TOML로 직렬화하지 못했습니다: {e}"))
-        })?;
+        toml::to_string(&root)
+            .map_err(|e| XBackupError::Config(format!("변경을 TOML로 직렬화하지 못했습니다: {e}")))
+    }
 
+    /// 감사 영수증 없이 변경을 저장한다. `doctor` 검증·직전본 보관·원자적 교체는 웹 저장과 같다.
+    ///
+    /// [`ConfigStore::apply`]가 [`AuditReceipt`]를 요구하는 것은 원격 요청이 흔적 없이 운영
+    /// config를 바꾸지 못하게 하려는 것이다. 터미널 편집기는 운영자가 파일을 직접 고치는 것과
+    /// 같은 권한 경계에 있고, 감사 로그는 CLI가 모르는 웹 state 디렉터리에 산다. 그래서 CLI
+    /// `config` 편집기만 이 경로를 직접 부른다.
+    pub(crate) fn apply_from_terminal(&self, change: &ProfileChange) -> Result<ChangeReceipt> {
+        if change.is_noop() {
+            // 바뀌는 것이 없다 — 파일도, 백업도, doctor 자식도 건드리지 않는다. 파일은
+            // 이미 요청받은 상태와 일치하므로 Persisted를 돌려준다(그러지 않으면 "무변경
+            // 저장"을 눌렀을 때 화면이 "config 파일은 아직 쓰이지 않았습니다"라는 혼란스러운
+            // 경고를 낸다 — 사실 쓸 것이 없을 뿐 검증 미배선 상태가 아니다).
+            return Ok(ChangeReceipt::Persisted);
+        }
+
+        let new_text = self.render(change)?;
         let doctor_exe = self.resolve_doctor_exe()?;
         let outcome = validate_with_doctor(&new_text, &doctor_exe)?;
 
@@ -1250,6 +1258,17 @@ impl ConfigStore for FileConfigStore {
         } else {
             ChangeReceipt::PersistedWithWarnings(outcome.warnings)
         })
+    }
+}
+
+impl ConfigStore for FileConfigStore {
+    /// `audit`를 값으로 받아 **소비만 한다** — 읽을 것이 없다(필드가 없는 증표 타입이다).
+    /// 이 파라미터의 존재가 곧 "이 호출 직전에 감사 로그 append가 성공했다"는 전제조건이고,
+    /// 그 전제를 문법 수준에서 강제하는 것이 목적이다([`ConfigStore`] doc). 이 함수 안에서는
+    /// 감사 로그를 다시 만지지 않는다 — 기록의 주체는 요청 핸들러 하나여야 한다.
+    fn apply(&self, change: &ProfileChange, audit: AuditReceipt) -> Result<ChangeReceipt> {
+        let _audit: AuditReceipt = audit;
+        self.apply_from_terminal(change)
     }
 
     /// v1 → v2 전환을 적용한다 — **파일 전체를 다시 쓴다.**

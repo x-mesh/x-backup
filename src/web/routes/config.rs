@@ -1080,7 +1080,7 @@ fn uri_credential_warning(lang: Lang, spec: &FieldSpec, profile: &Profile) -> Op
 /// 새 프로파일에는 상속받을 원본이 없다. `[defaults]`가 있으면 저장 뒤 그 값이 적용되지만,
 /// 그건 **저장 결과**이고 폼이 미리 그 값을 채워 넣어서는 안 된다 — 채우면 생성 즉시
 /// defaults가 프로파일에 복제된다(모듈 헤더 함정 2가 생성 경로에도 그대로 적용된다).
-fn blank_profile_view(lang: Lang) -> ProfileView {
+pub(crate) fn blank_profile_view(lang: Lang) -> ProfileView {
     let profile = Profile::default();
     let origins = ProfileOrigins::default();
     let mut view = build_profile_view(lang, "", &profile, &origins, &|_| false);
@@ -1308,11 +1308,12 @@ fn validate_dest(key: &str, raw: &str) -> Result<String> {
     Ok(raw.to_string())
 }
 
-/// 평문 URI를 검증한다 — **자격증명이 섞인 URI는 거부한다.**
+/// 평문 URI를 검증한다 — 스킴과 호스트가 있어야 한다.
 ///
-/// 거부하는 것이 이 화면의 핵심 규약이다. 허용하면 웹 콘솔이 config에 시크릿을 써 넣는
-/// 경로가 되고, 그 값은 다음 화면에서 가려진 표기로만 보이므로 운영자가 무엇을 저장했는지
-/// 확인할 수도 없다. 자격증명이 필요하면 env로 옮기고 `uri_env`에 이름을 적는다.
+/// 자격증명(`user:pass@`)은 거부하지 않는다. 프로파일이 많으면 프로파일마다 env를 두는
+/// 관리 부담이 크고, 같은 호스트의 env는 config 파일과 같은 침해 범위에 있다는 운영자
+/// 판단을 따른다(`init` 마법사도 평문 URI 저장을 허용한다). 대신 값은 화면·감사 로그에서
+/// 항상 가려지고([`RedactedUri`]), 저장된 프로파일에는 [`uri_credential_warning`]이 붙는다.
 fn validate_plain_uri(key: &str, raw: &str) -> Result<String> {
     let (_, rest) = raw.split_once("://").ok_or_else(|| {
         XBackupError::Usage(format!(
@@ -1321,18 +1322,10 @@ fn validate_plain_uri(key: &str, raw: &str) -> Result<String> {
         ))
     })?;
     let authority = &rest[..rest.find(['/', '?']).unwrap_or(rest.len())];
-    if authority.contains('@') {
-        return Err(XBackupError::Usage(format!(
-            "'{key}'에 자격증명이 들어 있습니다 — config 파일에 비밀번호를 쓸 수 없습니다. \
-             시크릿을 환경변수에 담고 그 이름을 '{}'에 적으세요.",
-            if key == KEY_URI {
-                "uri_env"
-            } else {
-                "read_uri_env"
-            }
-        )));
-    }
-    if authority.is_empty() {
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if host.is_empty() {
         return Err(XBackupError::Usage(format!(
             "'{key}' 값에 호스트가 없습니다."
         )));
@@ -1864,14 +1857,89 @@ fn profile_view_of(
     document: &ConfigDocument,
     name: &str,
 ) -> Option<ProfileView> {
+    profile_view(ctx.lang, document, name)
+}
+
+/// 이름으로 프로파일 화면 모델을 찾는다. 웹 폼과 CLI `config` 편집기가 같은 판정(편집 가능
+/// 여부·출처·가린 URI)을 보도록 둘 다 이 함수를 거친다.
+pub(crate) fn profile_view(
+    lang: Lang,
+    document: &ConfigDocument,
+    name: &str,
+) -> Option<ProfileView> {
     let profile = document.config.profiles.get(name)?;
     Some(build_profile_view(
-        ctx.lang,
+        lang,
         name,
         profile,
         &document.origins_of(name),
         &env_is_set,
     ))
+}
+
+/// 필드 하나의 입력값을 저장할 때와 같은 규칙으로 검증한다. CLI 편집기가 입력 직후 오류를
+/// 보여 주는 데 쓴다.
+pub(crate) fn validate_field_value(key: &str, raw: &str) -> Result<()> {
+    let spec = FIELDS
+        .iter()
+        .find(|spec| spec.key == key)
+        .ok_or_else(|| XBackupError::Usage(format!("알 수 없는 config 필드입니다: {key}")))?;
+    parse_field_value(spec, raw).map(|_| ())
+}
+
+/// 편집한 필드 값 목록(`(키, 입력값)`)으로 저장할 변경을 만든다. 웹 [`save`]와 같은 조립이다.
+///
+/// 목록에 없는 필드는 건드리지 않는다. 빈 값의 의미와 URI 지우기(`<key>_clear`)는
+/// [`build_change`]의 규약을 그대로 따른다.
+pub(crate) fn change_from_values(
+    lang: Lang,
+    op: ChangeOp,
+    name: ProfileName,
+    document: &ConfigDocument,
+    values: Vec<(String, String)>,
+) -> Result<ProfileChange> {
+    change_from_form(lang, op, name, document, &FormBody { pairs: values })
+}
+
+fn change_from_form(
+    lang: Lang,
+    op: ChangeOp,
+    name: ProfileName,
+    document: &ConfigDocument,
+    form: &FormBody,
+) -> Result<ProfileChange> {
+    // 편집 전 화면 모델 — "무엇이 편집 가능했는가"와 "값이 그대로인가"의 기준값이다.
+    // 폼을 그릴 때와 **같은 함수**로 만들어야 그 두 판정이 어긋나지 않는다.
+    let current = profile_view(lang, document, name.as_str());
+    let destination_editable = current
+        .as_ref()
+        .is_none_or(|view| view.destination_editable);
+    let origins = document.origins_of(name.as_str());
+    build_change(
+        op,
+        name,
+        document.syntax,
+        &origins,
+        destination_editable,
+        current.as_ref(),
+        form,
+    )
+}
+
+/// 화면 표시용 `set` 목록. 평문 `uri`/`read_uri`는 자격증명을 가린 표기로 바꾼다.
+pub(crate) fn masked_set_rows(change: &ProfileChange) -> Vec<(String, String)> {
+    change
+        .set_rows()
+        .into_iter()
+        .map(|(key, value)| {
+            if key == KEY_URI || key == KEY_READ_URI {
+                let shown = RedactedUri::from_raw(&value).shown().to_string();
+                (key, shown)
+            } else {
+                (key, value)
+            }
+        })
+        .collect()
 }
 
 /// `GET /config/edit/{profile}` — 편집 폼.
@@ -2046,22 +2114,7 @@ pub async fn save(
         _ => {}
     }
 
-    // 편집 전 화면 모델 — "무엇이 편집 가능했는가"와 "값이 그대로인가"의 기준값이다.
-    // 폼을 그릴 때와 **같은 함수**로 만들어야 그 두 판정이 어긋나지 않는다.
-    let current = profile_view_of(&ctx, &document, name.as_str());
-    let destination_editable = current
-        .as_ref()
-        .is_none_or(|view| view.destination_editable);
-    let origins = document.origins_of(name.as_str());
-    let change = match build_change(
-        op,
-        name,
-        document.syntax,
-        &origins,
-        destination_editable,
-        current.as_ref(),
-        &form,
-    ) {
+    let change = match change_from_form(ctx.lang, op, name, &document, &form) {
         Ok(change) => change,
         Err(error) => return problem(&ctx, StatusCode::BAD_REQUEST, &error.to_string(), None),
     };
@@ -2664,7 +2717,7 @@ async fn apply_and_render(ctx: &ServeConfig, change: ProfileChange) -> Response 
                 ctx.lang,
                 change.name.as_str(),
                 change.op.label(),
-                &change.set_rows(),
+                &masked_set_rows(&change),
                 &change.unset_rows(),
                 &change.broke_inheritance,
                 view::SaveOutcome {
@@ -3480,11 +3533,12 @@ uri_env = "MONGO_URI_T28"
         assert!(cleared.unset.contains("uri"), "명시적 삭제가 무시됐다");
     }
 
-    /// 자격증명이 섞인 URI 입력은 거부된다 — 웹이 config에 시크릿을 써 넣는 경로를 막는다.
+    /// 자격증명이 섞인 URI도 저장할 수 있다 — 운영자가 env 대신 config에 두기로 고를 수 있다.
+    /// 값은 그대로 쓰이고, 화면·감사 로그에서는 가려진다(`masked_set_rows`, `audit_args`).
     #[test]
-    fn plain_uri_with_credentials_is_rejected() {
+    fn plain_uri_with_credentials_is_accepted_and_masked_for_display() {
         let doc = document(V2_SAMPLE);
-        let error = build_change(
+        let change = build_change(
             ChangeOp::Update,
             ProfileName::parse("dr", Lang::En).unwrap(),
             doc.syntax,
@@ -3493,11 +3547,32 @@ uri_env = "MONGO_URI_T28"
             None,
             &form(&[("uri", "mongodb%3A%2F%2Fu%3Ap%40h%2Fdb")]),
         )
-        .expect_err("자격증명이 섞인 URI는 거부되어야 함");
-        assert!(
-            error.to_string().contains("uri_env"),
-            "대안 안내 누락: {error}"
+        .expect("자격증명이 섞인 URI도 저장할 수 있어야 함");
+        assert_eq!(
+            change.set.get("uri"),
+            Some(&Value::String("mongodb://u:p@h/db".to_string()))
         );
+        let shown = masked_set_rows(&change);
+        assert!(
+            shown.iter().all(|(_, value)| !value.contains("u:p@")),
+            "표시용 행에 비밀번호가 남았다: {shown:?}"
+        );
+    }
+
+    /// 자격증명만 있고 호스트가 없는 URI는 여전히 거부된다.
+    #[test]
+    fn plain_uri_without_a_host_is_rejected() {
+        let doc = document(V2_SAMPLE);
+        let error = build_change(
+            ChangeOp::Update,
+            ProfileName::parse("dr", Lang::En).unwrap(),
+            doc.syntax,
+            &doc.origins_of("dr"),
+            true,
+            None,
+            &form(&[("uri", "mongodb%3A%2F%2Fu%3Ap%40%2Fdb")]),
+        )
+        .expect_err("호스트 없는 URI는 거부되어야 함");
         assert_eq!(error.exit_code(), crate::error::exit_codes::USAGE);
     }
 

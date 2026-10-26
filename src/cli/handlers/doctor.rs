@@ -411,6 +411,16 @@ fn check_profile(
         None => {}
     }
 
+    // 다른 프로파일과 같은 백업 위치 — 복구 전용 공유가 정당할 수 있어 경고로만 알린다.
+    let shared = cfg.profiles_sharing_destination(name);
+    if let Some(message) = Config::shared_destination_warning(&shared, lang) {
+        items.push(Item {
+            status: CheckStatus::Warn,
+            label: "destination",
+            message,
+        });
+    }
+
     ProfileReport {
         name: name.to_string(),
         db,
@@ -521,4 +531,49 @@ fn render_json(reports: &[ProfileReport], overall: CheckStatus) {
             "profiles": profiles,
         })
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SHARED: &str = r#"
+[profile.prod]
+uri = "mongodb://db.internal:27017/app"
+dest = "local:/srv/x-backup-doctor-share"
+encrypt = false
+
+[profile.staging]
+uri = "mongodb://db.internal:27017/app"
+dest = "local:/srv/x-backup-doctor-share/"
+encrypt = false
+
+[profile.dr]
+uri = "mongodb://dr.internal:27017/app"
+dest = "local:/srv/x-backup-doctor-dr"
+encrypt = false
+"#;
+
+    fn shared_warning(name: &str) -> Option<String> {
+        let cfg = Config::from_toml_str(SHARED).unwrap();
+        check_profile(SHARED, &cfg, name, crate::i18n::Lang::En)
+            .items
+            .into_iter()
+            .find(|item| {
+                item.status == CheckStatus::Warn && item.message.contains("same backup location")
+            })
+            .map(|item| item.message)
+    }
+
+    #[test]
+    fn profiles_sharing_a_destination_get_a_warning_naming_each_other() {
+        let prod = shared_warning("prod").expect("prod에 경고가 있어야 함");
+        assert!(prod.contains("staging"), "{prod}");
+        let staging = shared_warning("staging").expect("staging에 경고가 있어야 함");
+        assert!(staging.contains("prod"), "{staging}");
+        assert!(
+            shared_warning("dr").is_none(),
+            "따로 쓰는 프로파일은 경고하지 않음"
+        );
+    }
 }

@@ -263,7 +263,7 @@ async fn handle_all(
 }
 
 /// 한 프로파일의 점검 보고서를 만든다(connect 실패도 보고서로 표현 — Err로 끊지 않음).
-async fn build_report(
+pub(crate) async fn build_report(
     config_toml: Option<&str>,
     profile: &str,
     lang: crate::i18n::Lang,

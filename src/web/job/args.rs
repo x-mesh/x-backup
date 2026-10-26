@@ -494,7 +494,7 @@ fn describe_char(c: char) -> String {
 /// (macOS 기본 APFS)에서는 `Prod`와 `prod`가 같은 락 파일로 접힌다 — 서로 다른 두
 /// 프로파일을 대소문자만 다르게 두면 의도보다 넓게 상호 배제된다(안전한 방향의
 /// 실패라 허용한다. 반대 방향, 즉 같은 프로파일이 다른 락을 잡는 일은 없다).
-fn is_profile_char(c: char) -> bool {
+pub(crate) fn is_profile_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-'
 }
 

@@ -76,6 +76,7 @@ x-backup update --check   # 확인만
 
 ```bash
 x-backup init                                   # 대화형 마법사 → config.toml
+x-backup config                                 # TUI로 프로파일 편집(방향키, 연결 테스트)
 x-backup doctor  --config config.toml           # config 정적 점검(오프라인·전 프로파일·DB 연결 없음)
 x-backup status  --profile prod                 # 백업 가능 상태 점검(신호등)
 x-backup status  --all                          # 모든 프로파일 비교(source vs target)
