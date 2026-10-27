@@ -7,9 +7,10 @@
 //! - **manual**(install.sh — `~/.local/bin` 등) → GitHub 릴리스 자산을 내려받아
 //!   `checksums.txt`로 sha256 검증 후 **원자적 rename**으로 자기 교체.
 //!
-//! 토큰 없이 동작한다. 다만 토큰이 있으면 쓴다. 비인증 GitHub API는 IP당 시간 60회라
-//! CI처럼 자주 부르는 환경에서는 한도에 걸리기 때문이다. 탐색 순서는 `GITHUB_TOKEN` >
-//! `GH_TOKEN`이며 서브프로세스 폴백은 없다.
+//! 토큰이 없으면 GitHub API를 쓰지 않는다. 비인증 API는 IP당 시간 60회라 한도에 걸리므로,
+//! 최신 태그는 `github.com/{REPO}/releases/latest`의 리다이렉트에서 읽고 자산은
+//! `releases/download/{tag}/{name}`에서 받는다. 토큰이 있으면 API 경로를 쓴다.
+//! 탐색 순서는 `GITHUB_TOKEN` > `GH_TOKEN`이며 서브프로세스 폴백은 없다.
 
 use std::path::{Path, PathBuf};
 
@@ -120,14 +121,14 @@ pub struct Release {
     pub assets: Vec<Asset>,
 }
 
-/// 릴리스 자산. 다운로드는 `browser_download_url`이 아니라 `url`(API asset endpoint)로
-/// 한다. `browser_download_url`은 Bearer 인증과 같이 못 쓰므로, 토큰이 있는 환경까지
-/// 한 경로로 덮으려면 이쪽이어야 한다.
+/// 릴리스 자산. 토큰이 있으면 `url`은 API asset endpoint다. `browser_download_url`은
+/// Bearer 인증과 같이 못 쓰기 때문이다. 토큰이 없으면 웹 다운로드 URL을 조립해 넣는다.
 #[derive(Debug, Deserialize)]
 pub struct Asset {
     /// 자산 파일명.
     pub name: String,
-    /// API asset endpoint (`.../releases/assets/{id}`).
+    /// 다운로드 URL — API asset endpoint(`.../releases/assets/{id}`) 또는
+    /// 웹 다운로드 URL(`.../releases/download/{tag}/{name}`).
     pub url: String,
 }
 
@@ -149,7 +150,12 @@ pub fn github_token() -> Option<String> {
 }
 
 fn http_client() -> Result<reqwest::Client> {
+    http_client_with(reqwest::redirect::Policy::default())
+}
+
+fn http_client_with(redirect: reqwest::redirect::Policy) -> Result<reqwest::Client> {
     reqwest::Client::builder()
+        .redirect(redirect)
         .user_agent(concat!("x-backup/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| {
@@ -167,8 +173,82 @@ fn auth_header(req: reqwest::RequestBuilder, token: &Option<String>) -> reqwest:
     }
 }
 
-/// 최신 릴리스를 조회한다. 404는 게시된 릴리스가 없는 경우라 안내 메시지로 바꾼다.
+fn no_release_error() -> XBackupError {
+    XBackupError::Config(crate::tr!(
+        "{REPO} has no published releases — check https://github.com/{REPO}/releases",
+        "{REPO}에 게시된 릴리스가 없습니다 — \
+         https://github.com/{REPO}/releases 를 확인하세요."
+    ))
+}
+
+/// 최신 릴리스를 조회한다. 토큰이 없으면 API 한도를 쓰지 않는 웹 경로를 탄다.
 pub async fn fetch_latest(token: &Option<String>) -> Result<Release> {
+    match token {
+        Some(_) => fetch_latest_api(token).await,
+        None => fetch_latest_web().await,
+    }
+}
+
+/// `releases/latest`가 보내는 `Location`(`.../releases/tag/{tag}`)에서 태그를 꺼낸다.
+/// 릴리스가 하나도 없으면 GitHub는 `.../releases`로 보내므로 None이다.
+fn tag_from_latest_location(location: &str) -> Option<&str> {
+    let (_, tag) = location.split_once("/releases/tag/")?;
+    let tag = tag.split(['?', '#', '/']).next().unwrap_or_default();
+    (!tag.is_empty()).then_some(tag)
+}
+
+/// 웹 경로는 자산 목록을 모르므로, 받을 이름(플랫폼 tarball + `checksums.txt`)으로 조립한다.
+/// 없는 자산은 다운로드 단계에서 HTTP 404로 드러난다.
+fn web_release(tag: &str) -> Release {
+    let assets = platform_asset_name()
+        .ok()
+        .into_iter()
+        .chain(std::iter::once("checksums.txt".to_string()))
+        .map(|name| Asset {
+            url: format!("https://github.com/{REPO}/releases/download/{tag}/{name}"),
+            name,
+        })
+        .collect();
+    Release {
+        tag_name: tag.to_string(),
+        assets,
+    }
+}
+
+async fn fetch_latest_web() -> Result<Release> {
+    let url = format!("https://github.com/{REPO}/releases/latest");
+    let resp = http_client_with(reqwest::redirect::Policy::none())?
+        .head(&url)
+        .send()
+        .await
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to query the release: {e}",
+                "릴리스 조회 실패: {e}"
+            ))
+        })?;
+
+    let status = resp.status();
+    if status.as_u16() == 404 {
+        return Err(no_release_error());
+    }
+    if !status.is_redirection() {
+        return Err(XBackupError::Failure(crate::tr!(
+            "failed to query the release: HTTP {status} ({url})",
+            "릴리스 조회 실패: HTTP {status} ({url})"
+        )));
+    }
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    tag_from_latest_location(location)
+        .map(web_release)
+        .ok_or_else(no_release_error)
+}
+
+async fn fetch_latest_api(token: &Option<String>) -> Result<Release> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
     let resp = auth_header(http_client()?.get(&url), token)
         .header("Accept", "application/vnd.github+json")
@@ -188,11 +268,7 @@ pub async fn fetch_latest(token: &Option<String>) -> Result<Release> {
                 "릴리스 응답 파싱 실패: {e}"
             ))
         }),
-        404 => Err(XBackupError::Config(crate::tr!(
-            "{REPO} has no published releases — check https://github.com/{REPO}/releases",
-            "{REPO}에 게시된 릴리스가 없습니다 — \
-             https://github.com/{REPO}/releases 를 확인하세요."
-        ))),
+        404 => Err(no_release_error()),
         s => Err(XBackupError::Failure(crate::tr!(
             "failed to query the release: HTTP {s} ({url})",
             "릴리스 조회 실패: HTTP {s} ({url})"
@@ -200,7 +276,7 @@ pub async fn fetch_latest(token: &Option<String>) -> Result<Release> {
     }
 }
 
-/// 자산을 API endpoint로 내려받는다(`Accept: application/octet-stream`).
+/// 자산을 내려받는다. API endpoint는 `Accept: application/octet-stream`이어야 바이너리를 준다.
 pub async fn download_asset(asset: &Asset, token: &Option<String>) -> Result<Vec<u8>> {
     let resp = auth_header(http_client()?.get(&asset.url), token)
         .header("Accept", "application/octet-stream")
@@ -376,6 +452,39 @@ mod tests {
         assert_eq!(parse_semver("v1.2"), None);
         assert_eq!(parse_semver("v1.2.3-rc.1"), None);
         assert!(parse_semver("v0.2.0") > parse_semver("v0.1.9"));
+    }
+
+    #[test]
+    fn latest_location_yields_the_tag() {
+        let base = "https://github.com/x-mesh/x-backup/releases";
+        assert_eq!(
+            tag_from_latest_location(&format!("{base}/tag/v0.6.1")),
+            Some("v0.6.1")
+        );
+        assert_eq!(
+            tag_from_latest_location(&format!("{base}/tag/v1.2.3?x=1")),
+            Some("v1.2.3")
+        );
+        assert_eq!(tag_from_latest_location(base), None);
+        assert_eq!(tag_from_latest_location(&format!("{base}/tag/")), None);
+        assert_eq!(tag_from_latest_location(""), None);
+    }
+
+    #[test]
+    fn web_release_points_at_download_urls() {
+        let r = web_release("v0.6.1");
+        assert_eq!(r.tag_name, "v0.6.1");
+        let sums = r.assets.iter().find(|a| a.name == "checksums.txt").unwrap();
+        assert_eq!(
+            sums.url,
+            "https://github.com/x-mesh/x-backup/releases/download/v0.6.1/checksums.txt"
+        );
+        if let Ok(name) = platform_asset_name() {
+            assert!(r
+                .assets
+                .iter()
+                .any(|a| a.name == name && a.url.ends_with(&name)));
+        }
     }
 
     #[test]

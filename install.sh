@@ -37,8 +37,9 @@ command -v tar  >/dev/null 2>&1 || err "tar가 필요합니다"
 # --- pick version -----------------------------------------------------------
 version=${XB_VERSION:-}
 if [ -z "$version" ]; then
-  version=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-    | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)
+  # api.github.com은 비인증 IP당 시간 60회 한도가 있어, 그 한도에 포함되지 않는 웹 리다이렉트로 태그를 읽는다.
+  version=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+    "https://github.com/${REPO}/releases/latest" | sed -n 's#.*/releases/tag/##p')
   [ -n "$version" ] || err "최신 릴리스 태그를 확인할 수 없습니다 — XB_VERSION으로 직접 지정하세요"
 fi
 case "$version" in v*) ;; *) version="v$version" ;; esac
