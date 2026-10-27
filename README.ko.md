@@ -381,7 +381,7 @@ credentials_env = "S3_CREDS"
 
 `destinations`(복수)가 있으면 단일 `destination`보다 우선한다. 정책은 **primary 필수,
 나머지는 경고**다: primary가 실패하면 백업 실패, 보조가 실패하면 백업은 성공하되
-exit 4(경고)로 실패한 destination을 알린다. `restore`·`list`·`prune`은 기본적으로
+exit 4(경고)로 실패한 destination을 알린다. `restore`·`list`·`prune`·`verify`는 기본적으로
 primary를 쓰고, `--from <name>`으로 특정 복제본을 고른다. 보존 정리는 위치마다 따로 돌린다.
 
 ### 백업 엔진

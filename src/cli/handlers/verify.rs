@@ -56,7 +56,7 @@ pub async fn handle(
         None => None,
     };
     let lang = crate::i18n::activate_from_toml(lang_flag, config_toml.as_deref());
-    let storage = open_storage(&config_path).await?;
+    let storage = open_storage(&config_path, args.from.as_deref()).await?;
     run(storage.as_ref(), &args, lang).await
 }
 
@@ -107,7 +107,10 @@ async fn run(storage: &dyn Storage, args: &VerifyArgs, lang: Lang) -> Result<()>
 }
 
 /// config를 읽어 destination=local Storage를 연다(backup/restore와 동일 규칙).
-async fn open_storage(config_path: &Option<PathBuf>) -> Result<Box<dyn Storage>> {
+async fn open_storage(
+    config_path: &Option<PathBuf>,
+    from: Option<&str>,
+) -> Result<Box<dyn Storage>> {
     let config_toml = match config_path {
         Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
             XBackupError::Config(crate::tr!(
@@ -128,7 +131,7 @@ async fn open_storage(config_path: &Option<PathBuf>) -> Result<Box<dyn Storage>>
         overrides: &overrides,
     })?;
 
-    let dest = &resolved.profile.destination;
+    let dest = resolved.profile.select_destination(from)?;
     match dest.r#type.as_deref() {
         Some("local") => {}
         Some("s3") => {
@@ -361,6 +364,7 @@ mod tests {
             deep,
             chain,
             json,
+            from: None,
         }
     }
 
@@ -508,5 +512,44 @@ mod tests {
         assert_eq!(default_profile_name(Some(toml)), "prod");
         assert_eq!(default_profile_name(None), "default");
         assert_eq!(default_profile_name(Some("")), "default");
+    }
+
+    /// 위치를 여럿 둔 프로파일은 단일 `destination` 필드가 비어 있다. 그 필드만 읽던 판본은
+    /// "destination.type이 없다"로 실패했다 — primary를 읽고, `--from`으로 다른 위치를 고른다.
+    #[tokio::test]
+    async fn multi_destination_profile_reads_primary_or_the_chosen_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        std::fs::write(dir.path().join("b").join("only-offsite"), b"x").unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "default_profile = \"p\"\n\
+                 [profile.p]\nuri = \"mongodb://127.0.0.1:1/app\"\n\
+                 [[profile.p.dest]]\nname = \"primary\"\ndest = \"local:{a}\"\n\
+                 [[profile.p.dest]]\nname = \"offsite\"\ndest = \"local:{b}\"\n",
+                a = dir.path().join("a").display(),
+                b = dir.path().join("b").display(),
+            ),
+        )
+        .unwrap();
+        let config = Some(config_path);
+
+        let primary = open_storage(&config, None).await.unwrap();
+        assert!(primary.list("").await.unwrap().is_empty());
+        let offsite = open_storage(&config, Some("offsite")).await.unwrap();
+        let entries = offsite.list("").await.unwrap();
+        assert!(entries.iter().any(|e| e.path == "only-offsite"));
+
+        let err = open_storage(&config, Some("nope"))
+            .await
+            .err()
+            .expect("없는 위치 이름은 거부해야 함");
+        assert!(
+            err.to_string().contains("primary, offsite"),
+            "고를 수 있는 이름을 알려야 함: {err}"
+        );
     }
 }
