@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-27
+
+### Fixed
+
+- `verify` failed with `destination.type is not set (local is required)` for a profile
+  with several destinations (`[[profile.x.dest]]`). It now reads the primary destination,
+  and `verify --from <NAME>` selects another one.
+
 ## [0.6.0] - 2026-10-26
 
 ### Added
