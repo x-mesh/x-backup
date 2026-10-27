@@ -388,7 +388,7 @@ credentials_env = "S3_CREDS"
 When `destinations` is non-empty it takes precedence over the single `destination`. The
 policy is **primary required, the rest are warnings**: if the primary fails the backup
 fails; if a secondary fails the backup still succeeds with exit 4 (warning) naming the
-failed destination. `restore`, `list`, and `prune` use the primary by default. Use
+failed destination. `restore`, `list`, `prune`, and `verify` use the primary by default. Use
 `--from <name>` to select a specific replica. Run `prune` once for each destination.
 
 ### Backup engine

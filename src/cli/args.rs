@@ -334,6 +334,10 @@ pub struct VerifyArgs {
     /// 결과를 기계 판독 JSON으로 출력한다.
     #[arg(long)]
     pub json: bool,
+    /// 어느 destination을 읽을지(멀티 destination일 때). 이름 또는 `type#idx`.
+    /// 미지정 시 primary(첫 destination).
+    #[arg(long, value_name = "NAME")]
+    pub from: Option<String>,
 }
 
 /// `prune` — 보존 관리 안전 삭제(FR-11, R19).
