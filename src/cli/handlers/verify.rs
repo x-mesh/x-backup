@@ -16,13 +16,26 @@
 use std::path::PathBuf;
 
 use crate::cli::args::VerifyArgs;
+use std::collections::BTreeMap;
+
 use crate::cli::output::{field_line, field_line_toned, status_token, style, Tone};
 use crate::config::env::collect_overrides_from_process;
 use crate::config::merged::MergeInput;
+use crate::config::secret::Secret;
 use crate::config::ResolvedConfig;
+use crate::engine::mysql::archive;
+use crate::engine::mysql::compare::{
+    compare_counts, count_archive_rows, count_live_rows, live_table_names, CompareReport,
+    TableStatus,
+};
+use crate::engine::mysql::conn::MysqlClient;
+use crate::engine::DbKind;
 use crate::error::{Result, XBackupError};
 use crate::i18n::Lang;
 use crate::manifest::chain::ChainReport;
+use crate::manifest::schema::BackupType;
+use crate::manifest::store::{data_path, ManifestStore};
+use crate::pipeline::stage::reverse_stack_for;
 use crate::pipeline::verify::{verify_backup, verify_chain_for, VerifyReport};
 use crate::storage::{LocalFs, Storage};
 
@@ -56,12 +69,118 @@ pub async fn handle(
         None => None,
     };
     let lang = crate::i18n::activate_from_toml(lang_flag, config_toml.as_deref());
+    let against = match args.against.as_deref() {
+        Some(spec) => Some(resolve_against(spec, config_toml.as_deref())?),
+        None => None,
+    };
     let storage = open_storage(&config_path, args.from.as_deref()).await?;
-    run(storage.as_ref(), &args, lang).await
+    run(storage.as_ref(), &args, lang, against.as_ref()).await
+}
+
+/// `--against` 값을 DB URI로 푼다. `://`가 있으면 URI, 아니면 같은 config의 프로파일 이름이다.
+fn resolve_against(spec: &str, config_toml: Option<&str>) -> Result<Secret> {
+    let uri = if spec.contains("://") {
+        Secret::new(spec.to_string())
+    } else {
+        let overrides = collect_overrides_from_process();
+        let cfg = ResolvedConfig::build(MergeInput {
+            config_toml,
+            profile_name: spec,
+            overrides: &overrides,
+        })?;
+        cfg.resolved_uri.ok_or_else(|| {
+            XBackupError::Config(crate::tr!(
+                "profile '{spec}' has no source.uri/uri_env",
+                "프로파일 '{spec}'에 source.uri/uri_env가 없습니다"
+            ))
+        })?
+    };
+    if DbKind::from_uri(uri.expose()) != DbKind::Mysql {
+        return Err(XBackupError::Usage(crate::tr!(
+            "--against supports only MariaDB/MySQL targets",
+            "--against는 MariaDB/MySQL 대상만 지원합니다"
+        )));
+    }
+    Ok(uri)
+}
+
+/// 백업 아카이브와 대상 DB의 테이블별 행 수를 비교한다. 대상 DB는 테이블마다 순차로 센다.
+async fn compare_backup(
+    storage: &dyn Storage,
+    backup_id: &str,
+    target: &Secret,
+    only: &[String],
+) -> Result<CompareReport> {
+    let manifest = ManifestStore::new(storage)
+        .read(backup_id)
+        .await
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to load the manifest ({backup_id}): {e}",
+                "manifest 로드 실패({backup_id}): {e}"
+            ))
+        })?;
+    let is_mysql_full = matches!(manifest.backup_type, BackupType::Full)
+        && manifest.tool_versions.archive_format.as_deref() == Some(archive::FORMAT_ID);
+    if !is_mysql_full {
+        return Err(XBackupError::Usage(crate::tr!(
+            "--against supports only MariaDB/MySQL full backups ({backup_id})",
+            "--against는 MariaDB/MySQL 풀 백업만 지원합니다({backup_id})"
+        )));
+    }
+
+    let stages = reverse_stack_for(&manifest)?;
+    let raw = storage
+        .get_stream(&data_path(backup_id))
+        .await
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to read data.bin ({backup_id}): {e}",
+                "data.bin 읽기 실패({backup_id}): {e}"
+            ))
+        })?;
+    let mut decoded = stages.apply(raw);
+    let mut backup_counts = count_archive_rows(&mut decoded).await?;
+
+    let mut client = MysqlClient::connect(target, None).await?;
+    let live = live_table_names(client.conn_mut()).await?;
+
+    if !only.is_empty() {
+        let unknown: Vec<&str> = only
+            .iter()
+            .filter(|t| !backup_counts.contains_key(*t) && !live.contains(*t))
+            .map(String::as_str)
+            .collect();
+        if !unknown.is_empty() {
+            return Err(XBackupError::Usage(crate::tr!(
+                "--tables names tables that exist neither in the backup nor in the target: {}",
+                "--tables에 백업과 대상 어디에도 없는 테이블이 있습니다: {}",
+                unknown.join(", ")
+            )));
+        }
+        backup_counts.retain(|table, _| only.contains(table));
+    }
+
+    let mut target_counts = BTreeMap::new();
+    for table in backup_counts.keys().filter(|t| live.contains(*t)) {
+        let rows = count_live_rows(client.conn_mut(), table).await?;
+        target_counts.insert(table.clone(), rows);
+    }
+    let extra = live
+        .iter()
+        .filter(|t| !backup_counts.contains_key(*t) && (only.is_empty() || only.contains(t)))
+        .cloned()
+        .collect();
+    Ok(compare_counts(&backup_counts, &target_counts, &extra))
 }
 
 /// 검증을 수행하고 종료 코드를 결정한다(Storage 주입 — 테스트 가능).
-async fn run(storage: &dyn Storage, args: &VerifyArgs, lang: Lang) -> Result<()> {
+async fn run(
+    storage: &dyn Storage,
+    args: &VerifyArgs,
+    lang: Lang,
+    against: Option<&Secret>,
+) -> Result<()> {
     // 1) 구조(+심층) 검증. 키 부재(Config)는 §8.5에 따라 검증 실패(exit 1)로 보정한다.
     let report = match verify_backup(storage, &args.id, args.deep).await {
         Ok(r) => r,
@@ -80,17 +199,31 @@ async fn run(storage: &dyn Storage, args: &VerifyArgs, lang: Lang) -> Result<()>
         None
     };
 
-    // 3) 출력.
+    // 3) 대상 DB와 행 수 비교(옵션).
+    let compare = match against {
+        Some(target) => Some(compare_backup(storage, &args.id, target, &args.tables).await?),
+        None => None,
+    };
+
+    // 4) 출력.
     if args.json {
-        print_json(&report, chain.as_ref());
+        print_json(&report, chain.as_ref(), compare.as_ref());
     } else {
-        print_human(&report, chain.as_ref(), lang);
+        print_human(&report, chain.as_ref(), compare.as_ref(), lang);
     }
 
-    // 4) 종료 코드 판정.
+    // 5) 종료 코드 판정.
+    //    - 행 수 불일치: 실패(exit 1).
     //    - broken chain: 경고 동반(exit 4) — verify 자체는 통과했으나 PITR 부적격.
     //    - 구조 경고(incomplete 등): exit 4.
     //    - 모두 정상: exit 0.
+    if let Some(c) = compare.as_ref().filter(|c| !c.is_match()) {
+        return Err(XBackupError::Failure(crate::tr!(
+            "row counts differ between the backup and the target in {} table(s)",
+            "백업과 대상의 행 수가 다른 테이블이 {}개 있습니다",
+            c.mismatched().count()
+        )));
+    }
     let chain_broken = chain.as_ref().is_some_and(|c| !c.is_continuous());
     if chain_broken {
         return Err(XBackupError::VerifyWarning(crate::tr!(
@@ -171,7 +304,12 @@ fn default_profile_name(config_toml: Option<&str>) -> String {
 }
 
 /// 사람이 읽는 검증 결과 출력(stdout).
-fn print_human(report: &VerifyReport, chain: Option<&ChainReport>, lang: Lang) {
+fn print_human(
+    report: &VerifyReport,
+    chain: Option<&ChainReport>,
+    compare: Option<&CompareReport>,
+    lang: Lang,
+) {
     const W: usize = 21;
     println!(
         "{} — {}",
@@ -267,16 +405,60 @@ fn print_human(report: &VerifyReport, chain: Option<&ChainReport>, lang: Lang) {
             );
         }
     }
+
+    if let Some(c) = compare {
+        let total = c.tables.len();
+        let differing = c.mismatched().count();
+        println!(
+            "{} — {}",
+            style(lang.sel("row count comparison", "행 수 비교"), Tone::Plan),
+            style(
+                lang.sel(
+                    &format!("{differing} of {total} tables differ"),
+                    &format!("{total}개 중 {differing}개 테이블 불일치")
+                ),
+                if differing == 0 {
+                    Tone::Success
+                } else {
+                    Tone::Danger
+                }
+            )
+        );
+        for t in c.mismatched() {
+            let show = |rows: Option<u64>| rows.map_or("-".to_string(), |n| n.to_string());
+            println!(
+                "    {} {}: backup {} / target {}",
+                status_token(status_label(t.status), Tone::Danger),
+                t.table,
+                show(t.backup_rows),
+                show(t.target_rows)
+            );
+        }
+    }
+}
+
+/// 비교 상태를 출력용 토큰(항상 영문)으로.
+fn status_label(status: TableStatus) -> &'static str {
+    match status {
+        TableStatus::Match => "MATCH",
+        TableStatus::Mismatch => "MISMATCH",
+        TableStatus::MissingInTarget => "MISSING",
+        TableStatus::ExtraInTarget => "EXTRA",
+    }
 }
 
 /// 기계 판독 JSON 출력(stdout).
-fn print_json(report: &VerifyReport, chain: Option<&ChainReport>) {
-    let value = build_json(report, chain);
+fn print_json(report: &VerifyReport, chain: Option<&ChainReport>, compare: Option<&CompareReport>) {
+    let value = build_json(report, chain, compare);
     println!("{value}");
 }
 
 /// JSON 출력 값을 만든다(순수 — 출력 부작용 없음).
-fn build_json(report: &VerifyReport, chain: Option<&ChainReport>) -> serde_json::Value {
+fn build_json(
+    report: &VerifyReport,
+    chain: Option<&ChainReport>,
+    compare: Option<&CompareReport>,
+) -> serde_json::Value {
     let chain_json = chain.map(|c| {
         serde_json::json!({
             "base_id": c.base_id,
@@ -284,6 +466,17 @@ fn build_json(report: &VerifyReport, chain: Option<&ChainReport>) -> serde_json:
             "continuous": c.is_continuous(),
             "breaks": c.breaks.iter().map(|b| b.to_string()).collect::<Vec<_>>(),
             "warnings": c.warnings.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
+        })
+    });
+    let compare_json = compare.map(|c| {
+        serde_json::json!({
+            "match": c.is_match(),
+            "tables": c.tables.iter().map(|t| serde_json::json!({
+                "table": t.table,
+                "backup_rows": t.backup_rows,
+                "target_rows": t.target_rows,
+                "status": status_label(t.status).to_ascii_lowercase(),
+            })).collect::<Vec<_>>(),
         })
     });
     serde_json::json!({
@@ -294,8 +487,9 @@ fn build_json(report: &VerifyReport, chain: Option<&ChainReport>) -> serde_json:
         "deep_decode_ok": report.deep_decode_ok,
         "empty_slice": report.empty_slice,
         "warnings": report.warnings,
-        "ok": report.is_ok(),
+        "ok": report.is_ok() && compare.is_none_or(|c| c.is_match()),
         "chain": chain_json,
+        "compare": compare_json,
     })
 }
 
@@ -363,6 +557,8 @@ mod tests {
             id: id.to_string(),
             deep,
             chain,
+            against: None,
+            tables: Vec::new(),
             json,
             from: None,
         }
@@ -376,9 +572,14 @@ mod tests {
         let payload = b"archive";
         seed(&fs, &full("bk", &sha256_hex(payload)), payload).await;
 
-        run(&fs, &args("bk", false, false, false), crate::i18n::Lang::En)
-            .await
-            .unwrap();
+        run(
+            &fs,
+            &args("bk", false, false, false),
+            crate::i18n::Lang::En,
+            None,
+        )
+        .await
+        .unwrap();
     }
 
     /// 변조 산출물은 exit 1로 실패한다.
@@ -389,9 +590,14 @@ mod tests {
         let m = full("bk", &sha256_hex(b"original"));
         seed(&fs, &m, b"TAMPERED").await;
 
-        let err = run(&fs, &args("bk", false, false, false), crate::i18n::Lang::En)
-            .await
-            .unwrap_err();
+        let err = run(
+            &fs,
+            &args("bk", false, false, false),
+            crate::i18n::Lang::En,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.exit_code(), 1);
     }
 
@@ -412,9 +618,14 @@ mod tests {
         unsafe {
             std::env::remove_var(crate::pipeline::stage::ENV_AGE_IDENTITY_FILE);
         }
-        let err = run(&fs, &args("bk", true, false, false), crate::i18n::Lang::En)
-            .await
-            .unwrap_err();
+        let err = run(
+            &fs,
+            &args("bk", true, false, false),
+            crate::i18n::Lang::En,
+            None,
+        )
+        .await
+        .unwrap_err();
         // §8.5: 키 부재 deep은 검증 실패(exit 1)로 보정.
         assert_eq!(err.exit_code(), 1, "키 부재 deep은 exit 1: {err}");
         assert!(
@@ -433,9 +644,14 @@ mod tests {
         m.status = BackupStatus::Incomplete;
         seed(&fs, &m, payload).await;
 
-        let err = run(&fs, &args("bk", false, false, false), crate::i18n::Lang::En)
-            .await
-            .unwrap_err();
+        let err = run(
+            &fs,
+            &args("bk", false, false, false),
+            crate::i18n::Lang::En,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.exit_code(), 4);
     }
 
@@ -462,9 +678,14 @@ mod tests {
             .await
             .unwrap();
 
-        let err = run(&fs, &args("i1", false, true, false), crate::i18n::Lang::En)
-            .await
-            .unwrap_err();
+        let err = run(
+            &fs,
+            &args("i1", false, true, false),
+            crate::i18n::Lang::En,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.exit_code(), 4, "broken chain은 exit 4: {err}");
     }
 
@@ -482,10 +703,29 @@ mod tests {
     /// 최상위 JSON 문서는 스키마 버전을 달고 나간다 — 소비자가 파서를 고르는 근거다.
     #[test]
     fn build_json_stamps_schema_at_top_level() {
-        let v = build_json(&report("bk"), None);
+        let v = build_json(&report("bk"), None, None);
         assert_eq!(v["schema"], VERIFY_JSON_SCHEMA);
         assert_eq!(v["backup_id"], "bk");
         assert!(v["chain"].is_null(), "--chain 없으면 chain은 null");
+    }
+
+    /// 행 수가 다르면 종료 코드(exit 1)와 같이 최상위 `ok`도 false다.
+    #[test]
+    fn build_json_ok_is_false_when_row_counts_differ() {
+        let backup = BTreeMap::from([("t".to_string(), 3u64)]);
+        let differ = BTreeMap::from([("t".to_string(), 2u64)]);
+        let mismatch =
+            crate::engine::mysql::compare::compare_counts(&backup, &differ, &Default::default());
+        let same = crate::engine::mysql::compare::compare_counts(
+            &backup,
+            &backup.clone(),
+            &Default::default(),
+        );
+        assert_eq!(
+            build_json(&report("bk"), None, Some(&mismatch))["ok"],
+            false
+        );
+        assert_eq!(build_json(&report("bk"), None, Some(&same))["ok"], true);
     }
 
     /// `--chain`이 붙어도 schema는 최상위에만 있다(중첩 객체는 버전을 갖지 않는다).
@@ -497,7 +737,7 @@ mod tests {
             breaks: Vec::new(),
             warnings: Vec::new(),
         };
-        let v = build_json(&report("i1"), Some(&chain));
+        let v = build_json(&report("i1"), Some(&chain), None);
         assert_eq!(v["schema"], VERIFY_JSON_SCHEMA);
         assert!(
             v["chain"].get("schema").is_none(),
