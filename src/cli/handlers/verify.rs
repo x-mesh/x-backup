@@ -23,9 +23,7 @@ use crate::config::env::collect_overrides_from_process;
 use crate::config::merged::MergeInput;
 use crate::config::secret::Secret;
 use crate::config::ResolvedConfig;
-use crate::engine::compare::{
-    compare_counts, CompareEngine, CompareReport, LiveTarget, TableStatus,
-};
+use crate::engine::compare::{compare_with_target, CompareEngine, CompareReport};
 use crate::engine::DbKind;
 use crate::error::{Result, XBackupError};
 use crate::i18n::Lang;
@@ -170,42 +168,9 @@ async fn compare_backup(
         )));
     }
 
-    let mut backup_counts = backup_row_counts(storage, backup_id, &manifest, engine).await?;
+    let backup_counts = backup_row_counts(storage, backup_id, &manifest, engine).await?;
 
-    let mut live_target = LiveTarget::connect(engine, target, estimate).await?;
-    let live = live_target.names().await?;
-    backup_counts.retain(|name, _| !live.ignore_in_backup.contains(name));
-
-    if !only.is_empty() {
-        let unknown: Vec<&str> = only
-            .iter()
-            .filter(|t| !backup_counts.contains_key(*t) && !live.names.contains(*t))
-            .map(String::as_str)
-            .collect();
-        if !unknown.is_empty() {
-            return Err(XBackupError::Usage(crate::tr!(
-                "--tables names entries that exist neither in the backup nor in the target: {}",
-                "--tables에 백업과 대상 어디에도 없는 항목이 있습니다: {}",
-                unknown.join(", ")
-            )));
-        }
-        backup_counts.retain(|table, _| only.contains(table));
-    }
-
-    let mut target_counts = BTreeMap::new();
-    for table in backup_counts.keys().filter(|t| live.names.contains(*t)) {
-        let rows = live_target.count(table).await?;
-        target_counts.insert(table.clone(), rows);
-    }
-    let extra = live
-        .names
-        .iter()
-        .filter(|t| !backup_counts.contains_key(*t) && (only.is_empty() || only.contains(t)))
-        .cloned()
-        .collect();
-    let mut report = compare_counts(&backup_counts, &target_counts, &extra);
-    report.estimated = estimate;
-    Ok(report)
+    compare_with_target(engine, target, backup_counts, only, estimate, true).await
 }
 
 /// 검증을 수행하고 종료 코드를 결정한다(Storage 주입 — 테스트 가능).
@@ -476,22 +441,12 @@ fn print_human(
             let show = |rows: Option<u64>| rows.map_or("-".to_string(), |n| n.to_string());
             println!(
                 "    {} {}: backup {} / target {}",
-                status_token(status_label(t.status), Tone::Danger),
+                status_token(t.status.label(), Tone::Danger),
                 t.table,
                 show(t.backup_rows),
                 show(t.target_rows)
             );
         }
-    }
-}
-
-/// 비교 상태를 출력용 토큰(항상 영문)으로.
-fn status_label(status: TableStatus) -> &'static str {
-    match status {
-        TableStatus::Match => "MATCH",
-        TableStatus::Mismatch => "MISMATCH",
-        TableStatus::MissingInTarget => "MISSING",
-        TableStatus::ExtraInTarget => "EXTRA",
     }
 }
 
@@ -524,7 +479,7 @@ fn build_json(
                 "table": t.table,
                 "backup_rows": t.backup_rows,
                 "target_rows": t.target_rows,
-                "status": status_label(t.status).to_ascii_lowercase(),
+                "status": t.status.label().to_ascii_lowercase(),
             })).collect::<Vec<_>>(),
         })
     });
@@ -554,6 +509,7 @@ fn ok_mark(ok: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::compare::compare_counts;
     use crate::manifest::schema::{
         BackupManifest, BackupStatus, BackupType, EncryptionMeta, OplogRange, OplogTimestamp,
         Topology, FORMAT_VERSION,

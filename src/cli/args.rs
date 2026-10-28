@@ -262,6 +262,10 @@ pub struct RestoreArgs {
     /// 복구 사전 점검을 건너뛴다.
     #[arg(long)]
     pub skip_precheck: bool,
+    /// 복구 직후 백업의 행 수와 대상 DB를 대조하는 확인을 건너뛴다(대용량이면 항목마다
+    /// `COUNT(*)`가 추가로 돌아 시간이 걸린다). 행 수가 기록되지 않은 백업은 어차피 확인하지 않는다.
+    #[arg(long)]
+    pub no_verify_rows: bool,
     /// 진행 표시를 억제한다(cron/CI).
     #[arg(long, conflicts_with = "progress")]
     pub quiet: bool,
