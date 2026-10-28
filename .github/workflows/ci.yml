@@ -4,7 +4,8 @@ name: CI
 #
 # 잡 구성 (docs/ci.md에 상세):
 #   - lint-and-test : 모든 PR/push. fmt --check, clippy(-D warnings),
-#                     단위(lib) + DB 불필요 E2E(exit_codes_e2e). DB/Docker 불필요.
+#                     단위(lib) + DB 불필요 E2E(exit_codes_e2e, json_schema_snapshot).
+#                     DB/Docker 불필요.
 #   - integration   : push to main + nightly. fixture로 single-node replica set
 #                     기동 + mongodb-database-tools 100.16.1(tarball+sha256) 설치 후
 #                     `--features integration-tests`.
@@ -98,6 +99,11 @@ jobs:
       # DB·Docker 없이 결정론적으로 도는 실 바이너리 E2E(종료 코드 매핑, SC6).
       - name: cargo test (E2E exit codes, no DB)
         run: cargo test --test exit_codes_e2e
+
+      # `--json` 출력의 키 구조 스냅샷(DB 불필요). integration 잡에서만 돌면 키를 바꾼 PR이
+      # 머지된 뒤에야 main에서 깨진다(#12 → #14).
+      - name: cargo test (JSON key snapshot, no DB)
+        run: cargo test --test json_schema_snapshot
 
       # ── DB 도구 외부 바이너리 의존 0 가드(로드맵 P0-4) ──
       # src/에서 서브프로세스 스폰(std/tokio process)은 아래 허용 목록에서만 허용한다.

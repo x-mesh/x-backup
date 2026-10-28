@@ -125,9 +125,10 @@ release-skip-tap: ## 릴리스 게시하되 Homebrew tap 갱신은 생략
 
 # ── 테스트 ────────────────────────────────────────────────────────────
 
-test: ## 단위(lib) + exit code E2E — DB·Docker 불필요
+test: ## 단위(lib) + exit code E2E + JSON 키 스냅샷 — DB·Docker 불필요
 	cargo test --lib
 	cargo test --test exit_codes_e2e
+	cargo test --test json_schema_snapshot
 
 test-integration: tools ## 통합 테스트 — 자체 fixture(:27017) 사용. compose mongodb와 동시 사용 금지
 	tests/fixtures/replica-set.sh up
