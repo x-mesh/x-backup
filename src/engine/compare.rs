@@ -18,6 +18,8 @@ pub enum TableStatus {
     ExtraInTarget,
     /// 행 수는 같지만 내용 다이제스트가 다르다(`--content`).
     ContentMismatch,
+    /// 행 수는 같지만 다이제스트가 한쪽에 없어 내용을 비교하지 못했다(`--content`).
+    ContentUnchecked,
 }
 
 impl TableStatus {
@@ -29,6 +31,7 @@ impl TableStatus {
             Self::MissingInTarget => "MISSING",
             Self::ExtraInTarget => "EXTRA",
             Self::ContentMismatch => "CONTENT",
+            Self::ContentUnchecked => "NO-DIGEST",
         }
     }
 }
@@ -103,7 +106,8 @@ pub fn compare_counts(
 
 /// 행 수가 같은(`Match`) 항목 중 내용 다이제스트가 다른 것을 `ContentMismatch`로 바꾼다(순수).
 ///
-/// 어느 한쪽에 다이제스트가 없는 항목은 비교할 수 없어 그대로 둔다.
+/// 어느 한쪽에 다이제스트가 없는 항목은 `ContentUnchecked`로 바꾼다. `--content`를 요청했는데
+/// 내용을 보지 못한 테이블이 `MATCH`로 남으면 검증이 끝난 것처럼 보이기 때문이다.
 pub fn apply_content_digests(
     report: &mut CompareReport,
     backup: &BTreeMap<String, String>,
@@ -113,10 +117,10 @@ pub fn apply_content_digests(
         if entry.status != TableStatus::Match {
             continue;
         }
-        if let (Some(b), Some(t)) = (backup.get(&entry.table), target.get(&entry.table)) {
-            if b != t {
-                entry.status = TableStatus::ContentMismatch;
-            }
+        match (backup.get(&entry.table), target.get(&entry.table)) {
+            (Some(b), Some(t)) if b != t => entry.status = TableStatus::ContentMismatch,
+            (Some(_), Some(_)) => {}
+            _ => entry.status = TableStatus::ContentUnchecked,
         }
     }
     report.content_checked = true;
@@ -490,20 +494,34 @@ mod tests {
     }
 
     #[test]
-    fn a_table_without_a_digest_on_either_side_is_left_alone() {
-        let mut report = report_of(&[("a", 1, 1), ("b", 1, 1)]);
+    fn a_table_missing_a_digest_on_either_side_is_not_reported_as_match() {
+        let mut report = report_of(&[("a", 1, 1), ("b", 1, 1), ("c", 1, 1)]);
         apply_content_digests(
             &mut report,
-            &digests(&[("a", "11")]),
-            &digests(&[("b", "22")]),
+            &digests(&[("a", "11"), ("c", "33")]),
+            &digests(&[("b", "22"), ("c", "33")]),
         );
-        assert!(report.tables.iter().all(|t| t.status == TableStatus::Match));
-        assert!(report.content_checked, "비교를 시도했다는 표시는 남는다");
+        let status = |name: &str| {
+            report
+                .tables
+                .iter()
+                .find(|t| t.table == name)
+                .unwrap()
+                .status
+        };
+        assert_eq!(status("a"), TableStatus::ContentUnchecked);
+        assert_eq!(status("b"), TableStatus::ContentUnchecked);
+        assert_eq!(status("c"), TableStatus::Match);
+        assert!(
+            !report.is_match(),
+            "내용을 보지 못한 테이블이 있으면 일치가 아니다"
+        );
     }
 
     #[test]
-    fn content_status_has_its_own_label() {
+    fn content_statuses_have_their_own_labels() {
         assert_eq!(TableStatus::ContentMismatch.label(), "CONTENT");
+        assert_eq!(TableStatus::ContentUnchecked.label(), "NO-DIGEST");
     }
 
     #[tokio::test]
