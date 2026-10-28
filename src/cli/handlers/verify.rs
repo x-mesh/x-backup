@@ -590,6 +590,30 @@ mod tests {
         .unwrap();
     }
 
+    /// `table_rows`가 있어도 data.bin이 없으면 `--against`는 대상 DB에 닿기 전에 실패한다.
+    /// 비교는 기록된 행 수를 쓰지만, 그 값은 앞 단계의 체크섬 검증을 통과한 백업에만 쓰인다.
+    #[tokio::test]
+    async fn against_with_table_rows_still_requires_data_bin() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = LocalFs::new(dir.path()).unwrap();
+        let mut m = full("bk", &sha256_hex(b"archive"));
+        m.tool_versions.archive_format = Some(archive::FORMAT_ID.to_string());
+        m.table_rows = Some(BTreeMap::from([("t".to_string(), 3u64)]));
+        ManifestStore::new(&fs).write(&m).await.unwrap();
+
+        let target = Secret::new("mysql://u:p@127.0.0.1:1/db");
+        let err = run(
+            &fs,
+            &args("bk", false, false, false),
+            crate::i18n::Lang::En,
+            Some(&target),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.to_string().contains("data.bin"), "{err}");
+    }
+
     /// 변조 산출물은 exit 1로 실패한다.
     #[tokio::test]
     async fn run_tampered_fails() {

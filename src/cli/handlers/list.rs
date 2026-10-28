@@ -254,7 +254,10 @@ pub async fn build_catalog(storage: &dyn Storage) -> Result<Vec<CatalogRow>> {
             engine: engine_from_archive(m.tool_versions.archive_format.as_deref()).to_string(),
             created_at: Some(m.created_at.clone()),
             stored_size_bytes: m.stored_size_bytes,
-            total_rows: m.table_rows.as_ref().map(|rows| rows.values().sum()),
+            total_rows: m
+                .table_rows
+                .as_ref()
+                .map(|rows| rows.values().fold(0u64, |acc, &n| acc.saturating_add(n))),
             chain_status,
             base_id: m.base_id.clone(),
             promoted_from_gap: m.promoted_from_gap,
