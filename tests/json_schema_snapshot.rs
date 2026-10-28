@@ -341,6 +341,7 @@ async fn verify_json_keys_are_stable() {
             "warnings",
             "ok",
             "chain",
+            "compare",
         ],
         "verify --json",
     );
@@ -350,6 +351,7 @@ async fn verify_json_keys_are_stable() {
     );
     assert_eq!(v["ok"], true, "온전한 백업은 검증을 통과해야 한다");
     assert!(v["chain"].is_null(), "--chain 없으면 chain은 null");
+    assert!(v["compare"].is_null(), "--against 없으면 compare는 null");
 }
 
 /// `verify --chain --json` — `chain` 하위 객체의 키 구조까지 계약이다.
@@ -386,6 +388,7 @@ async fn verify_chain_json_keys_are_stable() {
             "chain.continuous",
             "chain.breaks",
             "chain.warnings",
+            "compare",
         ],
         "verify --chain --json",
     );
@@ -394,4 +397,5 @@ async fn verify_chain_json_keys_are_stable() {
         v["chain"].get("schema").is_none(),
         "중첩 객체는 독립 문서가 아니므로 버전을 갖지 않는다"
     );
+    assert!(v["compare"].is_null(), "--against 없으면 compare는 null");
 }
