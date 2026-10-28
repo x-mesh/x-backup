@@ -1,6 +1,6 @@
-//! 백업 아카이브와 대상 DB의 테이블별 행 수 비교(`verify --against`).
+//! MariaDB/MySQL의 행 수 세기(`verify --against`) — 판정은 [`crate::engine::compare`]가 맡는다.
 //!
-//! manifest에는 행 수가 없어 아카이브의 `T`/`D`/`X` 프레임을 끝까지 읽어 센다(상수 메모리).
+//! manifest에 행 수가 없는 백업은 아카이브의 `T`/`D`/`X` 프레임을 끝까지 읽어 센다(상수 메모리).
 //! 대상 DB는 테이블마다 `COUNT(*)`를 **하나씩 순차로** 실행한다 — InnoDB는 행 수를 저장하지
 //! 않아 인덱스 전체를 훑으므로 병렬로 돌리면 운영 DB에 부하가 겹친다.
 //!
@@ -15,44 +15,6 @@ use tokio::io::AsyncRead;
 use super::archive::{self, Frame};
 use super::util::quote_ident;
 use crate::error::{Result, XBackupError};
-
-/// 한 테이블의 비교 결과 분류.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TableStatus {
-    Match,
-    Mismatch,
-    /// 백업에는 있으나 대상 DB에 테이블이 없다.
-    MissingInTarget,
-    /// 대상 DB에만 있다(행 수는 세지 않는다).
-    ExtraInTarget,
-}
-
-/// 테이블 하나의 백업·대상 행 수와 판정.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TableCompare {
-    pub table: String,
-    pub backup_rows: Option<u64>,
-    pub target_rows: Option<u64>,
-    pub status: TableStatus,
-}
-
-/// 전체 비교 결과.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompareReport {
-    pub tables: Vec<TableCompare>,
-}
-
-impl CompareReport {
-    pub fn is_match(&self) -> bool {
-        self.tables.iter().all(|t| t.status == TableStatus::Match)
-    }
-
-    pub fn mismatched(&self) -> impl Iterator<Item = &TableCompare> {
-        self.tables
-            .iter()
-            .filter(|t| t.status != TableStatus::Match)
-    }
-}
 
 /// `db.table` ns에서 테이블 이름만 뽑는다(복구 대상 DB 이름은 백업과 다를 수 있다).
 fn table_name(ns: &str) -> &str {
@@ -154,39 +116,6 @@ pub async fn count_live_rows(conn: &mut Conn, table: &str) -> Result<u64> {
     Ok(count.unwrap_or(0))
 }
 
-/// 백업 행 수와 대상 행 수를 판정한다(순수).
-///
-/// `target_counts`는 실제로 센 테이블만, `extra_in_target`은 백업에 없는 대상 테이블이다.
-pub fn compare_counts(
-    backup: &BTreeMap<String, u64>,
-    target_counts: &BTreeMap<String, u64>,
-    extra_in_target: &BTreeSet<String>,
-) -> CompareReport {
-    let mut tables = Vec::new();
-    for (table, &backup_rows) in backup {
-        let (target_rows, status) = match target_counts.get(table) {
-            Some(&rows) if rows == backup_rows => (Some(rows), TableStatus::Match),
-            Some(&rows) => (Some(rows), TableStatus::Mismatch),
-            None => (None, TableStatus::MissingInTarget),
-        };
-        tables.push(TableCompare {
-            table: table.clone(),
-            backup_rows: Some(backup_rows),
-            target_rows,
-            status,
-        });
-    }
-    for table in extra_in_target {
-        tables.push(TableCompare {
-            table: table.clone(),
-            backup_rows: None,
-            target_rows: None,
-            status: TableStatus::ExtraInTarget,
-        });
-    }
-    CompareReport { tables }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,39 +176,5 @@ mod tests {
         let mut buf = Vec::new();
         write_end(&mut buf).await.unwrap();
         assert!(count_archive_rows(&mut &buf[..]).await.is_err());
-    }
-
-    #[test]
-    fn classifies_match_mismatch_missing_and_extra() {
-        let backup = BTreeMap::from([
-            ("a".to_string(), 3u64),
-            ("b".to_string(), 5),
-            ("c".to_string(), 1),
-        ]);
-        let target = BTreeMap::from([("a".to_string(), 3u64), ("b".to_string(), 4)]);
-        let extra = BTreeSet::from(["z".to_string()]);
-
-        let report = compare_counts(&backup, &target, &extra);
-        let status = |name: &str| {
-            report
-                .tables
-                .iter()
-                .find(|t| t.table == name)
-                .unwrap()
-                .status
-        };
-        assert_eq!(status("a"), TableStatus::Match);
-        assert_eq!(status("b"), TableStatus::Mismatch);
-        assert_eq!(status("c"), TableStatus::MissingInTarget);
-        assert_eq!(status("z"), TableStatus::ExtraInTarget);
-        assert!(!report.is_match());
-        assert_eq!(report.mismatched().count(), 3);
-    }
-
-    #[test]
-    fn identical_counts_match() {
-        let backup = BTreeMap::from([("a".to_string(), 2u64)]);
-        let report = compare_counts(&backup, &backup.clone(), &BTreeSet::new());
-        assert!(report.is_match());
     }
 }

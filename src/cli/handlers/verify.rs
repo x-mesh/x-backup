@@ -23,12 +23,9 @@ use crate::config::env::collect_overrides_from_process;
 use crate::config::merged::MergeInput;
 use crate::config::secret::Secret;
 use crate::config::ResolvedConfig;
-use crate::engine::mysql::archive;
-use crate::engine::mysql::compare::{
-    compare_counts, count_archive_rows, count_live_rows, live_table_names, CompareReport,
-    TableStatus,
+use crate::engine::compare::{
+    compare_counts, CompareEngine, CompareReport, LiveTarget, TableStatus,
 };
-use crate::engine::mysql::conn::MysqlClient;
 use crate::engine::DbKind;
 use crate::error::{Result, XBackupError};
 use crate::i18n::Lang;
@@ -95,21 +92,58 @@ fn resolve_against(spec: &str, config_toml: Option<&str>) -> Result<Secret> {
             ))
         })?
     };
-    if DbKind::from_uri(uri.expose()) != DbKind::Mysql {
+    if DbKind::from_uri(uri.expose()) == DbKind::File {
         return Err(XBackupError::Usage(crate::tr!(
-            "--against supports only MariaDB/MySQL targets",
-            "--against는 MariaDB/MySQL 대상만 지원합니다"
+            "--against supports only MariaDB/MySQL, PostgreSQL, and MongoDB targets",
+            "--against는 MariaDB/MySQL, PostgreSQL, MongoDB 대상만 지원합니다"
         )));
     }
     Ok(uri)
 }
 
-/// 백업 아카이브와 대상 DB의 테이블별 행 수를 비교한다. 대상 DB는 테이블마다 순차로 센다.
+/// 백업의 테이블(컬렉션)별 행 수를 manifest에서 읽고, 없으면 아카이브를 끝까지 읽어 센다.
+async fn backup_row_counts(
+    storage: &dyn Storage,
+    backup_id: &str,
+    manifest: &crate::manifest::schema::BackupManifest,
+    engine: CompareEngine,
+) -> Result<BTreeMap<String, u64>> {
+    // 백업 시점에 기록된 행 수가 있으면 아카이브를 다시 읽지 않는다(개인키도 필요 없다).
+    // 이 필드가 생기기 전 백업은 아카이브를 끝까지 읽어 센다.
+    if let Some(rows) = manifest.table_rows.clone() {
+        return Ok(rows);
+    }
+    let stages = reverse_stack_for(manifest)?;
+    let raw = storage
+        .get_stream(&data_path(backup_id))
+        .await
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to read data.bin ({backup_id}): {e}",
+                "data.bin 읽기 실패({backup_id}): {e}"
+            ))
+        })?;
+    let mut decoded = stages.apply(raw);
+    match engine {
+        CompareEngine::Mysql => {
+            crate::engine::mysql::compare::count_archive_rows(&mut decoded).await
+        }
+        CompareEngine::Postgres => {
+            crate::engine::postgres::compare::count_archive_rows(&mut decoded).await
+        }
+        CompareEngine::MongoNative => {
+            crate::engine::native::compare::count_archive_docs(&mut decoded).await
+        }
+    }
+}
+
+/// 백업 아카이브와 대상 DB의 테이블(컬렉션)별 행 수를 비교한다. 대상은 항목마다 순차로 센다.
 async fn compare_backup(
     storage: &dyn Storage,
     backup_id: &str,
     target: &Secret,
     only: &[String],
+    estimate: bool,
 ) -> Result<CompareReport> {
     let manifest = ManifestStore::new(storage)
         .read(backup_id)
@@ -120,48 +154,38 @@ async fn compare_backup(
                 "manifest 로드 실패({backup_id}): {e}"
             ))
         })?;
-    let is_mysql_full = matches!(manifest.backup_type, BackupType::Full)
-        && manifest.tool_versions.archive_format.as_deref() == Some(archive::FORMAT_ID);
-    if !is_mysql_full {
+    let engine = CompareEngine::from_archive_format(manifest.tool_versions.archive_format.as_deref())
+        .filter(|_| matches!(manifest.backup_type, BackupType::Full))
+        .ok_or_else(|| {
+            XBackupError::Usage(crate::tr!(
+                "--against supports only MariaDB/MySQL, PostgreSQL, and MongoDB (native) full backups ({backup_id})",
+                "--against는 MariaDB/MySQL, PostgreSQL, MongoDB(native) 풀 백업만 지원합니다({backup_id})"
+            ))
+        })?;
+    if !engine.matches_target(DbKind::from_uri(target.expose())) {
         return Err(XBackupError::Usage(crate::tr!(
-            "--against supports only MariaDB/MySQL full backups ({backup_id})",
-            "--against는 MariaDB/MySQL 풀 백업만 지원합니다({backup_id})"
+            "the backup is a {} backup but the --against target is a different database type",
+            "백업은 {} 백업인데 --against 대상은 다른 종류의 DB입니다",
+            engine.label()
         )));
     }
 
-    // 백업 시점에 기록된 행 수가 있으면 아카이브를 다시 읽지 않는다(개인키도 필요 없다).
-    // 이 필드가 생기기 전 백업은 아카이브를 끝까지 읽어 센다.
-    let mut backup_counts = match manifest.table_rows.clone() {
-        Some(rows) => rows,
-        None => {
-            let stages = reverse_stack_for(&manifest)?;
-            let raw = storage
-                .get_stream(&data_path(backup_id))
-                .await
-                .map_err(|e| {
-                    XBackupError::Failure(crate::tr!(
-                        "failed to read data.bin ({backup_id}): {e}",
-                        "data.bin 읽기 실패({backup_id}): {e}"
-                    ))
-                })?;
-            let mut decoded = stages.apply(raw);
-            count_archive_rows(&mut decoded).await?
-        }
-    };
+    let mut backup_counts = backup_row_counts(storage, backup_id, &manifest, engine).await?;
 
-    let mut client = MysqlClient::connect(target, None).await?;
-    let live = live_table_names(client.conn_mut()).await?;
+    let mut live_target = LiveTarget::connect(engine, target, estimate).await?;
+    let live = live_target.names().await?;
+    backup_counts.retain(|name, _| !live.ignore_in_backup.contains(name));
 
     if !only.is_empty() {
         let unknown: Vec<&str> = only
             .iter()
-            .filter(|t| !backup_counts.contains_key(*t) && !live.contains(*t))
+            .filter(|t| !backup_counts.contains_key(*t) && !live.names.contains(*t))
             .map(String::as_str)
             .collect();
         if !unknown.is_empty() {
             return Err(XBackupError::Usage(crate::tr!(
-                "--tables names tables that exist neither in the backup nor in the target: {}",
-                "--tables에 백업과 대상 어디에도 없는 테이블이 있습니다: {}",
+                "--tables names entries that exist neither in the backup nor in the target: {}",
+                "--tables에 백업과 대상 어디에도 없는 항목이 있습니다: {}",
                 unknown.join(", ")
             )));
         }
@@ -169,16 +193,19 @@ async fn compare_backup(
     }
 
     let mut target_counts = BTreeMap::new();
-    for table in backup_counts.keys().filter(|t| live.contains(*t)) {
-        let rows = count_live_rows(client.conn_mut(), table).await?;
+    for table in backup_counts.keys().filter(|t| live.names.contains(*t)) {
+        let rows = live_target.count(table).await?;
         target_counts.insert(table.clone(), rows);
     }
     let extra = live
+        .names
         .iter()
         .filter(|t| !backup_counts.contains_key(*t) && (only.is_empty() || only.contains(t)))
         .cloned()
         .collect();
-    Ok(compare_counts(&backup_counts, &target_counts, &extra))
+    let mut report = compare_counts(&backup_counts, &target_counts, &extra);
+    report.estimated = estimate;
+    Ok(report)
 }
 
 /// 검증을 수행하고 종료 코드를 결정한다(Storage 주입 — 테스트 가능).
@@ -208,7 +235,9 @@ async fn run(
 
     // 3) 대상 DB와 행 수 비교(옵션).
     let compare = match against {
-        Some(target) => Some(compare_backup(storage, &args.id, target, &args.tables).await?),
+        Some(target) => {
+            Some(compare_backup(storage, &args.id, target, &args.tables, args.estimate).await?)
+        }
         None => None,
     };
 
@@ -226,8 +255,8 @@ async fn run(
     //    - 모두 정상: exit 0.
     if let Some(c) = compare.as_ref().filter(|c| !c.is_match()) {
         return Err(XBackupError::Failure(crate::tr!(
-            "row counts differ between the backup and the target in {} table(s)",
-            "백업과 대상의 행 수가 다른 테이블이 {}개 있습니다",
+            "row counts differ between the backup and the target in {} entries",
+            "백업과 대상의 행 수가 다른 항목이 {}개 있습니다",
             c.mismatched().count()
         )));
     }
@@ -421,8 +450,8 @@ fn print_human(
             style(lang.sel("row count comparison", "행 수 비교"), Tone::Plan),
             style(
                 lang.sel(
-                    &format!("{differing} of {total} tables differ"),
-                    &format!("{total}개 중 {differing}개 테이블 불일치")
+                    &format!("{differing} of {total} entries differ"),
+                    &format!("{total}개 중 {differing}개 항목 불일치")
                 ),
                 if differing == 0 {
                     Tone::Success
@@ -431,6 +460,18 @@ fn print_human(
                 }
             )
         );
+        if c.estimated {
+            println!(
+                "    {}",
+                style(
+                    lang.sel(
+                        "target counts are estimates and may be inexact",
+                        "대상 행 수는 추정치라 정확하지 않을 수 있습니다"
+                    ),
+                    Tone::Warning
+                )
+            );
+        }
         for t in c.mismatched() {
             let show = |rows: Option<u64>| rows.map_or("-".to_string(), |n| n.to_string());
             println!(
@@ -478,6 +519,7 @@ fn build_json(
     let compare_json = compare.map(|c| {
         serde_json::json!({
             "match": c.is_match(),
+            "estimated": c.estimated,
             "tables": c.tables.iter().map(|t| serde_json::json!({
                 "table": t.table,
                 "backup_rows": t.backup_rows,
@@ -567,6 +609,7 @@ mod tests {
             chain,
             against: None,
             tables: Vec::new(),
+            estimate: false,
             json,
             from: None,
         }
@@ -597,7 +640,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fs = LocalFs::new(dir.path()).unwrap();
         let mut m = full("bk", &sha256_hex(b"archive"));
-        m.tool_versions.archive_format = Some(archive::FORMAT_ID.to_string());
+        m.tool_versions.archive_format = Some(crate::engine::mysql::archive::FORMAT_ID.to_string());
         m.table_rows = Some(BTreeMap::from([("t".to_string(), 3u64)]));
         ManifestStore::new(&fs).write(&m).await.unwrap();
 
@@ -612,6 +655,52 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.exit_code(), 1);
         assert!(err.to_string().contains("data.bin"), "{err}");
+    }
+
+    /// 백업 엔진과 `--against` 대상 DB 종류가 다르면 접속 전에 사용법 오류(exit 2)로 거부한다.
+    #[tokio::test]
+    async fn against_rejects_a_target_of_a_different_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = LocalFs::new(dir.path()).unwrap();
+        let payload = b"archive";
+        let mut m = full("bk", &sha256_hex(payload));
+        m.tool_versions.archive_format =
+            Some(crate::engine::postgres::archive::FORMAT_ID.to_string());
+        seed(&fs, &m, payload).await;
+
+        let target = Secret::new("mysql://u:p@127.0.0.1:1/db");
+        let err = run(
+            &fs,
+            &args("bk", false, false, false),
+            crate::i18n::Lang::En,
+            Some(&target),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2, "{err}");
+        assert!(err.to_string().contains("PostgreSQL"), "{err}");
+    }
+
+    /// 지원하지 않는 아카이브 포맷(예: mongodump)은 `--against`를 사용법 오류로 거부한다.
+    #[tokio::test]
+    async fn against_rejects_an_unsupported_archive_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = LocalFs::new(dir.path()).unwrap();
+        let payload = b"archive";
+        let mut m = full("bk", &sha256_hex(payload));
+        m.tool_versions.archive_format = Some("0.1".to_string());
+        seed(&fs, &m, payload).await;
+
+        let target = Secret::new("mongodb://127.0.0.1:1/db");
+        let err = run(
+            &fs,
+            &args("bk", false, false, false),
+            crate::i18n::Lang::En,
+            Some(&target),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2, "{err}");
     }
 
     /// 변조 산출물은 exit 1로 실패한다.
@@ -752,13 +841,8 @@ mod tests {
     fn build_json_ok_is_false_when_row_counts_differ() {
         let backup = BTreeMap::from([("t".to_string(), 3u64)]);
         let differ = BTreeMap::from([("t".to_string(), 2u64)]);
-        let mismatch =
-            crate::engine::mysql::compare::compare_counts(&backup, &differ, &Default::default());
-        let same = crate::engine::mysql::compare::compare_counts(
-            &backup,
-            &backup.clone(),
-            &Default::default(),
-        );
+        let mismatch = compare_counts(&backup, &differ, &Default::default());
+        let same = compare_counts(&backup, &backup.clone(), &Default::default());
         assert_eq!(
             build_json(&report("bk"), None, Some(&mismatch))["ok"],
             false
