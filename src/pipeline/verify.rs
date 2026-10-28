@@ -466,7 +466,11 @@ mod tests {
     /// 암호화 백업 --deep인데 키 env가 없으면 거부한다(exit 2 — 키 부재).
     /// (verify 핸들러가 이를 exit 1로 보정한다; 여기서는 Config 에러임을 확인.)
     #[tokio::test]
+    // 키 env는 verify_backup의 await 도중에 읽히므로 끝날 때까지 잠근다. tokio::test는 단일
+    // 스레드 런타임이라 가드를 쥔 채 await해도 교착이 없다.
+    #[allow(clippy::await_holding_lock)]
     async fn deep_encrypted_without_key_is_rejected() {
+        let _guard = crate::web::auth::ENV_GUARD.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let fs = LocalFs::new(dir.path()).unwrap();
         // age 암호화로 표시한 manifest(실제 암호문 불필요 — 키 해석에서 먼저 막힘).
