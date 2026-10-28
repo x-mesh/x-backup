@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use crate::cli::args::RestoreArgs;
 use crate::cli::output::{
-    field_line, field_line_toned, style, style_stderr, OutputFlags, OutputMode, Tone,
+    field_line, field_line_toned, status_token, style, style_stderr, OutputFlags, OutputMode, Tone,
 };
 use crate::cli::progress::{new_counter, ProgressKind, ProgressReporter};
 use crate::config::env::collect_overrides_from_process;
@@ -19,8 +19,11 @@ use crate::config::file::{DestinationConfig, Profile};
 use crate::config::merged::MergeInput;
 use crate::config::secret::Secret;
 use crate::config::ResolvedConfig;
+use crate::engine::compare::{compare_with_target, CompareEngine, CompareReport};
 use crate::error::{Result, XBackupError};
 use crate::i18n::Lang;
+use crate::manifest::schema::BackupType;
+use crate::manifest::store::ManifestStore;
 use crate::pipeline::mysql_pitr::{run_mysql_pitr, MysqlPitrPlan, MysqlPitrRequest};
 use crate::pipeline::pg_pitr::{run_pg_pitr, PgPitrPlan, PgPitrRequest};
 use crate::pipeline::pitr::{run_pitr, PitrPlan, PitrRequest};
@@ -180,13 +183,30 @@ pub async fn handle(
     reporter.finish().await;
     let outcome = result?;
 
+    // 4.5) 복구 직후 행 수 확인 — 드라이런과 `--no-verify-rows`는 건너뛴다. 복구는 이미 끝났으므로
+    //      확인이 실패하거나 어긋나도 복구를 되돌리지 않고 경고(exit 4)로만 알린다.
+    let row_check = if request.dry_run || args.no_verify_rows {
+        RowCheck::Skipped
+    } else {
+        row_check_after_restore(
+            storage.as_ref(),
+            &outcome,
+            &request.target_uri,
+            mode.shows_human_summary(),
+            lang,
+        )
+        .await
+    };
+
     // 5) 출력. dry-run은 계획을, 실제 복구는 완료 요약을 낸다. 진행=stderr, 결과=stdout.
     //    복구 대상(host)은 자격증명을 가린 형태로 계획/요약/json 모두에 명시한다.
     let destination = crate::cli::output::redact_uri(request.target_uri.expose());
     if request.dry_run {
         print_plan(&outcome.plan, mode.emits_json(), &destination, lang);
     } else if mode.emits_json() {
-        println!("{}", build_restore_summary_json(&outcome, &destination));
+        let mut summary = build_restore_summary_json(&outcome, &destination);
+        attach_row_check(&mut summary, &row_check);
+        println!("{summary}");
     } else if mode.shows_human_summary() {
         const W: usize = 15;
         println!(
@@ -215,9 +235,170 @@ pub async fn handle(
         if let Some(only) = &outcome.plan.ns_include {
             println!("{}", field_line_toned("target ns", only, W, Tone::Value));
         }
+        print_row_check(&row_check, W, lang);
     }
 
-    Ok(())
+    row_check.into_result()
+}
+
+/// 복구 직후 행 수 확인의 결과.
+#[derive(Debug)]
+enum RowCheck {
+    /// 확인하지 않았다(드라이런, `--no-verify-rows`, 행 수가 기록되지 않은 백업 등).
+    Skipped,
+    Done(CompareReport),
+    /// 확인 자체가 실패했다(접속·조회 오류). 복구는 끝난 상태다.
+    Failed(String),
+}
+
+impl RowCheck {
+    /// 어긋남이나 확인 실패는 경고(exit 4)로 마감한다. 복구는 이미 끝났다.
+    fn into_result(self) -> Result<()> {
+        match self {
+            Self::Skipped => Ok(()),
+            Self::Done(report) if report.is_match() => Ok(()),
+            Self::Done(report) => Err(XBackupError::VerifyWarning(crate::tr!(
+                "the restore finished but row counts differ from the backup in {} entries",
+                "복구는 끝났지만 백업과 행 수가 다른 항목이 {}개 있습니다",
+                report.mismatched().count()
+            ))),
+            Self::Failed(reason) => Err(XBackupError::VerifyWarning(crate::tr!(
+                "the restore finished but the row count check failed: {reason}",
+                "복구는 끝났지만 행 수 확인에 실패했습니다: {reason}"
+            ))),
+        }
+    }
+}
+
+/// 복구한 백업의 manifest에 기록된 행 수와 대상 DB의 행 수를 대조한다.
+///
+/// 대상에 원래 있던 다른 테이블은 복구가 지우지 않으므로 `EXTRA`는 보고하지 않는다. `--only`로
+/// 일부만 복구했으면 그 항목만 비교한다. 행 수가 없거나 지원하지 않는 백업이면 건너뛴다.
+async fn row_check_after_restore(
+    storage: &dyn Storage,
+    outcome: &RestoreOutcome,
+    target: &Secret,
+    announce: bool,
+    lang: Lang,
+) -> RowCheck {
+    let manifest = match ManifestStore::new(storage).read(&outcome.backup_id).await {
+        Ok(manifest) => manifest,
+        Err(e) => return RowCheck::Failed(e.to_string()),
+    };
+    let Some(mut counts) = manifest.table_rows.clone() else {
+        return RowCheck::Skipped;
+    };
+    let engine =
+        CompareEngine::from_archive_format(manifest.tool_versions.archive_format.as_deref());
+    let Some(engine) = engine.filter(|e| {
+        matches!(manifest.backup_type, BackupType::Full)
+            && e.matches_target(crate::engine::DbKind::from_uri(target.expose()))
+    }) else {
+        return RowCheck::Skipped;
+    };
+    if let Some(only) = &outcome.plan.ns_include {
+        counts.retain(|name, _| name == only);
+    }
+    if counts.is_empty() {
+        return RowCheck::Skipped;
+    }
+
+    if announce {
+        eprintln!(
+            "{}",
+            style_stderr(
+                lang.sel("checking row counts…", "행 수 확인 중…"),
+                Tone::Muted
+            )
+        );
+    }
+    match compare_with_target(engine, target, counts, &[], false, false).await {
+        Ok(report) => RowCheck::Done(report),
+        Err(e) => RowCheck::Failed(e.to_string()),
+    }
+}
+
+/// 복구 요약에 행 수 확인 결과를 덧붙인다(사람용).
+fn print_row_check(check: &RowCheck, width: usize, lang: Lang) {
+    match check {
+        RowCheck::Skipped => {}
+        RowCheck::Done(report) => {
+            let total = report.tables.len();
+            let rows: u64 = report.tables.iter().filter_map(|t| t.backup_rows).sum();
+            let differing = report.mismatched().count();
+            if differing == 0 {
+                println!(
+                    "{}",
+                    field_line_toned(
+                        "row check",
+                        lang.sel(
+                            &format!("{total} entries match ({rows} rows)"),
+                            &format!("{total}개 항목 일치 ({rows}행)"),
+                        ),
+                        width,
+                        Tone::Success,
+                    )
+                );
+            } else {
+                println!(
+                    "{}",
+                    field_line_toned(
+                        "row check",
+                        lang.sel(
+                            &format!("{differing} of {total} entries differ"),
+                            &format!("{total}개 중 {differing}개 항목 불일치"),
+                        ),
+                        width,
+                        Tone::Danger,
+                    )
+                );
+                for t in report.mismatched() {
+                    let show = |rows: Option<u64>| rows.map_or("-".to_string(), |n| n.to_string());
+                    println!(
+                        "    {} {}: backup {} / target {}",
+                        status_token(t.status.label(), Tone::Danger),
+                        t.table,
+                        show(t.backup_rows),
+                        show(t.target_rows)
+                    );
+                }
+            }
+        }
+        RowCheck::Failed(reason) => {
+            println!(
+                "{}",
+                field_line_toned(
+                    "row check",
+                    lang.sel("not completed (see warning)", "완료하지 못함(경고 참고)"),
+                    width,
+                    Tone::Warning,
+                )
+            );
+            tracing::debug!(%reason, "복구 후 행 수 확인 실패");
+        }
+    }
+}
+
+/// 복구 요약 JSON에 `row_check`를 더한다. 확인하지 않았으면 키를 넣지 않는다.
+fn attach_row_check(summary: &mut serde_json::Value, check: &RowCheck) {
+    match check {
+        RowCheck::Skipped => {}
+        RowCheck::Done(report) => {
+            summary["row_check"] = serde_json::json!({
+                "match": report.is_match(),
+                "compared": report.tables.len(),
+                "mismatched": report.mismatched().map(|t| serde_json::json!({
+                    "table": t.table,
+                    "backup_rows": t.backup_rows,
+                    "target_rows": t.target_rows,
+                    "status": t.status.label().to_ascii_lowercase(),
+                })).collect::<Vec<_>>(),
+            });
+        }
+        RowCheck::Failed(reason) => {
+            summary["row_check"] = serde_json::json!({ "error": reason });
+        }
+    }
 }
 
 /// `--to-dir` 경로 — 백업을 **서버 없이** 로컬 mongodump 덤프 디렉터리로 추출한다.
@@ -1579,6 +1760,55 @@ mod tests {
             );
             assert_eq!(v["destination"], DEST, "{what}의 복구 대상 표기 누락");
         }
+    }
+
+    fn report(differs: bool) -> CompareReport {
+        let backup = std::collections::BTreeMap::from([("t".to_string(), 3u64)]);
+        let target =
+            std::collections::BTreeMap::from([("t".to_string(), if differs { 2u64 } else { 3 })]);
+        crate::engine::compare::compare_counts(&backup, &target, &Default::default())
+    }
+
+    /// 어긋남이나 확인 실패는 경고(exit 4)로 마감하고, 일치하거나 건너뛰면 성공이다.
+    #[test]
+    fn row_check_maps_to_warning_exit_only_when_something_is_off() {
+        assert!(RowCheck::Skipped.into_result().is_ok());
+        assert!(RowCheck::Done(report(false)).into_result().is_ok());
+
+        let mismatch = RowCheck::Done(report(true)).into_result().unwrap_err();
+        assert_eq!(mismatch.exit_code(), 4, "{mismatch}");
+        let failed = RowCheck::Failed("boom".into()).into_result().unwrap_err();
+        assert_eq!(failed.exit_code(), 4, "{failed}");
+        assert!(failed.to_string().contains("boom"));
+    }
+
+    /// 확인하지 않았으면 `row_check` 키를 넣지 않고, 했으면 일치 여부와 어긋난 항목만 담는다.
+    #[test]
+    fn row_check_json_key_is_absent_when_skipped_and_lists_only_mismatches() {
+        let base = serde_json::json!({ "restored": true });
+
+        let mut skipped = base.clone();
+        attach_row_check(&mut skipped, &RowCheck::Skipped);
+        assert!(skipped.get("row_check").is_none());
+
+        let mut matched = base.clone();
+        attach_row_check(&mut matched, &RowCheck::Done(report(false)));
+        assert_eq!(matched["row_check"]["match"], true);
+        assert_eq!(matched["row_check"]["compared"], 1);
+        assert_eq!(matched["row_check"]["mismatched"], serde_json::json!([]));
+
+        let mut differing = base.clone();
+        attach_row_check(&mut differing, &RowCheck::Done(report(true)));
+        assert_eq!(differing["row_check"]["match"], false);
+        assert_eq!(differing["row_check"]["mismatched"][0]["table"], "t");
+        assert_eq!(
+            differing["row_check"]["mismatched"][0]["status"],
+            "mismatch"
+        );
+
+        let mut failed = base;
+        attach_row_check(&mut failed, &RowCheck::Failed("x".into()));
+        assert_eq!(failed["row_check"]["error"], "x");
     }
 
     /// 계획과 요약은 `dry_run`/`restored`로 갈린다 — 소비자가 둘을 헷갈리면 안 된다.

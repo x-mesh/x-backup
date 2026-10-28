@@ -18,6 +18,18 @@ pub enum TableStatus {
     ExtraInTarget,
 }
 
+impl TableStatus {
+    /// 출력용 토큰(항상 영문).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Match => "MATCH",
+            Self::Mismatch => "MISMATCH",
+            Self::MissingInTarget => "MISSING",
+            Self::ExtraInTarget => "EXTRA",
+        }
+    }
+}
+
 /// 테이블 하나의 백업·대상 행 수와 판정.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableCompare {
@@ -213,6 +225,58 @@ impl LiveTarget {
             }
         }
     }
+}
+
+/// 백업의 항목별 행 수를 대상 DB와 비교한다. 대상은 항목마다 순차로 센다.
+///
+/// - `only`가 비어 있지 않으면 그 항목만 비교하고, 백업과 대상 어디에도 없는 이름은 사용법 오류다.
+/// - `report_extra`가 거짓이면 대상에만 있는 항목(`EXTRA`)은 보고하지 않는다(복구는 백업에 없는
+///   기존 테이블을 지우지 않으므로, 복구 직후 확인에서는 잡음이다).
+pub async fn compare_with_target(
+    engine: CompareEngine,
+    target: &crate::config::secret::Secret,
+    mut backup_counts: BTreeMap<String, u64>,
+    only: &[String],
+    estimate: bool,
+    report_extra: bool,
+) -> crate::error::Result<CompareReport> {
+    let mut live_target = LiveTarget::connect(engine, target, estimate).await?;
+    let live = live_target.names().await?;
+    backup_counts.retain(|name, _| !live.ignore_in_backup.contains(name));
+
+    if !only.is_empty() {
+        let unknown: Vec<&str> = only
+            .iter()
+            .filter(|t| !backup_counts.contains_key(*t) && !live.names.contains(*t))
+            .map(String::as_str)
+            .collect();
+        if !unknown.is_empty() {
+            return Err(crate::error::XBackupError::Usage(crate::tr!(
+                "--tables names entries that exist neither in the backup nor in the target: {}",
+                "--tables에 백업과 대상 어디에도 없는 항목이 있습니다: {}",
+                unknown.join(", ")
+            )));
+        }
+        backup_counts.retain(|table, _| only.contains(table));
+    }
+
+    let mut target_counts = BTreeMap::new();
+    for table in backup_counts.keys().filter(|t| live.names.contains(*t)) {
+        let rows = live_target.count(table).await?;
+        target_counts.insert(table.clone(), rows);
+    }
+    let extra: BTreeSet<String> = if report_extra {
+        live.names
+            .iter()
+            .filter(|t| !backup_counts.contains_key(*t) && (only.is_empty() || only.contains(t)))
+            .cloned()
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+    let mut report = compare_counts(&backup_counts, &target_counts, &extra);
+    report.estimated = estimate;
+    Ok(report)
 }
 
 #[cfg(test)]
