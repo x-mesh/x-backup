@@ -334,19 +334,20 @@ pub struct VerifyArgs {
     /// 체인 검증 — base+증분 체인 연속성(gap 없음) 확인(PITR 전제).
     #[arg(long)]
     pub chain: bool,
-    /// 백업과 MariaDB/MySQL DB의 테이블별 행 수를 비교한다(프로파일 이름 또는 DB URI).
-    /// 풀 백업만 지원하며, 아카이브 전체를 읽고 대상 DB에 테이블당 `COUNT(*)`를 순차 실행한다.
+    /// 백업과 DB의 테이블(컬렉션)별 행 수를 비교한다(프로파일 이름 또는 DB URI).
+    /// MariaDB/MySQL·PostgreSQL·MongoDB(native) 풀 백업을 지원하며, 대상 DB 종류가 백업과 같아야 한다.
+    /// 대상에 항목마다 `COUNT(*)`(MongoDB는 `countDocuments`)를 순차 실행한다.
     /// 운영 DB가 아니라 복구된 DB나 복제본을 가리키는 것을 권장한다.
     #[arg(long, value_name = "PROFILE|URI")]
     pub against: Option<String>,
-    /// `--against`로 비교할 테이블 이름(쉼표 구분). 미지정 시 백업의 모든 테이블.
-    #[arg(
-        long,
-        value_name = "TABLE",
-        value_delimiter = ',',
-        requires = "against"
-    )]
+    /// `--against`로 비교할 항목 이름(쉼표 구분). 미지정 시 백업의 모든 항목.
+    /// 이름 형식은 MySQL `table`, PostgreSQL `schema.table`, MongoDB `db.collection`이다.
+    #[arg(long, value_name = "NAME", value_delimiter = ',', requires = "against")]
     pub tables: Vec<String>,
+    /// MongoDB 대상의 문서 수를 `estimatedDocumentCount`(즉시, 샤드·비정상 종료 뒤에는 부정확할 수
+    /// 있음)로 센다. 기본은 정확한 `countDocuments`(컬렉션을 훑는다). 다른 DB 대상에는 쓸 수 없다.
+    #[arg(long, requires = "against")]
+    pub estimate: bool,
     /// 결과를 기계 판독 JSON으로 출력한다.
     #[arg(long)]
     pub json: bool,
