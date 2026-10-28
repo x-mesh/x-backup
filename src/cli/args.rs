@@ -230,6 +230,15 @@ pub struct BackupArgs {
     /// 압축을 끄면 덤프가 CPU에 묶여 다이제스트 계산이 시간에 그대로 더해질 수 있다.
     #[arg(long)]
     pub no_content_digest: bool,
+    /// 직전 풀 백업보다 행이 이 비율(%) 이상 줄었거나 테이블(컬렉션)이 사라졌으면 경고(exit 4)한다.
+    /// 0이면 경고를 끈다(변화 줄은 그대로 표시). 행이 10개 미만이던 테이블의 감소는 무시한다.
+    #[arg(
+        long,
+        value_name = "PERCENT",
+        default_value_t = crate::pipeline::rows_delta::DEFAULT_DROP_WARN_PERCENT,
+        value_parser = clap::value_parser!(u32).range(0..=100)
+    )]
+    pub warn_drop_percent: u32,
 }
 
 /// `restore` — PRD §9 restore 플래그 전체.
