@@ -257,7 +257,7 @@ where
 /// [`DuplexStream`]: tokio::io::DuplexStream
 async fn native_transfer(request: &MigrateRequest, plan: &MigratePlan) -> Result<()> {
     let dumper = NativeDumper::connect(&request.source_uri, request.timeout_secs).await?;
-    let mut stream = dumper.dump_stream(request.db.clone(), request.collection.clone());
+    let mut stream = dumper.dump_stream(request.db.clone(), request.collection.clone(), None);
     let handle = stream.handle();
 
     // target 드라이버 클라이언트(복구 경로와 동일 정책).
@@ -429,7 +429,7 @@ where
 
     // 전송: PgDumper(source) → restore_into(target). EOF 후 양측 결과 회수.
     let dumper = PgDumper::connect(&request.source_uri, request.timeout_secs).await?;
-    let mut stream = dumper.dump_stream(request.db.clone(), request.collection.clone());
+    let mut stream = dumper.dump_stream(request.db.clone(), request.collection.clone(), None);
     let handle = stream.handle();
     let tgt = pg_meta::connect(&request.target_uri, request.timeout_secs)
         .await
