@@ -397,4 +397,5 @@ async fn verify_chain_json_keys_are_stable() {
         v["chain"].get("schema").is_none(),
         "중첩 객체는 독립 문서가 아니므로 버전을 갖지 않는다"
     );
+    assert!(v["compare"].is_null(), "--against 없으면 compare는 null");
 }
