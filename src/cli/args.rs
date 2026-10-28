@@ -334,6 +334,19 @@ pub struct VerifyArgs {
     /// 체인 검증 — base+증분 체인 연속성(gap 없음) 확인(PITR 전제).
     #[arg(long)]
     pub chain: bool,
+    /// 백업과 MariaDB/MySQL DB의 테이블별 행 수를 비교한다(프로파일 이름 또는 DB URI).
+    /// 풀 백업만 지원하며, 아카이브 전체를 읽고 대상 DB에 테이블당 `COUNT(*)`를 순차 실행한다.
+    /// 운영 DB가 아니라 복구된 DB나 복제본을 가리키는 것을 권장한다.
+    #[arg(long, value_name = "PROFILE|URI")]
+    pub against: Option<String>,
+    /// `--against`로 비교할 테이블 이름(쉼표 구분). 미지정 시 백업의 모든 테이블.
+    #[arg(
+        long,
+        value_name = "TABLE",
+        value_delimiter = ',',
+        requires = "against"
+    )]
+    pub tables: Vec<String>,
     /// 결과를 기계 판독 JSON으로 출력한다.
     #[arg(long)]
     pub json: bool,
