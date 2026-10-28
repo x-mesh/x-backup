@@ -28,10 +28,10 @@ use tokio::task::JoinHandle;
 
 use super::archive::{self, HeaderFrame, TableFrame};
 use super::conn::MysqlClient;
-use super::digest::RowDigest;
 use super::util::{quote_ident, quote_qualified, strip_definer};
 use super::value::{render_value, ColCategory};
 use crate::config::secret::Secret;
+use crate::engine::digest::RowDigest;
 use crate::engine::progress::RowProgress;
 use crate::error::{Result, XBackupError};
 use crate::manifest::schema::MysqlBinlogCoords;

@@ -11,6 +11,7 @@
 //! 덤프/복구/status에만 얇은 seam을 둔다(작동하는 Mongo 코드의 전면 재작성 회피).
 
 pub mod compare;
+pub mod digest;
 pub mod file;
 pub mod mongo;
 pub mod mysql;

@@ -16,7 +16,11 @@ use tokio::io::AsyncRead;
 
 use super::archive::{self, Frame};
 use crate::config::secret::Secret;
+use crate::engine::digest::RowDigest;
 use crate::error::{Result, XBackupError};
+
+/// manifest `table_digests.algorithm`에 기록하는 식별자. 해시 입력은 문서의 raw BSON 바이트다.
+pub const DIGEST_ALGORITHM: &str = "sha256-sum128-bson-v1";
 
 /// `backup.rs`와 같은 시스템 DB 목록(백업이 덤프하지 않는 DB).
 const SYSTEM_DBS: [&str; 3] = ["admin", "config", "local"];
@@ -141,6 +145,32 @@ pub async fn count_live_docs(client: &Client, ns: &str, estimate: bool) -> Resul
             "{ns} 문서 수 조회 실패: {e}"
         ))
     })
+}
+
+/// 컬렉션 하나의 문서를 전부 읽어 내용 다이제스트를 구한다. 백업과 같은 raw BSON 바이트를 해시한다.
+pub async fn scan_live_digest(client: &Client, ns: &str) -> Result<String> {
+    let (db_name, coll_name) = ns.split_once('.').ok_or_else(|| {
+        XBackupError::Failure(crate::tr!("malformed ns: '{ns}'", "ns 형식 오류: '{ns}'"))
+    })?;
+    let coll = client
+        .database(db_name)
+        .collection::<bson::RawDocumentBuf>(coll_name);
+    let mut cursor = coll.find(doc! {}).await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "{ns}: failed to query documents: {e}",
+            "{ns} 문서 조회 실패: {e}"
+        ))
+    })?;
+    let mut digest = RowDigest::default();
+    while cursor.advance().await.map_err(|e| {
+        XBackupError::Failure(crate::tr!(
+            "{ns}: cursor advance failed: {e}",
+            "{ns} 커서 진행 실패: {e}"
+        ))
+    })? {
+        digest.add(cursor.current().as_bytes());
+    }
+    Ok(digest.finish())
 }
 
 #[cfg(test)]
