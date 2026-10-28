@@ -27,6 +27,7 @@ use tokio_postgres::Client;
 use super::archive;
 use super::conn::PgClient;
 use crate::config::secret::Secret;
+use crate::engine::progress::RowProgress;
 use crate::error::{Result, XBackupError};
 
 /// cursor→스트림 경계 버퍼(바이트). 백프레셔용.
@@ -67,6 +68,7 @@ impl PgDumper {
         self,
         schema_filter: Option<String>,
         table_filter: Option<String>,
+        progress: Option<Arc<RowProgress>>,
     ) -> PgDumpStream {
         let (mut writer, reader) = tokio::io::duplex(PIPE_BUFFER_BYTES);
         let outcome: Arc<Mutex<Option<Result<()>>>> = Arc::new(Mutex::new(None));
@@ -82,6 +84,7 @@ impl PgDumper {
                 schema_filter,
                 table_filter,
                 &rows_task,
+                progress.as_deref(),
             )
             .await;
             let _ = writer.shutdown().await;
@@ -128,6 +131,7 @@ async fn write_archive(
     schema_filter: Option<String>,
     table_filter: Option<String>,
     rows_cell: &Arc<Mutex<BTreeMap<String, u64>>>,
+    progress: Option<&RowProgress>,
 ) -> Result<()> {
     client
         .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
@@ -138,8 +142,15 @@ async fn write_archive(
                 "스냅샷 트랜잭션 시작 실패: {e}"
             ))
         })?;
-    let res =
-        write_archive_in_snapshot(client, writer, schema_filter, table_filter, rows_cell).await;
+    let res = write_archive_in_snapshot(
+        client,
+        writer,
+        schema_filter,
+        table_filter,
+        rows_cell,
+        progress,
+    )
+    .await;
     // 읽기 전용이라 부작용은 없지만, 성공은 COMMIT·실패는 ROLLBACK으로 명시적으로 닫는다.
     let _ = client
         .batch_execute(if res.is_ok() { "COMMIT" } else { "ROLLBACK" })
@@ -154,6 +165,7 @@ async fn write_archive_in_snapshot(
     schema_filter: Option<String>,
     table_filter: Option<String>,
     rows_cell: &Arc<Mutex<BTreeMap<String, u64>>>,
+    progress: Option<&RowProgress>,
 ) -> Result<()> {
     let version: String = client
         .query_one("SHOW server_version", &[])
@@ -178,8 +190,14 @@ async fn write_archive_in_snapshot(
 
     // 테이블 목록.
     let tables = list_tables(client, schema_filter.as_deref(), table_filter.as_deref()).await?;
+    if let Some(p) = progress {
+        p.set_total(tables.len());
+    }
     for t in &tables {
         let def = introspect_table(client, t).await?;
+        if let Some(p) = progress {
+            p.start_table(&def.ns);
+        }
         archive::write_table(
             writer,
             &archive::TableFrame {
@@ -217,11 +235,18 @@ async fn write_archive_in_snapshot(
                     def.ns
                 ))
             })? {
-                rows += copy_text_rows(&chunk);
+                let chunk_rows = copy_text_rows(&chunk);
+                rows += chunk_rows;
+                if let Some(p) = progress {
+                    p.add_rows(chunk_rows);
+                }
                 archive::write_data_bytes(writer, &chunk).await?;
             }
         }
         archive::write_table_end(writer).await?;
+        if let Some(p) = progress {
+            p.finish_table();
+        }
         // 파티션 부모는 행을 자식에 두므로 기록하지 않는다(합계에 0짜리 부모가 끼지 않게).
         if def.has_data {
             rows_cell

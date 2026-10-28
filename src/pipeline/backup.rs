@@ -307,6 +307,18 @@ pub async fn run_full_backup_with_meta(
     stages: StageStack,
     meta: BackupMeta,
 ) -> Result<BackupOutcome> {
+    run_full_backup_with_rows(request, storage, stages, meta, None).await
+}
+
+/// [`run_full_backup_with_meta`]에 컬렉션·문서 진행 상태([`RowProgress`](crate::engine::progress::RowProgress))를
+/// 더한 변형 — native 엔진의 덤프 task가 이 값을 갱신하고 CLI가 폴링해 보여 준다.
+pub async fn run_full_backup_with_rows(
+    request: &BackupRequest,
+    storage: &dyn Storage,
+    stages: StageStack,
+    meta: BackupMeta,
+    row_progress: Option<Arc<crate::engine::progress::RowProgress>>,
+) -> Result<BackupOutcome> {
     // 1) 드라이버로 서버 메타 + dump 전 oplog ts 조회.
     let mongo = MongoMeta::connect(&request.uri, request.timeout_secs).await?;
     let server_meta = mongo.server_meta().await?;
@@ -360,7 +372,8 @@ pub async fn run_full_backup_with_meta(
             let dumper =
                 crate::engine::native::NativeDumper::connect(&request.uri, request.timeout_secs)
                     .await?;
-            let nds = dumper.dump_stream(request.db.clone(), request.collection.clone());
+            let nds =
+                dumper.dump_stream(request.db.clone(), request.collection.clone(), row_progress);
             let handle = nds.handle();
             (Box::pin(nds), DumpFinalizer::Native(Some(handle)))
         }
@@ -392,6 +405,7 @@ pub async fn run_full_backup_with_meta(
 
     // 5) manifest 작성·기록. 압축/암호화 메타는 meta에서, archive_format(엔진)도 기록한다 —
     //    복구가 이 값을 보고 native/레거시 중 맞는 소비자를 고른다.
+    let table_rows = stored.dump_output.clone();
     let manifest = build_manifest(
         &stored.backup_id,
         &server_meta,
@@ -423,7 +437,7 @@ pub async fn run_full_backup_with_meta(
         compression: meta.compression.clone(),
         encryption: meta.encryption.clone(),
         oplog_range,
-        table_rows: None,
+        table_rows,
     })
 }
 
@@ -646,6 +660,38 @@ pub async fn run_pg_full_backup(
     profile_name: &str,
     enable_incremental: bool,
 ) -> Result<BackupOutcome> {
+    run_pg_full_backup_with_rows(
+        uri,
+        timeout_secs,
+        db,
+        collection,
+        storage,
+        stages,
+        meta,
+        progress_counter,
+        None,
+        profile_name,
+        enable_incremental,
+    )
+    .await
+}
+
+/// [`run_pg_full_backup`]에 테이블·행 진행 상태([`RowProgress`](crate::engine::progress::RowProgress))를
+/// 더한 변형 — 덤프 task가 이 값을 갱신하고 CLI가 폴링해 보여 준다.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_pg_full_backup_with_rows(
+    uri: &crate::config::secret::Secret,
+    timeout_secs: Option<u64>,
+    db: Option<String>,
+    collection: Option<String>,
+    storage: &dyn Storage,
+    stages: StageStack,
+    meta: BackupMeta,
+    progress_counter: Option<Arc<AtomicU64>>,
+    row_progress: Option<Arc<crate::engine::progress::RowProgress>>,
+    profile_name: &str,
+    enable_incremental: bool,
+) -> Result<BackupOutcome> {
     use crate::engine::postgres::{
         archive as pg_archive, backup::PgDumper, conn::PgClient, incremental,
     };
@@ -677,7 +723,7 @@ pub async fn run_pg_full_backup(
         .await
         .map(|v| format!("postgresql {v}"))
         .unwrap_or_else(|| "postgresql".to_string());
-    let dump = dumper.dump_stream(db, collection);
+    let dump = dumper.dump_stream(db, collection, row_progress);
     let dump_handle = dump.handle();
 
     // 공통 코어: 합성 → 저장 → 종료 판정 → 확정(Mongo 경로와 동일 골격).
@@ -712,7 +758,7 @@ pub async fn run_pg_full_backup(
         oplog_count: None,
         promoted_from_gap: false,
         mysql_binlog: None,
-        table_rows: Some(stored.dump_output),
+        table_rows: Some(stored.dump_output.clone()),
         status: BackupStatus::Complete,
     };
     write_manifest_or_cleanup(storage, &manifest).await?;
@@ -727,7 +773,7 @@ pub async fn run_pg_full_backup(
         compression: meta.compression.clone(),
         encryption: meta.encryption.clone(),
         oplog_range: None,
-        table_rows: None,
+        table_rows: Some(stored.dump_output),
     })
 }
 
@@ -761,7 +807,7 @@ pub async fn run_mysql_full_backup(
     .await
 }
 
-/// [`run_mysql_full_backup`]에 행·테이블 진행 상태([`RowProgress`](crate::engine::mysql::backup::RowProgress))를
+/// [`run_mysql_full_backup`]에 행·테이블 진행 상태([`RowProgress`](crate::engine::progress::RowProgress))를
 /// 더한 변형 — 덤프 task가 이 값을 갱신하고 CLI가 폴링해 보여 준다.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_mysql_full_backup_with_rows(
@@ -772,7 +818,7 @@ pub async fn run_mysql_full_backup_with_rows(
     stages: StageStack,
     meta: BackupMeta,
     progress_counter: Option<Arc<AtomicU64>>,
-    row_progress: Option<Arc<crate::engine::mysql::backup::RowProgress>>,
+    row_progress: Option<Arc<crate::engine::progress::RowProgress>>,
     promoted_from_gap: bool,
 ) -> Result<BackupOutcome> {
     use crate::engine::mysql::{archive as my_archive, backup::MysqlDumper};

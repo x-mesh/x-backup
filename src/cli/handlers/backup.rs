@@ -25,7 +25,7 @@ use crate::error::{Result, XBackupError};
 use crate::hooks::{HookContext, HookEvent, HookSet};
 use crate::i18n::Lang;
 use crate::manifest::schema::{CompressionMeta, EncryptionMeta, OplogRange, Topology};
-use crate::pipeline::backup::{run_full_backup_with_meta, BackupMeta, BackupRequest, Engine};
+use crate::pipeline::backup::{run_full_backup_with_rows, BackupMeta, BackupRequest, Engine};
 use crate::pipeline::incremental::{
     run_incremental_backup, IncrementalOutcome, IncrementalRequest,
 };
@@ -329,6 +329,9 @@ pub async fn handle(
         //    진행 표시(R16): 공유 카운터를 만들어 BackupRequest에 주입하고, 백업은 dump 총량을
         //    사전에 모르므로 부정형(spinner)로 처리 바이트·속도를 stderr에 표시한다(PRD §FR-9).
         let progress_counter = new_counter();
+        // 행·컬렉션 진행은 native 엔진만 알려 준다(mongodump는 아카이브를 해석하지 않는다).
+        let row_progress = matches!(engine, Engine::Native)
+            .then(crate::engine::progress::RowProgress::new);
         let request = BackupRequest {
             uri,
             mongodump_program: "mongodump".to_string(),
@@ -340,14 +343,26 @@ pub async fn handle(
         };
         let (stages, meta) = build_stages(&resolved, &args)?;
 
-        let reporter = ProgressReporter::start(
+        let reporter = ProgressReporter::start_with_detail(
             mode,
             ProgressKind::Indeterminate {
                 label: lang.sel("backup", "백업").into(),
             },
             progress_counter,
+            row_progress.as_ref().map(|progress| {
+                row_progress_detail(Arc::clone(progress), RowUnit::Collections, lang)
+            }),
         );
-        let result = run_full_backup_with_meta(&request, primary.as_ref(), stages, meta).await;
+        let started = Instant::now();
+        let result = run_full_backup_with_rows(
+            &request,
+            primary.as_ref(),
+            stages,
+            meta,
+            row_progress,
+        )
+        .await;
+        let elapsed = started.elapsed();
         reporter.finish().await;
         let outcome = result?;
 
@@ -369,6 +384,9 @@ pub async fn handle(
                 checksum_sha256: Some(&outcome.checksum_sha256),
                 topology: Some(format!("{:?}", outcome.topology)),
                 destinations: Some(dests.len()),
+                rows_total: outcome.table_rows.as_ref().map(|rows| rows.values().sum()),
+                table_rows: outcome.table_rows.as_ref(),
+                elapsed_secs: Some(elapsed.as_secs_f64()),
                 ..Default::default()
             }
             .emit();
@@ -396,6 +414,15 @@ pub async fn handle(
                 },
                 lang,
             );
+            if let Some(rows) = outcome.table_rows.as_ref() {
+                print_rows_summary(
+                    rows,
+                    RowUnit::Collections,
+                    elapsed,
+                    &outcome.backup_id,
+                    lang,
+                );
+            }
         }
 
         // 보조 복제 실패가 있으면 경고로 마감(exit 4) — primary 백업은 이미 성공.
@@ -579,9 +606,33 @@ fn summarize_rows(rows: &BTreeMap<String, u64>) -> RowsSummary {
     }
 }
 
-/// MySQL 풀 백업의 진행 줄에 붙일 상세(지금 덤프 중인 테이블·테이블 n/N·누적 행 수).
+/// 행을 세는 단위 — 표시 문구만 다르다(MySQL·PostgreSQL은 테이블, MongoDB는 컬렉션).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowUnit {
+    Tables,
+    Collections,
+}
+
+impl RowUnit {
+    fn en(self) -> &'static str {
+        match self {
+            Self::Tables => "tables",
+            Self::Collections => "collections",
+        }
+    }
+
+    fn ko(self) -> &'static str {
+        match self {
+            Self::Tables => "테이블",
+            Self::Collections => "컬렉션",
+        }
+    }
+}
+
+/// 백업 진행 줄에 붙일 상세(지금 덤프 중인 단위·단위 n/N·누적 행 수).
 fn row_progress_detail(
-    progress: Arc<crate::engine::mysql::backup::RowProgress>,
+    progress: Arc<crate::engine::progress::RowProgress>,
+    unit: RowUnit,
     lang: Lang,
 ) -> DetailFn {
     Arc::new(move || {
@@ -602,16 +653,18 @@ fn row_progress_detail(
         let text = lang
             .sel(
                 &format!(
-                    "{} · {}/{} tables · {rows} rows",
+                    "{} · {}/{} {} · {rows} rows",
                     printable(&snap.current),
                     snap.tables_done,
-                    snap.tables_total
+                    snap.tables_total,
+                    unit.en()
                 ),
                 &format!(
-                    "{} · {}/{} 테이블 · {rows}행",
+                    "{} · {}/{} {} · {rows}행",
                     printable(&snap.current),
                     snap.tables_done,
-                    snap.tables_total
+                    snap.tables_total,
+                    unit.ko()
                 ),
             )
             .to_string();
@@ -626,9 +679,10 @@ fn printable(name: &str) -> String {
         .collect()
 }
 
-/// 완료 요약 뒤에 행 수·소요 시간·다음 단계를 이어 출력한다(MySQL 풀 백업).
+/// 완료 요약 뒤에 행 수·소요 시간·다음 단계를 이어 출력한다(풀 백업).
 fn print_rows_summary(
     rows: &BTreeMap<String, u64>,
+    unit: RowUnit,
     elapsed: Duration,
     backup_id: &str,
     lang: Lang,
@@ -639,7 +693,7 @@ fn print_rows_summary(
     let empty = if sum.empty > 0 {
         lang.sel(
             &format!(" ({} empty)", sum.empty),
-            &format!(" (빈 테이블 {})", sum.empty),
+            &format!(" (빈 {} {})", unit.ko(), sum.empty),
         )
         .to_string()
     } else {
@@ -647,8 +701,8 @@ fn print_rows_summary(
     };
     let rows_text = lang
         .sel(
-            &format!("{total} rows · {} tables{empty}", sum.tables),
-            &format!("{total}행 · {}개 테이블{empty}", sum.tables),
+            &format!("{total} rows · {} {}{empty}", sum.tables, unit.en()),
+            &format!("{total}행 · {}개 {}{empty}", sum.tables, unit.ko()),
         )
         .to_string();
     println!("{}", field_line_toned("rows", rows_text, W, Tone::Value));
@@ -1102,14 +1156,21 @@ async fn handle_pg_backup(
 
     let (stages, meta) = build_stages(resolved, args)?;
     let progress_counter = new_counter();
-    let reporter = ProgressReporter::start(
+    let row_progress = crate::engine::progress::RowProgress::new();
+    let reporter = ProgressReporter::start_with_detail(
         mode,
         ProgressKind::Indeterminate {
             label: lang.sel("PG backup", "PG 백업").into(),
         },
         std::sync::Arc::clone(&progress_counter),
+        Some(row_progress_detail(
+            Arc::clone(&row_progress),
+            RowUnit::Tables,
+            lang,
+        )),
     );
-    let result = crate::pipeline::backup::run_pg_full_backup(
+    let started = Instant::now();
+    let result = crate::pipeline::backup::run_pg_full_backup_with_rows(
         &uri,
         timeout_secs,
         args.db.clone(),
@@ -1118,10 +1179,12 @@ async fn handle_pg_backup(
         stages,
         meta,
         Some(progress_counter),
+        Some(row_progress),
         &resolved.profile_name,
         enable_incremental,
     )
     .await;
+    let elapsed = started.elapsed();
     reporter.finish().await;
     let outcome = result?;
 
@@ -1140,6 +1203,9 @@ async fn handle_pg_backup(
             checksum_sha256: Some(&outcome.checksum_sha256),
             database: Some("postgresql"),
             destinations: Some(dest_count),
+            rows_total: outcome.table_rows.as_ref().map(|rows| rows.values().sum()),
+            table_rows: outcome.table_rows.as_ref(),
+            elapsed_secs: Some(elapsed.as_secs_f64()),
             ..Default::default()
         }
         .emit();
@@ -1163,6 +1229,9 @@ async fn handle_pg_backup(
             },
             lang,
         );
+        if let Some(rows) = outcome.table_rows.as_ref() {
+            print_rows_summary(rows, RowUnit::Tables, elapsed, &outcome.backup_id, lang);
+        }
     }
 
     if let Some(w) = replicate_warning {
@@ -1231,14 +1300,18 @@ async fn handle_mysql_backup(
 
     let (stages, meta) = build_stages(resolved, args)?;
     let progress_counter = new_counter();
-    let row_progress = crate::engine::mysql::backup::RowProgress::new();
+    let row_progress = crate::engine::progress::RowProgress::new();
     let reporter = ProgressReporter::start_with_detail(
         mode,
         ProgressKind::Indeterminate {
             label: lang.sel("MySQL backup", "MySQL 백업").into(),
         },
         std::sync::Arc::clone(&progress_counter),
-        Some(row_progress_detail(Arc::clone(&row_progress), lang)),
+        Some(row_progress_detail(
+            Arc::clone(&row_progress),
+            RowUnit::Tables,
+            lang,
+        )),
     );
     let started = Instant::now();
     let result = crate::pipeline::backup::run_mysql_full_backup_with_rows(
@@ -1299,7 +1372,7 @@ async fn handle_mysql_backup(
             lang,
         );
         if let Some(rows) = outcome.table_rows.as_ref() {
-            print_rows_summary(rows, elapsed, &outcome.backup_id, lang);
+            print_rows_summary(rows, RowUnit::Tables, elapsed, &outcome.backup_id, lang);
         }
     }
 
@@ -2000,6 +2073,29 @@ mod tests {
     use crate::cli::args::BackupArgs;
     use crate::config::file::Profile;
     use crate::config::merged::ResolvedConfig;
+
+    #[test]
+    fn progress_detail_uses_the_unit_label_and_counts_for_each_engine() {
+        let progress = crate::engine::progress::RowProgress::new();
+        // 사전 조회 전(총량 0)에는 보여 줄 텍스트가 없고 JSON 필드만 0으로 나간다.
+        let detail = row_progress_detail(Arc::clone(&progress), RowUnit::Collections, Lang::Ko);
+        assert_eq!(detail().text, "");
+        assert_eq!(
+            detail().fields,
+            vec![("rows", 0), ("tables_done", 0), ("tables_total", 0)]
+        );
+
+        progress.set_total(3);
+        progress.start_table("shop.orders");
+        progress.add_rows(1_500);
+        assert_eq!(detail().text, "shop.orders · 0/3 컬렉션 · 1,500행");
+        let en = row_progress_detail(Arc::clone(&progress), RowUnit::Tables, Lang::En);
+        assert_eq!(en().text, "shop.orders · 0/3 tables · 1,500 rows");
+        assert_eq!(
+            detail().fields,
+            vec![("rows", 1_500), ("tables_done", 0), ("tables_total", 3)]
+        );
+    }
 
     #[test]
     fn group_digits_inserts_commas_every_three_digits() {
