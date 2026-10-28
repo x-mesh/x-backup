@@ -21,6 +21,7 @@ pub mod archive;
 pub mod backup;
 pub mod compare;
 pub mod conn;
+pub mod digest;
 pub mod incremental;
 pub mod meta;
 pub mod restore;

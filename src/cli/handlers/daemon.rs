@@ -180,6 +180,7 @@ async fn run_job(config_path: &std::path::Path, lang_flag: Option<Lang>, job: &J
             skip_precheck: false,
             no_hooks: false,
             read_source: None,
+            no_content_digest: false,
         },
     )
     .await;

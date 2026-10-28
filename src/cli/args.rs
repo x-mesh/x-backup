@@ -225,6 +225,11 @@ pub struct BackupArgs {
     /// PRD-05). primary 부하 분리용. 미지정 시 config read_uri → 주 소스 순으로 폴백.
     #[arg(long, value_name = "URI")]
     pub read_source: Option<String>,
+    /// 테이블별 내용 다이제스트를 manifest에 기록하지 않는다. 기본(MySQL 풀 백업)은 기록하며
+    /// 나중에 `verify --against --content`가 복구된 DB의 값이 같은지 대조하는 기준이 된다.
+    /// 압축을 끄면 덤프가 CPU에 묶여 다이제스트 계산이 시간에 그대로 더해질 수 있다.
+    #[arg(long)]
+    pub no_content_digest: bool,
 }
 
 /// `restore` — PRD §9 restore 플래그 전체.
@@ -352,6 +357,10 @@ pub struct VerifyArgs {
     /// 있음)로 센다. 기본은 정확한 `countDocuments`(컬렉션을 훑는다). 다른 DB 대상에는 쓸 수 없다.
     #[arg(long, requires = "against")]
     pub estimate: bool,
+    /// 행 수가 같은 테이블은 대상 DB를 전부 읽어 내용 다이제스트까지 대조한다(`CONTENT`). 백업이
+    /// 다이제스트를 기록한 MariaDB/MySQL 풀 백업만 가능하다. `COUNT(*)`보다 훨씬 오래 걸린다.
+    #[arg(long, requires = "against")]
+    pub content: bool,
     /// 결과를 기계 판독 JSON으로 출력한다.
     #[arg(long)]
     pub json: bool,

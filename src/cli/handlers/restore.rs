@@ -312,7 +312,7 @@ async fn row_check_after_restore(
             )
         );
     }
-    match compare_with_target(engine, target, counts, &[], false, false).await {
+    match compare_with_target(engine, target, counts, &[], false, false, None).await {
         Ok(report) => RowCheck::Done(report),
         Err(e) => RowCheck::Failed(e.to_string()),
     }

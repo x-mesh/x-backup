@@ -484,6 +484,7 @@ fn build_manifest(
         promoted_from_gap: false,
         mysql_binlog: None,
         table_rows,
+        table_digests: None,
         status: BackupStatus::Complete,
     }
 }
@@ -759,6 +760,7 @@ pub async fn run_pg_full_backup_with_rows(
         promoted_from_gap: false,
         mysql_binlog: None,
         table_rows: Some(stored.dump_output.clone()),
+        table_digests: None,
         status: BackupStatus::Complete,
     };
     write_manifest_or_cleanup(storage, &manifest).await?;
@@ -802,6 +804,7 @@ pub async fn run_mysql_full_backup(
         meta,
         progress_counter,
         None,
+        true,
         promoted_from_gap,
     )
     .await
@@ -819,6 +822,7 @@ pub async fn run_mysql_full_backup_with_rows(
     meta: BackupMeta,
     progress_counter: Option<Arc<AtomicU64>>,
     row_progress: Option<Arc<crate::engine::progress::RowProgress>>,
+    content_digest: bool,
     promoted_from_gap: bool,
 ) -> Result<BackupOutcome> {
     use crate::engine::mysql::{archive as my_archive, backup::MysqlDumper};
@@ -831,7 +835,7 @@ pub async fn run_mysql_full_backup_with_rows(
         .await
         .map(|v| format!("mysql {v}"))
         .unwrap_or_else(|| "mysql".to_string());
-    let dump = dumper.dump_stream(table_filter, row_progress);
+    let dump = dumper.dump_stream(table_filter, row_progress, content_digest);
     let dump_handle = dump.handle();
 
     // 공통 코어: 합성 → 저장 → 종료 판정 → 확정. dump_output이 스냅샷 binlog 좌표
@@ -846,6 +850,10 @@ pub async fn run_mysql_full_backup_with_rows(
     .await?;
     let mysql_binlog = stored.dump_output.binlog;
     let table_rows = Some(stored.dump_output.table_rows);
+    let table_digests = content_digest.then(|| crate::manifest::schema::ContentDigests {
+        algorithm: crate::engine::mysql::digest::ALGORITHM.to_string(),
+        tables: stored.dump_output.table_digests,
+    });
 
     let manifest = BackupManifest {
         format_version: FORMAT_VERSION,
@@ -870,6 +878,7 @@ pub async fn run_mysql_full_backup_with_rows(
         promoted_from_gap,
         mysql_binlog,
         table_rows: table_rows.clone(),
+        table_digests,
         status: BackupStatus::Complete,
     };
     write_manifest_or_cleanup(storage, &manifest).await?;
@@ -1065,6 +1074,7 @@ pub async fn run_file_incremental_backup(
         promoted_from_gap: false,
         mysql_binlog: None,
         table_rows: None,
+        table_digests: None,
         status: BackupStatus::Complete,
     };
     write_manifest_or_cleanup(storage, &manifest).await?;
@@ -1243,6 +1253,7 @@ async fn run_file_full_backup_inner(
         promoted_from_gap,
         mysql_binlog: None,
         table_rows: None,
+        table_digests: None,
         status: BackupStatus::Complete,
     };
     write_manifest_or_cleanup(storage, &manifest).await?;
@@ -1445,6 +1456,7 @@ fn mysql_incremental_manifest(
         promoted_from_gap: false,
         mysql_binlog: end_coords,
         table_rows: None,
+        table_digests: None,
         status: BackupStatus::Complete,
     }
 }
@@ -1651,6 +1663,7 @@ fn pg_incremental_manifest(
         promoted_from_gap: false,
         mysql_binlog: None,
         table_rows: None,
+        table_digests: None,
         status: BackupStatus::Complete,
     }
 }
@@ -1817,6 +1830,7 @@ mod tests {
             promoted_from_gap: false,
             mysql_binlog: None,
             table_rows: None,
+            table_digests: None,
             status: BackupStatus::Complete,
         };
         let write_err = store.write(&manifest).await.unwrap_err();

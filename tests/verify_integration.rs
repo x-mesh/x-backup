@@ -49,6 +49,7 @@ fn base_manifest(id: &str, checksum: &str, stored: u64) -> BackupManifest {
         promoted_from_gap: false,
         mysql_binlog: None,
         table_rows: None,
+        table_digests: None,
         status: BackupStatus::Complete,
     }
 }

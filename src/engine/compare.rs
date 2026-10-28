@@ -16,6 +16,8 @@ pub enum TableStatus {
     MissingInTarget,
     /// 대상 DB에만 있다(행 수는 세지 않는다).
     ExtraInTarget,
+    /// 행 수는 같지만 내용 다이제스트가 다르다(`--content`).
+    ContentMismatch,
 }
 
 impl TableStatus {
@@ -26,6 +28,7 @@ impl TableStatus {
             Self::Mismatch => "MISMATCH",
             Self::MissingInTarget => "MISSING",
             Self::ExtraInTarget => "EXTRA",
+            Self::ContentMismatch => "CONTENT",
         }
     }
 }
@@ -45,6 +48,8 @@ pub struct CompareReport {
     pub tables: Vec<TableCompare>,
     /// 대상 행 수가 추정치(`--estimate`)라 정확하지 않을 수 있는지.
     pub estimated: bool,
+    /// 행 수가 같은 항목의 내용 다이제스트까지 대조했는지(`--content`).
+    pub content_checked: bool,
 }
 
 impl CompareReport {
@@ -92,7 +97,36 @@ pub fn compare_counts(
     CompareReport {
         tables,
         estimated: false,
+        content_checked: false,
     }
+}
+
+/// 행 수가 같은(`Match`) 항목 중 내용 다이제스트가 다른 것을 `ContentMismatch`로 바꾼다(순수).
+///
+/// 어느 한쪽에 다이제스트가 없는 항목은 비교할 수 없어 그대로 둔다.
+pub fn apply_content_digests(
+    report: &mut CompareReport,
+    backup: &BTreeMap<String, String>,
+    target: &BTreeMap<String, String>,
+) {
+    for entry in &mut report.tables {
+        if entry.status != TableStatus::Match {
+            continue;
+        }
+        if let (Some(b), Some(t)) = (backup.get(&entry.table), target.get(&entry.table)) {
+            if b != t {
+                entry.status = TableStatus::ContentMismatch;
+            }
+        }
+    }
+    report.content_checked = true;
+}
+
+fn content_unsupported() -> crate::error::XBackupError {
+    crate::error::XBackupError::Usage(crate::tr!(
+        "--content supports only MariaDB/MySQL backups for now",
+        "--content는 아직 MariaDB/MySQL 백업만 지원합니다"
+    ))
 }
 
 /// 비교를 지원하는 백업 엔진(아카이브 포맷으로 구분한다).
@@ -204,6 +238,43 @@ impl LiveTarget {
         }
     }
 
+    /// 내용 다이제스트 스캔을 준비한다(백업과 같은 세션·일관 스냅샷). MariaDB/MySQL만 지원한다.
+    pub async fn prepare_content_scan(&mut self) -> crate::error::Result<()> {
+        match self {
+            Self::Mysql(client) => {
+                crate::engine::mysql::digest::prepare_scan_session(client.conn_mut()).await
+            }
+            _ => Err(content_unsupported()),
+        }
+    }
+
+    /// 항목 하나의 내용 다이제스트를 대상에서 읽어 구한다. MariaDB/MySQL만 지원한다.
+    pub async fn digest(&mut self, name: &str) -> crate::error::Result<String> {
+        match self {
+            Self::Mysql(client) => {
+                use mysql_async::prelude::Queryable;
+                let conn = client.conn_mut();
+                let database: Option<Option<String>> =
+                    conn.query_first("SELECT DATABASE()").await.map_err(|e| {
+                        crate::error::XBackupError::Failure(crate::tr!(
+                            "failed to read the target database: {e}",
+                            "대상 데이터베이스 조회 실패: {e}"
+                        ))
+                    })?;
+                let db = database.flatten().ok_or_else(|| {
+                    crate::error::XBackupError::Usage(crate::tr!(
+                        "the comparison target URI must name a database (mysql://.../<db>)",
+                        "비교 대상 URI에 데이터베이스가 필요합니다(mysql://.../<db>)"
+                    ))
+                })?;
+                let (_rows, digest) =
+                    crate::engine::mysql::digest::scan_table_digest(conn, &db, name).await?;
+                Ok(digest)
+            }
+            _ => Err(content_unsupported()),
+        }
+    }
+
     /// 항목 하나의 행(문서) 수를 센다.
     pub async fn count(&mut self, name: &str) -> crate::error::Result<u64> {
         match self {
@@ -239,7 +310,20 @@ pub async fn compare_with_target(
     only: &[String],
     estimate: bool,
     report_extra: bool,
+    content: Option<&crate::manifest::schema::ContentDigests>,
 ) -> crate::error::Result<CompareReport> {
+    // 계산 방식을 모르는 다이제스트는 해석하지 않는다 — 접속하기 전에 거부한다.
+    if let Some(digests) = content {
+        if digests.algorithm != crate::engine::mysql::digest::ALGORITHM {
+            return Err(crate::error::XBackupError::Usage(crate::tr!(
+                "unsupported content digest algorithm '{}' (this build understands '{}')",
+                "지원하지 않는 내용 다이제스트 알고리즘 '{}'입니다(이 빌드는 '{}'만 이해합니다)",
+                digests.algorithm,
+                crate::engine::mysql::digest::ALGORITHM
+            )));
+        }
+    }
+
     let mut live_target = LiveTarget::connect(engine, target, estimate).await?;
     let live = live_target.names().await?;
     backup_counts.retain(|name, _| !live.ignore_in_backup.contains(name));
@@ -276,6 +360,21 @@ pub async fn compare_with_target(
     };
     let mut report = compare_counts(&backup_counts, &target_counts, &extra);
     report.estimated = estimate;
+
+    // 내용 다이제스트 — 행 수가 이미 어긋난 항목은 읽지 않는다(전체 스캔이라 비싸다).
+    if let Some(digests) = content {
+        live_target.prepare_content_scan().await?;
+        let mut target_digests = BTreeMap::new();
+        for entry in report
+            .tables
+            .iter()
+            .filter(|t| t.status == TableStatus::Match)
+        {
+            let digest = live_target.digest(&entry.table).await?;
+            target_digests.insert(entry.table.clone(), digest);
+        }
+        apply_content_digests(&mut report, &digests.tables, &target_digests);
+    }
     Ok(report)
 }
 
@@ -345,5 +444,88 @@ mod tests {
         assert!(!CompareEngine::Mysql.matches_target(DbKind::Postgres));
         assert!(!CompareEngine::Postgres.matches_target(DbKind::Mongo));
         assert!(!CompareEngine::MongoNative.matches_target(DbKind::File));
+    }
+
+    fn digests(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn report_of(rows: &[(&str, u64, u64)]) -> CompareReport {
+        let backup: BTreeMap<String, u64> =
+            rows.iter().map(|(t, b, _)| (t.to_string(), *b)).collect();
+        let target: BTreeMap<String, u64> =
+            rows.iter().map(|(t, _, n)| (t.to_string(), *n)).collect();
+        compare_counts(&backup, &target, &BTreeSet::new())
+    }
+
+    #[test]
+    fn content_mismatch_is_flagged_only_for_tables_whose_counts_match() {
+        // a: 행 수 일치 + 다이제스트 다름 → CONTENT, b: 행 수 일치 + 같음 → MATCH, c: 행 수가 이미 다름 → 그대로
+        let mut report = report_of(&[("a", 3, 3), ("b", 2, 2), ("c", 5, 4)]);
+        apply_content_digests(
+            &mut report,
+            &digests(&[("a", "11"), ("b", "22"), ("c", "33")]),
+            &digests(&[("a", "99"), ("b", "22"), ("c", "99")]),
+        );
+        let status = |name: &str| {
+            report
+                .tables
+                .iter()
+                .find(|t| t.table == name)
+                .unwrap()
+                .status
+        };
+        assert_eq!(status("a"), TableStatus::ContentMismatch);
+        assert_eq!(status("b"), TableStatus::Match);
+        assert_eq!(
+            status("c"),
+            TableStatus::Mismatch,
+            "행 수 불일치는 내용 비교로 덮지 않는다"
+        );
+        assert!(report.content_checked);
+        assert!(!report.is_match());
+    }
+
+    #[test]
+    fn a_table_without_a_digest_on_either_side_is_left_alone() {
+        let mut report = report_of(&[("a", 1, 1), ("b", 1, 1)]);
+        apply_content_digests(
+            &mut report,
+            &digests(&[("a", "11")]),
+            &digests(&[("b", "22")]),
+        );
+        assert!(report.tables.iter().all(|t| t.status == TableStatus::Match));
+        assert!(report.content_checked, "비교를 시도했다는 표시는 남는다");
+    }
+
+    #[test]
+    fn content_status_has_its_own_label() {
+        assert_eq!(TableStatus::ContentMismatch.label(), "CONTENT");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_digest_algorithm_is_rejected_before_connecting() {
+        let digests = crate::manifest::schema::ContentDigests {
+            algorithm: "other-algo-v9".to_string(),
+            tables: BTreeMap::new(),
+        };
+        // 포트 1은 닫혀 있다 — 접속을 시도했다면 연결 오류(exit 1)가 났을 것이다.
+        let target = crate::config::secret::Secret::new("mysql://u:p@127.0.0.1:1/db".to_string());
+        let err = compare_with_target(
+            CompareEngine::Mysql,
+            &target,
+            BTreeMap::new(),
+            &[],
+            false,
+            true,
+            Some(&digests),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2, "{err}");
+        assert!(err.to_string().contains("other-algo-v9"), "{err}");
     }
 }

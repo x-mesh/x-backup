@@ -28,6 +28,7 @@ use tokio::task::JoinHandle;
 
 use super::archive::{self, HeaderFrame, TableFrame};
 use super::conn::MysqlClient;
+use super::digest::RowDigest;
 use super::util::{quote_ident, quote_qualified, strip_definer};
 use super::value::{render_value, ColCategory};
 use crate::config::secret::Secret;
@@ -65,11 +66,12 @@ impl MysqlDumper {
         self,
         table_filter: Option<String>,
         progress: Option<Arc<RowProgress>>,
+        content_digest: bool,
     ) -> MysqlDumpStream {
         let (mut writer, reader) = tokio::io::duplex(PIPE_BUFFER_BYTES);
         let outcome: Arc<Mutex<Option<Result<()>>>> = Arc::new(Mutex::new(None));
         let coords: Arc<Mutex<Option<MysqlBinlogCoords>>> = Arc::new(Mutex::new(None));
-        let rows: Arc<Mutex<BTreeMap<String, u64>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let rows: Arc<DumpStats> = Arc::new(DumpStats::new(content_digest));
         let outcome_task = Arc::clone(&outcome);
         let coords_task = Arc::clone(&coords);
         let rows_task = Arc::clone(&rows);
@@ -106,15 +108,11 @@ async fn write_archive(
     writer: &mut DuplexStream,
     table_filter: Option<String>,
     coords_cell: &Arc<Mutex<Option<MysqlBinlogCoords>>>,
-    rows_cell: &Arc<Mutex<BTreeMap<String, u64>>>,
+    rows_cell: &Arc<DumpStats>,
     progress: Option<&RowProgress>,
 ) -> Result<()> {
     // 세션 설정 — UTF-8 + UTC(TIMESTAMP 정합, mysqldump --tz-utc 등가).
-    for stmt in [
-        "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
-        "SET NAMES utf8mb4",
-        "SET SESSION time_zone = '+00:00'",
-    ] {
+    for stmt in SNAPSHOT_SESSION_SETUP {
         conn.query_drop(stmt).await.map_err(|e| {
             XBackupError::Failure(crate::tr!(
                 "failed to set the snapshot transaction ({stmt}): {e}",
@@ -164,7 +162,7 @@ async fn write_archive_in_snapshot(
     table_filter: Option<String>,
     coords: &MysqlBinlogCoords,
     coords_cell: &Arc<Mutex<Option<MysqlBinlogCoords>>>,
-    rows_cell: &Arc<Mutex<BTreeMap<String, u64>>>,
+    rows_cell: &Arc<DumpStats>,
     progress: Option<&RowProgress>,
 ) -> Result<()> {
     let db: String = conn
@@ -239,14 +237,12 @@ async fn write_archive_in_snapshot(
         if let Some(p) = progress {
             p.start_table(table);
         }
-        let rows = dump_table(conn, writer, &db, table, progress).await?;
+        let dumped =
+            dump_table(conn, writer, &db, table, progress, rows_cell.content_digest).await?;
         if let Some(p) = progress {
             p.finish_table();
         }
-        rows_cell
-            .lock()
-            .expect("mysql table rows poisoned")
-            .insert(table.clone(), rows);
+        rows_cell.record(table, dumped);
     }
 
     // 후행 DDL — 뷰·트리거·루틴·이벤트(데이터 적재 후). 의존성 순서는 복구가 재시도로 흡수.
@@ -270,7 +266,8 @@ async fn dump_table(
     db: &str,
     table: &str,
     progress: Option<&RowProgress>,
-) -> Result<u64> {
+    content_digest: bool,
+) -> Result<TableDump> {
     // 소스 질의는 db로 정규화(현재 USE db와 무관히 정확). 아카이브에는 **bare** 테이블명을 담아
     // 복구가 대상 연결의 현재 DB로 들어가게 한다(mysqldump와 동일 — 교차 DB 복구 가능).
     let quoted_src = quote_qualified(db, table);
@@ -295,34 +292,12 @@ async fn dump_table(
             ))
         })?;
 
-    // 컬럼 — generated 제외(GENERATION_EXPRESSION<>''), invisible 포함.
-    let col_rows: Vec<(String, String, String)> = conn
-        .exec(
-            "SELECT COLUMN_NAME, DATA_TYPE, COALESCE(GENERATION_EXPRESSION, '') \
-             FROM information_schema.COLUMNS \
-             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
-            (db, table),
-        )
-        .await
-        .map_err(|e| {
-            XBackupError::Failure(crate::tr!(
-                "{ns}: failed to query columns: {e}",
-                "{ns} 컬럼 조회 실패: {e}"
-            ))
-        })?;
-
-    let mut insert_cols: Vec<String> = Vec::new();
-    let mut render_plan: Vec<ColCategory> = Vec::new();
-    let mut select_exprs: Vec<String> = Vec::new();
-    for (name, data_type, gen_expr) in &col_rows {
-        if !gen_expr.is_empty() {
-            continue; // generated 컬럼 — INSERT 불가, SELECT 제외.
-        }
-        let q = quote_ident(name);
-        insert_cols.push(q.clone());
-        select_exprs.push(q);
-        render_plan.push(ColCategory::from_data_type(data_type));
-    }
+    // 컬럼 — generated 제외, invisible 포함. 검증 스캔과 같은 계획을 쓴다.
+    let TablePlan {
+        insert_cols,
+        render_plan,
+        select_exprs,
+    } = load_table_plan(conn, db, table).await?;
 
     archive::write_table(
         writer,
@@ -337,6 +312,7 @@ async fn dump_table(
 
     // 데이터 — 명시 컬럼 SELECT 스트림(text protocol). 컬럼이 모두 generated면 SELECT 생략.
     let mut rows = 0u64;
+    let mut digest = content_digest.then(RowDigest::default);
     if !select_exprs.is_empty() {
         let select = format!("SELECT {} FROM {quoted_src}", select_exprs.join(", "));
         let mut result = conn.query_iter(select).await.map_err(|e| {
@@ -360,6 +336,9 @@ async fn dump_table(
                     ))
                 })?;
                 let tuple = render_row(&row, &render_plan);
+                if let Some(d) = digest.as_mut() {
+                    d.add(tuple.as_bytes());
+                }
                 archive::write_row(writer, tuple.as_bytes()).await?;
                 rows += 1;
                 if let Some(p) = progress {
@@ -371,11 +350,14 @@ async fn dump_table(
 
     archive::write_table_end(writer).await?;
     tracing::debug!(ns = %ns, rows, "MySQL 백업: 테이블 직렬화 완료");
-    Ok(rows)
+    Ok(TableDump {
+        rows,
+        digest: digest.map(RowDigest::finish),
+    })
 }
 
 /// 한 행을 `(v1, v2, ...)` 튜플로 렌더링한다.
-fn render_row(row: &Row, plan: &[ColCategory]) -> String {
+pub(super) fn render_row(row: &Row, plan: &[ColCategory]) -> String {
     let mut tuple = String::with_capacity(plan.len() * 8 + 2);
     tuple.push('(');
     for (i, cat) in plan.iter().enumerate() {
@@ -609,12 +591,102 @@ async fn write_events(conn: &mut Conn, writer: &mut DuplexStream, db: &str) -> R
     Ok(())
 }
 
+/// 덤프 task가 백업하면서 모으는 테이블별 결과 — 행 수와(켜져 있으면) 내용 다이제스트.
+#[derive(Debug)]
+struct DumpStats {
+    rows: Mutex<BTreeMap<String, u64>>,
+    digests: Mutex<BTreeMap<String, String>>,
+    /// 테이블별 내용 다이제스트를 계산하는지.
+    content_digest: bool,
+}
+
+impl DumpStats {
+    fn new(content_digest: bool) -> Self {
+        Self {
+            rows: Mutex::new(BTreeMap::new()),
+            digests: Mutex::new(BTreeMap::new()),
+            content_digest,
+        }
+    }
+
+    fn record(&self, table: &str, dumped: TableDump) {
+        self.rows
+            .lock()
+            .expect("mysql table rows poisoned")
+            .insert(table.to_string(), dumped.rows);
+        if let Some(digest) = dumped.digest {
+            self.digests
+                .lock()
+                .expect("mysql table digests poisoned")
+                .insert(table.to_string(), digest);
+        }
+    }
+}
+
+/// 테이블 하나를 덤프한 결과.
+struct TableDump {
+    rows: u64,
+    digest: Option<String>,
+}
+
+/// 백업과 검증 스캔이 공유하는 스냅샷 세션 설정 — UTF-8 + UTC(TIMESTAMP 정합,
+/// mysqldump --tz-utc 등가), REPEATABLE READ. 렌더링이 세션에 의존하므로 같아야 한다.
+pub(super) const SNAPSHOT_SESSION_SETUP: [&str; 3] = [
+    "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+    "SET NAMES utf8mb4",
+    "SET SESSION time_zone = '+00:00'",
+];
+
+/// 테이블 하나의 컬럼 계획 — 백업과 검증 스캔이 같은 컬럼·순서·렌더링을 쓰게 한다.
+pub(super) struct TablePlan {
+    /// INSERT 컬럼 목록(generated 제외, invisible 포함, quote됨).
+    pub insert_cols: Vec<String>,
+    pub render_plan: Vec<ColCategory>,
+    pub select_exprs: Vec<String>,
+}
+
+/// `information_schema.COLUMNS`에서 컬럼 계획을 만든다. generated 컬럼은 제외한다.
+pub(super) async fn load_table_plan(conn: &mut Conn, db: &str, table: &str) -> Result<TablePlan> {
+    let ns = format!("{db}.{table}");
+    let col_rows: Vec<(String, String, String)> = conn
+        .exec(
+            "SELECT COLUMN_NAME, DATA_TYPE, COALESCE(GENERATION_EXPRESSION, '') \
+             FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+            (db, table),
+        )
+        .await
+        .map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "{ns}: failed to query columns: {e}",
+                "{ns} 컬럼 조회 실패: {e}"
+            ))
+        })?;
+
+    let mut plan = TablePlan {
+        insert_cols: Vec::new(),
+        render_plan: Vec::new(),
+        select_exprs: Vec::new(),
+    };
+    for (name, data_type, gen_expr) in &col_rows {
+        if !gen_expr.is_empty() {
+            continue; // generated 컬럼 — INSERT 불가, SELECT 제외.
+        }
+        let q = quote_ident(name);
+        plan.insert_cols.push(q.clone());
+        plan.select_exprs.push(q);
+        plan.render_plan
+            .push(ColCategory::from_data_type(data_type));
+    }
+    Ok(plan)
+}
+
 /// MySQL 백업 아카이브 바이트 스트림([`AsyncRead`]). 파이프라인에 그대로 흘린다.
 pub struct MysqlDumpStream {
     reader: DuplexStream,
     outcome: Arc<Mutex<Option<Result<()>>>>,
     coords: Arc<Mutex<Option<MysqlBinlogCoords>>>,
-    rows: Arc<Mutex<BTreeMap<String, u64>>>,
+    rows: Arc<DumpStats>,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -634,7 +706,7 @@ impl MysqlDumpStream {
 pub struct MysqlDumpHandle {
     outcome: Arc<Mutex<Option<Result<()>>>>,
     coords: Arc<Mutex<Option<MysqlBinlogCoords>>>,
-    rows: Arc<Mutex<BTreeMap<String, u64>>>,
+    rows: Arc<DumpStats>,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -644,6 +716,8 @@ pub struct MysqlDumpOutput {
     pub binlog: Option<MysqlBinlogCoords>,
     /// 스냅샷 안에서 아카이브에 쓴 테이블별 행 수.
     pub table_rows: BTreeMap<String, u64>,
+    /// 테이블별 내용 다이제스트(내용 다이제스트를 끈 백업은 비어 있다).
+    pub table_digests: BTreeMap<String, String>,
 }
 
 impl MysqlDumpHandle {
@@ -660,7 +734,16 @@ impl MysqlDumpHandle {
             .unwrap_or(Ok(()))?;
         Ok(MysqlDumpOutput {
             binlog: self.coords.lock().expect("mysql coords poisoned").take(),
-            table_rows: std::mem::take(&mut *self.rows.lock().expect("mysql table rows poisoned")),
+            table_rows: std::mem::take(
+                &mut *self.rows.rows.lock().expect("mysql table rows poisoned"),
+            ),
+            table_digests: std::mem::take(
+                &mut *self
+                    .rows
+                    .digests
+                    .lock()
+                    .expect("mysql table digests poisoned"),
+            ),
         })
     }
 }
