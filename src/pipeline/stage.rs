@@ -176,12 +176,11 @@ fn resolve_decrypt_key(algorithm: &str) -> Result<DecryptKeySource> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use tokio::io::AsyncReadExt;
 
-    /// 키 env(`XB_AGE_IDENTITY_FILE` 등)를 만지는 테스트를 직렬화한다 — process-wide
-    /// env는 병렬 테스트 간 공유 상태라 동시 set/remove가 서로 간섭할 수 있다.
-    static ENV_GUARD: Mutex<()> = Mutex::new(());
+    /// 키 env(`XB_AGE_IDENTITY_FILE` 등)를 만지는 테스트를 직렬화한다. 같은 env를 만지는
+    /// 다른 모듈(web::auth, verify)의 테스트와 잠금이 갈리면 서로 간섭하므로 하나를 공유한다.
+    use crate::web::auth::ENV_GUARD;
 
     fn reader_from(data: &[u8]) -> BoxAsyncRead {
         Box::pin(std::io::Cursor::new(data.to_vec()))
