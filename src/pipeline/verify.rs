@@ -319,6 +319,7 @@ mod tests {
             oplog_count: None,
             promoted_from_gap: false,
             mysql_binlog: None,
+            table_rows: None,
             status: BackupStatus::Complete,
         }
     }

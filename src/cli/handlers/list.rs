@@ -44,6 +44,8 @@ pub struct CatalogRow {
     pub created_at: Option<String>,
     /// 저장 크기(data.bin 바이트). orphan은 실제 data 크기.
     pub stored_size_bytes: u64,
+    /// 백업이 담은 전체 행 수(MySQL 풀 백업의 `table_rows` 합). 기록이 없으면 None.
+    pub total_rows: Option<u64>,
     /// 체인 상태(`ok`/`broken`/`incomplete`/`orphan`).
     pub chain_status: String,
     /// base 풀백업 ID(증분만; full/orphan은 None).
@@ -252,6 +254,7 @@ pub async fn build_catalog(storage: &dyn Storage) -> Result<Vec<CatalogRow>> {
             engine: engine_from_archive(m.tool_versions.archive_format.as_deref()).to_string(),
             created_at: Some(m.created_at.clone()),
             stored_size_bytes: m.stored_size_bytes,
+            total_rows: m.table_rows.as_ref().map(|rows| rows.values().sum()),
             chain_status,
             base_id: m.base_id.clone(),
             promoted_from_gap: m.promoted_from_gap,
@@ -273,6 +276,7 @@ pub async fn build_catalog(storage: &dyn Storage) -> Result<Vec<CatalogRow>> {
             engine: "-".to_string(), // manifest 파싱 불가 → 엔진 불명.
             created_at: None,
             stored_size_bytes: size,
+            total_rows: None,
             chain_status: "corrupt".to_string(),
             base_id: None,
             promoted_from_gap: false,
@@ -324,6 +328,7 @@ fn detect_orphans(entries: &[StorageEntry], known_ids: &[String]) -> Vec<Catalog
             engine: "-".to_string(), // manifest 없음 → 엔진 불명.
             created_at: e.last_modified.clone(),
             stored_size_bytes: e.size,
+            total_rows: None,
             chain_status: "orphan".to_string(),
             base_id: None,
             promoted_from_gap: false,
@@ -420,13 +425,16 @@ fn print_human(
         return;
     }
     let mut table = Table::new(
-        &["ID", "TYPE", "DB", "CREATED", "SIZE", "CHAIN", "BASE"],
-        // SIZE는 우측 정렬(숫자), 나머지는 좌측.
+        &[
+            "ID", "TYPE", "DB", "CREATED", "SIZE", "ROWS", "CHAIN", "BASE",
+        ],
+        // SIZE·ROWS는 우측 정렬(숫자), 나머지는 좌측.
         &[
             Align::Left,
             Align::Left,
             Align::Left,
             Align::Left,
+            Align::Right,
             Align::Right,
             Align::Left,
             Align::Left,
@@ -445,6 +453,7 @@ fn print_human(
             r.engine.clone(), // DB 엔진(postgresql/mongodb)
             short_created(r.created_at.as_deref()),
             human_bytes(r.stored_size_bytes as i64), // raw bytes → "1.9 MiB"
+            r.total_rows.map_or("-".to_string(), |n| n.to_string()),
             chain_label(&r.chain_status).to_string(),
             r.base_id.as_deref().unwrap_or("-").to_string(),
         ];
@@ -569,6 +578,7 @@ fn print_json(rows: &[CatalogRow], store_loc: &str) {
                 "engine": r.engine,
                 "created_at": r.created_at,
                 "stored_size_bytes": r.stored_size_bytes,
+                "total_rows": r.total_rows,
                 "chain_status": r.chain_status,
                 "base_id": r.base_id,
             })
@@ -617,6 +627,7 @@ mod tests {
             oplog_count: None,
             promoted_from_gap: false,
             mysql_binlog: None,
+            table_rows: None,
             status: BackupStatus::Complete,
         }
     }
@@ -639,6 +650,26 @@ mod tests {
         let row = rows.iter().find(|r| r.id == "g1").expect("행 존재");
         assert_eq!(row.kind, "full", "필터용 kind는 full 유지");
         assert!(row.promoted_from_gap, "gap 승격 표식");
+    }
+
+    /// `table_rows`가 있으면 합계를 `total_rows`로 보이고, 없으면 None이다.
+    #[tokio::test]
+    async fn catalog_sums_table_rows_into_total_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = LocalFs::new(dir.path()).unwrap();
+        let mut with_rows = manifest("with", BackupType::Full, None);
+        with_rows.table_rows = Some(std::collections::BTreeMap::from([
+            ("a".to_string(), 40u64),
+            ("b".to_string(), 2u64),
+        ]));
+        let without_rows = manifest("without", BackupType::Full, None);
+        write_manifest(&fs, &with_rows).await;
+        write_manifest(&fs, &without_rows).await;
+
+        let rows = build_catalog(&fs).await.unwrap();
+        let total = |id: &str| rows.iter().find(|r| r.id == id).unwrap().total_rows;
+        assert_eq!(total("with"), Some(42));
+        assert_eq!(total("without"), None);
     }
 
     /// 연속 체인은 모든 행이 ok.

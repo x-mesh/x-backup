@@ -316,6 +316,7 @@ async fn write_fake_base(storage: &LocalFs, id: &str, end_ts: Timestamp) {
         oplog_count: None,
         promoted_from_gap: false,
         mysql_binlog: None,
+        table_rows: None,
         status: BackupStatus::Complete,
     };
     // data.bin도 같이 둔다(승격 풀 백업과 ID가 겹치지 않게 별도 디렉터리).

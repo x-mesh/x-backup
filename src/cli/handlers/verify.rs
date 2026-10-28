@@ -129,18 +129,25 @@ async fn compare_backup(
         )));
     }
 
-    let stages = reverse_stack_for(&manifest)?;
-    let raw = storage
-        .get_stream(&data_path(backup_id))
-        .await
-        .map_err(|e| {
-            XBackupError::Failure(crate::tr!(
-                "failed to read data.bin ({backup_id}): {e}",
-                "data.bin 읽기 실패({backup_id}): {e}"
-            ))
-        })?;
-    let mut decoded = stages.apply(raw);
-    let mut backup_counts = count_archive_rows(&mut decoded).await?;
+    // 백업 시점에 기록된 행 수가 있으면 아카이브를 다시 읽지 않는다(개인키도 필요 없다).
+    // 이 필드가 생기기 전 백업은 아카이브를 끝까지 읽어 센다.
+    let mut backup_counts = match manifest.table_rows.clone() {
+        Some(rows) => rows,
+        None => {
+            let stages = reverse_stack_for(&manifest)?;
+            let raw = storage
+                .get_stream(&data_path(backup_id))
+                .await
+                .map_err(|e| {
+                    XBackupError::Failure(crate::tr!(
+                        "failed to read data.bin ({backup_id}): {e}",
+                        "data.bin 읽기 실패({backup_id}): {e}"
+                    ))
+                })?;
+            let mut decoded = stages.apply(raw);
+            count_archive_rows(&mut decoded).await?
+        }
+    };
 
     let mut client = MysqlClient::connect(target, None).await?;
     let live = live_table_names(client.conn_mut()).await?;
@@ -540,6 +547,7 @@ mod tests {
             oplog_count: None,
             promoted_from_gap: false,
             mysql_binlog: None,
+            table_rows: None,
             status: BackupStatus::Complete,
         }
     }

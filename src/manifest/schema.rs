@@ -219,6 +219,10 @@ pub struct BackupManifest {
     /// MySQL 풀 백업 스냅샷 시점의 binlog 좌표(증분 base). Mongo/PG는 항상 None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mysql_binlog: Option<MysqlBinlogCoords>,
+    /// MySQL 풀 백업이 아카이브에 쓴 테이블별 행 수(테이블 이름 → 행 수). 일관 스냅샷 안에서
+    /// 센 값이라 아카이브 내용과 정확히 같다. 이 필드가 생기기 전 백업, 증분, Mongo/PG는 None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_rows: Option<std::collections::BTreeMap<String, u64>>,
     /// 완료 상태.
     pub status: BackupStatus,
 }
@@ -259,6 +263,7 @@ mod tests {
             oplog_count: None,
             promoted_from_gap: false,
             mysql_binlog: None,
+            table_rows: None,
             status: BackupStatus::Complete,
         }
     }
@@ -280,6 +285,21 @@ mod tests {
         let json = serde_json::to_string(&m).unwrap();
         assert!(!json.contains("\"compression\""));
         assert!(!json.contains("\"encryption\""));
+    }
+
+    /// `table_rows`가 없으면 직렬화에서 생략하고(기존 백업과 같은 바이트), 있으면 왕복한다.
+    #[test]
+    fn table_rows_is_omitted_when_none_and_round_trips_when_set() {
+        let mut m = sample();
+        assert!(!serde_json::to_string(&m).unwrap().contains("table_rows"));
+
+        m.table_rows = Some(std::collections::BTreeMap::from([
+            ("orders".to_string(), 3u64),
+            ("users".to_string(), 0u64),
+        ]));
+        let back: BackupManifest =
+            serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.table_rows, m.table_rows);
     }
 
     /// OplogTimestamp는 (t, i) 사전순으로 비교된다.

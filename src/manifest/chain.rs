@@ -1068,6 +1068,7 @@ mod tests {
             oplog_count: Some(0),
             promoted_from_gap: false,
             mysql_binlog: None,
+            table_rows: None,
             status: BackupStatus::Complete,
         };
         let node = ChainNode::from_manifest(&m);
