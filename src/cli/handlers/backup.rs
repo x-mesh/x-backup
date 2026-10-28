@@ -603,16 +603,27 @@ fn row_progress_detail(
             .sel(
                 &format!(
                     "{} · {}/{} tables · {rows} rows",
-                    snap.current, snap.tables_done, snap.tables_total
+                    printable(&snap.current),
+                    snap.tables_done,
+                    snap.tables_total
                 ),
                 &format!(
                     "{} · {}/{} 테이블 · {rows}행",
-                    snap.current, snap.tables_done, snap.tables_total
+                    printable(&snap.current),
+                    snap.tables_done,
+                    snap.tables_total
                 ),
             )
             .to_string();
         ProgressDetail { text, fields }
     })
+}
+
+/// 테이블 이름은 DB가 정한 임의 문자열이라, 제어 문자가 터미널 이스케이프로 해석되지 않게 치환한다.
+fn printable(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 /// 완료 요약 뒤에 행 수·소요 시간·다음 단계를 이어 출력한다(MySQL 풀 백업).
@@ -645,7 +656,7 @@ fn print_rows_summary(
         let largest = sum
             .largest
             .iter()
-            .map(|(name, n)| format!("{name} {}", group_digits(*n)))
+            .map(|(name, n)| format!("{} {}", printable(name), group_digits(*n)))
             .collect::<Vec<_>>()
             .join(" · ");
         println!("{}", field_line_toned("largest", largest, W, Tone::Value));
@@ -1980,6 +1991,12 @@ fn build_stages(resolved: &ResolvedConfig, args: &BackupArgs) -> Result<(StageSt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn printable_replaces_control_characters_in_table_names() {
+        assert_eq!(printable("orders"), "orders");
+        assert_eq!(printable("a\x1b[2Jb\n"), "a?[2Jb?");
+    }
     use crate::cli::args::BackupArgs;
     use crate::config::file::Profile;
     use crate::config::merged::ResolvedConfig;
