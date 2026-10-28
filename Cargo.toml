@@ -104,9 +104,10 @@ tempfile = "3"
 # 충돌(E0119)한다. 직접 사용하지 않지만 transitive 해석을 0.3.43에 고정해 빌드를 보호한다.
 # (mongodb가 time 호환을 갱신하면 제거 가능.)
 time = "=0.3.43"
-# 압축(t6) — async-compression(tokio bufread zstd 어댑터). PipelineStage가
+# 압축(t6) — async-compression(tokio bufread zstd/gzip 어댑터). PipelineStage가
 # AsyncRead→AsyncRead 어댑터로 직접 합성한다(리서치 stack §3, compress→encrypt 고정).
-async-compression = { version = "0.4", features = ["tokio", "zstd"] }
+# gzip 백엔드는 이미 트리에 있는 flate2(pure Rust)다.
+async-compression = { version = "0.4", features = ["tokio", "zstd", "gzip"] }
 # 암호화 기본(t6) — age v0.11(X25519 공개키 격리, §8.1). async feature로
 # Encryptor::wrap_async_output / Decryptor::new_async를 tokio 파이프라인에 브리지한다.
 age = { version = "0.11", features = ["async"] }

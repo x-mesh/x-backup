@@ -19,7 +19,7 @@ they form. Recorded against a live replica set; [the tape is in the repo](docs/a
 - ✅ **Incremental backup** — captures the oplog directly; on a gap it promotes to a full backup automatically (exit 4)
 - ✅ **PITR** — restore to a moment with `--at <RFC3339>`: the base is restored, then increments replay up to that time (MongoDB oplog, PostgreSQL logical-decoding changes, or MySQL binlog), gated on chain verification. On PostgreSQL and MySQL, `--at latest` replays everything instead
 - ✅ **Storage** — local disk or S3-compatible (MinIO, R2, OCI), streaming multipart upload with abort cleanup
-- ✅ **Encrypted by default** — `age` (X25519; only the public key lives on the backup host) or AES-256-GCM, compressed with zstd before encryption
+- ✅ **Encrypted by default** — `age` (X25519; only the public key lives on the backup host) or AES-256-GCM, compressed with zstd (default) or gzip before encryption. Set `compress = "none"` or use `--no-compress` to skip compression
 - ✅ **Integrity** — manifest + sha256, with `verify` (structural check, no key needed), `--deep`, and `--chain`
 - ✅ **Operations** — `doctor` offline config check (all profiles, no DB connection), `status` preflight (connection, topology, privileges, version/FCV, clock skew, oplog window, data shape, **last backup age**, **destination writability + free space**), `--all` source-vs-target diff, `--watch` live monitor, chain-safe `prune`, concurrent-run locking, a defined exit-code contract (0–5)
 - ✅ **PostgreSQL** — driver-native full backup/restore via the COPY protocol (data + tables + constraints + indexes + sequences), no `pg_dump`/`pg_restore`. Same pipeline (compress → encrypt → store), same `status`/`list`/`verify`/`restore`
@@ -168,7 +168,7 @@ default_profile = "prod"
 language = "ko"                  # description/help language (en | ko); labels stay English
 
 [defaults]                       # applied to every profile (lowest precedence)
-compress = "zstd:10"             # algorithm[:level]
+compress = "zstd:10"             # algorithm[:level]: zstd (1-22) | gzip (1-9) | none
 encrypt  = "age:/etc/x-backup/age.pub"   # "age:<public-key-path>" | true | false | "off"
 
 [profile.prod]
@@ -254,7 +254,7 @@ The normalizer rewrites them into the v1 nested tree, so behaviour is identical.
 | `dest_name` | `destination.name` | |
 | `s3_bucket`, `s3_prefix`, `s3_region`, `s3_endpoint`, `s3_creds` | `destination.s3.{bucket,prefix,region,endpoint,credentials_env}` | `s3_creds` is an env var **name** |
 | `[[profile.x.dest]]` (array of tables) | `destinations[]` | multi-destination; see below |
-| `compress = "zstd:6"` | `features.compression.{algorithm,level}` | or `compress_algorithm` + `compress_level` |
+| `compress = "zstd:6"` \| `"gzip:6"` \| `"none"` | `features.compression.{algorithm,level}` | or `compress_algorithm` + `compress_level`; out-of-range levels are clamped |
 | `encrypt = "age:/path"` \| `true` \| `false` \| `"off"` | `features.encryption.{enabled,algorithm,recipient_file}` | or `encrypt_algorithm` + `recipient_file`; `recipient_file` is a public-key **path** |
 | `incr_interval`, `incr_on_gap`, `pg_logical`, `mysql_binlog` | `features.incremental.{interval,on_gap,pg_logical,mysql_binlog}` | |
 | `keep_full`, `keep_days`, `keep_last` | `retention.{keep_full,keep_days,keep_last}` | |

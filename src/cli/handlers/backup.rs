@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use crate::cli::args::{BackupArgs, BackupType};
 use crate::cli::output::{field_line, field_line_toned, style, OutputFlags, OutputMode, Tone};
 use crate::cli::progress::{new_counter, ProgressKind, ProgressReporter};
-use crate::compress::{ZstdCompressStage, ALGORITHM_ZSTD};
+use crate::compress::{compress_stage, ALGORITHM_NONE};
 use crate::config::env::collect_overrides_from_process;
 use crate::config::file::DestinationConfig;
 use crate::config::merged::MergeInput;
@@ -1750,7 +1750,7 @@ async fn run_precheck(
 /// 순서(PRD §8.4 고정): **compress → encrypt**. 즉 dump 바이트에 먼저 압축, 그 다음
 /// 암호화를 적용한다([`StageStack::push`]는 push 순서로 감싼다).
 ///
-/// - **압축**: config `features.compression`가 활성(현재 zstd 단일)이면 압축 단계 push.
+/// - **압축**: config `features.compression.algorithm`(zstd/gzip)에 맞는 압축 단계를 push한다. `none`이나 `--no-compress`면 생략.
 ///   레벨은 CLI `--compress-level` > config `level` 우선. manifest.compression 기록.
 /// - **암호화**: 기본 ON(PRD §FR-5 — 평문은 명시적 `--no-encrypt`만). `--no-encrypt`면
 ///   경고 로그 후 암호화 단계를 생략한다. config `features.encryption.algorithm`에 따라
@@ -1761,23 +1761,21 @@ fn build_stages(resolved: &ResolvedConfig, args: &BackupArgs) -> Result<(StageSt
     let mut meta = BackupMeta::none();
 
     // ── 압축(compress 먼저) ──
-    // 현재 지원 알고리즘은 zstd 단일이다(config 기본값도 zstd). 레벨은 CLI 우선.
+    // 레벨은 CLI 우선. `none`이면 manifest에 압축 메타를 남기지 않아 복구가 해제를 건너뛴다.
     let comp = &features.compression;
-    if comp.algorithm == ALGORITHM_ZSTD {
-        let level = args.compress_level.unwrap_or(comp.level);
-        let stage = ZstdCompressStage::new(level);
+    let algorithm = if args.no_compress {
+        ALGORITHM_NONE
+    } else {
+        comp.algorithm.as_str()
+    };
+    let level = args.compress_level.unwrap_or(comp.level);
+    if let Some((stage, applied_level)) = compress_stage(algorithm, level)? {
         // manifest에는 실제 적용된(클램프 후) 레벨을 기록한다.
         meta.compression = Some(CompressionMeta {
-            algorithm: ALGORITHM_ZSTD.to_string(),
-            level: stage.level(),
+            algorithm: algorithm.to_string(),
+            level: applied_level,
         });
-        stack.push(Box::new(stage));
-    } else {
-        return Err(XBackupError::Config(crate::tr!(
-            "unknown compression algorithm: '{}' (only zstd is supported)",
-            "알 수 없는 압축 알고리즘: '{}'(zstd만 지원)",
-            comp.algorithm
-        )));
+        stack.push(stage);
     }
 
     // ── 암호화(encrypt 나중) ──
@@ -1955,6 +1953,7 @@ mod tests {
             collection: None,
             no_encrypt: false,
             compress_level: None,
+            no_compress: false,
             quiet: false,
             progress: false,
             json: false,
@@ -2025,6 +2024,46 @@ mod tests {
         args.no_encrypt = true;
         let (_stack, meta) = build_stages(&resolved_with(profile), &args).unwrap();
         assert_eq!(meta.compression.unwrap().level, 7);
+    }
+
+    #[test]
+    fn gzip_algorithm_is_recorded_with_its_clamped_level() {
+        let mut profile = Profile::default();
+        profile.features.compression.algorithm = "gzip".into();
+        profile.features.compression.level = 10;
+        let mut args = default_args();
+        args.no_encrypt = true;
+        let (_stack, meta) = build_stages(&resolved_with(profile), &args).unwrap();
+        let comp = meta.compression.unwrap();
+        assert_eq!((comp.algorithm.as_str(), comp.level), ("gzip", 9));
+    }
+
+    #[test]
+    fn none_or_no_compress_leaves_no_compression_meta() {
+        let mut profile = Profile::default();
+        profile.features.compression.algorithm = "none".into();
+        let mut args = default_args();
+        args.no_encrypt = true;
+        let (_stack, meta) = build_stages(&resolved_with(profile), &args).unwrap();
+        assert!(meta.compression.is_none());
+
+        let mut args = default_args();
+        args.no_encrypt = true;
+        args.no_compress = true;
+        let (_stack, meta) = build_stages(&resolved_with(Profile::default()), &args).unwrap();
+        assert!(meta.compression.is_none());
+    }
+
+    #[test]
+    fn unknown_compression_algorithm_is_config_error() {
+        let mut profile = Profile::default();
+        profile.features.compression.algorithm = "lz4".into();
+        let mut args = default_args();
+        args.no_encrypt = true;
+        assert!(matches!(
+            build_stages(&resolved_with(profile), &args),
+            Err(XBackupError::Config(_))
+        ));
     }
 
     /// age 암호화인데 recipient_file이 없으면 Config 에러로 막는다.
