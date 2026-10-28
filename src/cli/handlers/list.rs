@@ -44,7 +44,7 @@ pub struct CatalogRow {
     pub created_at: Option<String>,
     /// 저장 크기(data.bin 바이트). orphan은 실제 data 크기.
     pub stored_size_bytes: u64,
-    /// 백업이 담은 전체 행 수(MySQL 풀 백업의 `table_rows` 합). 기록이 없으면 None.
+    /// 백업이 담은 전체 행 수(풀 백업 `table_rows`의 합). 기록이 없으면 None.
     pub total_rows: Option<u64>,
     /// 체인 상태(`ok`/`broken`/`incomplete`/`orphan`).
     pub chain_status: String,

@@ -4,6 +4,7 @@
 //! 커서를 구동해 [`DuplexStream`]에 아카이브 프레임을 쓰고, 호출자는 [`AsyncRead`]로 받아
 //! 그대로 파이프라인(압축→암호화→저장)에 흘린다. 전 구간 스트리밍(상수 메모리).
 
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -51,11 +52,13 @@ impl NativeDumper {
     pub fn dump_stream(&self, db: Option<String>, collection: Option<String>) -> NativeDumpStream {
         let (mut writer, reader) = tokio::io::duplex(PIPE_BUFFER_BYTES);
         let outcome: Arc<Mutex<Option<Result<()>>>> = Arc::new(Mutex::new(None));
+        let rows: Arc<Mutex<BTreeMap<String, u64>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let client = self.client.clone();
         let outcome_task = Arc::clone(&outcome);
+        let rows_task = Arc::clone(&rows);
 
         let handle = tokio::spawn(async move {
-            let res = write_archive(&client, &mut writer, db, collection).await;
+            let res = write_archive(&client, &mut writer, db, collection, &rows_task).await;
             // 쓰기 측을 닫아 EOF를 보낸다(에러 여부와 무관히).
             let _ = writer.shutdown().await;
             *outcome_task.lock().expect("native dump outcome poisoned") = Some(res);
@@ -64,6 +67,7 @@ impl NativeDumper {
         NativeDumpStream {
             reader,
             outcome,
+            rows,
             task: Arc::new(Mutex::new(Some(handle))),
         }
     }
@@ -75,6 +79,7 @@ async fn write_archive(
     writer: &mut DuplexStream,
     db_filter: Option<String>,
     coll_filter: Option<String>,
+    rows_cell: &Arc<Mutex<BTreeMap<String, u64>>>,
 ) -> Result<()> {
     archive::write_header(writer, &Utc::now().to_rfc3339()).await?;
 
@@ -137,6 +142,7 @@ async fn write_archive(
 
             // 문서를 raw로 스트리밍(재직렬화 없이 바이트 그대로).
             let raw_coll = db.collection::<RawDocumentBuf>(&coll_name);
+            let mut rows = 0u64;
             let mut cursor = raw_coll.find(doc! {}).await.map_err(|e| {
                 XBackupError::Failure(crate::tr!(
                     "{ns}: failed to query documents: {e}",
@@ -150,8 +156,13 @@ async fn write_archive(
                 ))
             })? {
                 archive::write_raw_document(writer, cursor.current()).await?;
+                rows += 1;
             }
-            tracing::debug!(ns = %ns, indexes = indexes.len(), "네이티브 백업: 컬렉션 직렬화 완료");
+            rows_cell
+                .lock()
+                .expect("native collection rows poisoned")
+                .insert(ns.clone(), rows);
+            tracing::debug!(ns = %ns, indexes = indexes.len(), rows, "네이티브 백업: 컬렉션 직렬화 완료");
         }
     }
 
@@ -198,6 +209,7 @@ async fn collect_indexes(db: &mongodb::Database, coll: &str) -> Result<Vec<Docum
 pub struct NativeDumpStream {
     reader: DuplexStream,
     outcome: Arc<Mutex<Option<Result<()>>>>,
+    rows: Arc<Mutex<BTreeMap<String, u64>>>,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -206,6 +218,7 @@ impl NativeDumpStream {
     pub fn handle(&self) -> NativeDumpHandle {
         NativeDumpHandle {
             outcome: Arc::clone(&self.outcome),
+            rows: Arc::clone(&self.rows),
             task: Arc::clone(&self.task),
         }
     }
@@ -214,12 +227,14 @@ impl NativeDumpStream {
 /// [`NativeDumpStream`]의 결과를 회수하는 핸들.
 pub struct NativeDumpHandle {
     outcome: Arc<Mutex<Option<Result<()>>>>,
+    rows: Arc<Mutex<BTreeMap<String, u64>>>,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl NativeDumpHandle {
-    /// 스트림 EOF 후 백업 task의 결과를 회수한다(드라이버/직렬화 오류 전파).
-    pub async fn finish(self) -> Result<()> {
+    /// 스트림 EOF 후 백업 task의 결과를 회수하고, 아카이브에 쓴 컬렉션별 문서 수
+    /// (`db.컬렉션` → 문서 수)를 반환한다(드라이버/직렬화 오류 전파).
+    pub async fn finish(self) -> Result<BTreeMap<String, u64>> {
         let task = self.task.lock().expect("native dump task poisoned").take();
         if let Some(task) = task {
             let _ = task.await;
@@ -228,7 +243,10 @@ impl NativeDumpHandle {
             .lock()
             .expect("native dump outcome poisoned")
             .take()
-            .unwrap_or(Ok(()))
+            .unwrap_or(Ok(()))?;
+        Ok(std::mem::take(
+            &mut *self.rows.lock().expect("native collection rows poisoned"),
+        ))
     }
 }
 

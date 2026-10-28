@@ -27,6 +27,7 @@ use x_backup::config::secret::Secret;
 use x_backup::engine::postgres::incremental::{
     self, capture, recreate_slot_and_publication, slot_health, SlotHealth,
 };
+use x_backup::manifest::ManifestStore;
 use x_backup::pipeline::backup::{run_pg_full_backup, BackupMeta};
 use x_backup::pipeline::restore::{run_restore, RestoreRequest};
 use x_backup::pipeline::stage::StageStack;
@@ -287,6 +288,14 @@ async fn full_backup_restore_round_trip_preserves_data() {
     )
     .await
     .expect("PG 풀 백업 성공");
+
+    // 스냅샷 안에서 COPY로 쓴 행 수가 manifest에 `스키마.테이블` 키로 남는다.
+    let manifest = ManifestStore::new(&storage)
+        .read(&full.backup_id)
+        .await
+        .expect("manifest 읽기");
+    let rows = manifest.table_rows.expect("PG 풀 백업은 table_rows를 기록");
+    assert_eq!(rows.get("public.rt_accounts"), Some(&3));
 
     // 빈 대상 DB로 복구 — 충돌 없으니 H5 가드를 통과한다(force 불필요).
     recreate_database(&src, "xb_rt_target").await;

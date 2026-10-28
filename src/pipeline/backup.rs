@@ -13,6 +13,7 @@
 //! manifest 나중"). 어느 단계든 실패하면 [`cleanup`]으로 부분 산출물(data.bin 등)을
 //! best-effort 삭제한다 — manifest가 가리키는 파일이 없는 유령 상태를 피한다.
 
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -171,16 +172,17 @@ struct MongodumpFinalizer {
 
 impl DumpFinalizer {
     /// 정상 경로 — 스트림 EOF 후 종료를 판정한다(mongodump exit code / native task 결과).
-    async fn finish(&mut self) -> Result<()> {
+    /// native는 컬렉션별 문서 수를 돌려주고, mongodump는 archive를 해석하지 않아 None이다.
+    async fn finish(&mut self) -> Result<Option<BTreeMap<String, u64>>> {
         match self {
             #[cfg(feature = "legacy-mongodump")]
             DumpFinalizer::Mongodump(m) => match m.proc.take() {
-                Some(p) => p.wait().await,
-                None => Ok(()),
+                Some(p) => p.wait().await.map(|()| None),
+                None => Ok(None),
             },
             DumpFinalizer::Native(handle) => match handle.take() {
-                Some(h) => h.finish().await,
-                None => Ok(()),
+                Some(h) => h.finish().await.map(Some),
+                None => Ok(None),
             },
         }
     }
@@ -401,6 +403,7 @@ pub async fn run_full_backup_with_meta(
         oplog_range,
         archive_format,
         &meta,
+        stored.dump_output,
     );
     write_manifest_or_cleanup(storage, &manifest).await?;
 
@@ -437,6 +440,7 @@ fn build_manifest(
     oplog_range: Option<OplogRange>,
     archive_format: &str,
     meta: &BackupMeta,
+    table_rows: Option<BTreeMap<String, u64>>,
 ) -> BackupManifest {
     BackupManifest {
         format_version: FORMAT_VERSION,
@@ -465,7 +469,7 @@ fn build_manifest(
         // 풀 백업은 gap 승격이 아니다(증분 핸들러가 풀로 승격할 때만 true로 덮어쓴다).
         promoted_from_gap: false,
         mysql_binlog: None,
-        table_rows: None,
+        table_rows,
         status: BackupStatus::Complete,
     }
 }
@@ -491,7 +495,8 @@ async fn cleanup(storage: &dyn Storage, backup_id: &str) {
 
 /// dump 스트림 종료 판정 훅 — 엔진 공통 저장 코어([`store_dump_stream`])가 성공/실패
 /// 경로에서 호출한다(Phase 1 슬라이스 B). `Output`은 dump 측이 종료 시 넘겨주는 엔진
-/// 메타다(MySQL=스냅샷 binlog 좌표, Mongo/PG=없음).
+/// 메타다(MySQL=스냅샷 binlog 좌표와 테이블별 행 수, PG=테이블별 행 수,
+/// Mongo=native만 컬렉션별 문서 수).
 trait DumpTermination {
     type Output;
     /// 정상 경로 — put_stream EOF 후 dump 종료를 판정하고 결과를 회수한다.
@@ -501,8 +506,8 @@ trait DumpTermination {
 }
 
 impl DumpTermination for DumpFinalizer {
-    type Output = ();
-    async fn finish(mut self) -> Result<()> {
+    type Output = Option<BTreeMap<String, u64>>;
+    async fn finish(mut self) -> Result<Self::Output> {
         DumpFinalizer::finish(&mut self).await
     }
     async fn abort(mut self) {
@@ -511,8 +516,8 @@ impl DumpTermination for DumpFinalizer {
 }
 
 impl DumpTermination for crate::engine::postgres::backup::PgDumpHandle {
-    type Output = ();
-    async fn finish(self) -> Result<()> {
+    type Output = BTreeMap<String, u64>;
+    async fn finish(self) -> Result<Self::Output> {
         crate::engine::postgres::backup::PgDumpHandle::finish(self).await
     }
     // COPY task는 리더 drop으로 끝난다 — 결과만 흡수(종전 put 실패 경로와 동일).
@@ -707,7 +712,7 @@ pub async fn run_pg_full_backup(
         oplog_count: None,
         promoted_from_gap: false,
         mysql_binlog: None,
-        table_rows: None,
+        table_rows: Some(stored.dump_output),
         status: BackupStatus::Complete,
     };
     write_manifest_or_cleanup(storage, &manifest).await?;
@@ -1874,6 +1879,7 @@ mod tests {
             None,
             "mongodump",
             &meta,
+            None,
         );
         assert!(m.selective, "선택적 백업 manifest.selective=true");
         assert_eq!(m.original_size_bytes, 1000);

@@ -444,14 +444,14 @@ where
     let dump_res = handle.finish().await;
     // 둘 다 실패면 양쪽을 함께 보고한다(덤프 오류가 근본 원인일 수 있음 — 리뷰 #14).
     let inserted = match (restore_res, dump_res) {
-        (Ok(n), Ok(())) => n,
+        (Ok(n), Ok(_)) => n,
         (Err(re), Err(de)) => {
             return Err(XBackupError::Failure(crate::tr!(
                 "restore failed: {re} (the dump also failed — possibly the cause: {de})",
                 "복구 실패: {re} (덤프도 실패 — 원인일 수 있음: {de})"
             )))
         }
-        (Err(re), Ok(())) => return Err(re),
+        (Err(re), Ok(_)) => return Err(re),
         (Ok(_), Err(de)) => return Err(de),
     };
     tracing::info!(inserted, "PG 마이그레이션 완료(파일 없음)");

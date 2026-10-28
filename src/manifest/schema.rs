@@ -219,8 +219,9 @@ pub struct BackupManifest {
     /// MySQL 풀 백업 스냅샷 시점의 binlog 좌표(증분 base). Mongo/PG는 항상 None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mysql_binlog: Option<MysqlBinlogCoords>,
-    /// MySQL 풀 백업이 아카이브에 쓴 테이블별 행 수(테이블 이름 → 행 수). 일관 스냅샷 안에서
-    /// 센 값이라 아카이브 내용과 정확히 같다. 이 필드가 생기기 전 백업, 증분, Mongo/PG는 None.
+    /// 풀 백업이 아카이브에 쓴 테이블별 행 수. 키는 MySQL이 테이블 이름, PG가 `스키마.테이블`,
+    /// Mongo native 엔진이 `db.컬렉션`이다. 아카이브에 쓰면서 센 값이라 아카이브 내용과 정확히
+    /// 같다. 이 필드가 생기기 전 백업, 증분, mongodump 엔진 백업은 None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table_rows: Option<std::collections::BTreeMap<String, u64>>,
     /// 완료 상태.
