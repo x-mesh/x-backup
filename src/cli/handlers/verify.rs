@@ -635,7 +635,11 @@ mod tests {
 
     /// --deep인데 암호화 백업이고 키 env가 없으면 exit 1로 거부하고 격리 안내한다.
     #[tokio::test]
+    // 키 env는 run의 await 도중에 읽히므로 끝날 때까지 잠근다. tokio::test는 단일 스레드
+    // 런타임이라 가드를 쥔 채 await해도 교착이 없다.
+    #[allow(clippy::await_holding_lock)]
     async fn run_deep_without_key_rejected_exit1() {
+        let _guard = crate::web::auth::ENV_GUARD.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let fs = LocalFs::new(dir.path()).unwrap();
         let ct = b"ciphertext";
@@ -660,8 +664,10 @@ mod tests {
         .unwrap_err();
         // §8.5: 키 부재 deep은 검증 실패(exit 1)로 보정.
         assert_eq!(err.exit_code(), 1, "키 부재 deep은 exit 1: {err}");
+        // 메시지 언어는 다른 테스트가 바꿀 수 있는 전역 상태라, 두 언어에 공통인 env 이름으로 확인한다.
         assert!(
-            err.to_string().contains("private key"),
+            err.to_string()
+                .contains(crate::pipeline::stage::ENV_AGE_IDENTITY_FILE),
             "missing key-isolation guidance: {err}"
         );
     }
