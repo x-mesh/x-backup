@@ -243,6 +243,107 @@ async fn c2_slot_health_missing_then_active_then_recreate() {
         .await;
 }
 
+/// 원본 DB의 세션 기본값(DateStyle, extra_float_digits)이 기본이 아니어도 백업이 값을 바꾸지 않는다.
+///
+/// 백업 세션이 이 설정을 고정하지 않으면 `SQL, DMY`에서 날짜가 `02/03/2026` 같은 모호한 텍스트로
+/// 나가 대상(ISO, MDY)에서 일과 월이 바뀌고, `extra_float_digits=0`에서는 float가 반올림된다.
+/// 두 손상 모두 행 수는 그대로라 행 수 비교로는 잡히지 않는다.
+#[tokio::test]
+#[ignore = "requires PostgreSQL wal_level=logical; run with --features pg-integration"]
+async fn full_backup_survives_non_default_source_session_settings() {
+    let src_uri = src_uri();
+    let src = connect(&src_uri).await;
+    let db: String = src
+        .query_one("SELECT current_database()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let _ = src
+        .batch_execute("DROP TABLE IF EXISTS public.sess_settings")
+        .await;
+    src.batch_execute(
+        "CREATE TABLE public.sess_settings (id int PRIMARY KEY, d date, ts timestamp, \
+         tstz timestamptz, f4 real, f8 double precision)",
+    )
+    .await
+    .unwrap();
+    // 일과 월이 모두 유효한 모호한 날짜 — DMY와 MDY로 읽으면 서로 다른 날짜가 된다.
+    src.batch_execute(
+        "INSERT INTO public.sess_settings VALUES \
+         (1,'2026-03-02','2026-03-02 10:00:00.5','2026-03-02 10:00:00+09',0.33333334,0.3333333333333333),\
+         (2,'2026-11-05','2026-11-05 23:59:59','2026-11-05 23:59:59-05',1.1,0.1)",
+    )
+    .await
+    .unwrap();
+
+    // 새 세션이 갖게 될 기본값을 바꾼다(이미 열린 `src` 연결에는 영향이 없다).
+    src.batch_execute(&format!(
+        "ALTER DATABASE {db} SET datestyle TO 'SQL, DMY'; \
+         ALTER DATABASE {db} SET extra_float_digits TO 0"
+    ))
+    .await
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = LocalFs::new(dir.path()).unwrap();
+    let backup = run_pg_full_backup(
+        &Secret::new(src_uri.clone()),
+        None,
+        None,
+        None,
+        &storage,
+        StageStack::new(),
+        BackupMeta::none(),
+        None,
+        "sess",
+        false,
+    )
+    .await;
+
+    // 단언이 실패해도 다른 테스트가 같은 DB를 쓰므로 설정은 먼저 되돌린다.
+    src.batch_execute(&format!(
+        "ALTER DATABASE {db} RESET datestyle; ALTER DATABASE {db} RESET extra_float_digits"
+    ))
+    .await
+    .unwrap();
+    let full = backup.expect("PG 풀 백업 성공");
+
+    recreate_database(&src, "xb_sess_target").await;
+    let tgt_uri = swap_db(&src_uri, "xb_sess_target");
+    let req = RestoreRequest {
+        target_uri: Secret::new(tgt_uri.clone()),
+        mongorestore_program: "mongorestore".to_string(), // PG 경로에선 미사용.
+        backup_id: Some(full.backup_id.clone()),
+        only: None,
+        force: false,
+        dry_run: false,
+        skip_precheck: false,
+        timeout_secs: None,
+        progress_counter: None,
+    };
+    run_restore(&req, &storage, false, |_| {
+        panic!("빈 대상이라 confirm 미호출")
+    })
+    .await
+    .expect("빈 대상 복구 성공");
+
+    // 두 쪽을 같은 세션 설정으로 읽어 텍스트로 비교한다.
+    let values_sql =
+        "SELECT string_agg(id||'|'||d||'|'||ts||'|'||tstz||'|'||f4||'|'||f8, E'\\n' ORDER BY id) \
+         FROM public.sess_settings";
+    let pin = "SET datestyle TO ISO; SET extra_float_digits TO 3; SET TimeZone TO 'UTC'";
+    let src_check = connect(&src_uri).await;
+    src_check.batch_execute(pin).await.unwrap();
+    let src_values: String = src_check.query_one(values_sql, &[]).await.unwrap().get(0);
+    let tgt_check = connect(&tgt_uri).await;
+    tgt_check.batch_execute(pin).await.unwrap();
+    let tgt_values: String = tgt_check.query_one(values_sql, &[]).await.unwrap().get(0);
+    assert_eq!(
+        tgt_values, src_values,
+        "원본 세션 기본값이 달라도 복구한 값이 원본과 같아야 한다"
+    );
+}
+
 /// 풀 백업(H1 REPEATABLE READ 스냅샷) → 빈 대상으로 복구(H5 가드 happy path) 후
 /// 행 수·콘텐츠가 일치한다. serial 시퀀스 충실도도 함께 통과한다.
 #[tokio::test]
