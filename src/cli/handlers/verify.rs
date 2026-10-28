@@ -142,6 +142,7 @@ async fn compare_backup(
     target: &Secret,
     only: &[String],
     estimate: bool,
+    content: bool,
 ) -> Result<CompareReport> {
     let manifest = ManifestStore::new(storage)
         .read(backup_id)
@@ -168,9 +169,27 @@ async fn compare_backup(
         )));
     }
 
+    // `--content`는 기록된 다이제스트가 있어야 한다. 조용히 건너뛰면 검증한 것처럼 보이므로 거부한다.
+    let digests = if content {
+        if engine != CompareEngine::Mysql {
+            return Err(XBackupError::Usage(crate::tr!(
+                "--content supports only MariaDB/MySQL backups for now",
+                "--content는 아직 MariaDB/MySQL 백업만 지원합니다"
+            )));
+        }
+        Some(manifest.table_digests.as_ref().ok_or_else(|| {
+            XBackupError::Usage(crate::tr!(
+                "backup {backup_id} has no content digests (made before this feature or with --no-content-digest)",
+                "백업 {backup_id}에는 내용 다이제스트가 없습니다(이 기능 이전에 만들었거나 --no-content-digest로 만든 백업)"
+            ))
+        })?)
+    } else {
+        None
+    };
+
     let backup_counts = backup_row_counts(storage, backup_id, &manifest, engine).await?;
 
-    compare_with_target(engine, target, backup_counts, only, estimate, true).await
+    compare_with_target(engine, target, backup_counts, only, estimate, true, digests).await
 }
 
 /// 검증을 수행하고 종료 코드를 결정한다(Storage 주입 — 테스트 가능).
@@ -200,9 +219,17 @@ async fn run(
 
     // 3) 대상 DB와 행 수 비교(옵션).
     let compare = match against {
-        Some(target) => {
-            Some(compare_backup(storage, &args.id, target, &args.tables, args.estimate).await?)
-        }
+        Some(target) => Some(
+            compare_backup(
+                storage,
+                &args.id,
+                target,
+                &args.tables,
+                args.estimate,
+                args.content,
+            )
+            .await?,
+        ),
         None => None,
     };
 
@@ -412,7 +439,14 @@ fn print_human(
         let differing = c.mismatched().count();
         println!(
             "{} — {}",
-            style(lang.sel("row count comparison", "행 수 비교"), Tone::Plan),
+            style(
+                if c.content_checked {
+                    lang.sel("row count and content comparison", "행 수·내용 비교")
+                } else {
+                    lang.sel("row count comparison", "행 수 비교")
+                },
+                Tone::Plan
+            ),
             style(
                 lang.sel(
                     &format!("{differing} of {total} entries differ"),
@@ -475,6 +509,7 @@ fn build_json(
         serde_json::json!({
             "match": c.is_match(),
             "estimated": c.estimated,
+            "content": c.content_checked,
             "tables": c.tables.iter().map(|t| serde_json::json!({
                 "table": t.table,
                 "backup_rows": t.backup_rows,
@@ -546,6 +581,7 @@ mod tests {
             promoted_from_gap: false,
             mysql_binlog: None,
             table_rows: None,
+            table_digests: None,
             status: BackupStatus::Complete,
         }
     }
@@ -566,6 +602,7 @@ mod tests {
             against: None,
             tables: Vec::new(),
             estimate: false,
+            content: false,
             json,
             from: None,
         }
@@ -635,6 +672,48 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.exit_code(), 2, "{err}");
         assert!(err.to_string().contains("PostgreSQL"), "{err}");
+    }
+
+    /// `--content`는 MariaDB/MySQL 백업만 지원한다 — 다른 엔진은 접속 전에 사용법 오류(exit 2)다.
+    #[tokio::test]
+    async fn content_is_rejected_for_a_non_mysql_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = LocalFs::new(dir.path()).unwrap();
+        let payload = b"archive";
+        let mut m = full("bk", &sha256_hex(payload));
+        m.tool_versions.archive_format =
+            Some(crate::engine::postgres::archive::FORMAT_ID.to_string());
+        seed(&fs, &m, payload).await;
+
+        let mut a = args("bk", false, false, false);
+        a.content = true;
+        let target = Secret::new("postgres://u:p@127.0.0.1:1/db");
+        let err = run(&fs, &a, crate::i18n::Lang::En, Some(&target))
+            .await
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 2, "{err}");
+        assert!(err.to_string().contains("MariaDB/MySQL"), "{err}");
+    }
+
+    /// 다이제스트가 기록되지 않은 백업에 `--content`를 주면 조용히 건너뛰지 않고 거부한다.
+    #[tokio::test]
+    async fn content_requires_digests_recorded_in_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = LocalFs::new(dir.path()).unwrap();
+        let payload = b"archive";
+        let mut m = full("bk", &sha256_hex(payload));
+        m.tool_versions.archive_format = Some(crate::engine::mysql::archive::FORMAT_ID.to_string());
+        m.table_digests = None;
+        seed(&fs, &m, payload).await;
+
+        let mut a = args("bk", false, false, false);
+        a.content = true;
+        let target = Secret::new("mysql://u:p@127.0.0.1:1/db");
+        let err = run(&fs, &a, crate::i18n::Lang::En, Some(&target))
+            .await
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 2, "{err}");
+        assert!(err.to_string().contains("no content digests"), "{err}");
     }
 
     /// 지원하지 않는 아카이브 포맷(예: mongodump)은 `--against`를 사용법 오류로 거부한다.

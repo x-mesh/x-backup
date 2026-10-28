@@ -596,7 +596,7 @@ where
 
     // 전송: MysqlDumper(source) → restore_into(target). EOF 후 양측 결과 회수.
     let dumper = MysqlDumper::connect(&request.source_uri, request.timeout_secs).await?;
-    let mut stream = dumper.dump_stream(request.collection.clone(), None);
+    let mut stream = dumper.dump_stream(request.collection.clone(), None, false);
     let handle = stream.handle();
     let mut tgt = MysqlClient::connect(&request.target_uri, request.timeout_secs)
         .await

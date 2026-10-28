@@ -310,6 +310,7 @@ async fn seed_full_backup(root: &std::path::Path, id: &str, payload: &[u8]) {
         promoted_from_gap: false,
         mysql_binlog: None,
         table_rows: None,
+        table_digests: None,
         status: BackupStatus::Complete,
     };
     ManifestStore::new(&fs).write(&m).await.unwrap();

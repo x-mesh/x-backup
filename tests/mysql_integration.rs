@@ -25,6 +25,7 @@ use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Opts};
 
 use x_backup::config::secret::Secret;
+use x_backup::engine::mysql::digest;
 use x_backup::engine::mysql::incremental::{self, apply, capture, server_id_for};
 use x_backup::manifest::store::ManifestStore;
 use x_backup::pipeline::backup::{run_mysql_full_backup, BackupMeta};
@@ -146,6 +147,118 @@ async fn full_backup_restore_round_trip_preserves_data() {
     assert_eq!(
         tgt_content, src_content,
         "복구 후 콘텐츠 지문 일치(decimal·datetime·generated)"
+    );
+}
+
+/// 풀 백업이 테이블별 내용 다이제스트를 manifest에 기록하고, 복구한 DB를 같은 방식으로 스캔한
+/// 값이 같으며, 행 수는 그대로인 채 값 하나만 바뀌면 달라지는지 확인한다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "MySQL 필요(make mysql-up)"]
+async fn content_digest_is_recorded_survives_restore_and_catches_a_changed_value() {
+    let src_uri = src_uri();
+    let mut src = connect(&src_uri).await;
+    src.query_drop("DROP TABLE IF EXISTS cd_items")
+        .await
+        .unwrap();
+    src.query_drop(
+        "CREATE TABLE cd_items (id INT PRIMARY KEY, name VARCHAR(40), bal DECIMAL(10,2), \
+         ts DATETIME(6) NULL)",
+    )
+    .await
+    .unwrap();
+    src.query_drop(
+        "INSERT INTO cd_items VALUES (1,'alice',1.50,'2026-06-01 10:00:00.123456'),\
+         (2,'o\\'brien\\\\x',2.00,NULL),(3,'carol',3.25,'2026-06-03 00:00:00')",
+    )
+    .await
+    .unwrap();
+    let src_db: String = src.query_first("SELECT DATABASE()").await.unwrap().unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = LocalFs::new(dir.path()).unwrap();
+    let full = run_mysql_full_backup(
+        &Secret::new(src_uri.clone()),
+        None,
+        None,
+        &storage,
+        StageStack::new(),
+        BackupMeta::none(),
+        None,
+        false,
+    )
+    .await
+    .expect("MySQL 풀 백업 성공");
+
+    let manifest = ManifestStore::new(&storage)
+        .read(&full.backup_id)
+        .await
+        .unwrap();
+    let digests = manifest.table_digests.expect("다이제스트가 기록돼야 한다");
+    assert_eq!(digests.algorithm, digest::ALGORITHM);
+    let recorded = digests
+        .tables
+        .get("cd_items")
+        .expect("cd_items 다이제스트")
+        .clone();
+    assert_eq!(
+        manifest.table_rows.as_ref().unwrap().get("cd_items"),
+        Some(&3)
+    );
+
+    // 백업 시점과 같은 방식으로 원본을 스캔하면 기록된 값과 같다(원본은 그 사이 바뀌지 않았다).
+    let mut scan_src = connect(&src_uri).await;
+    digest::prepare_scan_session(&mut scan_src).await.unwrap();
+    let (src_rows, src_digest) = digest::scan_table_digest(&mut scan_src, &src_db, "cd_items")
+        .await
+        .unwrap();
+    assert_eq!((src_rows, src_digest.as_str()), (3, recorded.as_str()));
+
+    // 빈 대상으로 복구한 뒤 같은 방식으로 스캔해도 같다.
+    let tgt_uri = swap_db(&src_uri, "xb_cd_target");
+    recreate_database(&server_uri(&src_uri), "xb_cd_target").await;
+    let req = RestoreRequest {
+        target_uri: Secret::new(tgt_uri.clone()),
+        mongorestore_program: "mongorestore".to_string(), // MySQL 경로에선 미사용.
+        backup_id: Some(full.backup_id.clone()),
+        only: None,
+        force: false,
+        dry_run: false,
+        skip_precheck: false,
+        timeout_secs: None,
+        progress_counter: None,
+    };
+    run_restore(&req, &storage, false, |_| {
+        panic!("빈 대상이라 confirm 미호출")
+    })
+    .await
+    .expect("빈 대상 복구 성공");
+
+    let mut scan_tgt = connect(&tgt_uri).await;
+    digest::prepare_scan_session(&mut scan_tgt).await.unwrap();
+    let (tgt_rows, tgt_digest) =
+        digest::scan_table_digest(&mut scan_tgt, "xb_cd_target", "cd_items")
+            .await
+            .unwrap();
+    assert_eq!((tgt_rows, tgt_digest.as_str()), (3, recorded.as_str()));
+    drop(scan_tgt);
+
+    // 행 수는 그대로 두고 값 하나만 바꾸면 다이제스트가 달라진다(행 수 비교로는 못 잡는 손상).
+    let mut tgt = connect(&tgt_uri).await;
+    tgt.query_drop("UPDATE cd_items SET name = 'tampered' WHERE id = 3")
+        .await
+        .unwrap();
+    let mut scan_changed = connect(&tgt_uri).await;
+    digest::prepare_scan_session(&mut scan_changed)
+        .await
+        .unwrap();
+    let (changed_rows, changed_digest) =
+        digest::scan_table_digest(&mut scan_changed, "xb_cd_target", "cd_items")
+            .await
+            .unwrap();
+    assert_eq!(changed_rows, 3, "행 수는 같다");
+    assert_ne!(
+        changed_digest, recorded,
+        "값이 바뀌면 다이제스트가 달라진다"
     );
 }
 

@@ -224,8 +224,24 @@ pub struct BackupManifest {
     /// 같다. 이 필드가 생기기 전 백업, 증분, mongodump 엔진 백업은 None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table_rows: Option<std::collections::BTreeMap<String, u64>>,
+    /// 풀 백업이 아카이브에 쓴 테이블별 내용 다이제스트. 행 수가 같아도 값이 다른 손상을
+    /// `verify --against --content`가 잡는 기준이다. 현재 MySQL 풀 백업만 기록하고, 이 필드가
+    /// 생기기 전 백업이나 `--no-content-digest`로 만든 백업, 다른 엔진은 None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_digests: Option<ContentDigests>,
     /// 완료 상태.
     pub status: BackupStatus,
+}
+
+/// 테이블별 내용 다이제스트와 그 계산 방식.
+///
+/// `algorithm`이 바뀌면 이전 값과 비교할 수 없으므로 값을 해석하기 전에 반드시 확인한다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentDigests {
+    /// 계산 방식 식별자(예: `sha256-sum128-v1`).
+    pub algorithm: String,
+    /// 테이블 이름 → 32자리 소문자 hex 다이제스트.
+    pub tables: std::collections::BTreeMap<String, String>,
 }
 
 /// `serde(skip_serializing_if)`용 — `false`면 직렬화에서 생략한다(기본 백업의 잡음 제거).
@@ -265,6 +281,7 @@ mod tests {
             promoted_from_gap: false,
             mysql_binlog: None,
             table_rows: None,
+            table_digests: None,
             status: BackupStatus::Complete,
         }
     }
@@ -301,6 +318,25 @@ mod tests {
         let back: BackupManifest =
             serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert_eq!(back.table_rows, m.table_rows);
+    }
+
+    /// `table_digests`가 없으면 직렬화에서 생략하고, 있으면 알고리즘 태그와 함께 왕복한다.
+    #[test]
+    fn table_digests_is_omitted_when_none_and_round_trips_when_set() {
+        let mut m = sample();
+        assert!(!serde_json::to_string(&m).unwrap().contains("table_digests"));
+
+        m.table_digests = Some(ContentDigests {
+            algorithm: "sha256-sum128-v1".to_string(),
+            tables: std::collections::BTreeMap::from([(
+                "orders".to_string(),
+                "0123456789abcdef0123456789abcdef".to_string(),
+            )]),
+        });
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("sha256-sum128-v1"));
+        let back: BackupManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.table_digests, m.table_digests);
     }
 
     /// OplogTimestamp는 (t, i) 사전순으로 비교된다.

@@ -323,6 +323,7 @@ mod tests {
             promoted_from_gap: false,
             mysql_binlog: None,
             table_rows: table_rows.map(rows),
+            table_digests: None,
             status: BackupStatus::Complete,
         }
     }

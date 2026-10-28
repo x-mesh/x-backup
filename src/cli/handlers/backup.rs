@@ -1518,6 +1518,7 @@ async fn handle_mysql_backup(
         meta,
         Some(progress_counter),
         Some(row_progress),
+        !args.no_content_digest,
         /* promoted_from_gap */ false,
     )
     .await;
@@ -2610,6 +2611,7 @@ mod tests {
             skip_precheck: false,
             no_hooks: false,
             read_source: None,
+            no_content_digest: false,
             warn_drop_percent: crate::pipeline::rows_delta::DEFAULT_DROP_WARN_PERCENT,
         }
     }

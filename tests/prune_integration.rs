@@ -52,6 +52,7 @@ fn full(id: &str, created_secs: i64) -> BackupManifest {
         promoted_from_gap: false,
         mysql_binlog: None,
         table_rows: None,
+        table_digests: None,
         status: BackupStatus::Complete,
     }
 }
