@@ -86,6 +86,7 @@ x-backup backup  --profile prod                 # 풀 백업 → 압축 → 암�
 x-backup backup  --profile prod --type incr     # oplog 증분
 x-backup list    --profile prod                 # 카탈로그(체인 상태 포함)
 x-backup verify  --id <backup-id>               # 키 없는 구조 검증
+x-backup verify  --id <backup-id> --against <uri>   # 복구된 DB와 행 수 대조
 x-backup restore --profile prod --target mongodb://staging --dry-run
 x-backup restore --profile prod --target mongodb://staging --force
 x-backup restore --profile prod --at 2026-06-01T00:00:00Z --force   # PITR
@@ -591,6 +592,79 @@ x-backup list --profile prod --type incr           # 유형 필터(full|incr|orp
 x-backup list --profile prod --engine pg --limit 5 # DB 엔진 필터(postgresql|mongodb, pg/mongo 약어) + 상위 N개
 x-backup list --profile prod --json                # store 필드 포함 JSON
 ```
+
+**ROWS** 칼럼은 백업에 담긴 행 수를 보여 준다. 행 수가 기록되지 않은 백업은 `-`로 나온다.
+MySQL·PostgreSQL·MongoDB(native 엔진) 풀 백업은 행 수를 기록하고, 증분 백업·`mongodump`
+백업·이전 버전이 만든 백업은 기록하지 않는다. `--json`에서는 `total_rows` 필드이고, 알 수
+없으면 `null`이다.
+
+### 백업 진행과 요약
+
+MySQL·PostgreSQL·MongoDB(native 엔진) 풀 백업은 쓴 행 수를 보여 준다.
+
+진행 줄에는 지금 덤프 중인 테이블(컬렉션), 개수 `n/N`, 지금까지의 행 수가 나온다.
+
+```text
+PG 백업 public.big · 0/5 테이블 · 81,287행 45.39 KiB 223.93 KiB/s 0s
+```
+
+요약에는 네 줄이 더 붙는다.
+
+```text
+rows:      320,022행 · 5개 테이블 (빈 테이블 1)
+largest:   public.big 300,000 · public.middle_t 20,000 · public.small 17
+elapsed:   00:01 (225,990행/s)
+next:      x-backup verify --id <backup-id> --deep  ·  x-backup list
+```
+
+- `rows` — 전체 행 수, 테이블 수, 빈 테이블 수
+- `largest` — 행이 많은 상위 3개 테이블
+- `elapsed` — 소요 시간과 초당 행 수
+- `next` — 백업을 점검하는 명령
+
+요약은 터미널에서 나온다. stdout이 터미널이 아닐 때도 보려면 `--progress`를 붙인다.
+`--json`에서는 요약에 `rows_total`, `table_rows`, `elapsed_secs`가 더해지고, 진행 이벤트(stderr)에는
+`rows`, `tables_done`, `tables_total`이 실린다. MongoDB에서는 `tables_*`가 컬렉션 수를 뜻한다.
+파일·증분·`mongodump` 백업은 행 수를 보여 주지 않는다.
+
+### 복구된 DB 대조 (`verify --against`)
+
+복구한 DB가 백업과 다를 수 있다. `verify --against`는 백업의 테이블(컬렉션)별 행 수를 대상 DB와
+비교한다.
+
+```bash
+x-backup verify --id <backup-id> --against staging-restore         # 프로파일 이름
+x-backup verify --id <backup-id> --against "mysql://user@host/db"  # 또는 DB URI
+x-backup verify --id <backup-id> --against <uri> --tables orders,users
+x-backup verify --id <backup-id> --against <mongo-uri> --estimate
+```
+
+`verify`는 기본 프로파일의 destination에서 백업을 읽는다.
+
+MySQL·PostgreSQL·MongoDB(native 엔진)의 풀 백업을 지원하고, 대상은 백업과 같은 종류의 DB여야 한다.
+
+차이가 나는 테이블마다 상태를 출력한다.
+
+- `MISMATCH` — 행 수가 다르다.
+- `MISSING` — 백업에는 있으나 대상에 테이블이 없다.
+- `EXTRA` — 대상에만 있는 테이블이다.
+
+하나라도 다르면 종료 코드가 `1`이고, 모두 같으면 `0`이다.
+
+`--tables`에는 `table`(MySQL), `schema.table`(PostgreSQL), `db.collection`(MongoDB) 형식의 이름을
+쓴다. PostgreSQL 파티션 부모 테이블은 비교하지 않고 파티션을 비교한다.
+
+테이블마다 `COUNT(*)`(MongoDB는 `countDocuments`)를 하나씩 순차로 실행하므로 큰 테이블은 시간이
+걸린다. 운영 DB가 아니라 복구된 DB나 복제본을 `--against`로 가리키는 것을 권한다.
+
+`--estimate`는 MongoDB 전용이다. 즉시 나오는 `estimatedDocumentCount`를 읽으며, 샤드 클러스터나
+비정상 종료 뒤에는 정확하지 않을 수 있다. 출력과 `--json`(`compare.estimated`)에 추정치임이 표시된다.
+
+행 수가 기록되지 않은 이전 버전의 백업은 아카이브 전체를 읽는다. 암호화된 백업이면 개인키가 필요하다.
+행 수가 같아도 내용이 같다는 보증은 아니다.
+
+`--json`에는 `ok` 필드와 `compare` 객체(`match`, `estimated`, `tables` 목록)가 담기고, 항목마다
+`table`, `backup_rows`, `target_rows`, `status`가 있다.
 
 ### 라이브 모니터 (`status --watch`)
 

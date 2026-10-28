@@ -80,6 +80,7 @@ x-backup backup  --profile prod                 # full backup → compress → e
 x-backup backup  --profile prod --type incr     # oplog increment
 x-backup list    --profile prod                 # catalog, with chain status
 x-backup verify  --id <backup-id>               # structural check, no key required
+x-backup verify  --id <backup-id> --against <uri>   # compare row counts with a restored database
 x-backup restore --profile prod --target mongodb://staging --dry-run
 x-backup restore --profile prod --target mongodb://staging --force
 x-backup restore --profile prod --at 2026-06-01T00:00:00Z --force   # PITR
@@ -634,6 +635,86 @@ x-backup list --profile prod --json              # machine-readable; includes a 
 
 `--sort` is `created` (default) or `size`; the default order is descending (newest/biggest first),
 and `--asc` flips it. `--limit N` caps the rows after sorting/filtering.
+
+The **ROWS** column shows the number of rows in the backup. It shows `-` if the backup has no row
+count. A full backup of MySQL, PostgreSQL, or MongoDB (native engine) records the row count.
+Incremental backups, `mongodump` backups, and backups from older versions do not. In `--json`,
+the field is `total_rows`. Its value is `null` if the count is not known.
+
+### Backup progress and summary
+
+A full backup of MySQL, PostgreSQL, or MongoDB (native engine) shows how many rows it writes.
+
+The progress line shows the current table (or collection), the count `n/N`, and the total rows
+so far:
+
+```text
+PG backup public.big · 0/5 tables · 81,287 rows 45.39 KiB 223.93 KiB/s 0s
+```
+
+The summary has four more lines:
+
+```text
+rows:      320,022 rows · 5 tables (1 empty)
+largest:   public.big 300,000 · public.middle_t 20,000 · public.small 17
+elapsed:   00:01 (225,990 rows/s)
+next:      x-backup verify --id <backup-id> --deep  ·  x-backup list
+```
+
+- `rows` shows the total rows, the number of tables, and the number of empty tables.
+- `largest` shows the three tables with the most rows.
+- `elapsed` shows the run time and the rows per second.
+- `next` shows the command to check the backup.
+
+The summary appears on a terminal. If stdout is not a terminal, add `--progress` to show it.
+
+In `--json` mode, the summary has `rows_total`, `table_rows`, and `elapsed_secs`. Each progress
+event goes to stderr and has `rows`, `tables_done`, and `tables_total`. For MongoDB, the `tables_*`
+names count collections. File, incremental, and `mongodump` backups do not show rows.
+
+### Compare a restored database (`verify --against`)
+
+A restored database can differ from its backup. `verify --against` compares the row count of each
+table (or collection) in the backup with the target database.
+
+```bash
+x-backup verify --id <backup-id> --against staging-restore         # a profile name
+x-backup verify --id <backup-id> --against "mysql://user@host/db"  # or a database URI
+x-backup verify --id <backup-id> --against <uri> --tables orders,users
+x-backup verify --id <backup-id> --against <mongo-uri> --estimate
+```
+
+`verify` reads the backup from the destination of the default profile.
+
+The command supports full backups of MySQL, PostgreSQL, and MongoDB (native engine). The target
+must be the same database type as the backup.
+
+For each table that differs, the command prints a status:
+
+- `MISMATCH`: the row counts differ.
+- `MISSING`: the table is in the backup but not in the target.
+- `EXTRA`: the table is in the target but not in the backup.
+
+The exit code is `1` if any table differs. It is `0` if all tables match.
+
+Use these names in `--tables`: `table` (MySQL), `schema.table` (PostgreSQL), or `db.collection`
+(MongoDB). The command does not compare PostgreSQL partitioned parent tables. It compares their
+partitions.
+
+The command runs `COUNT(*)` (`countDocuments` for MongoDB) on each table, one table at a time. A
+large table takes time to count. Point `--against` to a restored database or a replica, not to a
+production database.
+
+`--estimate` applies to MongoDB only. It reads `estimatedDocumentCount`, which returns at once.
+The count can be wrong on a sharded cluster or after an unclean shutdown. The output and `--json`
+(`compare.estimated`) mark the result as an estimate.
+
+A backup from an older version has no recorded row counts. For this backup, the command reads the
+whole archive. If the backup is encrypted, the private key must be available. Equal row counts do
+not prove equal content.
+
+With `--json`, the output has an `ok` field and a `compare` object. The object has `match`,
+`estimated`, and a `tables` list. Each entry has `table`, `backup_rows`, `target_rows`, and `status`.
 
 ### Pruning (`prune`)
 
