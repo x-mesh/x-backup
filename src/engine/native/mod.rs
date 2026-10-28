@@ -14,6 +14,7 @@
 
 pub mod archive;
 pub mod backup;
+pub mod compare;
 pub mod export;
 pub mod restore;
 
