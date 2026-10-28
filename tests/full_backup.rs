@@ -95,8 +95,60 @@ async fn full_backup_produces_three_artifacts() {
         "data.bin 체크섬 불일치"
     );
 
+    // mongodump 엔진은 archive를 해석하지 않으므로 문서 수를 기록하지 않는다.
+    assert!(
+        manifest.table_rows.is_none(),
+        "mongodump 백업에 table_rows 기록됨"
+    );
+
     // 경로 헬퍼 일관성(상대 경로).
     assert_eq!(data_path(id), format!("{id}/data.bin"));
     assert_eq!(manifest_path(id), format!("{id}/manifest.json"));
     assert_eq!(manifest_sha_path(id), format!("{id}/manifest.json.sha256"));
+}
+
+/// native 엔진 풀 백업은 아카이브에 쓴 컬렉션별 문서 수를 manifest `table_rows`
+/// (`db.컬렉션` → 문서 수)에 남긴다. 빈 컬렉션도 0으로 기록한다.
+#[tokio::test]
+#[ignore = "requires a replica set; run with --features integration-tests"]
+async fn native_full_backup_records_collection_rows() {
+    const DB: &str = "xb_native_rows";
+    let client = mongodb::Client::with_uri_str(&test_uri())
+        .await
+        .expect("connect");
+    let db = client.database(DB);
+    db.drop().await.ok();
+    db.collection::<mongodb::bson::Document>("items")
+        .insert_many((0..3).map(|i| mongodb::bson::doc! { "i": i }))
+        .await
+        .expect("insert_many");
+    db.create_collection("empty").await.expect("create empty");
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let storage = LocalFs::new(dir.path()).expect("local storage");
+    let request = BackupRequest {
+        uri: Secret::new(test_uri()),
+        mongodump_program: "mongodump".to_string(),
+        timeout_secs: None,
+        db: Some(DB.to_string()),
+        collection: None,
+        engine: Engine::Native,
+        progress_counter: None,
+    };
+    let outcome = run_full_backup(&request, &storage, StageStack::new())
+        .await
+        .expect("native 풀 백업 성공");
+    let manifest = ManifestStore::new(&storage)
+        .read(&outcome.backup_id)
+        .await
+        .expect("manifest 읽기");
+    db.drop().await.ok();
+
+    assert_eq!(
+        manifest.table_rows,
+        Some(std::collections::BTreeMap::from([
+            (format!("{DB}.empty"), 0u64),
+            (format!("{DB}.items"), 3u64),
+        ]))
+    );
 }

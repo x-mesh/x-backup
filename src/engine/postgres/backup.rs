@@ -14,6 +14,7 @@
 //! 증분/PITR은 이 풀 덤프 모듈이 아니라 logical decoding 기반
 //! [`incremental`](super::incremental)이 담당한다.
 
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -69,11 +70,20 @@ impl PgDumper {
     ) -> PgDumpStream {
         let (mut writer, reader) = tokio::io::duplex(PIPE_BUFFER_BYTES);
         let outcome: Arc<Mutex<Option<Result<()>>>> = Arc::new(Mutex::new(None));
+        let rows: Arc<Mutex<BTreeMap<String, u64>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let outcome_task = Arc::clone(&outcome);
+        let rows_task = Arc::clone(&rows);
         let pg = self.pg;
 
         let handle = tokio::spawn(async move {
-            let res = write_archive(pg.client(), &mut writer, schema_filter, table_filter).await;
+            let res = write_archive(
+                pg.client(),
+                &mut writer,
+                schema_filter,
+                table_filter,
+                &rows_task,
+            )
+            .await;
             let _ = writer.shutdown().await;
             *outcome_task.lock().expect("pg dump outcome poisoned") = Some(res);
         });
@@ -81,6 +91,7 @@ impl PgDumper {
         PgDumpStream {
             reader,
             outcome,
+            rows,
             task: Arc::new(Mutex::new(Some(handle))),
         }
     }
@@ -116,6 +127,7 @@ async fn write_archive(
     writer: &mut DuplexStream,
     schema_filter: Option<String>,
     table_filter: Option<String>,
+    rows_cell: &Arc<Mutex<BTreeMap<String, u64>>>,
 ) -> Result<()> {
     client
         .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
@@ -126,7 +138,8 @@ async fn write_archive(
                 "스냅샷 트랜잭션 시작 실패: {e}"
             ))
         })?;
-    let res = write_archive_in_snapshot(client, writer, schema_filter, table_filter).await;
+    let res =
+        write_archive_in_snapshot(client, writer, schema_filter, table_filter, rows_cell).await;
     // 읽기 전용이라 부작용은 없지만, 성공은 COMMIT·실패는 ROLLBACK으로 명시적으로 닫는다.
     let _ = client
         .batch_execute(if res.is_ok() { "COMMIT" } else { "ROLLBACK" })
@@ -140,6 +153,7 @@ async fn write_archive_in_snapshot(
     writer: &mut DuplexStream,
     schema_filter: Option<String>,
     table_filter: Option<String>,
+    rows_cell: &Arc<Mutex<BTreeMap<String, u64>>>,
 ) -> Result<()> {
     let version: String = client
         .query_one("SHOW server_version", &[])
@@ -184,6 +198,7 @@ async fn write_archive_in_snapshot(
         // 데이터 — COPY text 불투명 바이트를 그대로 흘린다(해석 없음). text는 메이저 버전 간
         // 이식성이 안전하다(리뷰 #2). STORED generated 컬럼은 COPY 불가라 copy_cols에서 제외.
         // 파티션 부모(has_data=false)는 직접 데이터가 없어 COPY를 건너뛴다(자식 데이터 중복 방지).
+        let mut rows = 0u64;
         if def.has_data && !def.copy_cols.is_empty() {
             let cols = def.copy_cols.join(", ");
             let copy_sql = format!("COPY {} ({cols}) TO STDOUT (FORMAT text)", def.quoted);
@@ -202,11 +217,19 @@ async fn write_archive_in_snapshot(
                     def.ns
                 ))
             })? {
+                rows += copy_text_rows(&chunk);
                 archive::write_data_bytes(writer, &chunk).await?;
             }
         }
         archive::write_table_end(writer).await?;
-        tracing::debug!(ns = %def.ns, "PG 백업: 테이블 직렬화 완료");
+        // 파티션 부모는 행을 자식에 두므로 기록하지 않는다(합계에 0짜리 부모가 끼지 않게).
+        if def.has_data {
+            rows_cell
+                .lock()
+                .expect("pg table rows poisoned")
+                .insert(def.ns.clone(), rows);
+        }
+        tracing::debug!(ns = %def.ns, rows, "PG 백업: 테이블 직렬화 완료");
     }
 
     // 후행 DDL — 뷰 → 머티리얼라이즈드뷰(WITH DATA) → 트리거(테이블·함수가 다 존재한 뒤).
@@ -214,6 +237,12 @@ async fn write_archive_in_snapshot(
     write_triggers(client, writer, schema_filter.as_deref()).await?;
 
     archive::write_end(writer).await
+}
+
+/// COPY text 청크에 들어 있는 행 수. text 포맷은 행마다 줄바꿈으로 끝나고 값 안의 줄바꿈은
+/// `\n`으로 이스케이프하므로, 행이 청크 경계에 걸쳐도 줄바꿈 수의 합이 행 수와 같다.
+fn copy_text_rows(chunk: &[u8]) -> u64 {
+    chunk.iter().filter(|&&b| b == b'\n').count() as u64
 }
 
 /// 사용자 함수/프로시저를 선행 DDL로 쓴다(`pg_get_functiondef`). 확장 소유·집계/윈도우는 제외.
@@ -778,6 +807,7 @@ async fn local_partition_indexes(client: &Client, oid: u32) -> Result<Vec<String
 pub struct PgDumpStream {
     reader: DuplexStream,
     outcome: Arc<Mutex<Option<Result<()>>>>,
+    rows: Arc<Mutex<BTreeMap<String, u64>>>,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -786,6 +816,7 @@ impl PgDumpStream {
     pub fn handle(&self) -> PgDumpHandle {
         PgDumpHandle {
             outcome: Arc::clone(&self.outcome),
+            rows: Arc::clone(&self.rows),
             task: Arc::clone(&self.task),
         }
     }
@@ -794,12 +825,14 @@ impl PgDumpStream {
 /// [`PgDumpStream`]의 결과를 회수하는 핸들.
 pub struct PgDumpHandle {
     outcome: Arc<Mutex<Option<Result<()>>>>,
+    rows: Arc<Mutex<BTreeMap<String, u64>>>,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl PgDumpHandle {
-    /// 스트림 EOF 후 백업 task의 결과를 회수한다(드라이버/직렬화 오류 전파).
-    pub async fn finish(self) -> Result<()> {
+    /// 스트림 EOF 후 백업 task의 결과를 회수하고, 스냅샷 안에서 아카이브에 쓴 테이블별 행 수
+    /// (`스키마.테이블` → 행 수)를 반환한다(드라이버/직렬화 오류 전파).
+    pub async fn finish(self) -> Result<BTreeMap<String, u64>> {
         let task = self.task.lock().expect("pg dump task poisoned").take();
         if let Some(task) = task {
             let _ = task.await;
@@ -808,7 +841,10 @@ impl PgDumpHandle {
             .lock()
             .expect("pg dump outcome poisoned")
             .take()
-            .unwrap_or(Ok(()))
+            .unwrap_or(Ok(()))?;
+        Ok(std::mem::take(
+            &mut *self.rows.lock().expect("pg table rows poisoned"),
+        ))
     }
 }
 
@@ -819,5 +855,19 @@ impl AsyncRead for PgDumpStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.reader).poll_read(cx, buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::copy_text_rows;
+
+    /// 이스케이프된 `\n`은 세지 않고, 청크 경계에 걸친 행은 끝난 청크에서 한 번만 센다.
+    #[test]
+    fn copy_text_rows_counts_row_terminators_across_chunks() {
+        assert_eq!(copy_text_rows(b""), 0);
+        assert_eq!(copy_text_rows(b"1\tline\\nstill one\n2\t\\N\n"), 2);
+        let chunks: [&[u8]; 3] = [b"1\tpar", b"tial\n2\tb", b"\n"];
+        assert_eq!(chunks.iter().map(|c| copy_text_rows(c)).sum::<u64>(), 2);
     }
 }
