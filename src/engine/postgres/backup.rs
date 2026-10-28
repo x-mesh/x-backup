@@ -36,6 +36,18 @@ const PIPE_BUFFER_BYTES: usize = 256 * 1024;
 /// 시스템 스키마(백업 대상에서 제외).
 const SYSTEM_SCHEMAS: &str = "'pg_catalog','information_schema','pg_toast'";
 
+/// 덤프 세션이 COPY 텍스트를 만들기 전에 고정하는 설정(`pg_dump`와 같은 세 가지).
+///
+/// 고정하지 않으면 원본 DB·롤·서버의 기본값이 덤프 텍스트를 바꾼다. `DateStyle`이 `SQL, DMY`나
+/// `German, DMY`이면 날짜가 `02/03/2026`처럼 모호하게 나가 대상(ISO, MDY)에서 일과 월이 바뀌고,
+/// `extra_float_digits`가 0 이하이면 float가 반올림된다. 둘 다 행 수는 그대로라 조용히 지나간다.
+/// ISO 텍스트는 대상 세션의 `DateStyle`과 무관하게 해석되므로 복구 쪽은 고정하지 않는다.
+const DUMP_SESSION_SETTINGS: [&str; 3] = [
+    "SET DateStyle = ISO",
+    "SET extra_float_digits = 3",
+    "SET IntervalStyle = postgres",
+];
+
 /// 드라이버로 PostgreSQL 데이터 백업을 수행하는 덤퍼.
 pub struct PgDumper {
     pg: PgClient,
@@ -133,6 +145,14 @@ async fn write_archive(
     rows_cell: &Arc<Mutex<BTreeMap<String, u64>>>,
     progress: Option<&RowProgress>,
 ) -> Result<()> {
+    for setting in DUMP_SESSION_SETTINGS {
+        client.batch_execute(setting).await.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "failed to set the dump session ({setting}): {e}",
+                "덤프 세션 설정 실패({setting}): {e}"
+            ))
+        })?;
+    }
     client
         .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .await
