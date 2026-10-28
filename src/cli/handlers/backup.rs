@@ -25,10 +25,13 @@ use crate::error::{Result, XBackupError};
 use crate::hooks::{HookContext, HookEvent, HookSet};
 use crate::i18n::Lang;
 use crate::manifest::schema::{CompressionMeta, EncryptionMeta, OplogRange, Topology};
-use crate::pipeline::backup::{run_full_backup_with_rows, BackupMeta, BackupRequest, Engine};
+use crate::pipeline::backup::{
+    run_full_backup_with_rows, BackupMeta, BackupOutcome, BackupRequest, Engine,
+};
 use crate::pipeline::incremental::{
     run_incremental_backup, IncrementalOutcome, IncrementalRequest,
 };
+use crate::pipeline::rows_delta::{compute_delta, find_previous, DroppedTable, RowsDelta};
 use crate::pipeline::stage::{StageStack, ENV_AES_KEY_HEX};
 use crate::storage::{from_config, replicate_artifact, Storage};
 
@@ -93,6 +96,9 @@ pub struct BackupJsonSummary<'a> {
     /// 백업 실행에 걸린 시간(초).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_secs: Option<f64>,
+    /// 직전 풀 백업 대비 행 수 변화와 경고(비교할 수 없으면 키 생략).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows_vs_previous: Option<serde_json::Value>,
 }
 
 impl Default for BackupJsonSummary<'_> {
@@ -114,6 +120,7 @@ impl Default for BackupJsonSummary<'_> {
             rows_total: None,
             table_rows: None,
             elapsed_secs: None,
+            rows_vs_previous: None,
         }
     }
 }
@@ -376,6 +383,14 @@ pub async fn handle(
         )
         .await;
 
+        // 4.6) 직전 풀 백업 대비 행 수 변화 — 사라진 컬렉션이나 행 급감을 경고(exit 4)로 알린다.
+        let delta =
+            rows_delta_for(primary.as_ref(), &outcome, engine.archive_format(), &args).await;
+        let delta_warning = delta
+            .as_ref()
+            .and_then(|d| rows_delta_warning(d, RowUnit::Collections, lang));
+        let warning = merge_warnings(replicate_warning, delta_warning);
+
         // 5) 요약 출력(stdout — 결과 전용). 진행은 stderr, 결과/--json은 stdout으로 분리.
         if mode.emits_json() {
             BackupJsonSummary {
@@ -387,6 +402,7 @@ pub async fn handle(
                 rows_total: outcome.table_rows.as_ref().map(|rows| rows.values().sum()),
                 table_rows: outcome.table_rows.as_ref(),
                 elapsed_secs: Some(elapsed.as_secs_f64()),
+                rows_vs_previous: delta.as_ref().map(RowsDelta::to_json),
                 ..Default::default()
             }
             .emit();
@@ -420,13 +436,15 @@ pub async fn handle(
                     RowUnit::Collections,
                     elapsed,
                     &outcome.backup_id,
+                    delta.as_ref().map(|d| (d, args.warn_drop_percent)),
                     lang,
                 );
             }
         }
 
-        // 보조 복제 실패가 있으면 경고로 마감(exit 4) — primary 백업은 이미 성공.
-        if let Some(w) = replicate_warning {
+        // 보조 복제 실패나 직전 백업 대비 이상 징후가 있으면 경고로 마감(exit 4) — primary 백업은
+        // 이미 성공했다.
+        if let Some(w) = warning {
             return Err(XBackupError::Warning(w));
         }
         Ok(())
@@ -679,12 +697,166 @@ fn printable(name: &str) -> String {
         .collect()
 }
 
+/// 직전 풀 백업 대비 행 수 변화를 계산한다.
+///
+/// 선택적 백업(`--db`/`--collection`)은 일부만 담으므로, 행 수가 없거나 직전 백업이 없으면 비교할
+/// 수 없다. 정보 제공이 목적이라 직전 백업을 읽지 못해도 백업을 실패시키지 않고 경고만 남긴다.
+async fn rows_delta_for(
+    storage: &dyn Storage,
+    outcome: &BackupOutcome,
+    archive_format: &str,
+    args: &BackupArgs,
+) -> Option<RowsDelta> {
+    if args.db.is_some() || args.collection.is_some() {
+        return None;
+    }
+    let rows = outcome.table_rows.as_ref()?;
+    match find_previous(storage, &outcome.backup_id, archive_format).await {
+        Ok(Some(previous)) => Some(compute_delta(
+            &previous,
+            rows,
+            outcome.stored_size_bytes,
+            args.warn_drop_percent,
+        )),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!("직전 백업과 행 수를 비교하지 못했습니다: {e}");
+            None
+        }
+    }
+}
+
+/// 이름 목록을 최대 5개까지 보여 주고 나머지는 개수로 줄인다.
+fn limited_names<'a>(names: impl Iterator<Item = &'a str>, lang: Lang) -> String {
+    const SHOWN: usize = 5;
+    let names: Vec<String> = names.map(printable).collect();
+    let mut text = names[..names.len().min(SHOWN)].join(", ");
+    if names.len() > SHOWN {
+        text.push_str(lang.sel(
+            &format!(" (+{} more)", names.len() - SHOWN),
+            &format!(" (외 {}개)", names.len() - SHOWN),
+        ));
+    }
+    text
+}
+
+/// 크기 변화율을 `+0.9%` 형태로(소수 첫째 자리).
+fn signed_percent(percent: f64) -> String {
+    format!("{percent:+.1}%")
+}
+
+/// 직전 백업 대비 변화 줄과 경고 줄을 출력한다.
+fn print_rows_delta(delta: &RowsDelta, unit: RowUnit, drop_percent: u32, lang: Lang) {
+    const W: usize = 11;
+    let rows_diff = i128::from(delta.total) - i128::from(delta.previous_total);
+    let mut change = format!(
+        "{}… {} {}{}",
+        delta.previous_id.chars().take(8).collect::<String>(),
+        lang.sel("vs", "대비"),
+        if rows_diff >= 0 { "+" } else { "-" },
+        group_digits(rows_diff.unsigned_abs() as u64),
+    );
+    change.push_str(lang.sel(" rows", "행"));
+    if let Some(percent) = delta.rows_change_percent() {
+        change.push_str(&format!(" ({})", signed_percent(percent)));
+    }
+    if let Some(percent) = delta.size_change_percent() {
+        change.push_str(&format!(
+            " · {} {}",
+            lang.sel("size", "크기"),
+            signed_percent(percent)
+        ));
+    }
+    println!("{}", field_line_toned("vs prev", change, W, Tone::Value));
+
+    if !delta.vanished.is_empty() {
+        let text = lang
+            .sel(
+                &format!(
+                    "{} {} missing since the previous backup: {}",
+                    delta.vanished.len(),
+                    unit.en(),
+                    limited_names(delta.vanished.iter().map(String::as_str), lang)
+                ),
+                &format!(
+                    "직전 백업에 있던 {} {}개가 없습니다: {}",
+                    unit.ko(),
+                    delta.vanished.len(),
+                    limited_names(delta.vanished.iter().map(String::as_str), lang)
+                ),
+            )
+            .to_string();
+        println!("{}", field_line_toned("warning", text, W, Tone::Warning));
+    }
+    if !delta.dropped.is_empty() {
+        let shown = delta
+            .dropped
+            .iter()
+            .take(5)
+            .map(|d: &DroppedTable| {
+                format!(
+                    "{} {} → {}",
+                    printable(&d.table),
+                    group_digits(d.previous),
+                    group_digits(d.now)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = delta.dropped.len().saturating_sub(5);
+        let more = if more > 0 {
+            lang.sel(&format!(" (+{more} more)"), &format!(" (외 {more}개)"))
+                .to_string()
+        } else {
+            String::new()
+        };
+        let text = lang
+            .sel(
+                &format!("rows dropped by {drop_percent}% or more: {shown}{more}"),
+                &format!("행이 {drop_percent}% 이상 줄었습니다: {shown}{more}"),
+            )
+            .to_string();
+        println!("{}", field_line_toned("warning", text, W, Tone::Warning));
+    }
+}
+
+/// 직전 백업 대비 경고를 종료 코드(exit 4)용 한 줄로 요약한다. 경고가 없으면 None.
+fn rows_delta_warning(delta: &RowsDelta, unit: RowUnit, lang: Lang) -> Option<String> {
+    delta.has_warnings().then(|| {
+        lang.sel(
+            &format!(
+                "compared with the previous backup: {} {} missing, {} {} lost many rows",
+                delta.vanished.len(),
+                unit.en(),
+                delta.dropped.len(),
+                unit.en()
+            ),
+            &format!(
+                "직전 백업과 비교하면 사라진 {unit_ko} {}개, 행이 급감한 {unit_ko} {}개가 있습니다",
+                delta.vanished.len(),
+                delta.dropped.len(),
+                unit_ko = unit.ko()
+            ),
+        )
+        .to_string()
+    })
+}
+
+/// 경고가 둘 다 있으면 `; `로 이어 하나의 종료 경고로 만든다.
+fn merge_warnings(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (a, b) => a.or(b),
+    }
+}
+
 /// 완료 요약 뒤에 행 수·소요 시간·다음 단계를 이어 출력한다(풀 백업).
 fn print_rows_summary(
     rows: &BTreeMap<String, u64>,
     unit: RowUnit,
     elapsed: Duration,
     backup_id: &str,
+    delta: Option<(&RowsDelta, u32)>,
     lang: Lang,
 ) {
     const W: usize = 11;
@@ -730,6 +902,9 @@ fn print_rows_summary(
         "{}",
         field_line_toned("elapsed", elapsed_text, W, Tone::Value)
     );
+    if let Some((delta, drop_percent)) = delta {
+        print_rows_delta(delta, unit, drop_percent, lang);
+    }
     println!(
         "{}",
         field_line(
@@ -1196,6 +1371,18 @@ async fn handle_pg_backup(
     )
     .await;
 
+    let delta = rows_delta_for(
+        primary,
+        &outcome,
+        crate::engine::postgres::archive::FORMAT_ID,
+        args,
+    )
+    .await;
+    let delta_warning = delta
+        .as_ref()
+        .and_then(|d| rows_delta_warning(d, RowUnit::Tables, lang));
+    let warning = merge_warnings(replicate_warning, delta_warning);
+
     if mode.emits_json() {
         BackupJsonSummary {
             backup_id: &outcome.backup_id,
@@ -1206,6 +1393,7 @@ async fn handle_pg_backup(
             rows_total: outcome.table_rows.as_ref().map(|rows| rows.values().sum()),
             table_rows: outcome.table_rows.as_ref(),
             elapsed_secs: Some(elapsed.as_secs_f64()),
+            rows_vs_previous: delta.as_ref().map(RowsDelta::to_json),
             ..Default::default()
         }
         .emit();
@@ -1230,11 +1418,18 @@ async fn handle_pg_backup(
             lang,
         );
         if let Some(rows) = outcome.table_rows.as_ref() {
-            print_rows_summary(rows, RowUnit::Tables, elapsed, &outcome.backup_id, lang);
+            print_rows_summary(
+                rows,
+                RowUnit::Tables,
+                elapsed,
+                &outcome.backup_id,
+                delta.as_ref().map(|d| (d, args.warn_drop_percent)),
+                lang,
+            );
         }
     }
 
-    if let Some(w) = replicate_warning {
+    if let Some(w) = warning {
         return Err(XBackupError::Warning(w));
     }
     Ok(())
@@ -1338,6 +1533,18 @@ async fn handle_mysql_backup(
     )
     .await;
 
+    let delta = rows_delta_for(
+        primary,
+        &outcome,
+        crate::engine::mysql::archive::FORMAT_ID,
+        args,
+    )
+    .await;
+    let delta_warning = delta
+        .as_ref()
+        .and_then(|d| rows_delta_warning(d, RowUnit::Tables, lang));
+    let warning = merge_warnings(replicate_warning, delta_warning);
+
     if mode.emits_json() {
         BackupJsonSummary {
             backup_id: &outcome.backup_id,
@@ -1348,6 +1555,7 @@ async fn handle_mysql_backup(
             rows_total: outcome.table_rows.as_ref().map(|rows| rows.values().sum()),
             table_rows: outcome.table_rows.as_ref(),
             elapsed_secs: Some(elapsed.as_secs_f64()),
+            rows_vs_previous: delta.as_ref().map(RowsDelta::to_json),
             ..Default::default()
         }
         .emit();
@@ -1372,11 +1580,18 @@ async fn handle_mysql_backup(
             lang,
         );
         if let Some(rows) = outcome.table_rows.as_ref() {
-            print_rows_summary(rows, RowUnit::Tables, elapsed, &outcome.backup_id, lang);
+            print_rows_summary(
+                rows,
+                RowUnit::Tables,
+                elapsed,
+                &outcome.backup_id,
+                delta.as_ref().map(|d| (d, args.warn_drop_percent)),
+                lang,
+            );
         }
     }
 
-    if let Some(w) = replicate_warning {
+    if let Some(w) = warning {
         return Err(XBackupError::Warning(w));
     }
     Ok(())
@@ -2097,6 +2312,84 @@ mod tests {
         );
     }
 
+    fn delta_with(vanished: &[&str], dropped: usize) -> RowsDelta {
+        RowsDelta {
+            previous_id: "01a17ff8-d9b8".into(),
+            previous_total: 1_000,
+            total: 1_204,
+            previous_stored_size: 1_000,
+            stored_size: 980,
+            vanished: vanished.iter().map(|s| s.to_string()).collect(),
+            dropped: (0..dropped)
+                .map(|i| DroppedTable {
+                    table: format!("t{i}"),
+                    previous: 100,
+                    now: 10,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn limited_names_shows_five_and_counts_the_rest() {
+        let names = ["a", "b", "c", "d", "e", "f", "g"];
+        assert_eq!(
+            limited_names(names.iter().copied(), Lang::Ko),
+            "a, b, c, d, e (외 2개)"
+        );
+        assert_eq!(
+            limited_names(names.iter().copied(), Lang::En),
+            "a, b, c, d, e (+2 more)"
+        );
+        assert_eq!(limited_names(["x", "y"].into_iter(), Lang::Ko), "x, y");
+    }
+
+    #[test]
+    fn rows_delta_warning_exists_only_when_something_vanished_or_dropped() {
+        assert_eq!(
+            rows_delta_warning(&delta_with(&[], 0), RowUnit::Tables, Lang::Ko),
+            None
+        );
+        let text = rows_delta_warning(&delta_with(&["gone"], 2), RowUnit::Collections, Lang::Ko)
+            .expect("경고");
+        assert!(
+            text.contains("컬렉션 1개") && text.contains("컬렉션 2개"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn merge_warnings_joins_both_and_passes_a_single_one_through() {
+        assert_eq!(merge_warnings(None, None), None);
+        assert_eq!(merge_warnings(Some("a".into()), None), Some("a".into()));
+        assert_eq!(merge_warnings(None, Some("b".into())), Some("b".into()));
+        assert_eq!(
+            merge_warnings(Some("a".into()), Some("b".into())),
+            Some("a; b".into())
+        );
+    }
+
+    #[test]
+    fn signed_percent_always_shows_the_sign() {
+        assert_eq!(signed_percent(0.94), "+0.9%");
+        assert_eq!(signed_percent(-61.0), "-61.0%");
+        assert_eq!(signed_percent(0.0), "+0.0%");
+    }
+
+    #[test]
+    fn rows_vs_previous_is_omitted_from_json_when_absent() {
+        let plain = serde_json::to_string(&BackupJsonSummary::default()).unwrap();
+        assert!(!plain.contains("rows_vs_previous"));
+        let with = serde_json::to_string(&BackupJsonSummary {
+            rows_vs_previous: Some(delta_with(&["gone"], 0).to_json()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            with.contains(r#""rows_vs_previous":{"#) && with.contains(r#""vanished":["gone"]"#)
+        );
+    }
+
     #[test]
     fn group_digits_inserts_commas_every_three_digits() {
         assert_eq!(group_digits(0), "0");
@@ -2317,6 +2610,7 @@ mod tests {
             skip_precheck: false,
             no_hooks: false,
             read_source: None,
+            warn_drop_percent: crate::pipeline::rows_delta::DEFAULT_DROP_WARN_PERCENT,
         }
     }
 
