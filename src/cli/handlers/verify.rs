@@ -487,7 +487,7 @@ fn build_json(
         "deep_decode_ok": report.deep_decode_ok,
         "empty_slice": report.empty_slice,
         "warnings": report.warnings,
-        "ok": report.is_ok(),
+        "ok": report.is_ok() && compare.is_none_or(|c| c.is_match()),
         "chain": chain_json,
         "compare": compare_json,
     })
@@ -707,6 +707,25 @@ mod tests {
         assert_eq!(v["schema"], VERIFY_JSON_SCHEMA);
         assert_eq!(v["backup_id"], "bk");
         assert!(v["chain"].is_null(), "--chain 없으면 chain은 null");
+    }
+
+    /// 행 수가 다르면 종료 코드(exit 1)와 같이 최상위 `ok`도 false다.
+    #[test]
+    fn build_json_ok_is_false_when_row_counts_differ() {
+        let backup = BTreeMap::from([("t".to_string(), 3u64)]);
+        let differ = BTreeMap::from([("t".to_string(), 2u64)]);
+        let mismatch =
+            crate::engine::mysql::compare::compare_counts(&backup, &differ, &Default::default());
+        let same = crate::engine::mysql::compare::compare_counts(
+            &backup,
+            &backup.clone(),
+            &Default::default(),
+        );
+        assert_eq!(
+            build_json(&report("bk"), None, Some(&mismatch))["ok"],
+            false
+        );
+        assert_eq!(build_json(&report("bk"), None, Some(&same))["ok"], true);
     }
 
     /// `--chain`이 붙어도 schema는 최상위에만 있다(중첩 객체는 버전을 갖지 않는다).
