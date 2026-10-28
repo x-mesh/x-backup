@@ -279,6 +279,8 @@ pub struct BackupOutcome {
     pub encryption: Option<crate::manifest::schema::EncryptionMeta>,
     /// oplog 구간(replica set일 때만).
     pub oplog_range: Option<OplogRange>,
+    /// MySQL 풀 백업이 쓴 테이블별 행 수. 다른 경로는 None.
+    pub table_rows: Option<std::collections::BTreeMap<String, u64>>,
 }
 
 /// 풀 백업을 끝까지 실행한다(평문/기존 호환 진입점, 메타 없음).
@@ -418,6 +420,7 @@ pub async fn run_full_backup_with_meta(
         compression: meta.compression.clone(),
         encryption: meta.encryption.clone(),
         oplog_range,
+        table_rows: None,
     })
 }
 
@@ -719,6 +722,7 @@ pub async fn run_pg_full_backup(
         compression: meta.compression.clone(),
         encryption: meta.encryption.clone(),
         oplog_range: None,
+        table_rows: None,
     })
 }
 
@@ -738,6 +742,34 @@ pub async fn run_mysql_full_backup(
     progress_counter: Option<Arc<AtomicU64>>,
     promoted_from_gap: bool,
 ) -> Result<BackupOutcome> {
+    run_mysql_full_backup_with_rows(
+        uri,
+        timeout_secs,
+        table_filter,
+        storage,
+        stages,
+        meta,
+        progress_counter,
+        None,
+        promoted_from_gap,
+    )
+    .await
+}
+
+/// [`run_mysql_full_backup`]에 행·테이블 진행 상태([`RowProgress`](crate::engine::mysql::backup::RowProgress))를
+/// 더한 변형 — 덤프 task가 이 값을 갱신하고 CLI가 폴링해 보여 준다.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_mysql_full_backup_with_rows(
+    uri: &crate::config::secret::Secret,
+    timeout_secs: Option<u64>,
+    table_filter: Option<String>,
+    storage: &dyn Storage,
+    stages: StageStack,
+    meta: BackupMeta,
+    progress_counter: Option<Arc<AtomicU64>>,
+    row_progress: Option<Arc<crate::engine::mysql::backup::RowProgress>>,
+    promoted_from_gap: bool,
+) -> Result<BackupOutcome> {
     use crate::engine::mysql::{archive as my_archive, backup::MysqlDumper};
 
     let selective = table_filter.is_some();
@@ -748,7 +780,7 @@ pub async fn run_mysql_full_backup(
         .await
         .map(|v| format!("mysql {v}"))
         .unwrap_or_else(|| "mysql".to_string());
-    let dump = dumper.dump_stream(table_filter);
+    let dump = dumper.dump_stream(table_filter, row_progress);
     let dump_handle = dump.handle();
 
     // 공통 코어: 합성 → 저장 → 종료 판정 → 확정. dump_output이 스냅샷 binlog 좌표
@@ -786,7 +818,7 @@ pub async fn run_mysql_full_backup(
         oplog_count: None,
         promoted_from_gap,
         mysql_binlog,
-        table_rows,
+        table_rows: table_rows.clone(),
         status: BackupStatus::Complete,
     };
     write_manifest_or_cleanup(storage, &manifest).await?;
@@ -801,6 +833,7 @@ pub async fn run_mysql_full_backup(
         compression: meta.compression.clone(),
         encryption: meta.encryption.clone(),
         oplog_range: None,
+        table_rows,
     })
 }
 
@@ -1173,6 +1206,7 @@ async fn run_file_full_backup_inner(
         compression: meta.compression.clone(),
         encryption: meta.encryption.clone(),
         oplog_range,
+        table_rows: None,
     })
 }
 

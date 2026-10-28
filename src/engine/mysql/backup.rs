@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -60,7 +61,11 @@ impl MysqlDumper {
     /// `table_filter`(핸들러의 `--collection` 대응)가 있으면 그 테이블만. 별도 task가
     /// introspection+SELECT를 구동하고, 호출자는 [`AsyncRead`]로 받아 파이프라인에 흘린다.
     /// EOF 후 [`handle`](MysqlDumpStream::handle)로 결과·binlog 좌표를 회수한다.
-    pub fn dump_stream(self, table_filter: Option<String>) -> MysqlDumpStream {
+    pub fn dump_stream(
+        self,
+        table_filter: Option<String>,
+        progress: Option<Arc<RowProgress>>,
+    ) -> MysqlDumpStream {
         let (mut writer, reader) = tokio::io::duplex(PIPE_BUFFER_BYTES);
         let outcome: Arc<Mutex<Option<Result<()>>>> = Arc::new(Mutex::new(None));
         let coords: Arc<Mutex<Option<MysqlBinlogCoords>>> = Arc::new(Mutex::new(None));
@@ -77,6 +82,7 @@ impl MysqlDumper {
                 table_filter,
                 &coords_task,
                 &rows_task,
+                progress.as_deref(),
             )
             .await;
             let _ = writer.shutdown().await;
@@ -101,6 +107,7 @@ async fn write_archive(
     table_filter: Option<String>,
     coords_cell: &Arc<Mutex<Option<MysqlBinlogCoords>>>,
     rows_cell: &Arc<Mutex<BTreeMap<String, u64>>>,
+    progress: Option<&RowProgress>,
 ) -> Result<()> {
     // 세션 설정 — UTF-8 + UTC(TIMESTAMP 정합, mysqldump --tz-utc 등가).
     for stmt in [
@@ -134,9 +141,16 @@ async fn write_archive(
         let _ = conn.query_drop("UNLOCK TABLES").await;
     }
 
-    let res =
-        write_archive_in_snapshot(conn, writer, table_filter, &coords, coords_cell, rows_cell)
-            .await;
+    let res = write_archive_in_snapshot(
+        conn,
+        writer,
+        table_filter,
+        &coords,
+        coords_cell,
+        rows_cell,
+        progress,
+    )
+    .await;
     let _ = conn
         .query_drop(if res.is_ok() { "COMMIT" } else { "ROLLBACK" })
         .await;
@@ -151,6 +165,7 @@ async fn write_archive_in_snapshot(
     coords: &MysqlBinlogCoords,
     coords_cell: &Arc<Mutex<Option<MysqlBinlogCoords>>>,
     rows_cell: &Arc<Mutex<BTreeMap<String, u64>>>,
+    progress: Option<&RowProgress>,
 ) -> Result<()> {
     let db: String = conn
         .query_first("SELECT DATABASE()")
@@ -217,8 +232,17 @@ async fn write_archive_in_snapshot(
 
     // BASE TABLE 목록.
     let tables = list_tables(conn, &db, table_filter.as_deref()).await?;
+    if let Some(p) = progress {
+        p.set_total(tables.len());
+    }
     for table in &tables {
-        let rows = dump_table(conn, writer, &db, table).await?;
+        if let Some(p) = progress {
+            p.start_table(table);
+        }
+        let rows = dump_table(conn, writer, &db, table, progress).await?;
+        if let Some(p) = progress {
+            p.finish_table();
+        }
         rows_cell
             .lock()
             .expect("mysql table rows poisoned")
@@ -245,6 +269,7 @@ async fn dump_table(
     writer: &mut DuplexStream,
     db: &str,
     table: &str,
+    progress: Option<&RowProgress>,
 ) -> Result<u64> {
     // 소스 질의는 db로 정규화(현재 USE db와 무관히 정확). 아카이브에는 **bare** 테이블명을 담아
     // 복구가 대상 연결의 현재 DB로 들어가게 한다(mysqldump와 동일 — 교차 DB 복구 가능).
@@ -337,6 +362,9 @@ async fn dump_table(
                 let tuple = render_row(&row, &render_plan);
                 archive::write_row(writer, tuple.as_bytes()).await?;
                 rows += 1;
+                if let Some(p) = progress {
+                    p.add_row();
+                }
             }
         }
     }
@@ -579,6 +607,56 @@ async fn write_events(conn: &mut Conn, writer: &mut DuplexStream, db: &str) -> R
         }
     }
     Ok(())
+}
+
+/// 백업 진행 중 행·테이블 상태 — 덤프 task가 갱신하고 CLI가 폴링해 보여 준다.
+#[derive(Debug, Default)]
+pub struct RowProgress {
+    rows: AtomicU64,
+    tables_done: AtomicU64,
+    tables_total: AtomicU64,
+    current: Mutex<String>,
+}
+
+/// [`RowProgress`]의 한 시점 값.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowProgressSnapshot {
+    pub rows: u64,
+    pub tables_done: u64,
+    pub tables_total: u64,
+    /// 지금 덤프 중인 테이블(시작 전이면 빈 문자열).
+    pub current: String,
+}
+
+impl RowProgress {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn snapshot(&self) -> RowProgressSnapshot {
+        RowProgressSnapshot {
+            rows: self.rows.load(Ordering::Relaxed),
+            tables_done: self.tables_done.load(Ordering::Relaxed),
+            tables_total: self.tables_total.load(Ordering::Relaxed),
+            current: self.current.lock().expect("row progress poisoned").clone(),
+        }
+    }
+
+    fn set_total(&self, tables: usize) {
+        self.tables_total.store(tables as u64, Ordering::Relaxed);
+    }
+
+    fn start_table(&self, table: &str) {
+        *self.current.lock().expect("row progress poisoned") = table.to_string();
+    }
+
+    fn add_row(&self) {
+        self.rows.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn finish_table(&self) {
+        self.tables_done.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// MySQL 백업 아카이브 바이트 스트림([`AsyncRead`]). 파이프라인에 그대로 흘린다.

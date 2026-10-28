@@ -5,11 +5,14 @@
 //! URI 스킴으로 분기한다([`crate::engine::DbKind`] — Mongo는 아래 본 경로, PG는
 //! [`handle_pg_backup`]).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::cli::args::{BackupArgs, BackupType};
 use crate::cli::output::{field_line, field_line_toned, style, OutputFlags, OutputMode, Tone};
-use crate::cli::progress::{new_counter, ProgressKind, ProgressReporter};
+use crate::cli::progress::{new_counter, DetailFn, ProgressDetail, ProgressKind, ProgressReporter};
 use crate::compress::{compress_stage, ALGORITHM_NONE};
 use crate::config::env::collect_overrides_from_process;
 use crate::config::file::DestinationConfig;
@@ -81,6 +84,15 @@ pub struct BackupJsonSummary<'a> {
     /// 승격 사유 등 사람이 읽는 부연.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'a str>,
+    /// MySQL 풀 백업의 전체 행 수.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows_total: Option<u64>,
+    /// MySQL 풀 백업의 테이블별 행 수.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table_rows: Option<&'a BTreeMap<String, u64>>,
+    /// 백업 실행에 걸린 시간(초).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_secs: Option<f64>,
 }
 
 impl Default for BackupJsonSummary<'_> {
@@ -99,6 +111,9 @@ impl Default for BackupJsonSummary<'_> {
             database: None,
             destinations: None,
             reason: None,
+            rows_total: None,
+            table_rows: None,
+            elapsed_secs: None,
         }
     }
 }
@@ -512,6 +527,155 @@ fn backup_location(dest: &DestinationConfig, backup_id: &str) -> String {
         Some(p) => format!("{}/{}/", p.trim_end_matches('/'), backup_id),
         None => format!("{}:{}", dest.label(0), backup_id),
     }
+}
+
+/// 세 자리마다 쉼표를 넣는다(`133277` → `133,277`).
+fn group_digits(n: u64) -> String {
+    let mut reversed = Vec::new();
+    let mut run = 0;
+    for c in n.to_string().chars().rev() {
+        if run == 3 {
+            reversed.push(',');
+            run = 0;
+        }
+        reversed.push(c);
+        run += 1;
+    }
+    reversed.into_iter().rev().collect()
+}
+
+/// 경과 시간을 `MM:SS`(1시간 이상이면 `H:MM:SS`)로 쓴다.
+fn format_elapsed(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 3600 {
+        format!("{}:{:02}:{:02}", secs / 3600, secs % 3600 / 60, secs % 60)
+    } else {
+        format!("{:02}:{:02}", secs / 60, secs % 60)
+    }
+}
+
+/// 테이블별 행 수 요약.
+#[derive(Debug, PartialEq, Eq)]
+struct RowsSummary {
+    total: u64,
+    tables: usize,
+    empty: usize,
+    /// 행이 많은 순서의 상위 3개(행이 0인 테이블은 제외).
+    largest: Vec<(String, u64)>,
+}
+
+fn summarize_rows(rows: &BTreeMap<String, u64>) -> RowsSummary {
+    let mut by_size: Vec<(&String, &u64)> = rows.iter().filter(|(_, &n)| n > 0).collect();
+    by_size.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    RowsSummary {
+        total: rows.values().sum(),
+        tables: rows.len(),
+        empty: rows.values().filter(|&&n| n == 0).count(),
+        largest: by_size
+            .into_iter()
+            .take(3)
+            .map(|(name, &n)| (name.clone(), n))
+            .collect(),
+    }
+}
+
+/// MySQL 풀 백업의 진행 줄에 붙일 상세(지금 덤프 중인 테이블·테이블 n/N·누적 행 수).
+fn row_progress_detail(
+    progress: Arc<crate::engine::mysql::backup::RowProgress>,
+    lang: Lang,
+) -> DetailFn {
+    Arc::new(move || {
+        let snap = progress.snapshot();
+        let fields = vec![
+            ("rows", snap.rows),
+            ("tables_done", snap.tables_done),
+            ("tables_total", snap.tables_total),
+        ];
+        // 테이블 목록을 읽기 전에는 보여 줄 것이 없다.
+        if snap.tables_total == 0 {
+            return ProgressDetail {
+                text: String::new(),
+                fields,
+            };
+        }
+        let rows = group_digits(snap.rows);
+        let text = lang
+            .sel(
+                &format!(
+                    "{} · {}/{} tables · {rows} rows",
+                    snap.current, snap.tables_done, snap.tables_total
+                ),
+                &format!(
+                    "{} · {}/{} 테이블 · {rows}행",
+                    snap.current, snap.tables_done, snap.tables_total
+                ),
+            )
+            .to_string();
+        ProgressDetail { text, fields }
+    })
+}
+
+/// 완료 요약 뒤에 행 수·소요 시간·다음 단계를 이어 출력한다(MySQL 풀 백업).
+fn print_rows_summary(
+    rows: &BTreeMap<String, u64>,
+    elapsed: Duration,
+    backup_id: &str,
+    lang: Lang,
+) {
+    const W: usize = 11;
+    let sum = summarize_rows(rows);
+    let total = group_digits(sum.total);
+    let empty = if sum.empty > 0 {
+        lang.sel(
+            &format!(" ({} empty)", sum.empty),
+            &format!(" (빈 테이블 {})", sum.empty),
+        )
+        .to_string()
+    } else {
+        String::new()
+    };
+    let rows_text = lang
+        .sel(
+            &format!("{total} rows · {} tables{empty}", sum.tables),
+            &format!("{total}행 · {}개 테이블{empty}", sum.tables),
+        )
+        .to_string();
+    println!("{}", field_line_toned("rows", rows_text, W, Tone::Value));
+    if !sum.largest.is_empty() {
+        let largest = sum
+            .largest
+            .iter()
+            .map(|(name, n)| format!("{name} {}", group_digits(*n)))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        println!("{}", field_line_toned("largest", largest, W, Tone::Value));
+    }
+    let mut elapsed_text = format_elapsed(elapsed);
+    if elapsed.as_secs() >= 1 && sum.total > 0 {
+        let rate = (sum.total as f64 / elapsed.as_secs_f64()).round() as u64;
+        elapsed_text.push_str(&format!(
+            " ({}/s)",
+            lang.sel(
+                &format!("{} rows", group_digits(rate)),
+                &format!("{}행", group_digits(rate)),
+            )
+        ));
+    }
+    println!(
+        "{}",
+        field_line_toned("elapsed", elapsed_text, W, Tone::Value)
+    );
+    println!(
+        "{}",
+        field_line(
+            "next",
+            format!(
+                "x-backup verify --id {} --deep  ·  x-backup list",
+                style(backup_id, Tone::Value)
+            ),
+            W,
+        )
+    );
 }
 
 /// 백업 완료 요약(사람용)의 통일된 뷰 — 4개 경로(mongo·pg × full·incr)가 공유한다.
@@ -1056,14 +1220,17 @@ async fn handle_mysql_backup(
 
     let (stages, meta) = build_stages(resolved, args)?;
     let progress_counter = new_counter();
-    let reporter = ProgressReporter::start(
+    let row_progress = crate::engine::mysql::backup::RowProgress::new();
+    let reporter = ProgressReporter::start_with_detail(
         mode,
         ProgressKind::Indeterminate {
             label: lang.sel("MySQL backup", "MySQL 백업").into(),
         },
         std::sync::Arc::clone(&progress_counter),
+        Some(row_progress_detail(Arc::clone(&row_progress), lang)),
     );
-    let result = crate::pipeline::backup::run_mysql_full_backup(
+    let started = Instant::now();
+    let result = crate::pipeline::backup::run_mysql_full_backup_with_rows(
         &uri,
         timeout_secs,
         args.collection.clone(),
@@ -1071,9 +1238,11 @@ async fn handle_mysql_backup(
         stages,
         meta,
         Some(progress_counter),
+        Some(row_progress),
         /* promoted_from_gap */ false,
     )
     .await;
+    let elapsed = started.elapsed();
     reporter.finish().await;
     let outcome = result?;
 
@@ -1092,6 +1261,9 @@ async fn handle_mysql_backup(
             checksum_sha256: Some(&outcome.checksum_sha256),
             database: Some("mysql"),
             destinations: Some(dest_count),
+            rows_total: outcome.table_rows.as_ref().map(|rows| rows.values().sum()),
+            table_rows: outcome.table_rows.as_ref(),
+            elapsed_secs: Some(elapsed.as_secs_f64()),
             ..Default::default()
         }
         .emit();
@@ -1115,6 +1287,9 @@ async fn handle_mysql_backup(
             },
             lang,
         );
+        if let Some(rows) = outcome.table_rows.as_ref() {
+            print_rows_summary(rows, elapsed, &outcome.backup_id, lang);
+        }
     }
 
     if let Some(w) = replicate_warning {
@@ -1808,6 +1983,75 @@ mod tests {
     use crate::cli::args::BackupArgs;
     use crate::config::file::Profile;
     use crate::config::merged::ResolvedConfig;
+
+    #[test]
+    fn group_digits_inserts_commas_every_three_digits() {
+        assert_eq!(group_digits(0), "0");
+        assert_eq!(group_digits(999), "999");
+        assert_eq!(group_digits(1_000), "1,000");
+        assert_eq!(group_digits(133_277), "133,277");
+        assert_eq!(group_digits(1_234_567_890), "1,234,567,890");
+    }
+
+    #[test]
+    fn format_elapsed_switches_to_hours_at_one_hour() {
+        assert_eq!(format_elapsed(Duration::from_secs(38)), "00:38");
+        assert_eq!(format_elapsed(Duration::from_secs(61)), "01:01");
+        assert_eq!(format_elapsed(Duration::from_secs(3600)), "1:00:00");
+        assert_eq!(format_elapsed(Duration::from_secs(3725)), "1:02:05");
+    }
+
+    #[test]
+    fn summarize_rows_counts_empty_tables_and_ranks_the_largest() {
+        let rows = BTreeMap::from([
+            ("a_small".to_string(), 5u64),
+            ("b_big".to_string(), 900),
+            ("c_empty".to_string(), 0),
+            ("d_mid".to_string(), 40),
+            ("e_tie".to_string(), 40),
+            ("f_empty".to_string(), 0),
+        ]);
+        let sum = summarize_rows(&rows);
+        assert_eq!(sum.total, 985);
+        assert_eq!(sum.tables, 6);
+        assert_eq!(sum.empty, 2);
+        assert_eq!(
+            sum.largest,
+            vec![
+                ("b_big".to_string(), 900),
+                ("d_mid".to_string(), 40),
+                ("e_tie".to_string(), 40),
+            ],
+            "행이 같으면 이름순, 빈 테이블은 제외"
+        );
+    }
+
+    #[test]
+    fn summarize_rows_of_only_empty_tables_has_no_largest() {
+        let rows = BTreeMap::from([("t".to_string(), 0u64)]);
+        let sum = summarize_rows(&rows);
+        assert_eq!((sum.total, sum.empty), (0, 1));
+        assert!(sum.largest.is_empty());
+    }
+
+    #[test]
+    fn rows_fields_are_omitted_from_json_when_absent_and_present_when_set() {
+        let plain = serde_json::to_string(&BackupJsonSummary::default()).unwrap();
+        assert!(!plain.contains("rows_total") && !plain.contains("table_rows"));
+        assert!(!plain.contains("elapsed_secs"));
+
+        let rows = BTreeMap::from([("users".to_string(), 5u64)]);
+        let with_rows = serde_json::to_string(&BackupJsonSummary {
+            rows_total: Some(5),
+            table_rows: Some(&rows),
+            elapsed_secs: Some(1.5),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(with_rows.contains(r#""rows_total":5"#));
+        assert!(with_rows.contains(r#""table_rows":{"users":5}"#));
+        assert!(with_rows.contains(r#""elapsed_secs":1.5"#));
+    }
 
     /// 요약을 직렬화해 키 목록을 정렬해 돌려준다(값이 아니라 계약만 본다).
     fn keys_of(s: &BackupJsonSummary<'_>) -> Vec<String> {

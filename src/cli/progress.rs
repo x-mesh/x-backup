@@ -84,6 +84,36 @@ pub fn progress_json_line(bytes: u64, total: Option<u64>) -> String {
     }
 }
 
+/// 진행 줄에 덧붙일 상세(예: 지금 덤프 중인 테이블과 누적 행 수) — 폴링마다 새로 읽는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgressDetail {
+    /// 바/스피너 메시지 뒤에 붙는 사람용 텍스트.
+    pub text: String,
+    /// `--json` 진행 이벤트에 더하는 숫자 필드(키는 항상 영문).
+    pub fields: Vec<(&'static str, u64)>,
+}
+
+/// 폴링 task가 호출하는 상세 공급자.
+pub type DetailFn = Arc<dyn Fn() -> ProgressDetail + Send + Sync>;
+
+/// [`progress_json_line`]에 상세 숫자 필드를 더한 한 줄. 기존 소비자는 모르는 필드를 무시한다.
+pub fn progress_json_line_with_detail(
+    bytes: u64,
+    total: Option<u64>,
+    fields: &[(&'static str, u64)],
+) -> String {
+    // 기존 줄의 키 순서(event, bytes, total)를 지키려고 직접 조립한다. 키는 정적 식별자다.
+    let mut line = format!(r#"{{"event":"progress","bytes":{bytes}"#);
+    if let Some(t) = total {
+        line.push_str(&format!(r#","total":{t}"#));
+    }
+    for (key, n) in fields {
+        line.push_str(&format!(r#","{key}":{n}"#));
+    }
+    line.push('}');
+    line
+}
+
 /// 진행 표시기 — 백그라운드 폴링 task를 들고 있다가 [`ProgressReporter::finish`]에서 정리한다.
 ///
 /// 표시 모드가 아니면([`ProgressReporter::disabled`]) 아무 task도 띄우지 않는 무동작 핸들이다.
@@ -100,9 +130,19 @@ impl ProgressReporter {
     /// - `Json`: 진행 이벤트를 stderr JSON 라인으로 흘린다(화면 바 없음).
     /// - `Quiet`: 무표시([`Self::disabled`]).
     pub fn start(mode: OutputMode, kind: ProgressKind, counter: ProgressCounter) -> Self {
+        Self::start_with_detail(mode, kind, counter, None)
+    }
+
+    /// [`Self::start`]에 상세 공급자를 더한다. 바 모드는 메시지에, JSON 모드는 이벤트 필드에 반영한다.
+    pub fn start_with_detail(
+        mode: OutputMode,
+        kind: ProgressKind,
+        counter: ProgressCounter,
+        detail: Option<DetailFn>,
+    ) -> Self {
         match mode {
-            OutputMode::Progress => Self::start_bar(kind, counter),
-            OutputMode::Json => Self::start_json(kind, counter),
+            OutputMode::Progress => Self::start_bar(kind, counter, detail),
+            OutputMode::Json => Self::start_json(kind, counter, detail),
             OutputMode::Quiet => Self::disabled(counter),
         }
     }
@@ -117,7 +157,7 @@ impl ProgressReporter {
     }
 
     /// indicatif 바/스피너를 stderr에 그리는 표시기.
-    fn start_bar(kind: ProgressKind, counter: ProgressCounter) -> Self {
+    fn start_bar(kind: ProgressKind, counter: ProgressCounter, detail: Option<DetailFn>) -> Self {
         // 모든 ProgressBar는 명시적으로 stderr 타깃에 그린다(pitfall 9-1).
         let color = use_color_stderr();
         let bar = match &kind {
@@ -171,11 +211,20 @@ impl ProgressReporter {
         // 폴링 task: 200ms마다 공유 카운터를 읽어 바 위치를 갱신한다.
         let poll_counter = Arc::clone(&counter);
         let poll_bar = bar.clone();
+        let label = kind.label().to_string();
         let task = tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(200));
             loop {
                 tick.tick().await;
                 poll_bar.set_position(poll_counter.load(Ordering::SeqCst));
+                if let Some(detail) = &detail {
+                    let text = detail().text;
+                    poll_bar.set_message(if text.is_empty() {
+                        label.clone()
+                    } else {
+                        format!("{label} {text}")
+                    });
+                }
                 if poll_bar.is_finished() {
                     break;
                 }
@@ -190,7 +239,7 @@ impl ProgressReporter {
     }
 
     /// 진행 이벤트를 stderr JSON 라인으로 흘리는 표시기(--json).
-    fn start_json(kind: ProgressKind, counter: ProgressCounter) -> Self {
+    fn start_json(kind: ProgressKind, counter: ProgressCounter, detail: Option<DetailFn>) -> Self {
         let total = match &kind {
             ProgressKind::Exact { total_bytes, .. }
             | ProgressKind::Estimated {
@@ -205,14 +254,15 @@ impl ProgressReporter {
         let task = tokio::spawn(async move {
             use std::io::Write;
             let mut tick = tokio::time::interval(Duration::from_millis(200));
-            let mut last = u64::MAX;
+            let mut last = (u64::MAX, Vec::new());
             loop {
                 tick.tick().await;
                 let bytes = poll_counter.load(Ordering::SeqCst);
+                let fields = detail.as_ref().map(|d| d().fields).unwrap_or_default();
                 // 변화가 있을 때만 한 줄씩 stderr로(중복 억제).
-                if bytes != last {
-                    last = bytes;
-                    let line = progress_json_line(bytes, total);
+                if (bytes, &fields) != (last.0, &last.1) {
+                    let line = progress_json_line_with_detail(bytes, total, &fields);
+                    last = (bytes, fields);
                     // 진행 이벤트는 stderr 전용(stdout은 결과). 실패는 무시.
                     let _ = writeln!(std::io::stderr(), "{line}");
                 }
@@ -290,6 +340,34 @@ impl ProgressSuspend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_line_with_detail_keeps_base_order_and_appends_fields() {
+        assert_eq!(
+            progress_json_line_with_detail(
+                10,
+                None,
+                &[("rows", 7), ("tables_done", 1), ("tables_total", 4)]
+            ),
+            r#"{"event":"progress","bytes":10,"rows":7,"tables_done":1,"tables_total":4}"#
+        );
+        assert_eq!(
+            progress_json_line_with_detail(10, Some(20), &[("rows", 7)]),
+            r#"{"event":"progress","bytes":10,"total":20,"rows":7}"#
+        );
+    }
+
+    #[test]
+    fn json_line_with_detail_without_fields_equals_the_plain_line() {
+        assert_eq!(
+            progress_json_line_with_detail(1024, Some(4096), &[]),
+            progress_json_line(1024, Some(4096))
+        );
+        assert_eq!(
+            progress_json_line_with_detail(512, None, &[]),
+            progress_json_line(512, None)
+        );
+    }
 
     #[test]
     fn json_line_with_total() {
