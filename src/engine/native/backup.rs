@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 
 use super::archive;
 use crate::config::secret::Secret;
+use crate::engine::progress::RowProgress;
 use crate::error::{Result, XBackupError};
 
 /// 시스템 DB(백업 대상에서 제외).
@@ -49,7 +50,12 @@ impl NativeDumper {
     /// 별도 task가 드라이버 커서를 구동해 프레임을 [`DuplexStream`]에 쓴다 — 반환된
     /// [`NativeDumpStream`]을 파이프라인에 흘리고, EOF 후 [`finish`](NativeDumpStream::handle)로
     /// 결과(에러)를 회수한다.
-    pub fn dump_stream(&self, db: Option<String>, collection: Option<String>) -> NativeDumpStream {
+    pub fn dump_stream(
+        &self,
+        db: Option<String>,
+        collection: Option<String>,
+        progress: Option<Arc<RowProgress>>,
+    ) -> NativeDumpStream {
         let (mut writer, reader) = tokio::io::duplex(PIPE_BUFFER_BYTES);
         let outcome: Arc<Mutex<Option<Result<()>>>> = Arc::new(Mutex::new(None));
         let rows: Arc<Mutex<BTreeMap<String, u64>>> = Arc::new(Mutex::new(BTreeMap::new()));
@@ -58,7 +64,15 @@ impl NativeDumper {
         let rows_task = Arc::clone(&rows);
 
         let handle = tokio::spawn(async move {
-            let res = write_archive(&client, &mut writer, db, collection, &rows_task).await;
+            let res = write_archive(
+                &client,
+                &mut writer,
+                db,
+                collection,
+                &rows_task,
+                progress.as_deref(),
+            )
+            .await;
             // 쓰기 측을 닫아 EOF를 보낸다(에러 여부와 무관히).
             let _ = writer.shutdown().await;
             *outcome_task.lock().expect("native dump outcome poisoned") = Some(res);
@@ -80,9 +94,69 @@ async fn write_archive(
     db_filter: Option<String>,
     coll_filter: Option<String>,
     rows_cell: &Arc<Mutex<BTreeMap<String, u64>>>,
+    progress: Option<&RowProgress>,
 ) -> Result<()> {
     archive::write_header(writer, &Utc::now().to_rfc3339()).await?;
 
+    // 백업할 컬렉션을 먼저 모두 나열한다 — 진행 표시가 전체 개수(`n/N`)를 알 수 있게 하는
+    // 메타데이터 조회뿐이고, 문서는 읽지 않는다.
+    let targets = list_targets(client, db_filter.as_deref(), coll_filter.as_deref()).await?;
+    if let Some(p) = progress {
+        p.set_total(targets.len());
+    }
+
+    for (db_name, spec) in targets {
+        let db = client.database(&db_name);
+        let coll_name = spec.name;
+        let ns = format!("{db_name}.{coll_name}");
+        if let Some(p) = progress {
+            p.start_table(&ns);
+        }
+        let options = bson::to_document(&spec.options).unwrap_or_default();
+        let indexes = collect_indexes(&db, &coll_name).await?;
+        archive::write_collection(writer, &ns, &options, &indexes).await?;
+
+        // 문서를 raw로 스트리밍(재직렬화 없이 바이트 그대로).
+        let raw_coll = db.collection::<RawDocumentBuf>(&coll_name);
+        let mut rows = 0u64;
+        let mut cursor = raw_coll.find(doc! {}).await.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "{ns}: failed to query documents: {e}",
+                "{ns} 문서 조회 실패: {e}"
+            ))
+        })?;
+        while cursor.advance().await.map_err(|e| {
+            XBackupError::Failure(crate::tr!(
+                "{ns}: cursor advance failed: {e}",
+                "{ns} 커서 진행 실패: {e}"
+            ))
+        })? {
+            archive::write_raw_document(writer, cursor.current()).await?;
+            rows += 1;
+            if let Some(p) = progress {
+                p.add_row();
+            }
+        }
+        rows_cell
+            .lock()
+            .expect("native collection rows poisoned")
+            .insert(ns.clone(), rows);
+        if let Some(p) = progress {
+            p.finish_table();
+        }
+        tracing::debug!(ns = %ns, indexes = indexes.len(), rows, "네이티브 백업: 컬렉션 직렬화 완료");
+    }
+
+    archive::write_end(writer).await
+}
+
+/// 백업 대상 컬렉션을 `(db, 명세)`로 나열한다. 시스템 DB·`system.` 컬렉션·뷰/타임시리즈는 건너뛰고
+/// (뷰/타임시리즈는 1차 미커버, 경고), `db_filter`/`coll_filter`가 있으면 그 범위만 남긴다.
+async fn list_targets(
+    client: &Client,
+    db_filter: Option<&str>,
+    coll_filter: Option<&str>,
+) -> Result<Vec<(String, mongodb::results::CollectionSpecification)>> {
     let db_names = client.list_database_names().await.map_err(|e| {
         XBackupError::Failure(crate::tr!(
             "failed to list databases: {e}",
@@ -90,23 +164,24 @@ async fn write_archive(
         ))
     })?;
 
+    let mut targets = Vec::new();
     for db_name in db_names {
         if SYSTEM_DBS.contains(&db_name.as_str()) {
             continue;
         }
-        if let Some(want) = &db_filter {
-            if &db_name != want {
-                continue;
-            }
+        if db_filter.is_some_and(|want| want != db_name) {
+            continue;
         }
-        let db = client.database(&db_name);
-        // 컬렉션 명세(옵션 포함) — view/timeseries는 1차 미커버(건너뜀, 경고).
-        let mut specs = db.list_collections().await.map_err(|e| {
-            XBackupError::Failure(crate::tr!(
-                "failed to query collection specs ({db_name}): {e}",
-                "컬렉션 명세 조회 실패({db_name}): {e}"
-            ))
-        })?;
+        let mut specs = client
+            .database(&db_name)
+            .list_collections()
+            .await
+            .map_err(|e| {
+                XBackupError::Failure(crate::tr!(
+                    "failed to query collection specs ({db_name}): {e}",
+                    "컬렉션 명세 조회 실패({db_name}): {e}"
+                ))
+            })?;
 
         while let Some(spec) = specs.try_next().await.map_err(|e| {
             XBackupError::Failure(crate::tr!(
@@ -114,8 +189,7 @@ async fn write_archive(
                 "컬렉션 명세 순회 실패({db_name}): {e}"
             ))
         })? {
-            let coll_name = spec.name;
-            if coll_name.starts_with("system.") {
+            if spec.name.starts_with("system.") {
                 continue;
             }
             if !matches!(
@@ -123,50 +197,19 @@ async fn write_archive(
                 mongodb::results::CollectionType::Collection
             ) {
                 tracing::warn!(
-                    ns = %format!("{db_name}.{coll_name}"),
+                    ns = %format!("{db_name}.{}", spec.name),
                     kind = ?spec.collection_type,
                     "네이티브 백업: 일반 컬렉션이 아님 — 건너뜀(1차 미커버)"
                 );
                 continue;
             }
-            if let Some(want) = &coll_filter {
-                if &coll_name != want {
-                    continue;
-                }
+            if coll_filter.is_some_and(|want| want != spec.name) {
+                continue;
             }
-
-            let ns = format!("{db_name}.{coll_name}");
-            let options = bson::to_document(&spec.options).unwrap_or_default();
-            let indexes = collect_indexes(&db, &coll_name).await?;
-            archive::write_collection(writer, &ns, &options, &indexes).await?;
-
-            // 문서를 raw로 스트리밍(재직렬화 없이 바이트 그대로).
-            let raw_coll = db.collection::<RawDocumentBuf>(&coll_name);
-            let mut rows = 0u64;
-            let mut cursor = raw_coll.find(doc! {}).await.map_err(|e| {
-                XBackupError::Failure(crate::tr!(
-                    "{ns}: failed to query documents: {e}",
-                    "{ns} 문서 조회 실패: {e}"
-                ))
-            })?;
-            while cursor.advance().await.map_err(|e| {
-                XBackupError::Failure(crate::tr!(
-                    "{ns}: cursor advance failed: {e}",
-                    "{ns} 커서 진행 실패: {e}"
-                ))
-            })? {
-                archive::write_raw_document(writer, cursor.current()).await?;
-                rows += 1;
-            }
-            rows_cell
-                .lock()
-                .expect("native collection rows poisoned")
-                .insert(ns.clone(), rows);
-            tracing::debug!(ns = %ns, indexes = indexes.len(), rows, "네이티브 백업: 컬렉션 직렬화 완료");
+            targets.push((db_name.clone(), spec));
         }
     }
-
-    archive::write_end(writer).await
+    Ok(targets)
 }
 
 /// 컬렉션의 인덱스 명세를 createIndexes 호환 문서로 모은다(`_id_` 기본 인덱스 제외).

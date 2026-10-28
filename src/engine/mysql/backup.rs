@@ -17,7 +17,6 @@
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -32,6 +31,7 @@ use super::conn::MysqlClient;
 use super::util::{quote_ident, quote_qualified, strip_definer};
 use super::value::{render_value, ColCategory};
 use crate::config::secret::Secret;
+use crate::engine::progress::RowProgress;
 use crate::error::{Result, XBackupError};
 use crate::manifest::schema::MysqlBinlogCoords;
 
@@ -607,56 +607,6 @@ async fn write_events(conn: &mut Conn, writer: &mut DuplexStream, db: &str) -> R
         }
     }
     Ok(())
-}
-
-/// 백업 진행 중 행·테이블 상태 — 덤프 task가 갱신하고 CLI가 폴링해 보여 준다.
-#[derive(Debug, Default)]
-pub struct RowProgress {
-    rows: AtomicU64,
-    tables_done: AtomicU64,
-    tables_total: AtomicU64,
-    current: Mutex<String>,
-}
-
-/// [`RowProgress`]의 한 시점 값.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RowProgressSnapshot {
-    pub rows: u64,
-    pub tables_done: u64,
-    pub tables_total: u64,
-    /// 지금 덤프 중인 테이블(시작 전이면 빈 문자열).
-    pub current: String,
-}
-
-impl RowProgress {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-
-    pub fn snapshot(&self) -> RowProgressSnapshot {
-        RowProgressSnapshot {
-            rows: self.rows.load(Ordering::Relaxed),
-            tables_done: self.tables_done.load(Ordering::Relaxed),
-            tables_total: self.tables_total.load(Ordering::Relaxed),
-            current: self.current.lock().expect("row progress poisoned").clone(),
-        }
-    }
-
-    fn set_total(&self, tables: usize) {
-        self.tables_total.store(tables as u64, Ordering::Relaxed);
-    }
-
-    fn start_table(&self, table: &str) {
-        *self.current.lock().expect("row progress poisoned") = table.to_string();
-    }
-
-    fn add_row(&self) {
-        self.rows.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn finish_table(&self) {
-        self.tables_done.fetch_add(1, Ordering::Relaxed);
-    }
 }
 
 /// MySQL 백업 아카이브 바이트 스트림([`AsyncRead`]). 파이프라인에 그대로 흘린다.

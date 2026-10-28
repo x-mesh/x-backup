@@ -15,6 +15,7 @@ pub mod mongo;
 pub mod mysql;
 pub mod native;
 pub mod postgres;
+pub mod progress;
 
 /// 백업 대상 종류 — source URI 스킴으로 판별한다(DB 3종 + 파일/디렉터리).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
