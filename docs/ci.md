@@ -29,6 +29,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --lib                 # 단위
 cargo test --test exit_codes_e2e # DB 불필요 E2E(종료 코드, SC6)
+cargo test --test json_schema_snapshot # DB 불필요 --json 키 구조 스냅샷
 ```
 통합/S3 스위트는 `#![cfg(feature = ...)]`로 격리돼 있어 feature 미지정 시 **컴파일 대상에서
 제외**된다 — 따라서 `cargo test --lib`/`--test exit_codes_e2e`는 DB가 전혀 필요 없다.
