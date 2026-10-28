@@ -1020,6 +1020,17 @@ mod tests {
         }
     }
 
+    /// 자식의 명령행이 읽힐 때까지 기다린다. Linux에서 `spawn()`은 exec 중 close-on-exec
+    /// 파이프가 닫히는 순간 반환하는데, 커널은 그 뒤에 새 argv 영역을 설정하므로 직후의
+    /// `/proc/<pid>/cmdline`은 비어 있을 수 있다(CI에서 간헐 실패로 관측됨).
+    async fn wait_for_exec(pid: u32, token: &str) {
+        let ready = wait_until(Duration::from_secs(2), || {
+            os_process_cmdline_contains(pid, token).is_some()
+        })
+        .await;
+        assert!(ready, "pid {pid}의 명령행이 시간 안에 읽히지 않았습니다");
+    }
+
     /// 프로파일 lock 파일 경로 — `crate::lock::file_lock`의 `<dir>/<profile>.lock` 규칙을
     /// 테스트에서만 재현한다(그 함수는 `pub`이 아니다).
     fn lock_file_path(dir: &std::path::Path, profile: &str) -> PathBuf {
@@ -1121,6 +1132,7 @@ mod tests {
         cmd.process_group(0);
         let mut child = cmd.spawn().expect("spawn 실패");
         let pid = child.id().expect("pid 없음");
+        wait_for_exec(pid, SLEEP_PROFILE_TOKEN).await;
         let started_at = Utc::now();
 
         let identity = JobRecord {
@@ -1337,6 +1349,7 @@ mod tests {
         cmd.process_group(0);
         let mut child = cmd.spawn().expect("spawn 실패");
         let pid = child.id().expect("pid 없음");
+        wait_for_exec(pid, SLEEP_PROFILE_TOKEN).await;
         let started_at = Utc::now();
         let identity = JobRecord {
             pid,
@@ -1510,6 +1523,7 @@ mod tests {
         cmd.process_group(0);
         let mut child = cmd.spawn().expect("spawn 실패");
         let pid = child.id().expect("pid 없음");
+        wait_for_exec(pid, "77").await;
         let started_at = Utc::now();
 
         let identity = JobRecord {
