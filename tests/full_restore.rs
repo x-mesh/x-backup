@@ -310,6 +310,7 @@ async fn restore_half_matches_with_real_mongorestore() {
         oplog_count: None,
         promoted_from_gap: false,
         mysql_binlog: None,
+        table_rows: None,
         status: BackupStatus::Complete,
     };
     ManifestStore::new(&storage)

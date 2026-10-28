@@ -462,6 +462,7 @@ fn build_manifest(
         // 풀 백업은 gap 승격이 아니다(증분 핸들러가 풀로 승격할 때만 true로 덮어쓴다).
         promoted_from_gap: false,
         mysql_binlog: None,
+        table_rows: None,
         status: BackupStatus::Complete,
     }
 }
@@ -518,7 +519,7 @@ impl DumpTermination for crate::engine::postgres::backup::PgDumpHandle {
 }
 
 impl DumpTermination for crate::engine::mysql::backup::MysqlDumpHandle {
-    type Output = Option<crate::manifest::schema::MysqlBinlogCoords>;
+    type Output = crate::engine::mysql::backup::MysqlDumpOutput;
     async fn finish(self) -> Result<Self::Output> {
         crate::engine::mysql::backup::MysqlDumpHandle::finish(self).await
     }
@@ -703,6 +704,7 @@ pub async fn run_pg_full_backup(
         oplog_count: None,
         promoted_from_gap: false,
         mysql_binlog: None,
+        table_rows: None,
         status: BackupStatus::Complete,
     };
     write_manifest_or_cleanup(storage, &manifest).await?;
@@ -750,7 +752,7 @@ pub async fn run_mysql_full_backup(
     let dump_handle = dump.handle();
 
     // 공통 코어: 합성 → 저장 → 종료 판정 → 확정. dump_output이 스냅샷 binlog 좌표
-    // (증분 base — MysqlDumpHandle::finish의 반환값)다.
+    // (증분 base)와 테이블별 행 수(MysqlDumpHandle::finish의 반환값)다.
     let stored = store_dump_stream(
         storage,
         Box::pin(dump),
@@ -759,7 +761,8 @@ pub async fn run_mysql_full_backup(
         dump_handle,
     )
     .await?;
-    let mysql_binlog = stored.dump_output;
+    let mysql_binlog = stored.dump_output.binlog;
+    let table_rows = Some(stored.dump_output.table_rows);
 
     let manifest = BackupManifest {
         format_version: FORMAT_VERSION,
@@ -783,6 +786,7 @@ pub async fn run_mysql_full_backup(
         oplog_count: None,
         promoted_from_gap,
         mysql_binlog,
+        table_rows,
         status: BackupStatus::Complete,
     };
     write_manifest_or_cleanup(storage, &manifest).await?;
@@ -976,6 +980,7 @@ pub async fn run_file_incremental_backup(
         oplog_count: Some(diff.count()),
         promoted_from_gap: false,
         mysql_binlog: None,
+        table_rows: None,
         status: BackupStatus::Complete,
     };
     write_manifest_or_cleanup(storage, &manifest).await?;
@@ -1153,6 +1158,7 @@ async fn run_file_full_backup_inner(
         oplog_count: None,
         promoted_from_gap,
         mysql_binlog: None,
+        table_rows: None,
         status: BackupStatus::Complete,
     };
     write_manifest_or_cleanup(storage, &manifest).await?;
@@ -1353,6 +1359,7 @@ fn mysql_incremental_manifest(
         oplog_count: Some(change_count),
         promoted_from_gap: false,
         mysql_binlog: end_coords,
+        table_rows: None,
         status: BackupStatus::Complete,
     }
 }
@@ -1558,6 +1565,7 @@ fn pg_incremental_manifest(
         oplog_count: Some(change_count),
         promoted_from_gap: false,
         mysql_binlog: None,
+        table_rows: None,
         status: BackupStatus::Complete,
     }
 }
@@ -1723,6 +1731,7 @@ mod tests {
             oplog_count: None,
             promoted_from_gap: false,
             mysql_binlog: None,
+            table_rows: None,
             status: BackupStatus::Complete,
         };
         let write_err = store.write(&manifest).await.unwrap_err();

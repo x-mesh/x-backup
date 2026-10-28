@@ -129,18 +129,25 @@ async fn compare_backup(
         )));
     }
 
-    let stages = reverse_stack_for(&manifest)?;
-    let raw = storage
-        .get_stream(&data_path(backup_id))
-        .await
-        .map_err(|e| {
-            XBackupError::Failure(crate::tr!(
-                "failed to read data.bin ({backup_id}): {e}",
-                "data.bin 읽기 실패({backup_id}): {e}"
-            ))
-        })?;
-    let mut decoded = stages.apply(raw);
-    let mut backup_counts = count_archive_rows(&mut decoded).await?;
+    // 백업 시점에 기록된 행 수가 있으면 아카이브를 다시 읽지 않는다(개인키도 필요 없다).
+    // 이 필드가 생기기 전 백업은 아카이브를 끝까지 읽어 센다.
+    let mut backup_counts = match manifest.table_rows.clone() {
+        Some(rows) => rows,
+        None => {
+            let stages = reverse_stack_for(&manifest)?;
+            let raw = storage
+                .get_stream(&data_path(backup_id))
+                .await
+                .map_err(|e| {
+                    XBackupError::Failure(crate::tr!(
+                        "failed to read data.bin ({backup_id}): {e}",
+                        "data.bin 읽기 실패({backup_id}): {e}"
+                    ))
+                })?;
+            let mut decoded = stages.apply(raw);
+            count_archive_rows(&mut decoded).await?
+        }
+    };
 
     let mut client = MysqlClient::connect(target, None).await?;
     let live = live_table_names(client.conn_mut()).await?;
@@ -540,6 +547,7 @@ mod tests {
             oplog_count: None,
             promoted_from_gap: false,
             mysql_binlog: None,
+            table_rows: None,
             status: BackupStatus::Complete,
         }
     }
@@ -580,6 +588,30 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// `table_rows`가 있어도 data.bin이 없으면 `--against`는 대상 DB에 닿기 전에 실패한다.
+    /// 비교는 기록된 행 수를 쓰지만, 그 값은 앞 단계의 체크섬 검증을 통과한 백업에만 쓰인다.
+    #[tokio::test]
+    async fn against_with_table_rows_still_requires_data_bin() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = LocalFs::new(dir.path()).unwrap();
+        let mut m = full("bk", &sha256_hex(b"archive"));
+        m.tool_versions.archive_format = Some(archive::FORMAT_ID.to_string());
+        m.table_rows = Some(BTreeMap::from([("t".to_string(), 3u64)]));
+        ManifestStore::new(&fs).write(&m).await.unwrap();
+
+        let target = Secret::new("mysql://u:p@127.0.0.1:1/db");
+        let err = run(
+            &fs,
+            &args("bk", false, false, false),
+            crate::i18n::Lang::En,
+            Some(&target),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.to_string().contains("data.bin"), "{err}");
     }
 
     /// 변조 산출물은 exit 1로 실패한다.

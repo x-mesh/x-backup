@@ -15,6 +15,7 @@
 //! 데이터(generated 컬럼 제외, invisible 포함)·뷰·트리거·루틴(프로시저/함수)·이벤트.
 //! 잡지 않는 것: 사용자/권한·테이블스페이스·객체별 sql_mode 재현(복구는 고정 permissive 모드).
 
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -63,12 +64,21 @@ impl MysqlDumper {
         let (mut writer, reader) = tokio::io::duplex(PIPE_BUFFER_BYTES);
         let outcome: Arc<Mutex<Option<Result<()>>>> = Arc::new(Mutex::new(None));
         let coords: Arc<Mutex<Option<MysqlBinlogCoords>>> = Arc::new(Mutex::new(None));
+        let rows: Arc<Mutex<BTreeMap<String, u64>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let outcome_task = Arc::clone(&outcome);
         let coords_task = Arc::clone(&coords);
+        let rows_task = Arc::clone(&rows);
         let mut conn = self.client.into_conn();
 
         let handle = tokio::spawn(async move {
-            let res = write_archive(&mut conn, &mut writer, table_filter, &coords_task).await;
+            let res = write_archive(
+                &mut conn,
+                &mut writer,
+                table_filter,
+                &coords_task,
+                &rows_task,
+            )
+            .await;
             let _ = writer.shutdown().await;
             let _ = conn.disconnect().await;
             *outcome_task.lock().expect("mysql dump outcome poisoned") = Some(res);
@@ -78,6 +88,7 @@ impl MysqlDumper {
             reader,
             outcome,
             coords,
+            rows,
             task: Arc::new(Mutex::new(Some(handle))),
         }
     }
@@ -89,6 +100,7 @@ async fn write_archive(
     writer: &mut DuplexStream,
     table_filter: Option<String>,
     coords_cell: &Arc<Mutex<Option<MysqlBinlogCoords>>>,
+    rows_cell: &Arc<Mutex<BTreeMap<String, u64>>>,
 ) -> Result<()> {
     // 세션 설정 — UTF-8 + UTC(TIMESTAMP 정합, mysqldump --tz-utc 등가).
     for stmt in [
@@ -122,7 +134,9 @@ async fn write_archive(
         let _ = conn.query_drop("UNLOCK TABLES").await;
     }
 
-    let res = write_archive_in_snapshot(conn, writer, table_filter, &coords, coords_cell).await;
+    let res =
+        write_archive_in_snapshot(conn, writer, table_filter, &coords, coords_cell, rows_cell)
+            .await;
     let _ = conn
         .query_drop(if res.is_ok() { "COMMIT" } else { "ROLLBACK" })
         .await;
@@ -136,6 +150,7 @@ async fn write_archive_in_snapshot(
     table_filter: Option<String>,
     coords: &MysqlBinlogCoords,
     coords_cell: &Arc<Mutex<Option<MysqlBinlogCoords>>>,
+    rows_cell: &Arc<Mutex<BTreeMap<String, u64>>>,
 ) -> Result<()> {
     let db: String = conn
         .query_first("SELECT DATABASE()")
@@ -203,7 +218,11 @@ async fn write_archive_in_snapshot(
     // BASE TABLE 목록.
     let tables = list_tables(conn, &db, table_filter.as_deref()).await?;
     for table in &tables {
-        dump_table(conn, writer, &db, table).await?;
+        let rows = dump_table(conn, writer, &db, table).await?;
+        rows_cell
+            .lock()
+            .expect("mysql table rows poisoned")
+            .insert(table.clone(), rows);
     }
 
     // 후행 DDL — 뷰·트리거·루틴·이벤트(데이터 적재 후). 의존성 순서는 복구가 재시도로 흡수.
@@ -226,7 +245,7 @@ async fn dump_table(
     writer: &mut DuplexStream,
     db: &str,
     table: &str,
-) -> Result<()> {
+) -> Result<u64> {
     // 소스 질의는 db로 정규화(현재 USE db와 무관히 정확). 아카이브에는 **bare** 테이블명을 담아
     // 복구가 대상 연결의 현재 DB로 들어가게 한다(mysqldump와 동일 — 교차 DB 복구 가능).
     let quoted_src = quote_qualified(db, table);
@@ -292,6 +311,7 @@ async fn dump_table(
     .await?;
 
     // 데이터 — 명시 컬럼 SELECT 스트림(text protocol). 컬럼이 모두 generated면 SELECT 생략.
+    let mut rows = 0u64;
     if !select_exprs.is_empty() {
         let select = format!("SELECT {} FROM {quoted_src}", select_exprs.join(", "));
         let mut result = conn.query_iter(select).await.map_err(|e| {
@@ -316,13 +336,14 @@ async fn dump_table(
                 })?;
                 let tuple = render_row(&row, &render_plan);
                 archive::write_row(writer, tuple.as_bytes()).await?;
+                rows += 1;
             }
         }
     }
 
     archive::write_table_end(writer).await?;
-    tracing::debug!(ns = %ns, "MySQL 백업: 테이블 직렬화 완료");
-    Ok(())
+    tracing::debug!(ns = %ns, rows, "MySQL 백업: 테이블 직렬화 완료");
+    Ok(rows)
 }
 
 /// 한 행을 `(v1, v2, ...)` 튜플로 렌더링한다.
@@ -565,6 +586,7 @@ pub struct MysqlDumpStream {
     reader: DuplexStream,
     outcome: Arc<Mutex<Option<Result<()>>>>,
     coords: Arc<Mutex<Option<MysqlBinlogCoords>>>,
+    rows: Arc<Mutex<BTreeMap<String, u64>>>,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -574,6 +596,7 @@ impl MysqlDumpStream {
         MysqlDumpHandle {
             outcome: Arc::clone(&self.outcome),
             coords: Arc::clone(&self.coords),
+            rows: Arc::clone(&self.rows),
             task: Arc::clone(&self.task),
         }
     }
@@ -583,12 +606,21 @@ impl MysqlDumpStream {
 pub struct MysqlDumpHandle {
     outcome: Arc<Mutex<Option<Result<()>>>>,
     coords: Arc<Mutex<Option<MysqlBinlogCoords>>>,
+    rows: Arc<Mutex<BTreeMap<String, u64>>>,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
+/// 백업 task가 남기는 결과 — 스냅샷 binlog 좌표(증분 base)와 테이블별 행 수.
+#[derive(Debug, Default)]
+pub struct MysqlDumpOutput {
+    pub binlog: Option<MysqlBinlogCoords>,
+    /// 스냅샷 안에서 아카이브에 쓴 테이블별 행 수.
+    pub table_rows: BTreeMap<String, u64>,
+}
+
 impl MysqlDumpHandle {
-    /// 스트림 EOF 후 백업 task의 결과를 회수하고 스냅샷 binlog 좌표를 반환한다(증분 base).
-    pub async fn finish(self) -> Result<Option<MysqlBinlogCoords>> {
+    /// 스트림 EOF 후 백업 task의 결과를 회수하고 스냅샷 binlog 좌표(증분 base)와 테이블별 행 수를 반환한다.
+    pub async fn finish(self) -> Result<MysqlDumpOutput> {
         let task = self.task.lock().expect("mysql dump task poisoned").take();
         if let Some(task) = task {
             let _ = task.await;
@@ -598,7 +630,10 @@ impl MysqlDumpHandle {
             .expect("mysql dump outcome poisoned")
             .take()
             .unwrap_or(Ok(()))?;
-        Ok(self.coords.lock().expect("mysql coords poisoned").take())
+        Ok(MysqlDumpOutput {
+            binlog: self.coords.lock().expect("mysql coords poisoned").take(),
+            table_rows: std::mem::take(&mut *self.rows.lock().expect("mysql table rows poisoned")),
+        })
     }
 }
 
