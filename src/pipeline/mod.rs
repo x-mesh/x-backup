@@ -24,6 +24,7 @@ pub mod pg_pitr;
 pub mod pitr;
 pub mod prune;
 pub mod restore;
+pub mod rows_delta;
 pub mod stage;
 pub mod verify;
 
