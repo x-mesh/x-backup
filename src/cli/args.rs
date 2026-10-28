@@ -203,6 +203,9 @@ pub struct BackupArgs {
     /// 압축 레벨(미지정 시 config 기본값).
     #[arg(long, value_name = "N")]
     pub compress_level: Option<i32>,
+    /// 이번 실행만 압축하지 않는다(config `compress = "none"`과 같음).
+    #[arg(long, conflicts_with = "compress_level")]
+    pub no_compress: bool,
     /// 진행 표시를 억제하고 요약·경고·에러만 출력(cron/CI).
     #[arg(long, conflicts_with = "progress")]
     pub quiet: bool,

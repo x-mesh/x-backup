@@ -173,6 +173,7 @@ async fn run_job(config_path: &std::path::Path, lang_flag: Option<Lang>, job: &J
             collection: None,
             no_encrypt: false,
             compress_level: None,
+            no_compress: false,
             quiet: false, // 비-TTY auto-quiet가 처리.
             progress: false,
             json: false,

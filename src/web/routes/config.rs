@@ -234,9 +234,8 @@ const ENGINES: &[&str] = &["native", "mongodump"];
 const BACKUP_TYPES: &[&str] = &["full", "incr"];
 /// `output_mode` 허용 값(같은 doc).
 const OUTPUT_MODES: &[&str] = &["progress", "quiet"];
-/// `compress_algorithm` 허용 값. 권위는 `crate::compress::ALGORITHM_ZSTD`이며 복구 경로가
-/// zstd 외를 거부한다(`src/pipeline/stage.rs`).
-const COMPRESS_ALGORITHMS: &[&str] = &["zstd"];
+/// `compress_algorithm` 허용 값. 권위는 `crate::compress::ALGORITHMS`다.
+const COMPRESS_ALGORITHMS: &[&str] = crate::compress::ALGORITHMS;
 /// `encrypt_algorithm` 허용 값. 권위는 `crate::crypto`의 `ALGORITHM_AGE`/`ALGORITHM_AES_GCM`.
 const ENCRYPT_ALGORITHMS: &[&str] = &["age", "aes-256-gcm"];
 
@@ -3663,7 +3662,7 @@ uri_env = "MONGO_URI_T28"
         let origins = doc.origins_of("prod");
         let bad: &[(&str, &str)] = &[
             ("engine", "rsync"),              // 목록 밖
-            ("compress_algorithm", "gzip"),   // 목록 밖
+            ("compress_algorithm", "lz4"),    // 목록 밖
             ("encrypt", "yes"),               // 불리언 아님
             ("keep_full", "-1"),              // 범위 밖(u32)
             ("keep_full", "abc"),             // 정수 아님

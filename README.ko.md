@@ -23,7 +23,7 @@
 - ✅ **증분 백업** — oplog 직접 캡처, gap 감지 시 풀 백업 자동 승격(exit 4)
 - ✅ **PITR** — `--at <RFC3339>` 시점 복구(base 복원 후 증분 재생, 체인 검증 전제). MongoDB(oplog)·PostgreSQL(logical decoding)·MySQL(binlog) 지원. PostgreSQL·MySQL은 `--at latest`로 전체 재생도 된다
 - ✅ **스토리지** — 로컬 디스크 / S3 호환(MinIO·R2·OCI), 스트리밍 멀티파트 + abort
-- ✅ **암호화 기본** — `age`(X25519, 공개키만 백업 호스트에 배치) / AES-256-GCM 대안, zstd 압축 후 암호화
+- ✅ **암호화 기본** — `age`(X25519, 공개키만 백업 호스트에 배치) / AES-256-GCM 대안, zstd(기본) 또는 gzip으로 압축한 뒤 암호화. `compress = "none"`이나 `--no-compress`로 압축을 끌 수 있음
 - ✅ **무결성** — manifest + sha256, `verify`(키 불필요 구조 검증) / `--deep` / `--chain`
 - ✅ **운영** — `doctor` config 정적 점검(오프라인·DB 연결 없음), `status` 사전 점검(연결·토폴로지·권한·버전/FCV·시계차·oplog 윈도우·데이터 형상·**마지막 백업 나이**·**destination 쓰기 가능+여유 공간**), `--all` source/target 비교, `--watch` 라이브 모니터, `prune` 체인 안전 삭제(`--keep-last`·config retention), 동시 실행 잠금, exit code 규약 0~5
 - ✅ **PostgreSQL** — COPY 프로토콜 기반 드라이버 네이티브 풀 백업/복구(데이터 + 테이블 + 제약 + 인덱스 + 시퀀스), `pg_dump`/`pg_restore` 불필요. 동일 파이프라인(압축→암호화→저장)·동일 `status`/`list`/`verify`/`restore`
@@ -166,7 +166,7 @@ default_profile = "prod"
 language = "ko"                  # 설명/안내 문구 언어(en | ko). 라벨·기술용어는 항상 영문.
 
 [defaults]                       # 모든 프로파일에 적용(최하위 우선순위)
-compress = "zstd:10"             # 알고리즘[:레벨]
+compress = "zstd:10"             # 알고리즘[:레벨]: zstd(1~22) | gzip(1~9) | none
 encrypt  = "age:/etc/x-backup/age.pub"   # "age:<공개키-경로>" | true | false | "off"
 
 [profile.prod]
@@ -252,7 +252,7 @@ encrypt = false
 | `dest_name` | `destination.name` | |
 | `s3_bucket`, `s3_prefix`, `s3_region`, `s3_endpoint`, `s3_creds` | `destination.s3.{bucket,prefix,region,endpoint,credentials_env}` | `s3_creds`는 env 변수 *이름* |
 | `[[profile.x.dest]]`(테이블 배열) | `destinations[]` | 멀티 destination(아래 참조) |
-| `compress = "zstd:6"` | `features.compression.{algorithm,level}` | 또는 `compress_algorithm` + `compress_level` |
+| `compress = "zstd:6"` \| `"gzip:6"` \| `"none"` | `features.compression.{algorithm,level}` | 또는 `compress_algorithm` + `compress_level`. 범위 밖 레벨은 경계값으로 맞춤 |
 | `encrypt = "age:/path"` \| `true` \| `false` \| `"off"` | `features.encryption.{enabled,algorithm,recipient_file}` | 또는 `encrypt_algorithm` + `recipient_file`. `recipient_file`은 공개키 *경로* |
 | `incr_interval`, `incr_on_gap`, `pg_logical`, `mysql_binlog` | `features.incremental.{interval,on_gap,pg_logical,mysql_binlog}` | |
 | `keep_full`, `keep_days`, `keep_last` | `retention.{keep_full,keep_days,keep_last}` | |

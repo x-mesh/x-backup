@@ -404,7 +404,7 @@ fn expand_dest_array(name: &str, arr: &[Value]) -> Result<Value> {
     Ok(Value::Array(out))
 }
 
-/// `compress = "zstd:6"` | `"zstd"` 를 compression 테이블로 파싱.
+/// `compress = "zstd:6"` | `"gzip"` | `"none"` 을 compression 테이블로 파싱.
 fn parse_compress(name: &str, v: &Value, comp: &mut Table) -> Result<()> {
     let s = v.as_str().ok_or_else(|| {
         cfg_err(format!(
@@ -615,13 +615,11 @@ fn emit_profile_body(buf: &mut String, p: &Profile) {
 
     // ── compression(기본 zstd/10 생략) ──
     let c = &p.features.compression;
-    if c.algorithm != "zstd" || c.level != 10 {
-        if c.algorithm == "zstd" {
-            // level만 다른 흔한 경우도 compact 폼으로.
-            line_str(buf, "compress", &format!("zstd:{}", c.level));
-        } else {
-            line_str(buf, "compress", &format!("{}:{}", c.algorithm, c.level));
-        }
+    if c.algorithm == crate::compress::ALGORITHM_NONE && c.level == 10 {
+        // none은 레벨을 쓰지 않으므로 기본 레벨이면 붙이지 않는다.
+        line_str(buf, "compress", crate::compress::ALGORITHM_NONE);
+    } else if c.algorithm != "zstd" || c.level != 10 {
+        line_str(buf, "compress", &format!("{}:{}", c.algorithm, c.level));
     }
 
     // ── encryption(기본 enabled=true+age 생략; recipient_file 있으면 내보냄) ──
@@ -1121,6 +1119,42 @@ mod tests {
             },
         );
         roundtrip(&cfg);
+    }
+
+    #[test]
+    fn roundtrip_gzip_and_none_compression() {
+        for (algorithm, level, expected) in [
+            ("gzip", 6, "compress = \"gzip:6\""),
+            ("none", 10, "compress = \"none\""),
+            ("none", 3, "compress = \"none:3\""),
+        ] {
+            let mut cfg = Config::default();
+            cfg.profiles.insert(
+                "p".to_string(),
+                Profile {
+                    source: SourceConfig {
+                        uri: Some("mongodb://localhost:27017".to_string()),
+                        ..SourceConfig::default()
+                    },
+                    destination: DestinationConfig {
+                        r#type: Some("local".to_string()),
+                        path: Some("/srv/store".to_string()),
+                        ..DestinationConfig::default()
+                    },
+                    features: FeaturesConfig {
+                        compression: CompressionConfig {
+                            algorithm: algorithm.to_string(),
+                            level,
+                        },
+                        ..FeaturesConfig::default()
+                    },
+                    ..Profile::default()
+                },
+            );
+            let text = to_v2_string(&cfg).unwrap();
+            assert!(text.contains(expected), "{expected} 없음:\n{text}");
+            roundtrip(&cfg);
+        }
     }
 
     #[test]

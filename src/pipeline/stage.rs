@@ -26,7 +26,6 @@
 //! 단계 합성 자체에는 await가 없고, 데이터가 흐를 때 각 어댑터의 `poll_read`가
 //! 자연 백프레셔로 연결된다.
 
-use crate::compress::ZstdDecompressStage;
 use crate::crypto::{build_decrypt_stage, DecryptKeySource};
 use crate::error::{Result, XBackupError};
 use crate::manifest::schema::BackupManifest;
@@ -137,14 +136,14 @@ pub fn reverse_stack_for(manifest: &BackupManifest) -> Result<StageStack> {
 
     // 2) 압축해제 단계(역순 두 번째) — 복호화된 평문에 적용.
     if let Some(comp_meta) = &manifest.compression {
-        match comp_meta.algorithm.as_str() {
-            crate::compress::ALGORITHM_ZSTD => {
-                stack.push(Box::new(ZstdDecompressStage::new()));
-            }
-            other => {
-                return Err(XBackupError::Failure(crate::tr!("unknown compression algorithm: '{other}' (only zstd is supported) — cannot restore", "알 수 없는 압축 알고리즘: '{other}'(zstd만 지원) — 복구 불가")));
-            }
-        }
+        let other = comp_meta.algorithm.as_str();
+        let stage = crate::compress::decompress_stage(other).ok_or_else(|| {
+            XBackupError::Failure(crate::tr!(
+                "unknown compression algorithm: '{other}' (supported: zstd, gzip) — cannot restore",
+                "알 수 없는 압축 알고리즘: '{other}'(zstd, gzip만 지원) — 복구 불가"
+            ))
+        })?;
+        stack.push(stage);
     }
 
     Ok(stack)
