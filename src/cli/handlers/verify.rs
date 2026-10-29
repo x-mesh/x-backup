@@ -171,10 +171,10 @@ async fn compare_backup(
 
     // `--content`는 기록된 다이제스트가 있어야 한다. 조용히 건너뛰면 검증한 것처럼 보이므로 거부한다.
     let digests = if content {
-        if engine != CompareEngine::Mysql {
+        if engine.digest_algorithm().is_none() {
             return Err(XBackupError::Usage(crate::tr!(
-                "--content supports only MariaDB/MySQL backups for now",
-                "--content는 아직 MariaDB/MySQL 백업만 지원합니다"
+                "--content supports only MariaDB/MySQL and MongoDB (native) backups for now",
+                "--content는 아직 MariaDB/MySQL, MongoDB(native) 백업만 지원합니다"
             )));
         }
         Some(manifest.table_digests.as_ref().ok_or_else(|| {

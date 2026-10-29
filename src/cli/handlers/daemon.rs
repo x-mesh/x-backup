@@ -181,6 +181,7 @@ async fn run_job(config_path: &std::path::Path, lang_flag: Option<Lang>, job: &J
             no_hooks: false,
             read_source: None,
             no_content_digest: false,
+            content_digest: false,
             warn_drop_percent: crate::pipeline::rows_delta::DEFAULT_DROP_WARN_PERCENT,
         },
     )

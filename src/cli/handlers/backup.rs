@@ -367,6 +367,7 @@ pub async fn handle(
             stages,
             meta,
             row_progress,
+            args.content_digest,
         )
         .await;
         let elapsed = started.elapsed();
@@ -1091,6 +1092,12 @@ async fn handle_file_backup(
     backup_type: BackupType,
     lang: Lang,
 ) -> Result<()> {
+    if args.content_digest {
+        return Err(XBackupError::Usage(crate::tr!(
+            "--content-digest supports only MongoDB (native) backups (MariaDB/MySQL records digests by default)",
+            "--content-digest는 MongoDB(native) 백업에서만 쓸 수 있습니다(MariaDB/MySQL은 기본으로 기록합니다)"
+        )));
+    }
     if args.db.is_some() || args.collection.is_some() {
         return Err(XBackupError::Usage(
             "파일 백업은 --db/--collection(DB 선택 백업)과 병용할 수 없습니다 — 백업 범위는 \
@@ -1276,6 +1283,12 @@ async fn handle_pg_backup(
     backup_type: BackupType,
     lang: Lang,
 ) -> Result<()> {
+    if args.content_digest {
+        return Err(XBackupError::Usage(crate::tr!(
+            "--content-digest supports only MongoDB (native) backups (MariaDB/MySQL records digests by default)",
+            "--content-digest는 MongoDB(native) 백업에서만 쓸 수 있습니다(MariaDB/MySQL은 기본으로 기록합니다)"
+        )));
+    }
     let enable_incremental = resolved.profile.features.incremental.pg_logical;
 
     // FR-8 자동 사전 점검(엔진 무관, PRD §323) — mode.precheck && !--skip-precheck면 연결+읽기
@@ -2612,6 +2625,7 @@ mod tests {
             no_hooks: false,
             read_source: None,
             no_content_digest: false,
+            content_digest: false,
             warn_drop_percent: crate::pipeline::rows_delta::DEFAULT_DROP_WARN_PERCENT,
         }
     }

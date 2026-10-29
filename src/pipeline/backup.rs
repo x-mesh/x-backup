@@ -307,7 +307,7 @@ pub async fn run_full_backup_with_meta(
     stages: StageStack,
     meta: BackupMeta,
 ) -> Result<BackupOutcome> {
-    run_full_backup_with_rows(request, storage, stages, meta, None).await
+    run_full_backup_with_rows(request, storage, stages, meta, None, false).await
 }
 
 /// [`run_full_backup_with_meta`]에 컬렉션·문서 진행 상태([`RowProgress`](crate::engine::progress::RowProgress))를
@@ -318,7 +318,16 @@ pub async fn run_full_backup_with_rows(
     stages: StageStack,
     meta: BackupMeta,
     row_progress: Option<Arc<crate::engine::progress::RowProgress>>,
+    content_digest: bool,
 ) -> Result<BackupOutcome> {
+    // native 아카이브의 raw 문서 바이트만 해시할 수 있다(mongodump는 아카이브를 해석하지 않는다).
+    if content_digest && request.engine != Engine::Native {
+        return Err(XBackupError::Usage(crate::tr!(
+            "--content-digest requires the native engine",
+            "--content-digest는 native 엔진에서만 쓸 수 있습니다"
+        )));
+    }
+
     // 1) 드라이버로 서버 메타 + dump 전 oplog ts 조회.
     let mongo = MongoMeta::connect(&request.uri, request.timeout_secs).await?;
     let server_meta = mongo.server_meta().await?;
@@ -343,6 +352,7 @@ pub async fn run_full_backup_with_rows(
     // 2) dump 스트림 생성 — 엔진 분기. mongodump는 `--archive=-`(시점 일관 `--oplog`),
     //    native는 드라이버로 직접 아카이브 스트림을 만든다(외부 도구 불필요).
     let archive_format = request.engine.archive_format();
+    let digests_cell;
     let (dump_stream, finalizer): (BoxAsyncRead, DumpFinalizer) = match request.engine {
         // parse가 조기 거부하므로 미포함 빌드에서 도달 불가(방어적).
         #[cfg(not(feature = "legacy-mongodump"))]
@@ -360,6 +370,7 @@ pub async fn run_full_backup_with_rows(
             };
             let mut proc = DumpProcess::spawn(&spec)?;
             let stdout = proc.take_stdout()?;
+            digests_cell = None;
             (
                 Box::pin(stdout),
                 DumpFinalizer::Mongodump(Box::new(MongodumpFinalizer {
@@ -372,9 +383,14 @@ pub async fn run_full_backup_with_rows(
             let dumper =
                 crate::engine::native::NativeDumper::connect(&request.uri, request.timeout_secs)
                     .await?;
-            let nds =
-                dumper.dump_stream(request.db.clone(), request.collection.clone(), row_progress);
+            let nds = dumper.dump_stream(
+                request.db.clone(),
+                request.collection.clone(),
+                row_progress,
+                content_digest,
+            );
             let handle = nds.handle();
+            digests_cell = Some(handle.digests());
             (Box::pin(nds), DumpFinalizer::Native(Some(handle)))
         }
     };
@@ -406,7 +422,13 @@ pub async fn run_full_backup_with_rows(
     // 5) manifest 작성·기록. 압축/암호화 메타는 meta에서, archive_format(엔진)도 기록한다 —
     //    복구가 이 값을 보고 native/레거시 중 맞는 소비자를 고른다.
     let table_rows = stored.dump_output.clone();
-    let manifest = build_manifest(
+    let table_digests = digests_cell.filter(|_| content_digest).map(|cell| {
+        crate::manifest::schema::ContentDigests {
+            algorithm: crate::engine::native::compare::DIGEST_ALGORITHM.to_string(),
+            tables: std::mem::take(&mut *cell.lock().expect("native collection digests poisoned")),
+        }
+    });
+    let mut manifest = build_manifest(
         &stored.backup_id,
         &server_meta,
         topology,
@@ -419,6 +441,7 @@ pub async fn run_full_backup_with_rows(
         &meta,
         stored.dump_output,
     );
+    manifest.table_digests = table_digests;
     write_manifest_or_cleanup(storage, &manifest).await?;
 
     tracing::info!(

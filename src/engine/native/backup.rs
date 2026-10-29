@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 
 use super::archive;
 use crate::config::secret::Secret;
+use crate::engine::digest::RowDigest;
 use crate::engine::progress::RowProgress;
 use crate::error::{Result, XBackupError};
 
@@ -55,13 +56,16 @@ impl NativeDumper {
         db: Option<String>,
         collection: Option<String>,
         progress: Option<Arc<RowProgress>>,
+        content_digest: bool,
     ) -> NativeDumpStream {
         let (mut writer, reader) = tokio::io::duplex(PIPE_BUFFER_BYTES);
         let outcome: Arc<Mutex<Option<Result<()>>>> = Arc::new(Mutex::new(None));
         let rows: Arc<Mutex<BTreeMap<String, u64>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let digests: Arc<Mutex<BTreeMap<String, String>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let client = self.client.clone();
         let outcome_task = Arc::clone(&outcome);
         let rows_task = Arc::clone(&rows);
+        let digests_task = content_digest.then(|| Arc::clone(&digests));
 
         let handle = tokio::spawn(async move {
             let res = write_archive(
@@ -70,6 +74,7 @@ impl NativeDumper {
                 db,
                 collection,
                 &rows_task,
+                digests_task.as_ref(),
                 progress.as_deref(),
             )
             .await;
@@ -82,6 +87,7 @@ impl NativeDumper {
             reader,
             outcome,
             rows,
+            digests,
             task: Arc::new(Mutex::new(Some(handle))),
         }
     }
@@ -94,6 +100,7 @@ async fn write_archive(
     db_filter: Option<String>,
     coll_filter: Option<String>,
     rows_cell: &Arc<Mutex<BTreeMap<String, u64>>>,
+    digests_cell: Option<&Arc<Mutex<BTreeMap<String, String>>>>,
     progress: Option<&RowProgress>,
 ) -> Result<()> {
     archive::write_header(writer, &Utc::now().to_rfc3339()).await?;
@@ -119,6 +126,7 @@ async fn write_archive(
         // 문서를 raw로 스트리밍(재직렬화 없이 바이트 그대로).
         let raw_coll = db.collection::<RawDocumentBuf>(&coll_name);
         let mut rows = 0u64;
+        let mut digest = digests_cell.map(|_| RowDigest::default());
         let mut cursor = raw_coll.find(doc! {}).await.map_err(|e| {
             XBackupError::Failure(crate::tr!(
                 "{ns}: failed to query documents: {e}",
@@ -132,6 +140,9 @@ async fn write_archive(
             ))
         })? {
             archive::write_raw_document(writer, cursor.current()).await?;
+            if let Some(d) = digest.as_mut() {
+                d.add(cursor.current().as_bytes());
+            }
             rows += 1;
             if let Some(p) = progress {
                 p.add_row();
@@ -141,6 +152,11 @@ async fn write_archive(
             .lock()
             .expect("native collection rows poisoned")
             .insert(ns.clone(), rows);
+        if let (Some(cell), Some(d)) = (digests_cell, digest) {
+            cell.lock()
+                .expect("native collection digests poisoned")
+                .insert(ns.clone(), d.finish());
+        }
         if let Some(p) = progress {
             p.finish_table();
         }
@@ -253,6 +269,7 @@ pub struct NativeDumpStream {
     reader: DuplexStream,
     outcome: Arc<Mutex<Option<Result<()>>>>,
     rows: Arc<Mutex<BTreeMap<String, u64>>>,
+    digests: Arc<Mutex<BTreeMap<String, String>>>,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -262,6 +279,7 @@ impl NativeDumpStream {
         NativeDumpHandle {
             outcome: Arc::clone(&self.outcome),
             rows: Arc::clone(&self.rows),
+            digests: Arc::clone(&self.digests),
             task: Arc::clone(&self.task),
         }
     }
@@ -271,10 +289,17 @@ impl NativeDumpStream {
 pub struct NativeDumpHandle {
     outcome: Arc<Mutex<Option<Result<()>>>>,
     rows: Arc<Mutex<BTreeMap<String, u64>>>,
+    digests: Arc<Mutex<BTreeMap<String, String>>>,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl NativeDumpHandle {
+    /// 컬렉션별 내용 다이제스트 저장소. `finish`가 핸들을 소비하므로 미리 복제해 둔다.
+    /// 다이제스트를 켜지 않은 덤프에서는 끝까지 비어 있다.
+    pub fn digests(&self) -> Arc<Mutex<BTreeMap<String, String>>> {
+        Arc::clone(&self.digests)
+    }
+
     /// 스트림 EOF 후 백업 task의 결과를 회수하고, 아카이브에 쓴 컬렉션별 문서 수
     /// (`db.컬렉션` → 문서 수)를 반환한다(드라이버/직렬화 오류 전파).
     pub async fn finish(self) -> Result<BTreeMap<String, u64>> {

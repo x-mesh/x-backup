@@ -128,8 +128,8 @@ pub fn apply_content_digests(
 
 fn content_unsupported() -> crate::error::XBackupError {
     crate::error::XBackupError::Usage(crate::tr!(
-        "--content supports only MariaDB/MySQL backups for now",
-        "--content는 아직 MariaDB/MySQL 백업만 지원합니다"
+        "--content supports only MariaDB/MySQL and MongoDB (native) backups for now",
+        "--content는 아직 MariaDB/MySQL, MongoDB(native) 백업만 지원합니다"
     ))
 }
 
@@ -161,6 +161,15 @@ impl CompareEngine {
                 | (Self::Postgres, DbKind::Postgres)
                 | (Self::MongoNative, DbKind::Mongo)
         )
+    }
+
+    /// manifest에 기록되는 내용 다이제스트의 알고리즘 태그. 내용 대조를 지원하지 않으면 None.
+    pub fn digest_algorithm(self) -> Option<&'static str> {
+        match self {
+            Self::Mysql => Some(crate::engine::mysql::digest::ALGORITHM),
+            Self::MongoNative => Some(crate::engine::native::compare::DIGEST_ALGORITHM),
+            Self::Postgres => None,
+        }
     }
 
     pub fn label(self) -> &'static str {
@@ -248,11 +257,12 @@ impl LiveTarget {
             Self::Mysql(client) => {
                 crate::engine::mysql::digest::prepare_scan_session(client.conn_mut()).await
             }
-            _ => Err(content_unsupported()),
+            Self::Mongo { .. } => Ok(()),
+            Self::Postgres { .. } => Err(content_unsupported()),
         }
     }
 
-    /// 항목 하나의 내용 다이제스트를 대상에서 읽어 구한다. MariaDB/MySQL만 지원한다.
+    /// 항목 하나의 내용 다이제스트를 대상에서 읽어 구한다. MariaDB/MySQL, MongoDB만 지원한다.
     pub async fn digest(&mut self, name: &str) -> crate::error::Result<String> {
         match self {
             Self::Mysql(client) => {
@@ -275,7 +285,10 @@ impl LiveTarget {
                     crate::engine::mysql::digest::scan_table_digest(conn, &db, name).await?;
                 Ok(digest)
             }
-            _ => Err(content_unsupported()),
+            Self::Mongo { client, .. } => {
+                crate::engine::native::compare::scan_live_digest(client, name).await
+            }
+            Self::Postgres { .. } => Err(content_unsupported()),
         }
     }
 
@@ -318,12 +331,13 @@ pub async fn compare_with_target(
 ) -> crate::error::Result<CompareReport> {
     // 계산 방식을 모르는 다이제스트는 해석하지 않는다 — 접속하기 전에 거부한다.
     if let Some(digests) = content {
-        if digests.algorithm != crate::engine::mysql::digest::ALGORITHM {
+        let expected = engine.digest_algorithm().ok_or_else(content_unsupported)?;
+        if digests.algorithm != expected {
             return Err(crate::error::XBackupError::Usage(crate::tr!(
                 "unsupported content digest algorithm '{}' (this build understands '{}')",
                 "지원하지 않는 내용 다이제스트 알고리즘 '{}'입니다(이 빌드는 '{}'만 이해합니다)",
                 digests.algorithm,
-                crate::engine::mysql::digest::ALGORITHM
+                expected
             )));
         }
     }
@@ -385,6 +399,14 @@ pub async fn compare_with_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn digest_algorithm_tags_are_distinct_per_engine_and_absent_for_postgres() {
+        let mysql = CompareEngine::Mysql.digest_algorithm().unwrap();
+        let mongo = CompareEngine::MongoNative.digest_algorithm().unwrap();
+        assert_ne!(mysql, mongo, "해시 입력이 다르면 태그도 달라야 한다");
+        assert_eq!(CompareEngine::Postgres.digest_algorithm(), None);
+    }
 
     #[test]
     fn classifies_match_mismatch_missing_and_extra() {
