@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-29
+
+### Added
+
+- Backup compression accepts `compress = "gzip:N"` (level 1 to 9) and `compress = "none"`.
+  `backup --no-compress` turns compression off for one run. Restore reads gzip backups.
+- Full backups of MariaDB/MySQL, PostgreSQL and MongoDB (native engine) record the row
+  count of each table or collection in the manifest (`table_rows`). `list` shows a `ROWS`
+  column, and `list --json` has `total_rows`.
+- `verify --against <profile|uri>` compares the row counts in a backup with a target
+  database. It reports `MISMATCH`, `MISSING` and `EXTRA` and exits with code 1 on a
+  difference. `--tables` limits the comparison. For MongoDB, `--estimate` uses
+  `estimatedDocumentCount`.
+- `verify --against --content` compares content digests. A MariaDB/MySQL full backup
+  records a digest for each table by default (`--no-content-digest` turns it off). A
+  MongoDB native full backup records a digest for each collection with
+  `backup --content-digest`. A table with the same row count and different values is
+  reported as `CONTENT`.
+- `restore` compares the row counts of the backup with the target database after the
+  restore. A difference gives a warning and exit code 4. `--no-verify-rows` turns the
+  check off.
+- The backup progress line and the summary show rows, tables (collections), the largest
+  tables and the elapsed time. The `--json` output has `rows_total`, `table_rows` and
+  `elapsed_secs`.
+- A full backup compares its row counts with the previous full backup in the same
+  destination. If a table disappears or loses rows above `--warn-drop-percent` (default
+  50), the backup gives a warning and exit code 4. `--json` has `rows_vs_previous`.
+
+### Fixed
+
+- A PostgreSQL backup sets `DateStyle = ISO`, `extra_float_digits = 3` and
+  `IntervalStyle = postgres` for its session. Before this change, server defaults such as
+  `DateStyle = SQL, DMY` or a low `extra_float_digits` changed dates and rounded floats in
+  the dump, and the restore completed without an error.
+- `install.sh` and `x-backup update` read the latest release tag from the
+  `releases/latest` redirect. Without a token, they no longer use the GitHub API, so the
+  API rate limit no longer stops an install or an update.
+- Control characters in a table name are replaced with `?` in the backup progress line
+  and the summary.
+
 ## [0.6.1] - 2026-10-27
 
 ### Fixed
