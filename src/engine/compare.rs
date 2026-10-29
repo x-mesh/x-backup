@@ -168,7 +168,7 @@ impl CompareEngine {
         match self {
             Self::Mysql => Some(crate::engine::mysql::digest::ALGORITHM),
             Self::MongoNative => Some(crate::engine::native::compare::DIGEST_ALGORITHM),
-            Self::Postgres => None,
+            Self::Postgres => Some(crate::engine::postgres::digest::ALGORITHM),
         }
     }
 
@@ -258,7 +258,9 @@ impl LiveTarget {
                 crate::engine::mysql::digest::prepare_scan_session(client.conn_mut()).await
             }
             Self::Mongo { .. } => Ok(()),
-            Self::Postgres { .. } => Err(content_unsupported()),
+            Self::Postgres { client, .. } => {
+                crate::engine::postgres::digest::prepare_scan_session(client.client()).await
+            }
         }
     }
 
@@ -288,7 +290,16 @@ impl LiveTarget {
             Self::Mongo { client, .. } => {
                 crate::engine::native::compare::scan_live_digest(client, name).await
             }
-            Self::Postgres { .. } => Err(content_unsupported()),
+            Self::Postgres { client, live } => {
+                let (schema, table) = live.tables.get(name).ok_or_else(|| {
+                    crate::error::XBackupError::Failure(crate::tr!(
+                        "unknown PostgreSQL table: '{name}'",
+                        "알 수 없는 PostgreSQL 테이블: '{name}'"
+                    ))
+                })?;
+                crate::engine::postgres::digest::scan_table_digest(client.client(), schema, table)
+                    .await
+            }
         }
     }
 
@@ -401,11 +412,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn digest_algorithm_tags_are_distinct_per_engine_and_absent_for_postgres() {
+    fn digest_algorithm_tags_are_distinct_per_engine() {
         let mysql = CompareEngine::Mysql.digest_algorithm().unwrap();
         let mongo = CompareEngine::MongoNative.digest_algorithm().unwrap();
         assert_ne!(mysql, mongo, "해시 입력이 다르면 태그도 달라야 한다");
-        assert_eq!(CompareEngine::Postgres.digest_algorithm(), None);
+        let postgres = CompareEngine::Postgres.digest_algorithm().unwrap();
+        assert!(postgres != mysql && postgres != mongo);
     }
 
     #[test]

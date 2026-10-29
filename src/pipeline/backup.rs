@@ -696,6 +696,7 @@ pub async fn run_pg_full_backup(
         None,
         profile_name,
         enable_incremental,
+        true,
     )
     .await
 }
@@ -715,6 +716,7 @@ pub async fn run_pg_full_backup_with_rows(
     row_progress: Option<Arc<crate::engine::progress::RowProgress>>,
     profile_name: &str,
     enable_incremental: bool,
+    content_digest: bool,
 ) -> Result<BackupOutcome> {
     use crate::engine::postgres::{
         archive as pg_archive, backup::PgDumper, conn::PgClient, incremental,
@@ -747,8 +749,9 @@ pub async fn run_pg_full_backup_with_rows(
         .await
         .map(|v| format!("postgresql {v}"))
         .unwrap_or_else(|| "postgresql".to_string());
-    let dump = dumper.dump_stream(db, collection, row_progress);
+    let dump = dumper.dump_stream(db, collection, row_progress, content_digest);
     let dump_handle = dump.handle();
+    let digests_cell = dump_handle.digests();
 
     // 공통 코어: 합성 → 저장 → 종료 판정 → 확정(Mongo 경로와 동일 골격).
     let stored = store_dump_stream(
@@ -783,7 +786,10 @@ pub async fn run_pg_full_backup_with_rows(
         promoted_from_gap: false,
         mysql_binlog: None,
         table_rows: Some(stored.dump_output.clone()),
-        table_digests: None,
+        table_digests: content_digest.then(|| crate::manifest::schema::ContentDigests {
+            algorithm: crate::engine::postgres::digest::ALGORITHM.to_string(),
+            tables: std::mem::take(&mut *digests_cell.lock().expect("pg table digests poisoned")),
+        }),
         status: BackupStatus::Complete,
     };
     write_manifest_or_cleanup(storage, &manifest).await?;

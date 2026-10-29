@@ -674,15 +674,16 @@ mod tests {
         assert!(err.to_string().contains("PostgreSQL"), "{err}");
     }
 
-    /// `--content`는 MariaDB/MySQL 백업만 지원한다 — 다른 엔진은 접속 전에 사용법 오류(exit 2)다.
+    /// 다이제스트가 없는 PostgreSQL 백업도 엔진과 무관하게 접속 전에 사용법 오류(exit 2)로 거부한다.
     #[tokio::test]
-    async fn content_is_rejected_for_a_non_mysql_backup() {
+    async fn content_requires_digests_for_a_postgres_backup_too() {
         let dir = tempfile::tempdir().unwrap();
         let fs = LocalFs::new(dir.path()).unwrap();
         let payload = b"archive";
         let mut m = full("bk", &sha256_hex(payload));
         m.tool_versions.archive_format =
             Some(crate::engine::postgres::archive::FORMAT_ID.to_string());
+        m.table_digests = None;
         seed(&fs, &m, payload).await;
 
         let mut a = args("bk", false, false, false);
@@ -692,7 +693,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.exit_code(), 2, "{err}");
-        assert!(err.to_string().contains("MariaDB/MySQL"), "{err}");
+        assert!(err.to_string().contains("content digests"), "{err}");
     }
 
     /// 다이제스트가 기록되지 않은 백업에 `--content`를 주면 조용히 건너뛰지 않고 거부한다.

@@ -225,13 +225,13 @@ pub struct BackupArgs {
     /// PRD-05). primary 부하 분리용. 미지정 시 config read_uri → 주 소스 순으로 폴백.
     #[arg(long, value_name = "URI")]
     pub read_source: Option<String>,
-    /// 테이블별 내용 다이제스트를 manifest에 기록하지 않는다. 기본(MySQL 풀 백업)은 기록하며
+    /// 테이블별 내용 다이제스트를 manifest에 기록하지 않는다. 기본(MariaDB/MySQL, PostgreSQL 풀 백업)은 기록하며
     /// 나중에 `verify --against --content`가 복구된 DB의 값이 같은지 대조하는 기준이 된다.
     /// 압축을 끄면 덤프가 CPU에 묶여 다이제스트 계산이 시간에 그대로 더해질 수 있다.
     #[arg(long)]
     pub no_content_digest: bool,
-    /// MongoDB(native) 풀 백업에서 컬렉션별 내용 다이제스트를 manifest에 기록한다. MariaDB/MySQL과 달리
-    /// 기본은 끄며, 문서를 해시하는 시간이 백업에 더해진다(로컬 측정에서 +66%). 기록해 두면
+    /// MongoDB(native) 풀 백업에서 컬렉션별 내용 다이제스트를 manifest에 기록한다. MariaDB/MySQL,
+    /// PostgreSQL과 달리 기본은 끄며, 문서를 해시하는 시간이 백업에 더해진다(로컬 측정에서 +66%). 기록해 두면
     /// `verify --against --content`가 복구된 컬렉션의 문서 내용을 대조한다.
     #[arg(long, conflicts_with = "no_content_digest")]
     pub content_digest: bool,
