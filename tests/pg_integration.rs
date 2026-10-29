@@ -344,6 +344,144 @@ async fn full_backup_survives_non_default_source_session_settings() {
     );
 }
 
+/// 내용 다이제스트: 비기본 세션 설정(`Asia/Seoul`, `SQL, DMY`, bytea `escape`)의 원본도 복구 후 대상과
+/// 일치하고, 행 수가 같은 채 값 하나만 바뀌면 `CONTENT`로 잡힌다.
+#[tokio::test]
+#[ignore = "requires PostgreSQL wal_level=logical; run with --features pg-integration"]
+async fn content_digest_matches_after_restore_and_catches_a_changed_value() {
+    use x_backup::engine::compare::{compare_with_target, CompareEngine, TableStatus};
+
+    let src_uri = src_uri();
+    let src = connect(&src_uri).await;
+    let db: String = src
+        .query_one("SELECT current_database()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let _ = src
+        .batch_execute("DROP TABLE IF EXISTS public.dg_items")
+        .await;
+    src.batch_execute(
+        "CREATE TABLE public.dg_items (id int PRIMARY KEY, txt text, n numeric(12,4), \
+         f4 real, f8 double precision, d date, ts timestamp, tstz timestamptz, iv interval, \
+         b bytea, j jsonb, a int[], g int GENERATED ALWAYS AS (id * 2) STORED)",
+    )
+    .await
+    .unwrap();
+    src.batch_execute(
+        "INSERT INTO public.dg_items (id, txt, n, f4, f8, d, ts, tstz, iv, b, j, a) VALUES \
+         (1,'plain',1.5,1.1,0.1,'2026-03-02','2026-03-02 10:00:00.5','2026-03-02 10:00:00+09','1 year 2 mons 3 days','\\xdeadbeef','{\"k\":[1,2]}','{1,2,3}'),\
+         (2,E'tab\\there\\nnewline\\\\backslash','-0.0001',0.33333334,0.3333333333333333,'2026-11-05','1999-12-31 23:59:59','2026-11-05 23:59:59-05','-1 days','\\x','{}','{}'),\
+         (3,'한글 ✓',12345678.9999,16777217,123456789.12345678,'0001-01-01','2000-02-29 00:00:00','2000-02-29 12:00:00-05','00:00:00','\\x00ff','[1,null]',NULL)",
+    )
+    .await
+    .unwrap();
+    src.batch_execute(&format!(
+        "ALTER DATABASE {db} SET timezone TO 'Asia/Seoul'; \
+         ALTER DATABASE {db} SET datestyle TO 'SQL, DMY'; \
+         ALTER DATABASE {db} SET bytea_output TO 'escape'"
+    ))
+    .await
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = LocalFs::new(dir.path()).unwrap();
+    let backup = run_pg_full_backup(
+        &Secret::new(src_uri.clone()),
+        None,
+        None,
+        None,
+        &storage,
+        StageStack::new(),
+        BackupMeta::none(),
+        None,
+        "dg",
+        false,
+    )
+    .await;
+    src.batch_execute(&format!(
+        "ALTER DATABASE {db} RESET timezone; ALTER DATABASE {db} RESET datestyle; \
+         ALTER DATABASE {db} RESET bytea_output"
+    ))
+    .await
+    .unwrap();
+    let full = backup.expect("PG 풀 백업 성공");
+
+    let manifest = ManifestStore::new(&storage)
+        .read(&full.backup_id)
+        .await
+        .expect("manifest 읽기");
+    let digests = manifest
+        .table_digests
+        .clone()
+        .expect("PG 풀 백업은 기본으로 table_digests를 기록");
+    assert!(digests.tables.contains_key("public.dg_items"));
+    let counts = manifest.table_rows.expect("table_rows");
+
+    recreate_database(&src, "xb_dg_target").await;
+    let tgt_uri = swap_db(&src_uri, "xb_dg_target");
+    let req = RestoreRequest {
+        target_uri: Secret::new(tgt_uri.clone()),
+        mongorestore_program: "mongorestore".to_string(), // PG 경로에선 미사용.
+        backup_id: Some(full.backup_id.clone()),
+        only: None,
+        force: false,
+        dry_run: false,
+        skip_precheck: false,
+        timeout_secs: None,
+        progress_counter: None,
+    };
+    run_restore(&req, &storage, false, |_| {
+        panic!("빈 대상이라 confirm 미호출")
+    })
+    .await
+    .expect("빈 대상 복구 성공");
+
+    let target = Secret::new(tgt_uri.clone());
+    let report = compare_with_target(
+        CompareEngine::Postgres,
+        &target,
+        counts.clone(),
+        &[],
+        false,
+        true,
+        Some(&digests),
+    )
+    .await
+    .expect("복구 직후 대조");
+    let status = |report: &x_backup::engine::compare::CompareReport| {
+        report
+            .tables
+            .iter()
+            .find(|t| t.table == "public.dg_items")
+            .map(|t| t.status)
+            .expect("dg_items 항목")
+    };
+    assert_eq!(
+        status(&report),
+        TableStatus::Match,
+        "복구한 값이 원본과 같다"
+    );
+
+    // 행 수는 그대로 두고 값 하나만 바꾼다.
+    let tgt = connect(&tgt_uri).await;
+    tgt.batch_execute("UPDATE public.dg_items SET txt = 'plain!' WHERE id = 1")
+        .await
+        .unwrap();
+    let changed = compare_with_target(
+        CompareEngine::Postgres,
+        &target,
+        counts,
+        &[],
+        false,
+        true,
+        Some(&digests),
+    )
+    .await
+    .expect("변경 후 대조");
+    assert_eq!(status(&changed), TableStatus::ContentMismatch);
+}
+
 /// 풀 백업(H1 REPEATABLE READ 스냅샷) → 빈 대상으로 복구(H5 가드 happy path) 후
 /// 행 수·콘텐츠가 일치한다. serial 시퀀스 충실도도 함께 통과한다.
 #[tokio::test]

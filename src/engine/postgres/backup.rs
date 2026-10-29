@@ -26,6 +26,7 @@ use tokio_postgres::Client;
 
 use super::archive;
 use super::conn::PgClient;
+use super::digest::CopyRowDigest;
 use crate::config::secret::Secret;
 use crate::engine::progress::RowProgress;
 use crate::error::{Result, XBackupError};
@@ -36,16 +37,22 @@ const PIPE_BUFFER_BYTES: usize = 256 * 1024;
 /// 시스템 스키마(백업 대상에서 제외).
 const SYSTEM_SCHEMAS: &str = "'pg_catalog','information_schema','pg_toast'";
 
-/// 덤프 세션이 COPY 텍스트를 만들기 전에 고정하는 설정(`pg_dump`와 같은 세 가지).
+/// 덤프 세션이 COPY 텍스트를 만들기 전에 고정하는 설정(`pg_dump`의 세 가지와 `TimeZone`, `bytea_output`).
 ///
 /// 고정하지 않으면 원본 DB·롤·서버의 기본값이 덤프 텍스트를 바꾼다. `DateStyle`이 `SQL, DMY`나
 /// `German, DMY`이면 날짜가 `02/03/2026`처럼 모호하게 나가 대상(ISO, MDY)에서 일과 월이 바뀌고,
 /// `extra_float_digits`가 0 이하이면 float가 반올림된다. 둘 다 행 수는 그대로라 조용히 지나간다.
 /// ISO 텍스트는 대상 세션의 `DateStyle`과 무관하게 해석되므로 복구 쪽은 고정하지 않는다.
-const DUMP_SESSION_SETTINGS: [&str; 3] = [
+///
+/// `TimeZone`과 `bytea_output`은 값 자체는 바꾸지 않지만 텍스트를 바꾼다(`timestamptz`의 오프셋 표기,
+/// bytea의 hex/escape). 내용 다이제스트가 원본·대상의 세션 기본값 차이로 어긋나지 않게 함께 고정하며,
+/// 검증 스캔도 같은 설정을 쓴다.
+pub(super) const DUMP_SESSION_SETTINGS: [&str; 5] = [
     "SET DateStyle = ISO",
     "SET extra_float_digits = 3",
     "SET IntervalStyle = postgres",
+    "SET TimeZone = 'UTC'",
+    "SET bytea_output = hex",
 ];
 
 /// 드라이버로 PostgreSQL 데이터 백업을 수행하는 덤퍼.
@@ -81,12 +88,15 @@ impl PgDumper {
         schema_filter: Option<String>,
         table_filter: Option<String>,
         progress: Option<Arc<RowProgress>>,
+        content_digest: bool,
     ) -> PgDumpStream {
         let (mut writer, reader) = tokio::io::duplex(PIPE_BUFFER_BYTES);
         let outcome: Arc<Mutex<Option<Result<()>>>> = Arc::new(Mutex::new(None));
         let rows: Arc<Mutex<BTreeMap<String, u64>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let digests: Arc<Mutex<BTreeMap<String, String>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let outcome_task = Arc::clone(&outcome);
         let rows_task = Arc::clone(&rows);
+        let digests_task = content_digest.then(|| Arc::clone(&digests));
         let pg = self.pg;
 
         let handle = tokio::spawn(async move {
@@ -96,6 +106,7 @@ impl PgDumper {
                 schema_filter,
                 table_filter,
                 &rows_task,
+                digests_task.as_ref(),
                 progress.as_deref(),
             )
             .await;
@@ -107,6 +118,7 @@ impl PgDumper {
             reader,
             outcome,
             rows,
+            digests,
             task: Arc::new(Mutex::new(Some(handle))),
         }
     }
@@ -143,6 +155,7 @@ async fn write_archive(
     schema_filter: Option<String>,
     table_filter: Option<String>,
     rows_cell: &Arc<Mutex<BTreeMap<String, u64>>>,
+    digests_cell: Option<&Arc<Mutex<BTreeMap<String, String>>>>,
     progress: Option<&RowProgress>,
 ) -> Result<()> {
     for setting in DUMP_SESSION_SETTINGS {
@@ -168,6 +181,7 @@ async fn write_archive(
         schema_filter,
         table_filter,
         rows_cell,
+        digests_cell,
         progress,
     )
     .await;
@@ -185,6 +199,7 @@ async fn write_archive_in_snapshot(
     schema_filter: Option<String>,
     table_filter: Option<String>,
     rows_cell: &Arc<Mutex<BTreeMap<String, u64>>>,
+    digests_cell: Option<&Arc<Mutex<BTreeMap<String, String>>>>,
     progress: Option<&RowProgress>,
 ) -> Result<()> {
     let version: String = client
@@ -237,6 +252,7 @@ async fn write_archive_in_snapshot(
         // 이식성이 안전하다(리뷰 #2). STORED generated 컬럼은 COPY 불가라 copy_cols에서 제외.
         // 파티션 부모(has_data=false)는 직접 데이터가 없어 COPY를 건너뛴다(자식 데이터 중복 방지).
         let mut rows = 0u64;
+        let mut digest = digests_cell.map(|_| CopyRowDigest::default());
         if def.has_data && !def.copy_cols.is_empty() {
             let cols = def.copy_cols.join(", ");
             let copy_sql = format!("COPY {} ({cols}) TO STDOUT (FORMAT text)", def.quoted);
@@ -255,6 +271,9 @@ async fn write_archive_in_snapshot(
                     def.ns
                 ))
             })? {
+                if let Some(d) = digest.as_mut() {
+                    d.push(&chunk);
+                }
                 let chunk_rows = copy_text_rows(&chunk);
                 rows += chunk_rows;
                 if let Some(p) = progress {
@@ -273,6 +292,11 @@ async fn write_archive_in_snapshot(
                 .lock()
                 .expect("pg table rows poisoned")
                 .insert(def.ns.clone(), rows);
+            if let (Some(cell), Some(d)) = (digests_cell, digest) {
+                cell.lock()
+                    .expect("pg table digests poisoned")
+                    .insert(def.ns.clone(), d.finish().1);
+            }
         }
         tracing::debug!(ns = %def.ns, rows, "PG 백업: 테이블 직렬화 완료");
     }
@@ -853,6 +877,7 @@ pub struct PgDumpStream {
     reader: DuplexStream,
     outcome: Arc<Mutex<Option<Result<()>>>>,
     rows: Arc<Mutex<BTreeMap<String, u64>>>,
+    digests: Arc<Mutex<BTreeMap<String, String>>>,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -862,6 +887,7 @@ impl PgDumpStream {
         PgDumpHandle {
             outcome: Arc::clone(&self.outcome),
             rows: Arc::clone(&self.rows),
+            digests: Arc::clone(&self.digests),
             task: Arc::clone(&self.task),
         }
     }
@@ -871,10 +897,17 @@ impl PgDumpStream {
 pub struct PgDumpHandle {
     outcome: Arc<Mutex<Option<Result<()>>>>,
     rows: Arc<Mutex<BTreeMap<String, u64>>>,
+    digests: Arc<Mutex<BTreeMap<String, String>>>,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl PgDumpHandle {
+    /// 테이블별 내용 다이제스트 저장소. `finish`가 핸들을 소비하므로 미리 복제해 둔다.
+    /// 다이제스트를 켜지 않은 덤프에서는 끝까지 비어 있다.
+    pub fn digests(&self) -> Arc<Mutex<BTreeMap<String, String>>> {
+        Arc::clone(&self.digests)
+    }
+
     /// 스트림 EOF 후 백업 task의 결과를 회수하고, 스냅샷 안에서 아카이브에 쓴 테이블별 행 수
     /// (`스키마.테이블` → 행 수)를 반환한다(드라이버/직렬화 오류 전파).
     pub async fn finish(self) -> Result<BTreeMap<String, u64>> {
