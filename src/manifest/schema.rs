@@ -242,6 +242,10 @@ pub struct ContentDigests {
     pub algorithm: String,
     /// 테이블 이름 → 32자리 소문자 hex 다이제스트.
     pub tables: std::collections::BTreeMap<String, String>,
+    /// 다이제스트를 계산한 원본 세션의 설정 중 해시 입력 텍스트를 바꾸는 것(이름 → 값). 검증 스캔이
+    /// 같은 값으로 맞춘다. 현재 PostgreSQL의 `lc_monetary`만 기록하며, 다른 엔진은 비어 있다.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub session_settings: std::collections::BTreeMap<String, String>,
 }
 
 /// `serde(skip_serializing_if)`용 — `false`면 직렬화에서 생략한다(기본 백업의 잡음 제거).
@@ -332,9 +336,20 @@ mod tests {
                 "orders".to_string(),
                 "0123456789abcdef0123456789abcdef".to_string(),
             )]),
+            session_settings: Default::default(),
         });
         let json = serde_json::to_string(&m).unwrap();
         assert!(json.contains("sha256-sum128-v1"));
+        assert!(!json.contains("session_settings"), "비어 있으면 생략한다");
+        let back: BackupManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.table_digests, m.table_digests);
+
+        m.table_digests.as_mut().unwrap().session_settings = std::collections::BTreeMap::from([(
+            "lc_monetary".to_string(),
+            "de_DE.utf8".to_string(),
+        )]);
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("de_DE.utf8"));
         let back: BackupManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(back.table_digests, m.table_digests);
     }

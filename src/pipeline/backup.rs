@@ -426,6 +426,7 @@ pub async fn run_full_backup_with_rows(
         crate::manifest::schema::ContentDigests {
             algorithm: crate::engine::native::compare::DIGEST_ALGORITHM.to_string(),
             tables: std::mem::take(&mut *cell.lock().expect("native collection digests poisoned")),
+            session_settings: Default::default(),
         }
     });
     let mut manifest = build_manifest(
@@ -752,6 +753,7 @@ pub async fn run_pg_full_backup_with_rows(
     let dump = dumper.dump_stream(db, collection, row_progress, content_digest);
     let dump_handle = dump.handle();
     let digests_cell = dump_handle.digests();
+    let session_cell = dump_handle.session_settings();
 
     // 공통 코어: 합성 → 저장 → 종료 판정 → 확정(Mongo 경로와 동일 골격).
     let stored = store_dump_stream(
@@ -789,6 +791,9 @@ pub async fn run_pg_full_backup_with_rows(
         table_digests: content_digest.then(|| crate::manifest::schema::ContentDigests {
             algorithm: crate::engine::postgres::digest::ALGORITHM.to_string(),
             tables: std::mem::take(&mut *digests_cell.lock().expect("pg table digests poisoned")),
+            session_settings: std::mem::take(
+                &mut *session_cell.lock().expect("pg dump session poisoned"),
+            ),
         }),
         status: BackupStatus::Complete,
     };
@@ -882,6 +887,7 @@ pub async fn run_mysql_full_backup_with_rows(
     let table_digests = content_digest.then(|| crate::manifest::schema::ContentDigests {
         algorithm: crate::engine::mysql::digest::ALGORITHM.to_string(),
         tables: stored.dump_output.table_digests,
+        session_settings: Default::default(),
     });
 
     let manifest = BackupManifest {

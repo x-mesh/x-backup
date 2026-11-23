@@ -3,6 +3,7 @@
 //! 해시 입력은 `COPY ... TO STDOUT (FORMAT text)`가 내는 행 하나의 바이트다(줄바꿈 제외). 값 안의
 //! 줄바꿈은 COPY가 `\n` 두 글자로 이스케이프하므로 날 줄바꿈은 항상 행 경계다. 백업은 덤프 스트림
 //! 에서, 검증은 대상에서 같은 COPY를 같은 세션 설정(`DUMP_SESSION_SETTINGS`)으로 읽어 계산한다.
+//! money 텍스트를 정하는 `lc_monetary`는 덤프 세션의 값을 manifest에 기록해 두었다가 검증 스캔에 적용한다.
 //!
 //! PG 12 이전 서버는 `extra_float_digits = 3`에서 float를 더 길게 출력해 같은 값도 텍스트가 달라
 //! 다이제스트가 어긋난다. 그래서 대상이 PG 12 미만이면 대조를 거부한다(원본은 항상 12 이상이다).
@@ -10,7 +11,7 @@
 use futures::TryStreamExt;
 use tokio_postgres::Client;
 
-use super::backup::DUMP_SESSION_SETTINGS;
+use super::backup::{CONTENT_SESSION_SETTINGS, DUMP_SESSION_SETTINGS};
 use super::compare::quote_ident;
 use crate::engine::digest::RowDigest;
 use crate::error::{Result, XBackupError};
@@ -58,7 +59,13 @@ impl CopyRowDigest {
 }
 
 /// 대상 연결을 백업과 같은 세션(고정 설정 + 일관 스냅샷)으로 맞춘다. PG 12 미만이면 거부한다.
-pub async fn prepare_scan_session(client: &Client) -> Result<()> {
+///
+/// `recorded`는 manifest `table_digests.session_settings`다. 대상에 그 로캘이 없으면 경고만 남기고
+/// 대상 기본값으로 계속한다. money 컬럼이 없는 테이블은 영향을 받지 않기 때문이다.
+pub async fn prepare_scan_session(
+    client: &Client,
+    recorded: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
     let version_num: String = client
         .query_one("SHOW server_version_num", &[])
         .await
@@ -82,6 +89,23 @@ pub async fn prepare_scan_session(client: &Client) -> Result<()> {
                 "스캔 세션 설정 실패({setting}): {e}"
             ))
         })?;
+    }
+    for name in CONTENT_SESSION_SETTINGS {
+        let Some(value) = recorded.get(name) else {
+            continue;
+        };
+        if let Err(e) = client
+            .execute("SELECT set_config($1, $2, false)", &[&name, value])
+            .await
+        {
+            tracing::warn!(
+                "{}",
+                crate::tr!(
+                    "could not set {name} = '{value}' recorded at backup on the target ({e}); money columns may show CONTENT even when equal",
+                    "백업 때 기록한 {name} = '{value}'를 대상에 설정하지 못했습니다({e}). money 컬럼은 값이 같아도 CONTENT로 보일 수 있습니다"
+                )
+            );
+        }
     }
     client
         .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")

@@ -47,6 +47,10 @@ const SYSTEM_SCHEMAS: &str = "'pg_catalog','information_schema','pg_toast'";
 /// `TimeZone`과 `bytea_output`은 값 자체는 바꾸지 않지만 텍스트를 바꾼다(`timestamptz`의 오프셋 표기,
 /// bytea의 hex/escape). 내용 다이제스트가 원본·대상의 세션 기본값 차이로 어긋나지 않게 함께 고정하며,
 /// 검증 스캔도 같은 설정을 쓴다.
+///
+/// `lc_monetary`는 고정하지 않는다. 복구가 money 텍스트를 대상 세션의 로캘로 해석하므로, 덤프 쪽만
+/// 바꾸면 같은 로캘끼리의 복구도 깨진다. 대신 덤프 세션의 값을 [`CONTENT_SESSION_SETTINGS`]로 읽어
+/// 다이제스트와 함께 기록하고, 검증 스캔이 그 값으로 맞춘다.
 pub(super) const DUMP_SESSION_SETTINGS: [&str; 5] = [
     "SET DateStyle = ISO",
     "SET extra_float_digits = 3",
@@ -54,6 +58,9 @@ pub(super) const DUMP_SESSION_SETTINGS: [&str; 5] = [
     "SET TimeZone = 'UTC'",
     "SET bytea_output = hex",
 ];
+
+/// 덤프 세션에서 읽어 `table_digests.session_settings`에 기록하는 설정. money 텍스트가 이 로캘을 따른다.
+pub(super) const CONTENT_SESSION_SETTINGS: [&str; 1] = ["lc_monetary"];
 
 /// 드라이버로 PostgreSQL 데이터 백업을 수행하는 덤퍼.
 pub struct PgDumper {
@@ -94,9 +101,10 @@ impl PgDumper {
         let outcome: Arc<Mutex<Option<Result<()>>>> = Arc::new(Mutex::new(None));
         let rows: Arc<Mutex<BTreeMap<String, u64>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let digests: Arc<Mutex<BTreeMap<String, String>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let session: Arc<Mutex<BTreeMap<String, String>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let outcome_task = Arc::clone(&outcome);
         let rows_task = Arc::clone(&rows);
-        let digests_task = content_digest.then(|| Arc::clone(&digests));
+        let digests_task = content_digest.then(|| (Arc::clone(&digests), Arc::clone(&session)));
         let pg = self.pg;
 
         let handle = tokio::spawn(async move {
@@ -106,7 +114,7 @@ impl PgDumper {
                 schema_filter,
                 table_filter,
                 &rows_task,
-                digests_task.as_ref(),
+                digests_task.as_ref().map(|(d, s)| (d, s)),
                 progress.as_deref(),
             )
             .await;
@@ -119,6 +127,7 @@ impl PgDumper {
             outcome,
             rows,
             digests,
+            session,
             task: Arc::new(Mutex::new(Some(handle))),
         }
     }
@@ -143,6 +152,9 @@ struct TableDef {
     has_data: bool,
 }
 
+/// 덤프 task와 호출자가 함께 쓰는 이름 → 값 맵(테이블 다이제스트, 세션 설정).
+type SharedStrings = Arc<Mutex<BTreeMap<String, String>>>;
+
 /// 대상 데이터베이스 전체를 아카이브 프레임으로 직렬화해 writer에 쓴다.
 ///
 /// **스냅샷 일관성(H1):** 모든 introspection + 테이블별 COPY를 **단일 REPEATABLE READ
@@ -155,7 +167,7 @@ async fn write_archive(
     schema_filter: Option<String>,
     table_filter: Option<String>,
     rows_cell: &Arc<Mutex<BTreeMap<String, u64>>>,
-    digests_cell: Option<&Arc<Mutex<BTreeMap<String, String>>>>,
+    digest_cells: Option<(&SharedStrings, &SharedStrings)>,
     progress: Option<&RowProgress>,
 ) -> Result<()> {
     for setting in DUMP_SESSION_SETTINGS {
@@ -166,6 +178,24 @@ async fn write_archive(
             ))
         })?;
     }
+    if let Some((_, session_cell)) = digest_cells {
+        let mut session = BTreeMap::new();
+        for name in CONTENT_SESSION_SETTINGS {
+            let value: String = client
+                .query_one("SELECT current_setting($1)", &[&name])
+                .await
+                .map(|r| r.get(0))
+                .map_err(|e| {
+                    XBackupError::Failure(crate::tr!(
+                        "failed to read the dump session setting {name}: {e}",
+                        "덤프 세션 설정 {name} 조회 실패: {e}"
+                    ))
+                })?;
+            session.insert(name.to_string(), value);
+        }
+        *session_cell.lock().expect("pg dump session poisoned") = session;
+    }
+    let digests_cell = digest_cells.map(|(d, _)| d);
     client
         .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .await
@@ -878,6 +908,7 @@ pub struct PgDumpStream {
     outcome: Arc<Mutex<Option<Result<()>>>>,
     rows: Arc<Mutex<BTreeMap<String, u64>>>,
     digests: Arc<Mutex<BTreeMap<String, String>>>,
+    session: Arc<Mutex<BTreeMap<String, String>>>,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -888,6 +919,7 @@ impl PgDumpStream {
             outcome: Arc::clone(&self.outcome),
             rows: Arc::clone(&self.rows),
             digests: Arc::clone(&self.digests),
+            session: Arc::clone(&self.session),
             task: Arc::clone(&self.task),
         }
     }
@@ -898,6 +930,7 @@ pub struct PgDumpHandle {
     outcome: Arc<Mutex<Option<Result<()>>>>,
     rows: Arc<Mutex<BTreeMap<String, u64>>>,
     digests: Arc<Mutex<BTreeMap<String, String>>>,
+    session: Arc<Mutex<BTreeMap<String, String>>>,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -906,6 +939,12 @@ impl PgDumpHandle {
     /// 다이제스트를 켜지 않은 덤프에서는 끝까지 비어 있다.
     pub fn digests(&self) -> Arc<Mutex<BTreeMap<String, String>>> {
         Arc::clone(&self.digests)
+    }
+
+    /// 다이제스트를 계산한 덤프 세션의 설정([`CONTENT_SESSION_SETTINGS`]). 다이제스트를 켜지 않은
+    /// 덤프에서는 비어 있다.
+    pub fn session_settings(&self) -> Arc<Mutex<BTreeMap<String, String>>> {
+        Arc::clone(&self.session)
     }
 
     /// 스트림 EOF 후 백업 task의 결과를 회수하고, 스냅샷 안에서 아카이브에 쓴 테이블별 행 수
