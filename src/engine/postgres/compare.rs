@@ -27,7 +27,7 @@ pub struct LiveTables {
 }
 
 /// 식별자를 쌍따옴표로 quote한다(내부 쌍따옴표는 두 배).
-fn quote_ident(name: &str) -> String {
+pub(super) fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 

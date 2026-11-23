@@ -430,7 +430,8 @@ where
 
     // 전송: PgDumper(source) → restore_into(target). EOF 후 양측 결과 회수.
     let dumper = PgDumper::connect(&request.source_uri, request.timeout_secs).await?;
-    let mut stream = dumper.dump_stream(request.db.clone(), request.collection.clone(), None);
+    let mut stream =
+        dumper.dump_stream(request.db.clone(), request.collection.clone(), None, false);
     let handle = stream.handle();
     let tgt = pg_meta::connect(&request.target_uri, request.timeout_secs)
         .await

@@ -168,7 +168,7 @@ impl CompareEngine {
         match self {
             Self::Mysql => Some(crate::engine::mysql::digest::ALGORITHM),
             Self::MongoNative => Some(crate::engine::native::compare::DIGEST_ALGORITHM),
-            Self::Postgres => None,
+            Self::Postgres => Some(crate::engine::postgres::digest::ALGORITHM),
         }
     }
 
@@ -252,13 +252,22 @@ impl LiveTarget {
     }
 
     /// 내용 다이제스트 스캔을 준비한다(백업과 같은 세션·일관 스냅샷). MariaDB/MySQL만 지원한다.
-    pub async fn prepare_content_scan(&mut self) -> crate::error::Result<()> {
+    pub async fn prepare_content_scan(
+        &mut self,
+        digests: &crate::manifest::schema::ContentDigests,
+    ) -> crate::error::Result<()> {
         match self {
             Self::Mysql(client) => {
                 crate::engine::mysql::digest::prepare_scan_session(client.conn_mut()).await
             }
             Self::Mongo { .. } => Ok(()),
-            Self::Postgres { .. } => Err(content_unsupported()),
+            Self::Postgres { client, .. } => {
+                crate::engine::postgres::digest::prepare_scan_session(
+                    client.client(),
+                    &digests.session_settings,
+                )
+                .await
+            }
         }
     }
 
@@ -288,7 +297,16 @@ impl LiveTarget {
             Self::Mongo { client, .. } => {
                 crate::engine::native::compare::scan_live_digest(client, name).await
             }
-            Self::Postgres { .. } => Err(content_unsupported()),
+            Self::Postgres { client, live } => {
+                let (schema, table) = live.tables.get(name).ok_or_else(|| {
+                    crate::error::XBackupError::Failure(crate::tr!(
+                        "unknown PostgreSQL table: '{name}'",
+                        "알 수 없는 PostgreSQL 테이블: '{name}'"
+                    ))
+                })?;
+                crate::engine::postgres::digest::scan_table_digest(client.client(), schema, table)
+                    .await
+            }
         }
     }
 
@@ -381,7 +399,7 @@ pub async fn compare_with_target(
 
     // 내용 다이제스트 — 행 수가 이미 어긋난 항목은 읽지 않는다(전체 스캔이라 비싸다).
     if let Some(digests) = content {
-        live_target.prepare_content_scan().await?;
+        live_target.prepare_content_scan(digests).await?;
         let mut target_digests = BTreeMap::new();
         for entry in report
             .tables
@@ -401,11 +419,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn digest_algorithm_tags_are_distinct_per_engine_and_absent_for_postgres() {
+    fn digest_algorithm_tags_are_distinct_per_engine() {
         let mysql = CompareEngine::Mysql.digest_algorithm().unwrap();
         let mongo = CompareEngine::MongoNative.digest_algorithm().unwrap();
         assert_ne!(mysql, mongo, "해시 입력이 다르면 태그도 달라야 한다");
-        assert_eq!(CompareEngine::Postgres.digest_algorithm(), None);
+        let postgres = CompareEngine::Postgres.digest_algorithm().unwrap();
+        assert!(postgres != mysql && postgres != mongo);
     }
 
     #[test]
@@ -551,6 +570,7 @@ mod tests {
         let digests = crate::manifest::schema::ContentDigests {
             algorithm: "other-algo-v9".to_string(),
             tables: BTreeMap::new(),
+            session_settings: BTreeMap::new(),
         };
         // 포트 1은 닫혀 있다 — 접속을 시도했다면 연결 오류(exit 1)가 났을 것이다.
         let target = crate::config::secret::Secret::new("mysql://u:p@127.0.0.1:1/db".to_string());
