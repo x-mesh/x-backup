@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-24
+
+### Added
+
+- A PostgreSQL full backup records a content digest for each table by default
+  (`--no-content-digest` turns it off). `verify --against --content` compares these
+  digests with a PostgreSQL 12 or later target. A table with the same row count and
+  different values is reported as `CONTENT`.
+
+### Fixed
+
+- `money` values follow the `lc_monetary` setting of the session. The PostgreSQL backup
+  records the `lc_monetary` value of the dump session with the digests, and the
+  `verify --content` scan uses the same value. If the target does not have that locale,
+  the scan gives a warning and continues.
+
 ## [0.7.0] - 2026-10-29
 
 ### Added
